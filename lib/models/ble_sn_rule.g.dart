@@ -1,0 +1,28 @@
+// GENERATED CODE - DO NOT MODIFY BY HAND
+
+part of 'ble_sn_rule.dart';
+
+// **************************************************************************
+// JsonSerializableGenerator
+// **************************************************************************
+
+BleSnRule _$BleSnRuleFromJson(Map<String, dynamic> json) => BleSnRule(
+      byteLength: (json['byteLength'] as num?)?.toInt() ?? 0,
+      startSubIndex: (json['startSubIndex'] as num?)?.toInt() ?? 0,
+      replaceRex: json['replaceRex'] as String? ?? "",
+      scanFilterMarks: (json['scanFilterMarks'] as List<dynamic>?)
+              ?.map((e) => e as String)
+              .toList() ??
+          const [],
+      isMatchBySn: json['isMatchBySn'] as bool? ?? false,
+      matchCount: (json['matchCount'] as num?)?.toInt() ?? 1,
+    );
+
+Map<String, dynamic> _$BleSnRuleToJson(BleSnRule instance) => <String, dynamic>{
+      'byteLength': instance.byteLength,
+      'startSubIndex': instance.startSubIndex,
+      'replaceRex': instance.replaceRex,
+      'scanFilterMarks': instance.scanFilterMarks,
+      'isMatchBySn': instance.isMatchBySn,
+      'matchCount': instance.matchCount,
+    };

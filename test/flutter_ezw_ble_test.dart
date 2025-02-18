@@ -1,0 +1,93 @@
+import 'dart:typed_data';
+
+import 'package:flutter_ezw_ble/src/flutter_ezw_ble_method_channel.dart';
+import 'package:flutter_ezw_ble/src/flutter_ezw_ble_platform_interface.dart';
+import 'package:flutter_ezw_ble/models/ble_config.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:plugin_platform_interface/plugin_platform_interface.dart';
+
+class MockFlutterEzwBlePlatform
+    with MockPlatformInterfaceMixin
+    implements FlutterEzwBlePlatform {
+
+  @override
+  Future<String?> getPlatformVersion() {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<int> bleState() {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> enableConfig(BleConfig config) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> startScan() {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> stopScan() {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> connectDevice(String uuid, {String? sn, bool? afterUpgrade}) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> disconnectDevice(String uuid) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> deviceConnected(String uuid) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> sendCmd(String uuid, Uint8List data) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> openAppSettings() {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> openBleSettings() {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> enterUpgradeState(String uuid) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> quiteUpgradeState(String uuid) {
+    throw UnimplementedError();
+  }
+}
+
+void main() {
+  final FlutterEzwBlePlatform initialPlatform = FlutterEzwBlePlatform.instance;
+
+  test('$MethodChannelEzwBle is the default instance', () {
+    expect(initialPlatform, isInstanceOf<MethodChannelEzwBle>());
+  });
+
+  // test('getPlatformVersion', () async {
+  //   EzwBle ezwBlePlugin = EzwBle();
+  //   MockFlutterEzwBlePlatform fakePlatform = MockFlutterEzwBlePlatform();
+  //   FlutterEzwBlePlatform.instance = fakePlatform;
+
+  //   expect(await ezwBlePlugin.getPlatformVersion(), '42');
+  // });
+}
