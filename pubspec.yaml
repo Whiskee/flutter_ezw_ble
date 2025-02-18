@@ -12,7 +12,7 @@ dependencies:
   flutter:
     sdk: flutter
   plugin_platform_interface: ^2.0.2
-  # EZW-工具集合
+  # EZW-Utils
   flutter_ezw_utils:
     git: 
       url: https://github.com/Whiskee/flutter_ezw_utils.git
