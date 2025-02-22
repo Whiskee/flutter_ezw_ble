@@ -7,7 +7,7 @@ import 'package:flutter_ezw_utils/extension/rxdart_ext.dart';
 
 extension BleDeviceExt on BleDevice {}
 
-extension RxMatchDevice on Rx<BleMatchDevice?> {
+extension RxMatchDeviceExt on Rx<BleMatchDevice?> {
   void update(BleConnectModel connectModel) {
     //  1、如果没有匹配的对象，直接返回
     final oldDevice = value?.copy();
