@@ -3,7 +3,7 @@ library flutter_ezw;
 export 'package:flutter_ezw_ble/flutter_ezw_ble.dart';
 
 /// ThirdPart
-export 'package:flutter_ezw_utils/flutter_ezw_utils.dart';
+export 'package:flutter_ezw_utils/flutter_ezw_index.dart';
 
 /// Core
 export 'core/common.dart';
