@@ -1,8 +1,6 @@
-library flutter_ezw_ble;
-
 import 'package:flutter_ezw_ble/dfu/dfu_service.dart';
-import 'package:flutter_ezw_ble/src/flutter_ezw_ble_event_channel.dart';
-import 'package:flutter_ezw_ble/src/flutter_ezw_ble_method_channel.dart';
+import 'package:flutter_ezw_ble/flutter_ezw_ble_event_channel.dart';
+import 'package:flutter_ezw_ble/flutter_ezw_ble_method_channel.dart';
 import 'package:flutter_ezw_ble/models/ble_cmd.dart';
 import 'package:flutter_ezw_ble/models/ble_connect_model.dart';
 import 'package:flutter_ezw_ble/models/ble_connect_state.dart';
@@ -10,25 +8,49 @@ import 'package:flutter_ezw_ble/models/ble_match_device.dart';
 import 'package:flutter_ezw_ble/models/ble_status.dart';
 import 'package:flutter_ezw_utils/extension/string_ext.dart';
 
-export 'core/common.dart';
-export 'core/extension/ble_device_ext.dart';
-export 'core/tools/connect_state_converter.dart';
-export 'dfu/dfu_service.dart';
-export 'dfu/models/dfu_manifest.dart';
-export 'dfu/models/dfu_update.dart';
-export 'models/ble_cmd.dart';
-export 'models/ble_config.dart';
-export 'models/ble_connect_model.dart';
-export 'models/ble_connect_state.dart';
-export 'models/ble_device.dart';
-export 'models/ble_match_device.dart';
-export 'models/ble_sn_rule.dart';
-export 'models/ble_status.dart';
-export 'models/ble_uuid.dart';
+const String ezwBleTag = "flutter_ezw_ble";
 
-// ThirdPart
-export 'package:flutter_ezw_utils/flutter_ezw_utils.dart';
-export 'package:mcumgr_flutter/mcumgr_flutter.dart';
-export 'package:archive/archive.dart';
+class EzwBle {
+  static final EzwBle to = EzwBle._init();
 
-part 'src/flutter_ezw_ble.dart';
+  /// 原生方法回调
+  MethodChannelEzwBle bleMC = MethodChannelEzwBle();
+
+  /// 原生监听事件
+  //  - 蓝牙状态
+  Stream<BleState> bleStateEC =
+      BleEventChannel.bleState.ec.map((data) => BleStateExt.from(data));
+  //  - 蓝牙搜索结果
+  Stream<BleMatchDevice> scanResultEC =
+      BleEventChannel.scanResult.ec.map((data) {
+    final jsonMap = (data as String? ?? "").toMap();
+    return BleMatchDevice.fromJson(jsonMap);
+  });
+  //  - 开启连接后的流程
+  Stream<BleConnectModel> connectStatusEC =
+      BleEventChannel.connectStatus.ec.map((data) {
+    //  1、获取设备连接状态
+    final jsonMap = (data as String? ?? "").toMap();
+    return BleConnectModel.fromJson(jsonMap);
+  });
+  //  - 蓝牙数据: 返回BleCmd中的data数据为 base64处理过的，需要自行解析成Uint8List
+  Stream<BleCmd> receiveDataEC =
+      BleEventChannel.receiveData.ec.map((data) => BleCmd.receiveMap(data));
+
+  EzwBle._init() {
+    //  1、监听蓝牙状态，如果蓝牙状态为不可用，则停止所有OTA升级
+    bleStateEC.listen((state) {
+      if (state != BleState.available) {
+        DfuService.to.stopAllOTAUpdate();
+      }
+    });
+    //  2、监听蓝牙数据: 如果是异常状态且正在OTA升级，则停止OTA升级
+    connectStatusEC.listen((status) async {
+      final isUpdating =
+          await DfuService.to.checkDeviceIsOTAUpdating(status.uuid);
+      if (status.connectState.isError && isUpdating) {
+        DfuService.to.stopOTAUpdate(status.uuid);
+      }
+    });
+  }
+}

@@ -3,9 +3,11 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:flutter_ezw_ble/flutter_ezw_ble.dart';
+import 'package:archive/archive.dart';
+import 'package:flutter_ezw_ble/flutter_ezw_index.dart';
 import 'package:flutter_ezw_utils/extension/list_ext.dart';
 import 'package:flutter_ezw_utils/extension/rxdart_ext.dart';
+import 'package:mcumgr_flutter/mcumgr_flutter.dart';
 import 'package:path_provider/path_provider.dart';
 
 /// OTA升级状态

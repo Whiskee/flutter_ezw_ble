@@ -2,7 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_ezw_ble/flutter_ezw_ble.dart';
+import 'package:flutter_ezw_ble/flutter_ezw_index.dart';
 
 void main() {
   runApp(const MyApp());
