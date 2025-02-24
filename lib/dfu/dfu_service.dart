@@ -5,8 +5,6 @@ import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_index.dart';
-import 'package:flutter_ezw_utils/extension/list_ext.dart';
-import 'package:flutter_ezw_utils/extension/rxdart_ext.dart';
 import 'package:mcumgr_flutter/mcumgr_flutter.dart';
 import 'package:path_provider/path_provider.dart';
 
@@ -33,8 +31,8 @@ class DfuService {
   //  临时缓存当前正在进行OTA升级的设备
   final List<DfuUpdate> _upgradeTemp = [];
   //  Get: 是否有设备正在进行OTA升级
-  final Rx<List<String>> _upgradingDevices = <String>[].rx;
-  Rx<List<String>> get upgradingDevices => _upgradingDevices;
+  final RxList<String> _upgradingDevices = <String>[].obs;
+  RxList<String> get upgradingDevices => _upgradingDevices;
   //  监听升级状态
   final StreamController<(String, FirmwareUpgradeState)> _otaStateStreamCtl =
       StreamController.broadcast();

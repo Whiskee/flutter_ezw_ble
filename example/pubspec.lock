@@ -255,7 +255,7 @@ packages:
     description:
       path: "."
       ref: main
-      resolved-ref: a1b1fb33d0245bbeac571e7d261316dd6ae82549
+      resolved-ref: "43b2db20270c7695fe72ee42e36eb778361bfebc"
       url: "https://github.com/Whiskee/flutter_ezw_utils.git"
     source: git
     version: "0.0.1"
@@ -283,6 +283,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "4.0.0"
+  flutter_screenutil:
+    dependency: transitive
+    description:
+      name: flutter_screenutil
+      sha256: "8239210dd68bee6b0577aa4a090890342d04a136ce1c81f98ee513fc0ce891de"
+      url: "https://pub.dev"
+    source: hosted
+    version: "5.9.3"
   flutter_test:
     dependency: "direct dev"
     description: flutter
@@ -306,6 +314,14 @@ packages:
     description: flutter
     source: sdk
     version: "0.0.0"
+  get:
+    dependency: transitive
+    description:
+      name: get
+      sha256: c79eeb4339f1f3deffd9ec912f8a923834bec55f7b49c9e882b8fef2c139d425
+      url: "https://pub.dev"
+    source: hosted
+    version: "4.7.2"
   glob:
     dependency: transitive
     description:
