@@ -6,7 +6,6 @@ export 'package:flutter_ezw_ble/flutter_ezw_ble.dart';
 export 'package:flutter_ezw_utils/flutter_ezw_index.dart';
 
 /// Core
-export 'core/common.dart';
 export 'core/extension/ble_device_ext.dart';
 export 'core/tools/connect_state_converter.dart';
 
