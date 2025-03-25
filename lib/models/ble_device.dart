@@ -1,5 +1,6 @@
 import 'package:flutter_ezw_ble/core/tools/connect_state_converter.dart';
 import 'package:flutter_ezw_ble/models/ble_connect_state.dart';
+import 'package:flutter_ezw_ble/models/ble_device_hardwarve.dart';
 import 'package:json_annotation/json_annotation.dart';
 
 part 'ble_device.g.dart';
@@ -14,6 +15,9 @@ class BleDevice {
   @ConnectStateListConverter()
   BleConnectState connectState;
 
+  //  硬件信息
+  BleDeviceHardware hardware = BleDeviceHardware();
+
   BleDevice(
     this.name,
     this.uuid,
@@ -27,5 +31,11 @@ class BleDevice {
 
   Map<String, dynamic> toJson() => _$BleDeviceToJson(this);
 
-  BleDevice copy() => BleDevice(name, uuid, sn, rssi, connectState: connectState);
+  BleDevice copy() => BleDevice(
+        name,
+        uuid,
+        sn,
+        rssi,
+        connectState: connectState,
+      )..hardware = hardware.copy();
 }
