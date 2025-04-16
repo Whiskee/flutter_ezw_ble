@@ -12,9 +12,7 @@ class BleSnRule {
   final String replaceRex;
   //  扫描设备时，只返回SN含有过滤标识的对象
   final List<String> scanFilterMarks;
-  //  是否开启SN匹配
-  final bool isMatchBySn;
-  //  组合设备数:总数
+  //  组合设备数:总数, 如果为1，则不开启匹配模式，返回单个设备，如果大于2，则表示默认开启匹配模式，组成一个设备
   final int matchCount;
 
   BleSnRule({
@@ -22,10 +20,10 @@ class BleSnRule {
     this.startSubIndex = 0,
     this.replaceRex = "",
     this.scanFilterMarks = const [],
-    this.isMatchBySn = false,
     this.matchCount = 1,
   }) {
-    assert(isMatchBySn && matchCount >= 1, "When matching mode is enabled, the number of matches must be greater than or equal to 1");
+    assert(matchCount > 0,
+        "When matching mode is enabled, the number of matches must be greater than or equal to 1");
   }
 
   factory BleSnRule.fromJson(Map<String, dynamic> json) =>

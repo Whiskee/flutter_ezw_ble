@@ -86,7 +86,7 @@ class BleManager private constructor() {
                 val bleDevice = device.toBleDevice(deviceSn, result.rssi)
                 scanResultTemp.add(bleDevice)
                 //  - 4.2、判断是否需要根据SN组合设备，不需要就直接提交
-                if (!snRule.isMatchBySn) {
+                if (snRule.matchCount < 2) {
                     sendMatchDevices(deviceSn, listOf(bleDevice))
                     return
                 }

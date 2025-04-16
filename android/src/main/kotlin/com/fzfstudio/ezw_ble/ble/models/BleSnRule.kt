@@ -11,12 +11,10 @@ data class BleSnRule(
     val replaceRex: String,
     //  扫描设备时，只返回SN含有过滤标识的对象
     val scanFilterMarks: List<String>,
-    //  是否开启SN匹配
-    val isMatchBySn: Boolean,
-    //  组合设备数:总数
+    //  组合设备数:总数，如果为1不执行匹配，返回单个设备，如果大于2则默认开启匹配模式
     val matchCount: Int,
 ): Serializable {
     companion object {
-        fun empty() = BleSnRule(0, 0, "", listOf(), false, 1)
+        fun empty() = BleSnRule(0, 0, "", listOf(), 1)
     }
 }

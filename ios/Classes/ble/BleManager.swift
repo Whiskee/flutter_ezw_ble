@@ -103,7 +103,7 @@ extension BleManager: CBCentralManagerDelegate {
         )
         scanResultTemp.append((bleDevice, peripheral))
         //  - 5.2、判断是否需要根据SN组合设备，不需要就直接提交
-        guard snRule.isMatchBySn else {
+        guard snRule.matchCount > 1 else {
             sendMatchDevices(sn: deviceSn, devices: [bleDevice])
             return
         }
