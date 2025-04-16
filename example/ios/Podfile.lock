@@ -55,13 +55,13 @@ EXTERNAL SOURCES:
 
 SPEC CHECKSUMS:
   Flutter: e0871f40cf51350855a761d2e70bf5af5b9b5de7
-  flutter_ezw_ble: 6ec97d102c22c19d93f6d7922dd24f4f02359fe3
-  flutter_ezw_utils: ca2132083490441ea81200d2de16b384fae6f744
-  integration_test: 252f60fa39af5e17c3aa9899d35d908a0721b573
+  flutter_ezw_ble: 684455e64acc3989dc94ffdce397da3ab10d4179
+  flutter_ezw_utils: 02f8ed48d61b2f9b7643407e97047dba1455abf4
+  integration_test: 4a889634ef21a45d28d50d622cf412dc6d9f586e
   iOSMcuManagerLibrary: 4102a4595be1c69e5286d7f1520a733c82c30b0a
-  mcumgr_flutter: 097e59bec5917b527ba6d095da57bdaed2de1fa2
-  path_provider_foundation: 2b6b4c569c0fb62ec74538f866245ac84301af46
-  shared_preferences_foundation: fcdcbc04712aee1108ac7fda236f363274528f78
+  mcumgr_flutter: 8c4a598cb1b4d10a9adbc0f13288334297185506
+  path_provider_foundation: 080d55be775b7414fd5a5ef3ac137b97b097e564
+  shared_preferences_foundation: 9e1978ff2562383bd5676f64ec4e9aa8fa06a6f7
   SwiftCBOR: ce5354ec8b660da2d6fc754462881119dbe1f963
   SwiftProtobuf: 4dbaffec76a39a8dc5da23b40af1a5dc01a4c02d
 

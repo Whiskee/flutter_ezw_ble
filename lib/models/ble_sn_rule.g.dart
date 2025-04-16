@@ -14,7 +14,6 @@ BleSnRule _$BleSnRuleFromJson(Map<String, dynamic> json) => BleSnRule(
               ?.map((e) => e as String)
               .toList() ??
           const [],
-      isMatchBySn: json['isMatchBySn'] as bool? ?? false,
       matchCount: (json['matchCount'] as num?)?.toInt() ?? 1,
     );
 
@@ -23,6 +22,5 @@ Map<String, dynamic> _$BleSnRuleToJson(BleSnRule instance) => <String, dynamic>{
       'startSubIndex': instance.startSubIndex,
       'replaceRex': instance.replaceRex,
       'scanFilterMarks': instance.scanFilterMarks,
-      'isMatchBySn': instance.isMatchBySn,
       'matchCount': instance.matchCount,
     };
