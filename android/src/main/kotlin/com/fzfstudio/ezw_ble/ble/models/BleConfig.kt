@@ -17,7 +17,7 @@ data class BleConfig(
 
     companion object {
         fun empty(): BleConfig = BleConfig("",
-            BleUUID(""), 15000.0, 60000.0, 255, BleSnRule.Companion.empty())
+            BleUUID(""), 15000.0, 60000.0, 255, BleSnRule.empty())
     }
 
     /**

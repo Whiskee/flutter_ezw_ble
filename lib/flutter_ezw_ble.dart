@@ -1,9 +1,7 @@
-import 'package:flutter_ezw_ble/dfu/dfu_service.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_event_channel.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_method_channel.dart';
 import 'package:flutter_ezw_ble/models/ble_cmd.dart';
 import 'package:flutter_ezw_ble/models/ble_connect_model.dart';
-import 'package:flutter_ezw_ble/models/ble_connect_state.dart';
 import 'package:flutter_ezw_ble/models/ble_match_device.dart';
 import 'package:flutter_ezw_ble/models/ble_status.dart';
 import 'package:flutter_ezw_utils/extension/string_ext.dart';
@@ -37,20 +35,5 @@ class EzwBle {
   Stream<BleCmd> receiveDataEC =
       BleEventChannel.receiveData.ec.map((data) => BleCmd.receiveMap(data));
 
-  EzwBle._init() {
-    //  1、监听蓝牙状态，如果蓝牙状态为不可用，则停止所有OTA升级
-    bleStateEC.listen((state) {
-      if (state != BleState.available) {
-        DfuService.to.stopAllOTAUpdate();
-      }
-    });
-    //  2、监听蓝牙数据: 如果是异常状态且正在OTA升级，则停止OTA升级
-    connectStatusEC.listen((status) async {
-      final isUpdating =
-          await DfuService.to.checkDeviceIsOTAUpdating(status.uuid);
-      if (status.connectState.isError && isUpdating) {
-        DfuService.to.stopOTAUpdate(status.uuid);
-      }
-    });
-  }
+  EzwBle._init();
 }

@@ -3,6 +3,8 @@ import 'package:flutter_ezw_ble/flutter_ezw_index.dart';
 extension BleDeviceExt on BleDevice {}
 
 extension RxMatchDeviceExt on Rx<BleMatchDevice?> {
+
+  ///  更新连接状态
   void update(BleConnectModel connectModel) {
     //  1、如果没有匹配的对象，直接返回
     final oldDevice = value?.copy();
@@ -16,6 +18,7 @@ extension RxMatchDeviceExt on Rx<BleMatchDevice?> {
     value = oldDevice;
   }
 
+  ///  进入升级状态
   void otaUpgrading(String uuid) =>
       update(BleConnectModel(uuid, BleConnectState.upgrade));
 }

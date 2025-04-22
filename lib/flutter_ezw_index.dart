@@ -1,18 +1,13 @@
 library flutter_ezw;
 
-export 'package:flutter_ezw_ble/flutter_ezw_ble.dart';
 
 /// ThirdPart
 export 'package:flutter_ezw_utils/flutter_ezw_index.dart';
+export 'package:flutter_ezw_ble/flutter_ezw_ble.dart';
 
 /// Core
 export 'core/extension/ble_device_ext.dart';
 export 'core/tools/connect_state_converter.dart';
-
-/// DFU
-export 'dfu/dfu_service.dart';
-export 'dfu/models/dfu_manifest.dart';
-export 'dfu/models/dfu_update.dart';
 
 /// Models
 export 'models/ble_cmd.dart';

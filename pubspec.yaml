@@ -17,12 +17,6 @@ dependencies:
     git: 
       url: https://github.com/Whiskee/flutter_ezw_utils.git
       ref: main
-  # https://pub.dev/packages/mcumgr_flutter
-  mcumgr_flutter: ^0.4.2
-  # https://pub.dev/packages/archive
-  archive: ^4.0.2
-  # https://pub.dev/packages/path_provider
-  path_provider: ^2.1.5
 
 dev_dependencies:
   flutter_test:
