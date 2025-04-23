@@ -44,8 +44,8 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       methodChannel.invokeMethod("deviceConnected", uuid);
 
   @override
-  Future<void> sendCmd(String uuid, Uint8List data) async =>
-      methodChannel.invokeMethod("sendCmd", {"uuid": uuid, "data": data});
+  Future<void> sendCmd(String uuid, Uint8List data, {bool? isOtaCmd}) async =>
+      methodChannel.invokeMethod("sendCmd", {"uuid": uuid, "data": data, "isOtaCmd": isOtaCmd});
 
   @override
   Future<void> enterUpgradeState(String uuid) =>

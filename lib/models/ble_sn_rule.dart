@@ -4,7 +4,7 @@ part 'ble_sn_rule.g.dart';
 
 @JsonSerializable()
 class BleSnRule {
-  //  总长度识别，如果为0，则表示适配所有长度
+  //  总长度识别，如果为0，则表示适配所有长度, 不为0，则一定要比startSubIndex大
   final int byteLength;
   //  开始截断位置
   final int startSubIndex;
@@ -22,6 +22,7 @@ class BleSnRule {
     this.scanFilterMarks = const [],
     this.matchCount = 1,
   }) {
+    assert(byteLength == 0 || (byteLength > 0 && byteLength > startSubIndex), "ByteLength must be greater than startSubIndex");
     assert(matchCount > 0,
         "When matching mode is enabled, the number of matches must be greater than or equal to 1");
   }

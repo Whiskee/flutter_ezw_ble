@@ -120,21 +120,21 @@ extension BleManager: CBCentralManagerDelegate {
         sendMatchDevices(sn: deviceSn, devices: matchDevices)
     }
     
-//    func centralManager(_ central: CBCentralManager, willRestoreState dict: [String : Any]) {
-//        logger.error("BleManager - willRestoreState: \(dict)")
-//    }
-//    
-//    func centralManager(_ central: CBCentralManager, didUpdateANCSAuthorizationFor peripheral: CBPeripheral) {
-//        logger.error("BleManager - didUpdateANCSAuthorizationFor")
-//    }
-//    
-//    func centralManager(_ central: CBCentralManager, connectionEventDidOccur event: CBConnectionEvent, for peripheral: CBPeripheral) {
-//        logger.error("BleManager - connectionEventDidOccur: event = \(event.rawValue)")
-//    }
-//    
-//    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, timestamp: CFAbsoluteTime, isReconnecting: Bool, error: (any Error)?) {
-//        logger.error("BleManager - didDisconnectPeripheral: timestamp = \(timestamp), isReconnecting = \(isReconnecting), error = \(error)")
-//    }
+    func centralManager(_ central: CBCentralManager, willRestoreState dict: [String : Any]) {
+        logger.error("BleManager - willRestoreState: \(dict)")
+    }
+    
+    func centralManager(_ central: CBCentralManager, didUpdateANCSAuthorizationFor peripheral: CBPeripheral) {
+        logger.error("BleManager - didUpdateANCSAuthorizationFor")
+    }
+    
+    func centralManager(_ central: CBCentralManager, connectionEventDidOccur event: CBConnectionEvent, for peripheral: CBPeripheral) {
+        logger.error("BleManager - connectionEventDidOccur: event = \(event.rawValue)")
+    }
+    
+    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, timestamp: CFAbsoluteTime, isReconnecting: Bool, error: (any Error)?) {
+        logger.error("BleManager - didDisconnectPeripheral: timestamp = \(timestamp), isReconnecting = \(isReconnecting), error = \(error)")
+    }
     
     /**
      * 设备连接成功回调
@@ -254,6 +254,11 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
         let readChars = currentConfig.uuid.readCharUUID == nil ? nil : characteristics.first { chars in
             chars.uuid.isEqual(currentConfig.uuid.readCharUUID)
         }
+        if writeChars == nil || readChars == nil {
+            connectStateLog(uuid: peripheral.identifier.uuidString, state: .charsFail)
+            logger.error("BleManager - didDiscoverCharacteristicsFor(\(peripheral.identifier.uuidString)): Error = Chars not found")
+            return
+        }
         updateConnectedDevice(uuid: peripheral.identifier.uuidString, writeChars: writeChars, readChars: readChars)
         //  3、更新连接状态
         connectStateLog(uuid: peripheral.identifier.uuidString, state: .connectFinish)
@@ -269,7 +274,7 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             return
         }
         guard characteristic.isNotifying else {
-            logger.error("BleManager -  update notification state(\(peripheral.identifier.uuidString)): Error = no notifying")
+            logger.error("BleManager - update notification state(\(peripheral.identifier.uuidString)): Error = no notifying")
             return
         }
         logger.info("BleManager -  update notification state(\(peripheral.identifier.uuidString)): Success")
@@ -417,12 +422,13 @@ extension BleManager {
      *  - 升级中不允许发送cmd
      *
      */
-    func sendCmd(uuid: String, data: Data) {
+    func sendCmd(uuid: String, data: Data, isOtaCmd: Bool?) {
         guard checkIsFunctionCanBeCalled() else {
             return
         }
-        guard upgradeDevices?.contains(where: {$0 == uuid}) != true else {
-            logger.info("BleManage - sendCmd(\(uuid)): Cannot send commands during upgrade")
+        // 如果设备在升级中且不是OTA指令，则不允许发送
+        guard upgradeDevices?.contains(where: {$0 == uuid}) != true || isOtaCmd == true else {
+            logger.info("BleManage - sendCmd(\(uuid)): Cannot send non-OTA commands during upgrade")
             return
         }
         guard let device = connectedDevices.first(where: { device in
@@ -455,6 +461,7 @@ extension BleManager {
             return
         }
         upgradeDevices?.removeAll(where: { $0 == uuid })
+        connectStateLog(uuid: uuid, state: .connected)
         logger.info("BleManage - quiteUpgradeState(\(uuid)): Had Quite upgrade state")
     }
 }
@@ -504,17 +511,17 @@ extension BleManager {
      */
     private func parseDataToObtainSn(manufactureData: Data?) -> String {
         var sn: String = ""
-        //  如果byteLength为0，则处理所有长度Data的数据
-        guard currentConfig.snRule.byteLength != 0 else {
-            if let manufactureData = manufactureData {
-                sn = String(data: manufactureData, encoding: .utf8) ?? ""
+        //  根据SnRule截取manufacture中的数据
+        if var manufactureData = manufactureData {
+            var startIndex = currentConfig.snRule.startSubIndex
+            if startIndex > manufactureData.count {
+                startIndex = 0
             }
-            return replaceControlCharacters(in: sn)
-        }
-        //  如果byteLength大于0，则根据规则解析Data
-        if var manufactureData = manufactureData,
-           manufactureData.count == currentConfig.snRule.byteLength {
-            let subrange = currentConfig.snRule.startSubIndex..<manufactureData.endIndex
+            var endIndex = manufactureData.endIndex
+            if currentConfig.snRule.byteLength > 0, manufactureData.count > currentConfig.snRule.byteLength {
+                endIndex = currentConfig.snRule.byteLength
+            }
+            let subrange = startIndex..<endIndex
             manufactureData = manufactureData.subdata(in: subrange)
             sn = String(data: manufactureData, encoding: .utf8) ?? ""
         }
@@ -633,6 +640,7 @@ extension BleManager {
                                        updateByUser: Bool = false) {
         //  1、没有缓存就不更新
         guard uuid.isNotEmpty, connectedDevices.isNotEmpty else {
+            logger.error("BleManager - updateConnectedDevice(\(uuid)): Not found device")
             return;
         }
         //  2、获取缓存设备
@@ -643,7 +651,7 @@ extension BleManager {
             logger.error("BleManager - updateConnectedDevice(\(uuid)): No cache device object")
             return
         }
-        //  2、更新缓存设备信息
+        //  3、更新缓存设备信息
         var connectedDevice = connectedDevices[index]
         //  - 设置写
         if let writeChars = writeChars {

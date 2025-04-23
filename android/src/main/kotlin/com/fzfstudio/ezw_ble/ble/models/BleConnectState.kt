@@ -49,13 +49,13 @@ enum class BleConnectState {
                 this == SEARCH_CHARS ||
                 this == CONNECT_FINISH
     /**
-     *  是否正在连接中
+     *  已连接：真实连接和升级是属于连接状态
      */
     val isConnected: Boolean
         get() = this == CONNECTED || this == UPGRADE
 
     /**
-     *  是否正在连接中
+     *  是否已经断连
      */
     val isDisconnected: Boolean
         get() = this == DISCONNECT_BY_MYSELF ||

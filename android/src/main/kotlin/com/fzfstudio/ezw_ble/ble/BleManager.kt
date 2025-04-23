@@ -335,11 +335,11 @@ class BleManager private constructor() {
      *  发送数据
      *
      */
-    fun sendCmd(uuid: String, data: ByteArray) {
+    fun sendCmd(uuid: String, data: ByteArray, isOtaCmd: Boolean = false) {
         if (!checkIsFunctionCanBeCalled() || uuid.isEmpty()) {
             return
         }
-        if (upgradeDevices.contains(uuid)) {
+        if (upgradeDevices.contains(uuid) && !isOtaCmd) {
             Log.i(tag, "SendCmd: $uuid, Cannot send commands during upgrade")
             return
         }
@@ -455,11 +455,16 @@ class BleManager private constructor() {
             return sn.toString()
         }
         val snRule = currentConfig.snRule
-        //  2、解析全部
-        if (snRule.byteLength == 0 || bytes.size < snRule.byteLength) {
-            return String(bytes, Charsets.UTF_8)
+        var startIndex = snRule.startSubIndex
+        if (startIndex > bytes.size) {
+            startIndex = 0
         }
-        sn = String(bytes.copyOfRange(snRule.startSubIndex, snRule.byteLength), Charsets.UTF_8)
+        var endIndex = bytes.size
+        if (snRule.byteLength > 0 && endIndex > (snRule.byteLength - startIndex)) {
+            endIndex = snRule.byteLength
+        }
+        sn = String(bytes, Charsets.UTF_8)
+        sn = String(bytes.copyOfRange(startIndex, endIndex), Charsets.UTF_8)
         return replaceControlCharacters(sn)
     }
 
