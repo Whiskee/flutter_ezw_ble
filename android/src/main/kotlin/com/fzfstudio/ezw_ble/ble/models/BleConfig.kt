@@ -4,7 +4,8 @@ import com.fzfstudio.ezw_utils.gson.GsonSerializable
 
 data class BleConfig(
     val name: String,
-    val uuid: BleUUID,
+    //  可以配置多个uuid数据
+    val uuids: List<BleUuid>,
     //  毫秒
     val connectTimeout: Double,
     //  设备升级后启动新固件之前需要的时间，用于重连时
@@ -16,13 +17,12 @@ data class BleConfig(
 ): GsonSerializable() {
 
     companion object {
-        fun empty(): BleConfig = BleConfig("",
-            BleUUID(""), 15000.0, 60000.0, 255, BleSnRule.empty())
+        fun empty(): BleConfig = BleConfig("", listOf(), 15000.0, 60000.0, 255, BleSnRule.empty())
     }
 
     /**
      *  不能为空对象：配置名称，ServiceUUID
      */
-    fun isEmpty(): Boolean = name.isEmpty() || uuid.service.isEmpty()
+    fun isEmpty(): Boolean = name.isEmpty() || uuids.isEmpty()
 
 }

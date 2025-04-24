@@ -9,7 +9,8 @@ part 'ble_config.g.dart';
 @JsonSerializable()
 class BleConfig {
   final String name;
-  final BleUUID uuid;
+  //  可用UUID
+  final List<BleUuid> uuids;
   //  如果设置了匹配规则
   final BleSnRule snRule;
   //  毫秒
@@ -21,7 +22,7 @@ class BleConfig {
 
   BleConfig(
     this.name,
-    this.uuid,
+    this.uuids,
     this.snRule, {
     this.connectTimeout = 15000,
     this.upgradeSwapTime = 60000,
@@ -35,7 +36,7 @@ class BleConfig {
 
   Map<String, dynamic> customToJson() {
     final map = toJson();
-    map["uuid"] = uuid.toJson();
+    map["uuids"] = uuids.map((e) => e.toJson()).toList();
     map["snRule"] = snRule.toJson();
     return map;
   }

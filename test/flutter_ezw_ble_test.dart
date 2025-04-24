@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_method_channel.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_platform_interface.dart';
 import 'package:flutter_ezw_ble/models/ble_config.dart';
+import 'package:flutter_ezw_ble/models/ble_uuid_type.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
@@ -50,9 +51,10 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
-  Future<void> sendCmd(String uuid, Uint8List data) {
+  Future<void> sendCmd(String uuid, Uint8List data, {BleUuidType uuidType = BleUuidType.common, bool? isOtaCmd}) {
     throw UnimplementedError();
   }
+
 
   @override
   Future<void> openAppSettings() {

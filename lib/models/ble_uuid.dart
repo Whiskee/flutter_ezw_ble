@@ -1,21 +1,26 @@
+import 'package:flutter_ezw_ble/core/tools/uuid_tyoe_converter.dart';
+import 'package:flutter_ezw_ble/models/ble_uuid_type.dart';
 import 'package:json_annotation/json_annotation.dart';
 
 part 'ble_uuid.g.dart';
 
 @JsonSerializable()
-class BleUUID {
+class BleUuid {
   final String service;
-  final String? writeChars;
-  final String? readChars;
+  final String writeChars;
+  final String readChars;
+  @UuidTypeConverter()
+  final BleUuidType type;
 
-  BleUUID(
+  BleUuid(
     this.service, {
-    this.writeChars,
-    this.readChars,
+    required this.writeChars,
+    required this.readChars,
+    this.type = BleUuidType.common,
   });
 
-  factory BleUUID.fromJson(Map<String, dynamic> json) => _$BleUUIDFromJson(json);
-  
-  Map<String, dynamic> toJson() => _$BleUUIDToJson(this);
-  
+  factory BleUuid.fromJson(Map<String, dynamic> json) =>
+      _$BleUuidFromJson(json);
+
+  Map<String, dynamic> toJson() => _$BleUuidToJson(this);
 }

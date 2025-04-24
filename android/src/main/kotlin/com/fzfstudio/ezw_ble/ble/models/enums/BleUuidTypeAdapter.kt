@@ -9,11 +9,12 @@ import com.google.gson.JsonElement
 import com.google.gson.JsonPrimitive
 import com.google.gson.JsonSerializationContext
 import com.google.gson.JsonSerializer
+import com.google.gson.annotations.JsonAdapter
 import java.lang.reflect.Type
 
-class BleConnectStateAdapter: JsonSerializer<BleConnectState>, JsonDeserializer<BleConnectState> {
+class BleUuidTypeAdapter: JsonSerializer<BleUuidType>, JsonDeserializer<BleUuidType> {
     override fun serialize(
-        src: BleConnectState?,
+        src: BleUuidType?,
         typeOfSrc: Type?,
         context: JsonSerializationContext?
     ): JsonElement? = JsonPrimitive(src?.name?.toCamelCase())
@@ -22,5 +23,5 @@ class BleConnectStateAdapter: JsonSerializer<BleConnectState>, JsonDeserializer<
         json: JsonElement?,
         typeOfT: Type?,
         context: JsonDeserializationContext?
-    ): BleConnectState? = BleConnectState.valueOf(json?.asString?.toUpperSnakeCase() ?: BleConnectState.NONE.name)
+    ): BleUuidType? = BleUuidType.valueOf(json?.asString?.toUpperSnakeCase() ?: BleUuidType.COMMON.name)
 }

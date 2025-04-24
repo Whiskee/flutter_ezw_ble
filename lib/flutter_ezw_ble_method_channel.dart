@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble.dart';
 import 'package:flutter_ezw_ble/models/ble_config.dart';
+import 'package:flutter_ezw_ble/models/ble_uuid_type.dart';
 
 import 'flutter_ezw_ble_platform_interface.dart';
 
@@ -44,8 +45,14 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       methodChannel.invokeMethod("deviceConnected", uuid);
 
   @override
-  Future<void> sendCmd(String uuid, Uint8List data, {bool? isOtaCmd}) async =>
-      methodChannel.invokeMethod("sendCmd", {"uuid": uuid, "data": data, "isOtaCmd": isOtaCmd});
+  Future<void> sendCmd(String uuid, Uint8List data,
+          {BleUuidType uuidType = BleUuidType.common, bool? isOtaCmd}) async =>
+      methodChannel.invokeMethod("sendCmd", {
+        "uuid": uuid,
+        "data": data,
+        "uuidType": uuidType.name,
+        "isOtaCmd": isOtaCmd,
+      });
 
   @override
   Future<void> enterUpgradeState(String uuid) =>

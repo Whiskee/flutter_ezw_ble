@@ -1,6 +1,7 @@
 package com.fzfstudio.ezw_ble.ble.models
 
 import android.bluetooth.BluetoothGatt
+import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
 
 class BleDevice(
     val name: String,

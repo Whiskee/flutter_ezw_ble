@@ -8,7 +8,9 @@ part of 'ble_config.dart';
 
 BleConfig _$BleConfigFromJson(Map<String, dynamic> json) => BleConfig(
       json['name'] as String,
-      BleUUID.fromJson(json['uuid'] as Map<String, dynamic>),
+      (json['uuids'] as List<dynamic>)
+          .map((e) => BleUuid.fromJson(e as Map<String, dynamic>))
+          .toList(),
       BleSnRule.fromJson(json['snRule'] as Map<String, dynamic>),
       connectTimeout: (json['connectTimeout'] as num?)?.toDouble() ?? 15000,
       upgradeSwapTime: (json['upgradeSwapTime'] as num?)?.toDouble() ?? 60000,
@@ -17,7 +19,7 @@ BleConfig _$BleConfigFromJson(Map<String, dynamic> json) => BleConfig(
 
 Map<String, dynamic> _$BleConfigToJson(BleConfig instance) => <String, dynamic>{
       'name': instance.name,
-      'uuid': instance.uuid,
+      'uuids': instance.uuids,
       'snRule': instance.snRule,
       'connectTimeout': instance.connectTimeout,
       'upgradeSwapTime': instance.upgradeSwapTime,

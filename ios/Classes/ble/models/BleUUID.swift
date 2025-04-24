@@ -7,10 +7,11 @@
 
 import CoreBluetooth
 
-struct BleUUID: Codable {
+struct BleUuid: Codable {
     let service: String
     var writeChars: String?
     var readChars: String?
+    var type: BleUuidType = BleUuidType.common
  
     // 计算属性，允许访问 CBUUID 对象
     var serviceUUID: CBUUID {
@@ -22,6 +23,5 @@ struct BleUUID: Codable {
     var readCharUUID: CBUUID? {
         get { return readChars.map(CBUUID.init(string:)) }
     }
-    
     
 }

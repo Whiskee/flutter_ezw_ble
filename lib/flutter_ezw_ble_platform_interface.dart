@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:flutter_ezw_ble/models/ble_config.dart';
+import 'package:flutter_ezw_ble/models/ble_uuid_type.dart';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
 import 'flutter_ezw_ble_method_channel.dart';
@@ -61,8 +62,9 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     throw UnimplementedError('deviceConnected() has not been implemented.');
   }
 
-  Future<void> sendCmd(String uuid, Uint8List data) {
-    throw UnimplementedError('deviceConnected() has not been implemented.');
+  Future<void> sendCmd(String uuid, Uint8List data,
+      {BleUuidType uuidType = BleUuidType.common, bool? isOtaCmd}) {
+    throw UnimplementedError('sendCmd() has not been implemented.');
   }
 
   Future<void> enterUpgradeState(String uuid) {

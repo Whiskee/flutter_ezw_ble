@@ -16,6 +16,7 @@ class BleDevice {
   BleConnectState connectState;
 
   //  硬件信息
+  @JsonKey(includeFromJson: false, includeToJson: false)
   BleDeviceHardware hardware = BleDeviceHardware();
 
   BleDevice(

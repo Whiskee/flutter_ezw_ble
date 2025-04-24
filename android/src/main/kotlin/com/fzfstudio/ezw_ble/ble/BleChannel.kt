@@ -8,6 +8,7 @@ import com.fzfstudio.ezw_ble.EZW_BLE_CHANNEL_NAME
 import com.fzfstudio.ezw_utils.extension.toCamelCase
 import com.fzfstudio.ezw_utils.extension.toUpperSnakeCase
 import com.fzfstudio.ezw_ble.ble.models.BleConfig
+import com.fzfstudio.ezw_ble.ble.models.enums.BleUuidType
 import com.fzfstudio.ezw_utils.gson.toJson
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.EventChannel
@@ -73,7 +74,7 @@ enum class BleMC {
                 val jsonMap = arguments as Map<*, *>?
                 val uuid = jsonMap?.get("uuid") as String? ?: ""
                 val sn = jsonMap?.get("sn") as String? ?: ""
-                val afterUpgrade = jsonMap?.get("afterUpgrade") as Boolean? ?: false
+                val afterUpgrade = jsonMap?.get("afterUpgrade") as Boolean? == true
                 if (uuid.isNotEmpty() && sn.isNotEmpty()) {
                     BleManager.instance.connect(uuid, sn, afterUpgrade = afterUpgrade)
                 }
@@ -87,7 +88,8 @@ enum class BleMC {
                 val uuid = jsonMap?.get("uuid") as String? ?: ""
                 val data = jsonMap?.get("data") as ByteArray? ?: byteArrayOf()
                 val isOtaCmd = jsonMap?.get("isOtaCmd") as Boolean? == true
-                BleManager.instance.sendCmd(uuid, data, isOtaCmd = isOtaCmd)
+                val uuidType = jsonMap?.get("uuidType") as String? ?: BleUuidType.COMMON.name
+                BleManager.instance.sendCmd(uuid, data, isOtaCmd = isOtaCmd, uuidType = BleUuidType.valueOf(uuidType.toUpperSnakeCase()))
             }
             ENTER_UPGRADE_STATE -> {
                 val uuid = arguments as String? ?: ""

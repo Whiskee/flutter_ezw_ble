@@ -1,12 +1,14 @@
 package com.fzfstudio.ezw_ble.ble.models
 
+import com.fzfstudio.ezw_ble.ble.models.enums.BleUuidType
 import java.io.Serializable
 import java.util.UUID
 
-data class BleUUID(
+data class BleUuid(
     val service: String,
     val writeChars: String? = null,
     val readChars: String? = null,
+    val type: BleUuidType = BleUuidType.COMMON
 ): Serializable {
 
     val serviceUUID: UUID

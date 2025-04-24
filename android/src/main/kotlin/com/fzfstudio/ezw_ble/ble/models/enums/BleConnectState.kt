@@ -1,6 +1,5 @@
-package com.fzfstudio.ezw_ble.ble.models
+package com.fzfstudio.ezw_ble.ble.models.enums
 
-import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectStateAdapter
 import com.google.gson.annotations.JsonAdapter
 
 @JsonAdapter(BleConnectStateAdapter::class)
