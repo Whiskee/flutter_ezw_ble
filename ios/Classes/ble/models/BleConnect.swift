@@ -35,6 +35,8 @@ enum BleConnectState: String, Codable {
     case noDeviceFound
     //  已经被绑定
     case alreadyBound
+    //  绑定失败
+    case boundFail
     //  获取服务发现失败
     case serviceFail
     //  获取读写特征失败
@@ -81,6 +83,7 @@ enum BleConnectState: String, Codable {
         return self == .emptyUuid ||
         self == .noDeviceFound ||
         self == .alreadyBound ||
+        self == .boundFail ||
         self == .serviceFail ||
         self == .charsFail ||
         self == .timeout

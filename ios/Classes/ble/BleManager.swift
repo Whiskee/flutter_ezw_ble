@@ -264,13 +264,6 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
         }
         updateConnectedDevice(uuid: peripheral.identifier.uuidString, writeChars: writeChars, readChars: readChars, uuidType: targetUuid.type)
         logger.info("BleManager::didDiscoverCharacteristicsFor: \(peripheral.identifier.uuidString), uuidType = \(targetUuid.type.rawValue), write = \(writeChars!.uuid.uuidString), read = \(readChars!.uuid.uuidString)")
-        //  4、当全部的Uuids特征信息全部获取完，则发送连接成功信息
-        if let connectedDevice = connectedDevices.first(where: { device  in
-            device.peripheral.identifier.uuidString == peripheral.identifier.uuidString
-        }), connectedDevice.writeCharsDic.keys.count == currentConfig.uuids.count {
-            //  3、更新连接状态
-            connectStateLog(uuid: peripheral.identifier.uuidString, state: .connectFinish)
-        }
     }
     
     /**
@@ -278,12 +271,25 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
      */
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         if let error = error {
+            //  配对授权失败
+            if let error = error as NSError?, error.domain == CBATTErrorDomain, error.code == 5 {
+                connectStateLog(uuid: peripheral.identifier.uuidString, state: .boundFail)
+            }
             logger.error("BleManager::update notification state: \(peripheral.identifier.uuidString), error = \(error)")
             return
         }
         guard characteristic.isNotifying else {
             logger.error("BleManager::update notification state: \(peripheral.identifier.uuidString), error = no notifying")
             return
+        }
+        //  当全部的Uuids特征信息全部获取完,且设备未连接，则发送连接流程完成
+        if let connectedDevice = connectedDevices.first(where: { device  in
+            device.peripheral.identifier.uuidString == peripheral.identifier.uuidString
+        }), connectedDevice.writeCharsDic.keys.count == currentConfig.uuids.count, !connectedDevice.isConnected {
+            //  延迟1s，让设备做好度写特征准备
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                self?.connectStateLog(uuid: peripheral.identifier.uuidString, state: .connectFinish)
+            }
         }
         logger.info("BleManager::update notification state: \(peripheral.identifier.uuidString), chars = \(characteristic.uuid.uuidString)")
     }

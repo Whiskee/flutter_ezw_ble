@@ -20,6 +20,8 @@ enum BleConnectState {
   noDeviceFound,
   //  已经被绑定
   alreadyBound,
+  //  绑定失败
+  boundFail,
   //  获取服务发现失败
   serviceFail,
   //  获取读写特征失败
@@ -57,6 +59,8 @@ extension BleConnectStateExt on BleConnectState {
         return BleConnectState.noDeviceFound;
       case "alreadyBound":
         return BleConnectState.alreadyBound;
+      case "boundFail":
+        return BleConnectState.boundFail;
       case "serviceFail":
         return BleConnectState.serviceFail;
       case "charsFail":
@@ -104,6 +108,7 @@ extension BleConnectStateExt on BleConnectState {
       this == BleConnectState.emptyUuid ||
       this == BleConnectState.noDeviceFound ||
       this == BleConnectState.alreadyBound ||
+      this == BleConnectState.boundFail ||
       this == BleConnectState.serviceFail ||
       this == BleConnectState.charsFail ||
       this == BleConnectState.timeout;

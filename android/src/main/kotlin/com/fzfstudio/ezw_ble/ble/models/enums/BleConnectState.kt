@@ -25,6 +25,8 @@ enum class BleConnectState {
     NO_DEVICE_FOUND,
     //  已经被绑定
     ALREADY_BOUND,
+    //  绑定失败
+    BOUND_FAIL,
     //  获取服务发现失败
     SERVICE_FAIL,
     //  获取读写特征失败
@@ -67,6 +69,7 @@ enum class BleConnectState {
         get() = this == EMPTY_UUID ||
                 this == NO_DEVICE_FOUND ||
                 this == ALREADY_BOUND ||
+                this == BOUND_FAIL ||
                 this == SERVICE_FAIL ||
                 this == CHARS_FAIL ||
                 this == TIMEOUT

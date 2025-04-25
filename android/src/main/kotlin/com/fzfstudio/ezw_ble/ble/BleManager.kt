@@ -55,7 +55,7 @@ class BleManager private constructor() {
     }
     //  - 搜索配置
     private val scanSettings by lazy {
-        ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
+        ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_BALANCED).build()
     }
     //  - 搜索回调
     private val scanCallback: ScanCallback by lazy {
