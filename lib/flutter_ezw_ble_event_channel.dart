@@ -1,5 +1,6 @@
 import 'package:flutter/services.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_index.dart';
+import 'package:flutter_ezw_utils/flutter_ezw_index.dart';
 
 /// 蓝牙EventChannel
 enum BleEventChannel {
