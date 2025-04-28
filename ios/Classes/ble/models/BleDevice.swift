@@ -12,5 +12,6 @@ struct BleDevice: Codable {
     let sn: String
     let belongConfig: String
     let rssi: Int
+    let mac: String
 }
 

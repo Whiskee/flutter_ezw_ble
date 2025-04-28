@@ -14,7 +14,10 @@ BleConfig _$BleConfigFromJson(Map<String, dynamic> json) => BleConfig(
       BleSnRule.fromJson(json['snRule'] as Map<String, dynamic>),
       connectTimeout: (json['connectTimeout'] as num?)?.toDouble() ?? 15000,
       upgradeSwapTime: (json['upgradeSwapTime'] as num?)?.toDouble() ?? 60000,
-      mtu: (json['mtu'] as num?)?.toInt() ?? 255,
+      macRule: json['macRule'] == null
+          ? null
+          : BleMacRule.fromJson(json['macRule'] as Map<String, dynamic>),
+      mtu: (json['mtu'] as num?)?.toInt() ?? 512,
     );
 
 Map<String, dynamic> _$BleConfigToJson(BleConfig instance) => <String, dynamic>{
@@ -23,5 +26,6 @@ Map<String, dynamic> _$BleConfigToJson(BleConfig instance) => <String, dynamic>{
       'snRule': instance.snRule,
       'connectTimeout': instance.connectTimeout,
       'upgradeSwapTime': instance.upgradeSwapTime,
+      'macRule': instance.macRule,
       'mtu': instance.mtu,
     };

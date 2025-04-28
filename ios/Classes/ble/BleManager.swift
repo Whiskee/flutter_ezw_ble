@@ -79,12 +79,14 @@ extension BleManager: CBCentralManagerDelegate {
         }) else {
             return
         }
-        //  4、组装蓝牙数据
-        let snRule = currentConfig.snRule
-        //  - 4.1、根据规则获取SN
+        //  4、规则解析
         let manufactureData = advertisementData["kCBAdvDataManufacturerData"] as? Data
+        //  - 4.1、获取MAC地址
+        let deviceMac = parseDataToMac(manufactureData: manufactureData)
+        //  - 4.2、根据SN组装蓝牙数据
+        let snRule = currentConfig.snRule
         let deviceSn = parseDataToObtainSn(manufactureData: manufactureData)
-        //  - 4.2、阻断发送到Flutter
+        //  - 4.2.1、阻断发送到Flutter
         //  -- a、SN无法被解析的
         //  -- b、不包含标识的设备
         if deviceSn.isEmpty ||
@@ -99,7 +101,8 @@ extension BleManager: CBCentralManagerDelegate {
         let bleDevice = peripheral.toBleDevice(
             sn: deviceSn,
             belongConfig: currentConfig.name,
-            rssi: RSSI.intValue
+            rssi: RSSI.intValue,
+            mac: deviceMac,
         )
         scanResultTemp.append((bleDevice, peripheral))
         //  - 5.2、判断是否需要根据SN组合设备，不需要就直接提交
@@ -522,6 +525,34 @@ extension BleManager {
             device.identifier.uuidString == uuidStr
         }
     }
+    
+    /**
+     *  解析数据获取MAC地址
+     */
+    private func parseDataToMac(manufactureData: Data?) -> String {
+        var mac: String = ""
+        //  根据SnRule截取manufacture中的数据
+        if var manufactureData = manufactureData, let macRule = currentConfig.macRule {
+            var startIndex = macRule.startIndex
+            if startIndex > manufactureData.count {
+                startIndex = 0
+            }
+            var endIndex = macRule.endIndex
+            if manufactureData.endIndex > macRule.endIndex {
+                endIndex = manufactureData.endIndex
+            }
+            manufactureData = manufactureData.subdata(in: startIndex..<endIndex)
+            var hexList = manufactureData.map {
+                String(format: "%02X", $0)
+            }
+            if macRule.isReverse {
+                hexList = hexList.reversed()
+            }
+            mac = hexList.joined(separator: ":")
+        }
+        return mac
+    }
+    
     
     /**
      *  解析数据获取SN

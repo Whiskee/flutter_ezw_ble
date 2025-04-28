@@ -12,13 +12,14 @@ extension CBPeripheral {
     /**
      * 转化可识别蓝牙数据
      */
-    func toBleDevice(sn: String, belongConfig: String, rssi: Int) -> BleDevice {
+    func toBleDevice(sn: String, belongConfig: String, rssi: Int, mac: String = "") -> BleDevice {
         return BleDevice(
             name: name ?? "",
             uuid: identifier.uuidString,
             sn: sn,
             belongConfig: belongConfig,
-            rssi: rssi
+            rssi: rssi,
+            mac: mac,
         )
     }
     

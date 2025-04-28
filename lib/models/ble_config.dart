@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:flutter_ezw_ble/models/ble_mac_rule.dart';
 import 'package:flutter_ezw_ble/models/ble_sn_rule.dart';
 import 'package:flutter_ezw_ble/models/ble_uuid.dart';
 import 'package:json_annotation/json_annotation.dart';
@@ -17,6 +18,8 @@ class BleConfig {
   final double connectTimeout;
   //  设备升级后启动新固件之前需要的时间，用于重连时
   final double upgradeSwapTime;
+  //  仅iOS使用，解析MAC地址
+  final BleMacRule? macRule;
   //  仅Android使用
   final int mtu;
 
@@ -26,7 +29,8 @@ class BleConfig {
     this.snRule, {
     this.connectTimeout = 15000,
     this.upgradeSwapTime = 60000,
-    this.mtu = 255,
+    this.macRule,
+    this.mtu = 512,
   });
 
   factory BleConfig.fromJson(Map<String, dynamic> json) =>
@@ -38,6 +42,7 @@ class BleConfig {
     final map = toJson();
     map["uuids"] = uuids.map((e) => e.toJson()).toList();
     map["snRule"] = snRule.toJson();
+    map["macRule"] = macRule?.toJson();
     return map;
   }
 

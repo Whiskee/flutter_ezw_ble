@@ -11,6 +11,7 @@ BleDevice _$BleDeviceFromJson(Map<String, dynamic> json) => BleDevice(
       json['uuid'] as String,
       json['sn'] as String,
       (json['rssi'] as num).toInt(),
+      mac: json['mac'] as String? ?? '',
       connectState: json['connectState'] == null
           ? BleConnectState.none
           : const ConnectStateListConverter()
@@ -22,6 +23,7 @@ Map<String, dynamic> _$BleDeviceToJson(BleDevice instance) => <String, dynamic>{
       'uuid': instance.uuid,
       'sn': instance.sn,
       'rssi': instance.rssi,
+      'mac': instance.mac,
       'connectState':
           const ConnectStateListConverter().toJson(instance.connectState),
     };
