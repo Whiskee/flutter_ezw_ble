@@ -8,6 +8,7 @@
 enum BleUuidType: String, Codable {
     case common
     case largeData
+    case streaming
     case ota
 }
 

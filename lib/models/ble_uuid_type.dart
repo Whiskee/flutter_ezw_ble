@@ -3,6 +3,8 @@ enum BleUuidType {
   common,
   // 大数据
   largeData,
+  // 流式数据
+  streaming,
   // OTA
   ota,
 }

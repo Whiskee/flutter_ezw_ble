@@ -6,5 +6,6 @@ import com.google.gson.annotations.JsonAdapter
 enum class BleUuidType {
     COMMON,
     LARGE_DATA,
+    STREAMING,
     OTA;
 }
