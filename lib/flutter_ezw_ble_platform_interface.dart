@@ -63,7 +63,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   }
 
   Future<void> sendCmd(String uuid, Uint8List data,
-      {BleUuidType uuidType = BleUuidType.common, bool? isOtaCmd}) {
+      {BleUuidType uuidType = BleUuidType.common}) {
     throw UnimplementedError('sendCmd() has not been implemented.');
   }
 

@@ -20,4 +20,9 @@ extension BleUuidTypeExt on BleUuidType {
         return BleUuidType.common;
     }
   }
+
+  bool get isCommon => this == BleUuidType.common;
+  bool get isLargeData => this == BleUuidType.largeData;
+  bool get isStreaming => this == BleUuidType.streaming;
+  bool get isOta => this == BleUuidType.ota;
 }

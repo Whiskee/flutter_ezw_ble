@@ -87,9 +87,8 @@ enum class BleMC {
                 val jsonMap = arguments as Map<*, *>?
                 val uuid = jsonMap?.get("uuid") as String? ?: ""
                 val data = jsonMap?.get("data") as ByteArray? ?: byteArrayOf()
-                val isOtaCmd = jsonMap?.get("isOtaCmd") as Boolean? == true
                 val uuidType = jsonMap?.get("uuidType") as String? ?: BleUuidType.COMMON.name
-                BleManager.instance.sendCmd(uuid, data, isOtaCmd = isOtaCmd, uuidType = BleUuidType.valueOf(uuidType.toUpperSnakeCase()))
+                BleManager.instance.sendCmd(uuid, data, uuidType = BleUuidType.valueOf(uuidType.toUpperSnakeCase()))
             }
             ENTER_UPGRADE_STATE -> {
                 val uuid = arguments as String? ?: ""

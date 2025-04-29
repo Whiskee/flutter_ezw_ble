@@ -8,4 +8,14 @@ enum class BleUuidType {
     LARGE_DATA,
     STREAMING,
     OTA;
+
+    /// Get:
+    val isCommon: Boolean
+        get() = this == COMMON
+    val isLargeData: Boolean
+        get() = this == LARGE_DATA
+    val isStreaming: Boolean
+        get() = this == STREAMING
+    val isOta: Boolean
+        get() = this == OTA
 }

@@ -91,7 +91,7 @@ enum BleMC: String {
             let isOtaCmd: Bool = jsonData["isOtaCmd"] as? Bool ?? false
             let uuidType: String = jsonData["uuidType"] as? String ?? ""
             if let data = jsonData["data"] as? FlutterStandardTypedData {
-                BleManager.shared.sendCmd(uuid: uuid, data: data.data, isOtaCmd: isOtaCmd, uuidType: BleUuidType(rawValue: uuidType) ?? .common)
+                BleManager.shared.sendCmd(uuid: uuid, data: data.data, uuidType: BleUuidType(rawValue: uuidType) ?? .common)
             }
             break
         case .enterUpgradeState:

@@ -336,11 +336,11 @@ class BleManager private constructor() {
      *  发送数据
      *
      */
-    fun sendCmd(uuid: String, data: ByteArray, isOtaCmd: Boolean = false, uuidType: BleUuidType = BleUuidType.COMMON) {
+    fun sendCmd(uuid: String, data: ByteArray, uuidType: BleUuidType = BleUuidType.COMMON) {
         if (!checkIsFunctionCanBeCalled() || uuid.isEmpty()) {
             return
         }
-        if (upgradeDevices.contains(uuid) && !isOtaCmd) {
+        if (upgradeDevices.contains(uuid) && !uuidType.isOta) {
             Log.i(tag, "SendCmd: $uuid, Cannot send commands during upgrade")
             return
         }

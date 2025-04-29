@@ -51,10 +51,10 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
-  Future<void> sendCmd(String uuid, Uint8List data, {BleUuidType uuidType = BleUuidType.common, bool? isOtaCmd}) {
+  Future<void> sendCmd(String uuid, Uint8List data,
+      {BleUuidType uuidType = BleUuidType.common}) {
     throw UnimplementedError();
   }
-
 
   @override
   Future<void> openAppSettings() {

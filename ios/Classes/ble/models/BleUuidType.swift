@@ -10,5 +10,29 @@ enum BleUuidType: String, Codable {
     case largeData
     case streaming
     case ota
+    
+    var isCommon: Bool {
+        get {
+            return self == .common
+        }
+    }
+    
+    var isLargeData: Bool {
+        get {
+            return self == .largeData
+        }
+    }
+    
+    var isStreaming: Bool {
+        get {
+            return self == .streaming
+        }
+    }
+    
+    var isOta: Bool {
+        get {
+            return self == .ota
+        }
+    }
 }
 
