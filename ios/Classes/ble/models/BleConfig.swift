@@ -12,6 +12,8 @@ struct BleConfig: Codable {
     let uuids: [BleUuid]
     //  SN解析规则
     let snRule: BleSnRule
+    //  是否主动发起设备绑定
+    let initiateBinding: Bool
     //  连接超时时间(ms)
     let connectTimeout: TimeInterval
     //  设备升级后启动新固件之前需要的时间，用于重连时
@@ -19,11 +21,12 @@ struct BleConfig: Codable {
     //  MAC地址解析规则
     let macRule: BleMacRule?
     
-    init(name: String, uuids: [BleUuid], snRule: BleSnRule, isScanByServiceUUID: Bool = false, connectTimeout: TimeInterval = 15000, upgradeSwapTime: TimeInterval = 60000, macRule: BleMacRule?) {
+    init(name: String, uuids: [BleUuid], snRule: BleSnRule, initiateBinding: Bool = false, connectTimeout: TimeInterval = 15000, upgradeSwapTime: TimeInterval = 60000, macRule: BleMacRule?) {
         self.name = name
         self.uuids = uuids
         assert(uuids.contains { $0.type == .common }, "Configuration must contain at least one UUID of common type")
         self.snRule = snRule
+        self.initiateBinding = initiateBinding
         self.connectTimeout = connectTimeout
         self.upgradeSwapTime = upgradeSwapTime
         assert(connectTimeout > 10000, "The timeout period must be greater than 10000ms")

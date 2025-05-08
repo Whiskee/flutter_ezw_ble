@@ -7,6 +7,8 @@ enum BleConnectState {
   searchService,
   //  步骤4: 获取服务读写特征
   searchChars,
+  //  步骤5: 发起绑定
+  startBinding,
   //  步骤5: 特征获取完毕，连接流程完成
   connectFinish,
   //  错误码：
@@ -47,6 +49,8 @@ extension BleConnectStateExt on BleConnectState {
         return BleConnectState.searchService;
       case "searchChars":
         return BleConnectState.searchChars;
+      case "startBinding":
+        return BleConnectState.startBinding;
       case "connectFinish":
         return BleConnectState.connectFinish;
       case "disconnectByUser":
@@ -85,6 +89,7 @@ extension BleConnectStateExt on BleConnectState {
       this == BleConnectState.contactDevice ||
       this == BleConnectState.searchService ||
       this == BleConnectState.searchChars ||
+      this == BleConnectState.startBinding ||
       this == BleConnectState.connectFinish;
 
   //  连接流程：连接最后一步

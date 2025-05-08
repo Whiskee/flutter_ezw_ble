@@ -14,6 +14,8 @@ class BleConfig {
   final List<BleUuid> uuids;
   //  如果设置了匹配规则
   final BleSnRule snRule;
+  //  是否要主动发送绑定
+  final bool initiateBinding;
   //  毫秒
   final double connectTimeout;
   //  设备升级后启动新固件之前需要的时间，用于重连时
@@ -27,6 +29,7 @@ class BleConfig {
     this.name,
     this.uuids,
     this.snRule, {
+    this.initiateBinding = false,
     this.connectTimeout = 15000,
     this.upgradeSwapTime = 60000,
     this.macRule,

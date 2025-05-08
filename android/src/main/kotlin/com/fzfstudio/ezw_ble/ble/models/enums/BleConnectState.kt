@@ -12,6 +12,8 @@ enum class BleConnectState {
     SEARCH_SERVICE,
     //  步骤4: 获取服务读写特征
     SEARCH_CHARS,
+    //  步骤5: 发起绑定
+    START_BINDING,
     //  步骤5: 特征获取完毕，连接流程完成
     CONNECT_FINISH,
     //  错误码：
@@ -48,6 +50,7 @@ enum class BleConnectState {
                 this == CONTACT_DEVICE ||
                 this == SEARCH_SERVICE ||
                 this == SEARCH_CHARS ||
+                this == START_BINDING ||
                 this == CONNECT_FINISH
     /**
      *  已连接：真实连接和升级是属于连接状态

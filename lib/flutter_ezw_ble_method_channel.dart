@@ -47,7 +47,7 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
   @override
   Future<void> sendCmd(String uuid, Uint8List data,
           {BleUuidType uuidType = BleUuidType.common}) async =>
-      methodChannel.invokeMethod("sendCmd", {
+      methodChannel.invokeMethod<void>("sendCmd", {
         "uuid": uuid,
         "data": data,
         "uuidType": uuidType.name,

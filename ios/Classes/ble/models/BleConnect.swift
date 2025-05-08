@@ -23,7 +23,9 @@ enum BleConnectState: String, Codable {
     case searchService
     //  步骤4: 获取服务读写特征
     case searchChars
-    //  步骤5: 特征获取完毕，连接流程完成
+    //  步骤5: 开始绑定
+    case startBinding
+    //  步骤6: 特征获取完毕，连接流程完成
     case connectFinish
     //  用户主动断连
     case disconnectByUser
@@ -58,6 +60,7 @@ enum BleConnectState: String, Codable {
         self == .contactDevice ||
         self == .searchService ||
         self == .searchChars ||
+        self == .startBinding ||
         self == .connectFinish
     }
     

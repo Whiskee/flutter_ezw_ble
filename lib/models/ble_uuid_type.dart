@@ -14,6 +14,8 @@ extension BleUuidTypeExt on BleUuidType {
     switch (label) {
       case "largeData":
         return BleUuidType.largeData;
+      case "streaming":
+        return BleUuidType.streaming;
       case "ota":
         return BleUuidType.ota;
       default:

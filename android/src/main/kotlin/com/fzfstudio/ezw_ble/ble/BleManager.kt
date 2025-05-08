@@ -20,17 +20,19 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
 import com.fzfstudio.ezw_ble.ble.extension.toBleDevice
-import com.fzfstudio.ezw_utils.extension.toHexString
 import com.fzfstudio.ezw_ble.ble.models.BleCmd
 import com.fzfstudio.ezw_ble.ble.models.BleConfig
-import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
 import com.fzfstudio.ezw_ble.ble.models.BleConnectModel
 import com.fzfstudio.ezw_ble.ble.models.BleConnectTemp
 import com.fzfstudio.ezw_ble.ble.models.BleDevice
+import com.fzfstudio.ezw_ble.ble.models.BleGatt
 import com.fzfstudio.ezw_ble.ble.models.BleMatchDevice
+import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
 import com.fzfstudio.ezw_ble.ble.models.enums.BleUuidType
 import com.fzfstudio.ezw_ble.ble.services.BleStateListener
 import com.fzfstudio.ezw_ble.ble.services.BleStateListener.BluetoothStateCallback
+import com.fzfstudio.ezw_ble.ble.tools.DataQueues
+import com.fzfstudio.ezw_utils.extension.toHexString
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -133,6 +135,8 @@ class BleManager private constructor() {
     //  - 蓝牙状态
     val currentBleState
         get() = if (!bleLocation) 6 else if (!blePermission) 3 else bleState
+    //  - 能获取最大的MTU值
+    var myMtu = 0
 
     //  - 蓝牙业务处理
     private val bluetoothAdapter: BluetoothAdapter
@@ -248,7 +252,7 @@ class BleManager private constructor() {
         }
         //  1、uuid为空不处理
         if (uuid.isEmpty()) {
-            connectStateLog(uuid, BleConnectState.EMPTY_UUID)
+            handleConnectState(uuid, BleConnectState.EMPTY_UUID)
             Log.w(tag,"Start connect: $uuid, Empty uuid")
             return
         }
@@ -263,7 +267,7 @@ class BleManager private constructor() {
         if (waitingConnectDevices.size > 1) {
             val currentIndex = waitingConnectDevices.indexOfFirst { it.uuid == uuid }
             val lastDevice = waitingConnectDevices[currentIndex - 1]
-            connectStateLog(uuid, BleConnectState.CONNECTING)
+            handleConnectState(uuid, BleConnectState.CONNECTING)
             Log.w(tag,"Start connect: $uuid, waiting ${lastDevice.uuid} finish connecting")
             return
         }
@@ -271,8 +275,8 @@ class BleManager private constructor() {
         var bleDevice = connectedDevices.firstOrNull { it.uuid == uuid }
         //  4、获取新的连接对象
         val remoteDevice = bluetoothAdapter.getRemoteDevice(uuid)
-        if (remoteDevice == null) {
-            connectStateLog(uuid, BleConnectState.NO_DEVICE_FOUND)
+        if (remoteDevice == null || remoteDevice.name == null) {
+            handleConnectState(uuid, BleConnectState.NO_DEVICE_FOUND)
             Log.w(tag,"Start connect: $uuid, no device found")
             return
         }
@@ -283,26 +287,27 @@ class BleManager private constructor() {
         }
         //  6、执行连接
         val connectCallBack = createConnectCallBack()
-        bleDevice.gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            remoteDevice.connectGatt(weakContext?.get(), false, connectCallBack, BluetoothDevice.TRANSPORT_LE, BluetoothDevice.PHY_LE_2M)
+        val gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            remoteDevice.connectGatt(weakContext?.get(), false, connectCallBack, BluetoothDevice.TRANSPORT_LE)
         } else {
             remoteDevice.connectGatt(weakContext?.get(), false, connectCallBack)
         }
+        bleDevice.gattMap[BleUuidType.COMMON] = BleGatt(gatt)
         //  7、读取信号值
-        bleDevice.gatt?.readRemoteRssi()
+        gatt?.readRemoteRssi()
         //  8、开启连接超时定时器
         val timeoutTimer = Timer()
         timeoutTimer.schedule(object : TimerTask() {
             override fun run() {
-                connectStateLog(uuid, BleConnectState.TIMEOUT)
+                handleConnectState(uuid, BleConnectState.TIMEOUT)
                 Log.i(tag, "Start connect: $uuid, connect time out")
                 disconnectDevice(uuid)
             }
-        }, currentConfig.connectTimeout.toLong() + (if (afterUpgrade) currentConfig.upgradeSwapTime.toLong() else 0))
+        }, currentConfig.connectTimeout.toLong() + (if (afterUpgrade) currentConfig.upgradeSwapTime.toLong() else 0),)
         waitingConnectDevices.firstOrNull { it.uuid == uuid }?.timeoutTimer = timeoutTimer
         //  9、待连接中的设备已经处于连接中，不再发送
         if (!isWaitingDevice) {
-            connectStateLog(uuid, BleConnectState.CONNECTING)
+            handleConnectState(uuid, BleConnectState.CONNECTING)
         }
         Log.i(tag, "Start connect: $uuid, connecting, after upgrade = $afterUpgrade")
     }
@@ -316,7 +321,7 @@ class BleManager private constructor() {
         }
         //  1、执行设备断连
         disconnectDevice(uuid)
-        connectStateLog(uuid, BleConnectState.DISCONNECT_BY_MYSELF)
+        handleConnectState(uuid, BleConnectState.DISCONNECT_BY_MYSELF)
         Log.i(tag, "Disconnect: $uuid, finish")
     }
 
@@ -327,7 +332,7 @@ class BleManager private constructor() {
         if (!checkIsFunctionCanBeCalled() || uuid.isEmpty()) {
             return
         }
-        connectStateLog(uuid, BleConnectState.CONNECTED)
+        handleConnectState(uuid, BleConnectState.CONNECTED)
         Log.i(tag, "Connected: $uuid, finish")
     }
 
@@ -344,7 +349,10 @@ class BleManager private constructor() {
             Log.i(tag, "SendCmd: $uuid, Cannot send commands during upgrade")
             return
         }
-        deviceSendCmd(uuid, data, uuidType)
+        DataQueues.instance.addToQueues(BleCmd(uuid, uuidType, data, false))
+        if (DataQueues.instance.getQueuesSize(uuid) == 1) {
+            connectedDevices.firstOrNull { it.uuid == uuid }?.writeCharacteristic(data, uuidType)
+        }
     }
 
     /**
@@ -355,7 +363,7 @@ class BleManager private constructor() {
             return
         }
         upgradeDevices.add(uuid)
-        connectStateLog(uuid, BleConnectState.UPGRADE)
+        handleConnectState(uuid, BleConnectState.UPGRADE)
         Log.i(tag, "EnterUpgradeState: $uuid Into upgrade state")
     }
 
@@ -432,17 +440,20 @@ class BleManager private constructor() {
             //  2、如果没有绑定成功就结束
             if (!isBonded) {
                 Log.e( tag, "Ble status listener - bond state: ${device.address} unable to bind")
+                handleConnectState(connectedDevice.uuid, BleConnectState.BOUND_FAIL)
                 return
             }
             //  3、检查当前设备连接状态，如果出现异常就不处理
             if (connectedDevice.connectState.isError) {
                 Log.i( tag, "Ble status listener - bond state: ${device.address} is ${connectedDevice.connectState}, bound failure")
+                handleConnectState(connectedDevice.uuid, BleConnectState.BOUND_FAIL)
                 return
             }
-            //  4、绑定成功就开始搜索服务
-            connectedDevice.gatt?.discoverServices()
-            connectStateLog(connectedDevice.uuid, BleConnectState.SEARCH_SERVICE)
-            Log.i( tag, "Ble status listener - bond state: ${device.address} is bonded, start search services")
+            //  4、主动绑定时，需要进入CONNECT_FINISH流程，如果是眼镜主动绑定，则默认进入CONNECT_FINISH
+            if (currentConfig.initiateBinding) {
+                handleConnectState(connectedDevice.uuid, BleConnectState.CONNECT_FINISH)
+            }
+            Log.i( tag, "Ble status listener - bond state: ${device.address} is bonded, ${connectedDevice.myGatt}, finish connect")
         }
     }
 
@@ -503,73 +514,94 @@ class BleManager private constructor() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             val device = gatt.device
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                Log.i(tag, "Connect call back: ${device.address}, contact device, state = STATE_CONNECTED(code:2)")
-                //  5、建立配对
-                if (device.bondState == BluetoothDevice.BOND_BONDED) {
-                    gatt.discoverServices()
-                    connectStateLog(device.address, BleConnectState.SEARCH_SERVICE)
-                    Log.i(tag, "Connect call back: ${device.address}, device is bonded, start search services")
-                } else {
-                    device.createBond()
-                    Log.i(tag, "Connect call back: ${device.address}, device not bond, start binding")
-                }
+                gatt.discoverServices()
+                handleConnectState(device.address, BleConnectState.SEARCH_SERVICE)
+                Log.i(tag, "Connect call back: ${device.address}, had contact device, state = STATE_CONNECTED(code:2), start search services")
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 //  移除连接对象，升级中的对象不处理
                 if (upgradeDevices.contains(device.address)) {
                     return
                 }
                 connectCallBacks.removeAll { it.first == device.address  }
-                connectStateLog(device.address, BleConnectState.DISCONNECT_FROM_SYS)
+                handleConnectState(device.address, BleConnectState.DISCONNECT_FROM_SYS)
                 Log.e(tag, "Connect call back: ${gatt.device.address}, state = STATE_DISCONNECTED(code:0)")
             }
         }
         //  服务发现
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            val address = gatt.device.address
-            //  1、获取服务失败，直接返回
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                connectStateLog(address, BleConnectState.SERVICE_FAIL)
-                Log.e(tag, "Connect call back: $address, discover service failure")
-                return
-            }
-            //  发现服务：
-            currentConfig.uuids.forEach { uuid ->
-                val service = uuid.service
-                //  2、获取读/写服务
-                val server = gatt.getService(uuid.serviceUUID)
-                val characteristic = server?.getCharacteristic(uuid.readCharsUUID)
-                if (characteristic == null) {
-                    Log.e(tag, "Connect call back: $address, ${service}, characteristic service not found")
-                    connectStateLog(address, BleConnectState.CHARS_FAIL)
-                    return
-                }
-                //  3、开启读服务数据时监听
-                val setCharsNotifySuccess = gatt.setCharacteristicNotification(characteristic, true)
-                Log.i(tag, "Connect call back: $address, ${service}, set chars notify success = $setCharsNotifySuccess")
-                //  4、开启写服务数据监听
-                //  获取与给定 BluetoothGattCharacteristic 关联的描述符。描述符本质上是与特性相关的附加信息，可以包括例如 客户端配置描述符（Client Characteristic Configuration Descriptor，简称 CCCD）或 描述特性的格式、权限
-                var descriptor = characteristic.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
-                val isWrite = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothStatusCodes.SUCCESS
-                } else {
-                    descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                    gatt.writeDescriptor(descriptor)
-                }
-                Log.i(tag, "Connect call back: $address, ${service}, enable descriptor and write = $isWrite")
-            }
-            //
-            val bleDevice = connectedDevices.firstOrNull { it.uuid == address }
-            //  5、必须请求MTU
-            val changeMtu = gatt.requestMtu(currentConfig.mtu)
-            Log.i(tag, "Connect call back: $address, change mtu = ${currentConfig.mtu}, is success = $changeMtu")
-            bleDevice?.gatt = gatt
             mainScope.launch {
-                //  延迟200ms，避免设备没有准备好出现设备繁忙的问题
-                delay(200)
-                connectStateLog(address, BleConnectState.CONNECT_FINISH)
+                //  1、获取服务所匹配的连接设备
+                val address = gatt.device.address
+                val currentDevice = connectedDevices.firstOrNull { it.uuid == gatt.device.address } ?: return@launch
+                //  2、获取服务失败，直接返回
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    handleConnectState(address, BleConnectState.SERVICE_FAIL)
+                    Log.e(tag, "Connect call back: $address, discover service failure")
+                    return@launch
+                }
+                //  3、发现服务：
+                currentConfig.uuids.forEach { uuid ->
+                    val service = uuid.service
+                    //  2、获取读/写服务
+                    val server = gatt.getService(uuid.serviceUUID)
+                    val writeChars = server?.getCharacteristic(uuid.writeCharsUUID)
+                    if (writeChars == null) {
+                        Log.e(tag, "Connect call back: $address, ${service}, write characteristic not found")
+                        handleConnectState(address, BleConnectState.CHARS_FAIL)
+                        return@launch
+                    }
+                    val readChars = server.getCharacteristic(uuid.readCharsUUID)
+                    if (readChars == null) {
+                        Log.e(tag, "Connect call back: $address, ${service}, read characteristic not found")
+                        handleConnectState(address, BleConnectState.CHARS_FAIL)
+                        return@launch
+                    }
+                    //  缓存读写特征
+                    currentDevice.gattMap[uuid.type] = BleGatt(gatt, writeChars, readChars)
+                    //  3、开启读服务数据时监听
+                    val setCharsNotifySuccess = gatt.setCharacteristicNotification(readChars, true)
+                    Log.i(tag, "Connect call back: $address, ${service}, set chars notify success = $setCharsNotifySuccess")
+                    delay(100)
+                    //  4、开启写服务数据监听
+                    //  获取与给定 BluetoothGattCharacteristic 关联的描述符。描述符本质上是与特性相关的附加信息，可以包括例如 客户端配置描述符（Client Characteristic Configuration Descriptor，简称 CCCD）或 描述特性的格式、权限
+                    var descriptor = readChars.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
+                    val isWrite = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothStatusCodes.SUCCESS
+                    } else {
+                        descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                        gatt.writeDescriptor(descriptor)
+                    }
+                    delay(100)
+                    Log.i(tag, "Connect call back: $address, ${service}, enable descriptor and write = $isWrite")
+                }
+                //  4、MTU大于0则发起MTU修改
+                if (currentConfig.mtu > 0) {
+                    val changeMtu = gatt.requestMtu(currentConfig.mtu)
+                    Log.i(tag, "Connect call back: $address, change mtu to = ${currentConfig.mtu}, request success = $changeMtu")
+                }
+                //  6、如果是主动互动发起绑定则调用createBond，并通过绑定回调处理连接状态
+                if (currentConfig.initiateBinding && gatt.device.bondState != BluetoothDevice.BOND_BONDED) {
+                    gatt.device.createBond()
+                    Log.i(tag, "Connect call back: $address, start create bond")
+                    handleConnectState(address, BleConnectState.START_BINDING)
+                    return@launch
+                }
+                //  - 6.1、如果不需要则直接连接成功
+                handleConnectState(address, BleConnectState.CONNECT_FINISH)
                 Log.i(tag, "Connect call back: $address, connect finish")
             }
         }
+
+        override fun onCharacteristicRead(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray,
+            status: Int
+        ) {
+            super.onCharacteristicRead(gatt, characteristic, value, status)
+            Log.i(tag, "Connect call back: ${gatt.device.address}, read uuid = ${characteristic.uuid}, read chars value = ${value.toHexString()}, status = $status")
+        }
+
         //  发送数据后回调
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
@@ -577,11 +609,45 @@ class BleManager private constructor() {
             value: ByteArray
         ) {
             super.onCharacteristicChanged(gatt, characteristic, value)
-            val bleCmdMap = BleCmd(gatt.device.address, value, true).toMap()
             mainScope.launch {
+                //  1、获取配置中的私有服务
+                val currentUuid = currentConfig.uuids.firstOrNull { uuid ->
+                    uuid.readCharsUUID == characteristic.uuid
+                }
+                if (currentUuid == null) {
+                    Log.i(tag, "Send cmd: Replay ${gatt.device.address} fail, not found current uuid")
+                    return@launch
+                }
+                //  2、解析数据
+                val bleCmdMap = BleCmd(gatt.device.address, currentUuid.type, value, true).toMap()
                 BleEC.RECEIVE_DATA.event?.success(bleCmdMap)
-                Log.i(tag, "Send cmd - replay: ${gatt.device.address}, success = true, value = ${value.toHexString()}, type = ${characteristic.writeType}")
+                Log.i(tag, "Send cmd: Replay ${gatt.device.address} success, type = ${currentUuid.type}, value = ${value.toHexString()}, chartsType = ${characteristic.writeType}")
             }
+        }
+
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt?,
+            characteristic: BluetoothGattCharacteristic?,
+            status: Int
+        ) {
+            super.onCharacteristicWrite(gatt, characteristic, status)
+            val address = gatt?.device?.address
+            if (address.isNullOrEmpty()) {
+                DataQueues.instance.clearQueues()
+                return
+            }
+            DataQueues.instance.popQueues(address)
+            val cmd = DataQueues.instance.getFirstCmd(address)
+            if (cmd != null) {
+                connectedDevices.firstOrNull { it.uuid == address }?.writeCharacteristic(cmd.data, cmd.type)
+            }
+            Log.i(tag, "Send cmd: ${gatt.device.address}, write is success = ${status == BluetoothGatt.GATT_SUCCESS}")
+        }
+
+        override fun onMtuChanged(gatt: BluetoothGatt?, mtu: Int, status: Int) {
+            super.onMtuChanged(gatt, mtu, status)
+            myMtu = mtu
+            Log.i(tag, "Connect call back: ${gatt?.device?.address}, change mtu call back ${if (status == BluetoothGatt. GATT_SUCCESS )  "success" else "fail"}, new mtu value = $mtu")
         }
     }
 
@@ -591,9 +657,12 @@ class BleManager private constructor() {
     private fun disconnectDevice(uuid: String) {
         //  1、执行设备断连
         val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
-        connectedDevice?.gatt?.disconnect()
-        connectedDevice?.gatt?.close()
-        connectedDevice?.gatt = null
+        //  - 1.1、断连所有GATT
+        connectedDevice?.gattMap?.values?.forEach { gatt ->
+            gatt.gatt?.disconnect()
+            gatt.gatt?.close()
+        }
+        connectedDevice?.gattMap?.clear()
         //  2、移除待连接设备对象
         val connectTemp =  waitingConnectDevices.firstOrNull {
             it.uuid == uuid
@@ -604,9 +673,9 @@ class BleManager private constructor() {
     }
 
     /**
-     *  连接状态打印
+     *  处理连接状态
      */
-    private fun connectStateLog(uuid: String, state: BleConnectState) {
+    private fun handleConnectState(uuid: String, state: BleConnectState) {
         //  1、处理断连和错误连接
         if (state.isDisconnected || state.isError) {
             disconnectDevice(uuid)
@@ -631,42 +700,4 @@ class BleManager private constructor() {
         }
     }
 
-    /**
-     * 给设备发送指令
-     */
-    @Synchronized
-    private fun deviceSendCmd(uuid: String, data: ByteArray?, uuidType: BleUuidType = BleUuidType.COMMON) {
-        val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
-        val dataHex = data?.toHexString()
-        if (connectedDevice?.gatt == null || dataHex == null) {
-            BleEC.RECEIVE_DATA.event?.success(BleCmd.fail(uuid).toMap())
-            Log.e(tag, "Send cmd: $uuid, $uuidType, $dataHex, gatt is null, please reconnect first")
-            return
-        }
-        val targetUuid = currentConfig.uuids.firstOrNull { uuid -> uuid.type == uuidType }
-        if (targetUuid == null) {
-            BleEC.RECEIVE_DATA.event?.success(BleCmd.fail(uuid).toMap())
-            Log.i(tag, "Send cmd: $uuid, $uuidType, $dataHex, can not found uuid type")
-            return
-        }
-        val characteristic = connectedDevice.gatt!!.getService(targetUuid.serviceUUID)?.getCharacteristic(targetUuid.writeCharsUUID)
-        if (characteristic == null) {
-            BleEC.RECEIVE_DATA.event?.success(BleCmd.fail(uuid).toMap())
-            Log.i(tag, "Send cmd: $uuid, ${targetUuid.type}|${targetUuid.service}, $dataHex, no write chars found")
-            return
-        }
-        var isSuccess = false
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val status = connectedDevice.gatt!!.writeCharacteristic(characteristic, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
-            isSuccess = status == BluetoothStatusCodes.SUCCESS
-            Log.i(tag, "Send cmd: $uuid, ${targetUuid.type}|${targetUuid.service}, $dataHex, write status = $status")
-        } else {
-            characteristic.value = data
-            isSuccess = connectedDevice.gatt!!.writeCharacteristic(characteristic)
-            Log.i("BleDevice", "Send cmd: $uuid, ${targetUuid.type}|${targetUuid.service}, $dataHex, isSuccess = $isSuccess")
-        }
-        if (!isSuccess) {
-            BleEC.RECEIVE_DATA.event?.success(BleCmd.fail(uuid).toMap())
-        }
-    }
 }

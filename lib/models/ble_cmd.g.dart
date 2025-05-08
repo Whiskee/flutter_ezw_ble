@@ -8,13 +8,15 @@ part of 'ble_cmd.dart';
 
 BleCmd _$BleCmdFromJson(Map<String, dynamic> json) => BleCmd(
       json['uuid'] as String,
-      json['isSuccess'] as bool,
+      const UuidTypeConverter().fromJson(json['type'] as String),
       data: _$JsonConverterFromJson<String, Uint8List>(
           json['data'], const Uint8ListConverter().fromJson),
+      isSuccess: json['isSuccess'] as bool? ?? false,
     );
 
 Map<String, dynamic> _$BleCmdToJson(BleCmd instance) => <String, dynamic>{
       'uuid': instance.uuid,
+      'type': const UuidTypeConverter().toJson(instance.type),
       'data': _$JsonConverterToJson<String, Uint8List>(
           instance.data, const Uint8ListConverter().toJson),
       'isSuccess': instance.isSuccess,
