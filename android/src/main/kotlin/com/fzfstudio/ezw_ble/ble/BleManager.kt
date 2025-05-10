@@ -561,7 +561,7 @@ class BleManager private constructor() {
                     //  3、开启读服务数据时监听
                     val setCharsNotifySuccess = gatt.setCharacteristicNotification(readChars, true)
                     Log.i(tag, "Connect call back: $address, ${service}, set chars notify success = $setCharsNotifySuccess")
-                    delay(100)
+                    delay(300)
                     //  4、开启写服务数据监听
                     //  获取与给定 BluetoothGattCharacteristic 关联的描述符。描述符本质上是与特性相关的附加信息，可以包括例如 客户端配置描述符（Client Characteristic Configuration Descriptor，简称 CCCD）或 描述特性的格式、权限
                     var descriptor = readChars.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
@@ -621,7 +621,7 @@ class BleManager private constructor() {
                 //  2、解析数据
                 val bleCmdMap = BleCmd(gatt.device.address, currentUuid.type, value, true).toMap()
                 BleEC.RECEIVE_DATA.event?.success(bleCmdMap)
-                Log.i(tag, "Send cmd: Replay ${gatt.device.address} success, type = ${currentUuid.type}, value = ${value.toHexString()}, chartsType = ${characteristic.writeType}")
+                Log.i(tag, "Send cmd: Replay ${gatt.device.address} success, type = ${currentUuid.type}, length = ${value.size}, value = ${value.toHexString()}, chartsType = ${characteristic.writeType}")
             }
         }
 
@@ -647,7 +647,7 @@ class BleManager private constructor() {
         override fun onMtuChanged(gatt: BluetoothGatt?, mtu: Int, status: Int) {
             super.onMtuChanged(gatt, mtu, status)
             myMtu = mtu
-            Log.i(tag, "Connect call back: ${gatt?.device?.address}, change mtu call back ${if (status == BluetoothGatt. GATT_SUCCESS )  "success" else "fail"}, new mtu value = $mtu")
+            Log.i(tag, "Connect call back: ${gatt?.device?.address}, change mtu ${if (status == BluetoothGatt. GATT_SUCCESS )  "success" else "fail"}, new mtu value = $mtu")
         }
     }
 
