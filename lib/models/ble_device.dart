@@ -9,6 +9,7 @@ part 'ble_device.g.dart';
 
 @JsonSerializable()
 class BleDevice {
+  final String beLongConfig;
   final String name;
   //  iOS为UUID，Android为MAC地址
   final String uuid;
@@ -16,6 +17,7 @@ class BleDevice {
   final int rssi;
   //  MAC地址，Android MAC地址等于UUID
   String mac;
+
   //  连接状态
   @ConnectStateListConverter()
   BleConnectState connectState;
@@ -24,6 +26,7 @@ class BleDevice {
   BleDeviceHardware hardware = BleDeviceHardware();
 
   BleDevice(
+    this.beLongConfig,
     this.name,
     this.uuid,
     this.sn,
@@ -42,6 +45,7 @@ class BleDevice {
   Map<String, dynamic> toJson() => _$BleDeviceToJson(this);
 
   BleDevice copy() => BleDevice(
+        beLongConfig,
         name,
         uuid,
         sn,

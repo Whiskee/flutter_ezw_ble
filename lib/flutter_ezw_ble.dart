@@ -34,5 +34,7 @@ class EzwBle {
   //  - 蓝牙数据: 返回BleCmd中的data数据为 base64处理过的，需要自行解析成Uint8List
   Stream<BleCmd> receiveDataEC =
       BleEventChannel.receiveData.ec.map((data) => BleCmd.receiveMap(data));
+
+  /// 构造函数
   EzwBle._init();
 }

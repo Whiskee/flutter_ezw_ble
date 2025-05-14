@@ -8,7 +8,6 @@ import com.fzfstudio.ezw_ble.EZW_BLE_CHANNEL_NAME
 import com.fzfstudio.ezw_utils.extension.toCamelCase
 import com.fzfstudio.ezw_utils.extension.toUpperSnakeCase
 import com.fzfstudio.ezw_ble.ble.models.BleConfig
-import com.fzfstudio.ezw_ble.ble.models.enums.BleUuidType
 import com.fzfstudio.ezw_utils.gson.toJson
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.EventChannel
@@ -22,7 +21,7 @@ enum class BleMC {
     //  当前蓝牙状态
     BLE_STATE,
     //  开启蓝牙配置
-    ENABLE_CONFIG,
+    INIT_CONFIGS,
     //  开始扫描设备
     START_SCAN,
     //  停止扫描设备
@@ -61,22 +60,26 @@ enum class BleMC {
             BLE_STATE -> {
                 return result.success(BleManager.instance.currentBleState)
             }
-            ENABLE_CONFIG -> {
-                val jsonMap = arguments as Map<*, *>?
-                val config = jsonMap?.toJson<BleConfig>()
-                if (config != null) {
-                    BleManager.instance.enableConfig(config)
+            INIT_CONFIGS -> {
+                val jsonMap = arguments as List<*>?
+                val configs = jsonMap?.mapNotNull { (it as Map<*, *>).toJson<BleConfig>() }
+                if (configs != null) {
+                    BleManager.instance.initConfigs(configs)
                 }
             }
-            START_SCAN -> BleManager.instance.startScan()
+            START_SCAN -> {
+                val belongConfig = arguments as String? ?: ""
+                BleManager.instance.startScan(belongConfig)
+            }
             STOP_SCAN -> BleManager.instance.stopScan()
             CONNECT_DEVICE -> {
                 val jsonMap = arguments as Map<*, *>?
+                val belongConfig = jsonMap?.get("belongConfig") as String??: ""
                 val uuid = jsonMap?.get("uuid") as String? ?: ""
                 val sn = jsonMap?.get("sn") as String? ?: ""
                 val afterUpgrade = jsonMap?.get("afterUpgrade") as Boolean? == true
                 if (uuid.isNotEmpty() && sn.isNotEmpty()) {
-                    BleManager.instance.connect(uuid, sn, afterUpgrade = afterUpgrade)
+                    BleManager.instance.connect(belongConfig, uuid, sn, afterUpgrade = afterUpgrade)
                 }
             }
             DISCONNECT_DEVICE -> {
@@ -87,8 +90,8 @@ enum class BleMC {
                 val jsonMap = arguments as Map<*, *>?
                 val uuid = jsonMap?.get("uuid") as String? ?: ""
                 val data = jsonMap?.get("data") as ByteArray? ?: byteArrayOf()
-                val uuidType = jsonMap?.get("uuidType") as String? ?: BleUuidType.COMMON.name
-                BleManager.instance.sendCmd(uuid, data, uuidType = BleUuidType.valueOf(uuidType.toUpperSnakeCase()))
+                val psType = jsonMap?.get("psType") as Int? ?: 0
+                BleManager.instance.sendCmd(uuid, data, psType)
             }
             ENTER_UPGRADE_STATE -> {
                 val uuid = arguments as String? ?: ""

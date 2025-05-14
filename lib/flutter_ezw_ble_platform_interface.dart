@@ -1,7 +1,6 @@
 import 'dart:typed_data';
 
 import 'package:flutter_ezw_ble/models/ble_config.dart';
-import 'package:flutter_ezw_ble/models/ble_uuid_type.dart';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
 import 'flutter_ezw_ble_method_channel.dart';
@@ -35,11 +34,11 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     throw UnimplementedError('bleState() has not been implemented.');
   }
 
-  Future<void> enableConfig(BleConfig config) {
-    throw UnimplementedError('enableConfig() has not been implemented.');
+  Future<void> initConfigs(List<BleConfig> configs) {
+    throw UnimplementedError('initConfig() has not been implemented.');
   }
 
-  Future<void> startScan() {
+  Future<void> startScan(String belongConfig) {
     throw UnimplementedError('startScan() has not been implemented.');
   }
 
@@ -50,7 +49,12 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   ///
   /// - param sn only for Android
   ///
-  Future<void> connectDevice(String uuid, {String? sn, bool? afterUpgrade}) {
+  Future<void> connectDevice(
+    String belongConfig,
+    String uuid, {
+    String? sn,
+    bool? afterUpgrade,
+  }) {
     throw UnimplementedError('connectDevice() has not been implemented.');
   }
 
@@ -62,8 +66,11 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     throw UnimplementedError('deviceConnected() has not been implemented.');
   }
 
-  Future<void> sendCmd(String uuid, Uint8List data,
-      {BleUuidType uuidType = BleUuidType.common}) {
+  Future<void> sendCmd(
+    String uuid,
+    Uint8List data, {
+    int psType = 0,
+  }) {
     throw UnimplementedError('sendCmd() has not been implemented.');
   }
 

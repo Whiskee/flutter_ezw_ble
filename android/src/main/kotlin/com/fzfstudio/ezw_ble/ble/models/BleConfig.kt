@@ -4,10 +4,10 @@ import com.fzfstudio.ezw_utils.gson.GsonSerializable
 
 data class BleConfig(
     val name: String,
-    //  可以配置多个uuid数据
-    val uuids: List<BleUuid>,
+    //  配置多个私有服务
+    val privateServices: List<BlePrivateService>,
     //  如果设置了匹配规则，cd
-    val  snRule: BleSnRule,
+    val snRule: BleSnRule,
     //  是否主动发起设备绑定
     val initiateBinding: Boolean,
     //  毫秒
@@ -19,12 +19,12 @@ data class BleConfig(
 ): GsonSerializable() {
 
     companion object {
-        fun empty(): BleConfig = BleConfig("", listOf(), BleSnRule.empty(), true, 15000.0, 60000.0, 0)
+        fun empty(): BleConfig = BleConfig("", listOf(), BleSnRule.empty(), true, 15000.0, 60000.0, 512)
     }
 
     /**
      *  不能为空对象：配置名称，ServiceUUID
      */
-    fun isEmpty(): Boolean = name.isEmpty() || uuids.isEmpty()
+    fun isEmpty(): Boolean = name.isEmpty() || privateServices.isEmpty()
 
 }

@@ -8,8 +8,8 @@ part of 'ble_config.dart';
 
 BleConfig _$BleConfigFromJson(Map<String, dynamic> json) => BleConfig(
       json['name'] as String,
-      (json['uuids'] as List<dynamic>)
-          .map((e) => BleUuid.fromJson(e as Map<String, dynamic>))
+      (json['privateServices'] as List<dynamic>)
+          .map((e) => BlePrivateService.fromJson(e as Map<String, dynamic>))
           .toList(),
       BleSnRule.fromJson(json['snRule'] as Map<String, dynamic>),
       initiateBinding: json['initiateBinding'] as bool? ?? false,
@@ -23,7 +23,7 @@ BleConfig _$BleConfigFromJson(Map<String, dynamic> json) => BleConfig(
 
 Map<String, dynamic> _$BleConfigToJson(BleConfig instance) => <String, dynamic>{
       'name': instance.name,
-      'uuids': instance.uuids,
+      'privateServices': instance.privateServices,
       'snRule': instance.snRule,
       'initiateBinding': instance.initiateBinding,
       'connectTimeout': instance.connectTimeout,

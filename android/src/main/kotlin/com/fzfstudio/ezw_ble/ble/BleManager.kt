@@ -27,16 +27,16 @@ import com.fzfstudio.ezw_ble.ble.models.BleConnectTemp
 import com.fzfstudio.ezw_ble.ble.models.BleDevice
 import com.fzfstudio.ezw_ble.ble.models.BleGatt
 import com.fzfstudio.ezw_ble.ble.models.BleMatchDevice
+import com.fzfstudio.ezw_ble.ble.models.BleSnRule
 import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
-import com.fzfstudio.ezw_ble.ble.models.enums.BleUuidType
 import com.fzfstudio.ezw_ble.ble.services.BleStateListener
 import com.fzfstudio.ezw_ble.ble.services.BleStateListener.BluetoothStateCallback
-import com.fzfstudio.ezw_ble.ble.tools.DataQueues
 import com.fzfstudio.ezw_utils.extension.toHexString
 import kotlinx.coroutines.MainScope
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.lang.ref.WeakReference
+import java.util.LinkedList
+import java.util.Queue
 import java.util.Timer
 import java.util.TimerTask
 import java.util.UUID
@@ -59,63 +59,29 @@ class BleManager private constructor() {
     private val scanSettings by lazy {
         ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_BALANCED).build()
     }
-    //  - 搜索回调
-    private val scanCallback: ScanCallback by lazy {
-        object : ScanCallback() {
-            override fun onScanResult(callbackType: Int, result: ScanResult) {
-                val device = result.device
-                //  1、过滤：无名称设备
-                if (device.name.isNullOrEmpty()) {
-                    return
-                }
-                //  2、过滤已经缓存过的对象
-                //  -- 由于已经过滤了重复项，所以不用担心会重复发送已经发送过的对象
-                if (scanResultTemp.firstOrNull { it.uuid == device.address } != null) {
-                    return
-                }
-                //  3、组装蓝牙数据
-                //  - 3.1、获取SN数据
-                val snRule = currentConfig.snRule
-                val deviceSn = parseDataToObtainSn(result.scanRecord?.bytes)
-                //  - 3.2、阻断发送到Flutter
-                //  -- a、SN无法被解析的
-                //  -- b、不包含标识的设备
-                if (deviceSn.isEmpty() ||
-                    (snRule.scanFilterMarks.isNotEmpty() && !snRule.scanFilterMarks.any { deviceSn.contains(it) })) {
-                    return
-                }
-                //  4、发送设备到Flutter
-                //  - 4.1、创建设备自定义模型对象,并缓存
-                val bleDevice = device.toBleDevice(deviceSn, result.rssi)
-                scanResultTemp.add(bleDevice)
-                //  - 4.2、判断是否需要根据SN组合设备，不需要就直接提交
-                if (snRule.matchCount < 2) {
-                    sendMatchDevices(deviceSn, listOf(bleDevice))
-                    return
-                }
-                //  - 4.3、从缓存中获取到相同的sn,
-                val matchDevices = scanResultTemp.filter { it.sn == bleDevice.sn }
-                //  -- 判断是否达到组合设备数量上限后，如果没有达到就不处理
-                if (matchDevices.size != snRule.matchCount) {
-                    return
-                }
-                sendMatchDevices(deviceSn, matchDevices)
-            }
-            override fun onBatchScanResults(results: List<ScanResult>) { Log.i(tag, "Start scan: batch = $results") }
-            override fun onScanFailed(errorCode: Int) { Log.e(tag, "Start scan: error = $errorCode") }
-        }
-    }
     //  - 缓存已连接的设备
     private val connectedDevices: MutableList<BleDevice> = mutableListOf()
     //  - 蓝牙连接回调
     private val connectCallBacks: MutableList<Pair<String, BluetoothGattCallback>> = mutableListOf()
+    //  - 搜素结果临时缓存(DeviceInfo, 蓝牙对象)
+    private val scanResultTemp: MutableList<BleDevice> = mutableListOf()
+    //  - 待连接设备缓存（UUID，SN）
+    private val waitingConnectDevices: MutableList<BleConnectTemp> = mutableListOf()
+    //  - 私有服务读写操作队列(私有服务类型，Descriptor)
+    private val descriptorQueue: Queue<Pair<Int, BluetoothGattDescriptor>> = LinkedList()
+    //  - 是否正在升级中
+    private val upgradeDevices: MutableList<String> = mutableListOf()
+    //  - 指令发送队列
+    private val sendCmdQueue: Queue<BleCmd> = LinkedList()
 
-    /// =========== Variables
+    /// =========== Private Variables
     private var weakContext: WeakReference<Context>? = null
     //  - 蓝牙管理工具
     private lateinit var bluetoothManager: BluetoothManager
     //  - 系统蓝牙状态监听
     private lateinit var bleStateListener: BleStateListener
+    //  - 蓝牙搜索回调
+    private var scanCallback: ScanCallback? = null
     //  - 当前蓝牙状态,默认无状态
     private var bleState: Int = 0
     //  - 当前蓝牙权限,默认无权限
@@ -123,26 +89,19 @@ class BleManager private constructor() {
     //  - 当前蓝牙定位权限，默认无权限
     private var bleLocation: Boolean = false
     //  - 当前蓝牙基础配置，必须实现
-    private var currentConfig: BleConfig = BleConfig.empty()
-    //  - 搜素结果临时缓存(DeviceInfo, 蓝牙对象)
-    private val scanResultTemp: MutableList<BleDevice> = mutableListOf()
-    //  - 待连接设备缓存（UUID，SN）
-    private val waitingConnectDevices: MutableList<BleConnectTemp> = mutableListOf()
-    //  - 是否正在升级中
-    private val upgradeDevices: MutableList<String> = mutableListOf()
+    private var bleConfigs: List<BleConfig> = listOf()
 
-    /// =========== Get/Set
+    /// =========== Public Variable
+    //  - 设备回复最大的MTU
+    var myMtu = 0
+
+    /// =========== Get
     //  - 蓝牙状态
     val currentBleState
         get() = if (!bleLocation) 6 else if (!blePermission) 3 else bleState
-    //  - 能获取最大的MTU值
-    var myMtu = 0
-
     //  - 蓝牙业务处理
     private val bluetoothAdapter: BluetoothAdapter
         get() = bluetoothManager.adapter
-
-    /// =========== Method: Public
 
     /**
      * 初始化工具
@@ -213,20 +172,70 @@ class BleManager private constructor() {
 
     /**
      * 开启（设置）蓝牙配置
+     *
+     * @param newConfigs 要设置的蓝牙配置
      */
-    fun enableConfig(config: BleConfig) {
-        this.currentConfig = config
+    fun initConfigs(newConfigs: List<BleConfig>) {
+        bleConfigs = newConfigs
     }
 
     /**
      *  开启扫描
      */
-    fun startScan() {
+    fun startScan(belongConfig: String) {
         if (!checkIsFunctionCanBeCalled()) {
             return
         }
+        //  执行搜索先优先执行停止搜索
+        stopScan()
         //  移除历史记录
         scanResultTemp.clear()
+        //  创建搜索回调
+        scanCallback = object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: ScanResult) {
+                val device = result.device
+                //  1、过滤：无名称设备
+                if (device.name.isNullOrEmpty()) {
+                    return
+                }
+                //  2、过滤已经缓存过的对象
+                //  -- 由于已经过滤了重复项，所以不用担心会重复发送已经发送过的对象
+                if (scanResultTemp.firstOrNull { it.uuid == device.address } != null) {
+                    return
+                }
+                val myBleConfig = bleConfigs.firstOrNull { it.name == belongConfig } ?: bleConfigs.first()
+                //  3、组装蓝牙数据
+                //  - 3.1、获取SN数据
+                val snRule = myBleConfig.snRule
+                val deviceSn = parseDataToObtainSn(result.scanRecord?.bytes, myBleConfig.snRule)
+                //  - 3.2、阻断发送到Flutter
+                //  -- a、SN无法被解析的
+                //  -- b、不包含标识的设备
+                if (deviceSn.isEmpty() ||
+                    (snRule.scanFilterMarks.isNotEmpty() && !snRule.scanFilterMarks.any { deviceSn.contains(it) })) {
+                    return
+                }
+                //  4、发送设备到Flutter
+                //  - 4.1、创建设备自定义模型对象,并缓存
+                val bleDevice = device.toBleDevice(myBleConfig.name, deviceSn, result.rssi)
+                scanResultTemp.add(bleDevice)
+                //  - 4.2、判断是否需要根据SN组合设备，不需要就直接提交
+                if (snRule.matchCount < 2) {
+                    sendMatchDevices(deviceSn, listOf(bleDevice))
+                    return
+                }
+                //  - 4.3、从缓存中获取到相同的sn,
+                val matchDevices = scanResultTemp.filter { it.sn == bleDevice.sn }
+                //  -- 判断是否达到组合设备数量上限后，如果没有达到就不处理
+                if (matchDevices.size != snRule.matchCount) {
+                    return
+                }
+                sendMatchDevices(deviceSn, matchDevices)
+            }
+            override fun onBatchScanResults(results: List<ScanResult>) { Log.i(tag, "Start scan: batch = $results") }
+            override fun onScanFailed(errorCode: Int) { Log.e(tag, "Start scan: error = $errorCode") }
+        }
+        //  执行搜索
         bluetoothAdapter.bluetoothLeScanner?.startScan(null, scanSettings, scanCallback)
         Log.i(tag, "Start scan: success")
     }
@@ -234,19 +243,21 @@ class BleManager private constructor() {
     /**
      *  停止扫描
      */
-    fun stopScan() {
+    fun stopScan(isStartScan: Boolean = false) {
         if (!checkIsFunctionCanBeCalled()) {
             return
         }
-        bluetoothAdapter.bluetoothLeScanner?.stopScan(scanCallback)
-        Log.i(tag, "Stop scan: success")
+        scanCallback?.let {
+            bluetoothAdapter.bluetoothLeScanner?.stopScan(it)
+        }
+        Log.i(tag, if (isStartScan) "Start scan: checking if scan is already running, stopping it first if necessary" else "Stop scan: success")
     }
 
     /*
      *  连接设备
      */
     @Synchronized
-    fun connect(uuid: String, sn: String, isWaitingDevice: Boolean = false, afterUpgrade: Boolean = false) {
+    fun connect(belongConfig: String, uuid: String, sn: String, isWaitingDevice: Boolean = false, afterUpgrade: Boolean = false) {
         if (!checkIsFunctionCanBeCalled() ) {
             return
         }
@@ -256,13 +267,13 @@ class BleManager private constructor() {
             Log.w(tag,"Start connect: $uuid, Empty uuid")
             return
         }
-        //  - 如果非升级模式下有升级状态的数据需要清除
+        //  3、如果非升级模式下有升级状态的数据需要清除
         if (!afterUpgrade && upgradeDevices.contains(uuid)) {
             upgradeDevices.remove(uuid)
         }
-        //  2、缓存连接对象，如果缓存中超过1个就等待考前的连接完成后再开始执行
+        //  4、缓存连接对象，如果缓存中超过1个就等待考前的连接完成后再开始执行
         if (!waitingConnectDevices.any { it.uuid == uuid }) {
-            waitingConnectDevices.add(BleConnectTemp(uuid, sn, afterUpgrade))
+            waitingConnectDevices.add(BleConnectTemp(belongConfig, uuid, sn, afterUpgrade))
         }
         if (waitingConnectDevices.size > 1) {
             val currentIndex = waitingConnectDevices.indexOfFirst { it.uuid == uuid }
@@ -282,17 +293,18 @@ class BleManager private constructor() {
         }
         //  5、获取BleDevice，并执行连接
         if (bleDevice == null) {
-            bleDevice = remoteDevice.toBleDevice(sn, 0)
+            bleDevice = remoteDevice.toBleDevice(belongConfig, sn, 0)
             connectedDevices.add(bleDevice)
         }
-        //  6、执行连接
+        val belongConfig = bleConfigs.firstOrNull { it.name == belongConfig }?: bleConfigs.first()
+        //  6、执行连接:默认获取基础私有服务的Gatt进行处理
         val connectCallBack = createConnectCallBack()
         val gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             remoteDevice.connectGatt(weakContext?.get(), false, connectCallBack, BluetoothDevice.TRANSPORT_LE)
         } else {
             remoteDevice.connectGatt(weakContext?.get(), false, connectCallBack)
         }
-        bleDevice.gattMap[BleUuidType.COMMON] = BleGatt(gatt)
+        bleDevice.gattMap[0] = BleGatt(gatt)
         //  7、读取信号值
         gatt?.readRemoteRssi()
         //  8、开启连接超时定时器
@@ -303,13 +315,13 @@ class BleManager private constructor() {
                 Log.i(tag, "Start connect: $uuid, connect time out")
                 disconnectDevice(uuid)
             }
-        }, currentConfig.connectTimeout.toLong() + (if (afterUpgrade) currentConfig.upgradeSwapTime.toLong() else 0),)
+        }, belongConfig.connectTimeout.toLong() + (if (afterUpgrade) belongConfig.upgradeSwapTime.toLong() else 0),)
         waitingConnectDevices.firstOrNull { it.uuid == uuid }?.timeoutTimer = timeoutTimer
         //  9、待连接中的设备已经处于连接中，不再发送
         if (!isWaitingDevice) {
             handleConnectState(uuid, BleConnectState.CONNECTING)
         }
-        Log.i(tag, "Start connect: $uuid, connecting, after upgrade = $afterUpgrade")
+        Log.i(tag, "Start connect: $uuid connecting, belong config = ${bleDevice.beLongConfig}, after upgrade = $afterUpgrade")
     }
 
     /**
@@ -340,18 +352,24 @@ class BleManager private constructor() {
      *
      *  发送数据
      *
+     *  @param uuid 发送指令设备
+     *  @param data 指令数据
+     *  @param psType 私有服务类型
+     *
      */
-    fun sendCmd(uuid: String, data: ByteArray, uuidType: BleUuidType = BleUuidType.COMMON) {
+    fun sendCmd(uuid: String, data: ByteArray, psType: Int = 0) {
         if (!checkIsFunctionCanBeCalled() || uuid.isEmpty()) {
             return
         }
-        if (upgradeDevices.contains(uuid) && !uuidType.isOta) {
-            Log.i(tag, "SendCmd: $uuid, Cannot send commands during upgrade")
+        if (upgradeDevices.contains(uuid) && psType == 1) {
+            Log.i(tag, "Send cmd: $uuid, Cannot send commands during upgrade")
             return
         }
-        DataQueues.instance.addToQueues(BleCmd(uuid, uuidType, data, false))
-        if (DataQueues.instance.getQueuesSize(uuid) == 1) {
-            connectedDevices.firstOrNull { it.uuid == uuid }?.writeCharacteristic(data, uuidType)
+        sendCmdQueue.add(BleCmd(uuid, psType, data, false))
+        //  如果只有一个，就立马poll出来
+        if (sendCmdQueue.size == 1) {
+            sendCmdQueue.poll()
+            connectedDevices.firstOrNull { it.uuid == uuid }?.writeCharacteristic(data, psType)
         }
     }
 
@@ -384,8 +402,13 @@ class BleManager private constructor() {
      *  检查是否添加了蓝牙配置
      */
     private fun checkBleConfigIsConfigured(): Boolean {
-        if (currentConfig.isEmpty()) {
-            Log.e(tag, "checkBleConfigIsConfigured: Bluetooth configuration has not been configured yet")
+        val commonPs = bleConfigs.first().privateServices.firstOrNull()
+        if (commonPs == null) {
+            Log.e(tag, "CheckBleConfigIsConfigured: Bluetooth configuration has not been configured or not setting private service yet")
+            return false
+        }
+        if (commonPs.type != 0) {
+            Log.e(tag, "CheckBleConfigIsConfigured: The first type of private service must be 0, where 0 represents the basic private service.")
             return false
         }
         return true
@@ -398,7 +421,7 @@ class BleManager private constructor() {
      */
     private fun checkIsFunctionCanBeCalled(): Boolean {
         if (bleState != 5) {
-            Log.e(tag, "checkIsFunctionCanBeCalled: ble status = $bleState")
+            Log.e(tag, "CheckIsFunctionCanBeCalled: ble status = $bleState")
             return false
         }
         if (!checkBleConfigIsConfigured()) {
@@ -449,8 +472,9 @@ class BleManager private constructor() {
                 handleConnectState(connectedDevice.uuid, BleConnectState.BOUND_FAIL)
                 return
             }
+            val belongConfig = bleConfigs.first { it.name == connectedDevice.beLongConfig }
             //  4、主动绑定时，需要进入CONNECT_FINISH流程，如果是眼镜主动绑定，则默认进入CONNECT_FINISH
-            if (currentConfig.initiateBinding) {
+            if (belongConfig.initiateBinding) {
                 handleConnectState(connectedDevice.uuid, BleConnectState.CONNECT_FINISH)
             }
             Log.i( tag, "Ble status listener - bond state: ${device.address} is bonded, ${connectedDevice.myGatt}, finish connect")
@@ -460,13 +484,12 @@ class BleManager private constructor() {
     /**
      *  解析数据获取SN
      */
-    private fun parseDataToObtainSn(bytes: ByteArray?): String {
+    private fun parseDataToObtainSn(bytes: ByteArray?, snRule: BleSnRule): String {
         var sn = ""
         //  1、获取到的数据为空直接返回空
         if (bytes == null) {
             return sn.toString()
         }
-        val snRule = currentConfig.snRule
         var startIndex = snRule.startSubIndex
         if (startIndex > bytes.size) {
             startIndex = 0
@@ -477,18 +500,18 @@ class BleManager private constructor() {
         }
         sn = String(bytes, Charsets.UTF_8)
         sn = String(bytes.copyOfRange(startIndex, endIndex), Charsets.UTF_8)
-        return replaceControlCharacters(sn)
+        return replaceControlCharacters(sn, snRule)
     }
 
     /**
      *  正则替换字符
      */
-    private fun replaceControlCharacters(preSn: String): String {
-        if (currentConfig.snRule.replaceRex.isEmpty()) {
+    private fun replaceControlCharacters(preSn: String, snRule: BleSnRule): String {
+        if (snRule.replaceRex.isEmpty()) {
             return preSn
         }
         // 编译正则表达式
-        val pattern = Pattern.compile(currentConfig.snRule.replaceRex)
+        val pattern = Pattern.compile(snRule.replaceRex)
         // 获取匹配器
         val matcher = pattern.matcher(preSn)
         // 替换所有匹配的子串
@@ -500,7 +523,7 @@ class BleManager private constructor() {
      */
     private fun sendMatchDevices(sn: String, devices: List<BleDevice>) {
         //  - 4.3、将结果发送到Flutter
-        val matchDevice = BleMatchDevice(sn, currentConfig.name, devices)
+        val matchDevice = BleMatchDevice(sn, devices)
         val json = matchDevice.toJson()
         BleEC.SCAN_RESULT.event?.success(matchDevice.toJson())
         Log.i(tag, "Send match devices: $json)")
@@ -510,6 +533,10 @@ class BleManager private constructor() {
      * 连接回调
      */
     private fun createConnectCallBack() = object : BluetoothGattCallback() {
+
+        /// 是否服务处理状态
+        private var isPsHandleFinish = true
+
         //  连接状态监听
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             val device = gatt.device
@@ -518,7 +545,7 @@ class BleManager private constructor() {
                 handleConnectState(device.address, BleConnectState.SEARCH_SERVICE)
                 Log.i(tag, "Connect call back: ${device.address}, had contact device, state = STATE_CONNECTED(code:2), start search services")
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                //  移除连接对象，升级中的对象不处理
+                //  升级中的对象不处理
                 if (upgradeDevices.contains(device.address)) {
                     return
                 }
@@ -527,69 +554,66 @@ class BleManager private constructor() {
                 Log.e(tag, "Connect call back: ${gatt.device.address}, state = STATE_DISCONNECTED(code:0)")
             }
         }
+
         //  服务发现
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            mainScope.launch {
-                //  1、获取服务所匹配的连接设备
-                val address = gatt.device.address
-                val currentDevice = connectedDevices.firstOrNull { it.uuid == gatt.device.address } ?: return@launch
-                //  2、获取服务失败，直接返回
-                if (status != BluetoothGatt.GATT_SUCCESS) {
-                    handleConnectState(address, BleConnectState.SERVICE_FAIL)
-                    Log.e(tag, "Connect call back: $address, discover service failure")
-                    return@launch
-                }
-                //  3、发现服务：
-                currentConfig.uuids.forEach { uuid ->
-                    val service = uuid.service
-                    //  2、获取读/写服务
-                    val server = gatt.getService(uuid.serviceUUID)
-                    val writeChars = server?.getCharacteristic(uuid.writeCharsUUID)
-                    if (writeChars == null) {
-                        Log.e(tag, "Connect call back: $address, ${service}, write characteristic not found")
-                        handleConnectState(address, BleConnectState.CHARS_FAIL)
-                        return@launch
-                    }
-                    val readChars = server.getCharacteristic(uuid.readCharsUUID)
-                    if (readChars == null) {
-                        Log.e(tag, "Connect call back: $address, ${service}, read characteristic not found")
-                        handleConnectState(address, BleConnectState.CHARS_FAIL)
-                        return@launch
-                    }
-                    //  缓存读写特征
-                    currentDevice.gattMap[uuid.type] = BleGatt(gatt, writeChars, readChars)
-                    //  3、开启读服务数据时监听
-                    val setCharsNotifySuccess = gatt.setCharacteristicNotification(readChars, true)
-                    Log.i(tag, "Connect call back: $address, ${service}, set chars notify success = $setCharsNotifySuccess")
-                    delay(300)
-                    //  4、开启写服务数据监听
-                    //  获取与给定 BluetoothGattCharacteristic 关联的描述符。描述符本质上是与特性相关的附加信息，可以包括例如 客户端配置描述符（Client Characteristic Configuration Descriptor，简称 CCCD）或 描述特性的格式、权限
-                    var descriptor = readChars.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
-                    val isWrite = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothStatusCodes.SUCCESS
-                    } else {
-                        descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                        gatt.writeDescriptor(descriptor)
-                    }
-                    delay(100)
-                    Log.i(tag, "Connect call back: $address, ${service}, enable descriptor and write = $isWrite")
-                }
-                //  4、MTU大于0则发起MTU修改
-                if (currentConfig.mtu > 0) {
-                    val changeMtu = gatt.requestMtu(currentConfig.mtu)
-                    Log.i(tag, "Connect call back: $address, change mtu to = ${currentConfig.mtu}, request success = $changeMtu")
-                }
-                //  6、如果是主动互动发起绑定则调用createBond，并通过绑定回调处理连接状态
-                if (currentConfig.initiateBinding && gatt.device.bondState != BluetoothDevice.BOND_BONDED) {
-                    gatt.device.createBond()
-                    Log.i(tag, "Connect call back: $address, start create bond")
-                    handleConnectState(address, BleConnectState.START_BINDING)
-                    return@launch
-                }
-                //  - 6.1、如果不需要则直接连接成功
-                handleConnectState(address, BleConnectState.CONNECT_FINISH)
-                Log.i(tag, "Connect call back: $address, connect finish")
+            //  1、获取服务所匹配的连接设备
+            val address = gatt.device.address
+            val currentDevice = connectedDevices.firstOrNull { it.uuid == gatt.device.address } ?: return
+            //  2、获取服务失败，直接返回
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                handleConnectState(address, BleConnectState.SERVICE_FAIL)
+                Log.e(tag, "Connect call back: $address, discover service failure")
+                return
             }
+            //  3、处理私有服务：
+            //  - PrivateService是否处理状态
+            isPsHandleFinish = true
+            //  - 获取去设备蓝牙配置信息
+            val belongConfig = bleConfigs.first { it.name == currentDevice.beLongConfig }
+            belongConfig.privateServices.forEach { uuid ->
+                val service = uuid.service
+                //  2、获取读/写服务
+                val server = gatt.getService(uuid.serviceUUID)
+                val writeChars = server?.getCharacteristic(uuid.writeCharsUUID)
+                if (writeChars == null) {
+                    Log.e(tag, "Connect call back: $address, ${service}, write characteristic not found")
+                    handleConnectState(address, BleConnectState.CHARS_FAIL)
+                    isPsHandleFinish = false
+                    return
+                }
+                val readChars = server.getCharacteristic(uuid.readCharsUUID)
+                if (readChars == null) {
+                    Log.e(tag, "Connect call back: $address, ${service}, read characteristic not found")
+                    handleConnectState(address, BleConnectState.CHARS_FAIL)
+                    isPsHandleFinish = false
+                    return
+                }
+                //  3、开启读服务数据时监听
+                val setCharsNotifySuccess = gatt.setCharacteristicNotification(readChars, true)
+                Log.i(tag, "Connect call back: $address, ${service}, set chars notify success = $setCharsNotifySuccess")
+                //  4、开启写服务数据监听
+                //  获取与给定 BluetoothGattCharacteristic 关联的描述符。描述符本质上是与特性相关的附加信息，可以包括例如 客户端配置描述符（Client Characteristic Configuration Descriptor，简称 CCCD）或 描述特性的格式、权限
+                var descriptor = readChars.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
+                descriptorQueue.add(Pair(uuid.type, descriptor))
+                //  缓存读写特征
+                currentDevice.gattMap[uuid.type] = BleGatt(gatt, writeChars, readChars)
+            }
+            if (!isPsHandleFinish) {
+                return
+            }
+            //  处理下一个对
+            processNextDescriptor(gatt)
+        }
+
+        override fun onDescriptorWrite(
+            gatt: BluetoothGatt?,
+            descriptor: BluetoothGattDescriptor?,
+            status: Int
+        ) {
+            super.onDescriptorWrite(gatt, descriptor, status)
+            Log.i(tag, "Connect call back: ${gatt?.device?.address}, is descriptor write success = ${status == BluetoothGatt. GATT_SUCCESS}")
+            processNextDescriptor(gatt)
         }
 
         override fun onCharacteristicRead(
@@ -610,18 +634,20 @@ class BleManager private constructor() {
         ) {
             super.onCharacteristicChanged(gatt, characteristic, value)
             mainScope.launch {
+                val connectedDevice = findConnectedDevice(gatt.device.address)
+                val belongConfig = bleConfigs.first { it.name == connectedDevice?.beLongConfig }
                 //  1、获取配置中的私有服务
-                val currentUuid = currentConfig.uuids.firstOrNull { uuid ->
+                val currentUuid = belongConfig.privateServices.firstOrNull { uuid ->
                     uuid.readCharsUUID == characteristic.uuid
                 }
                 if (currentUuid == null) {
-                    Log.i(tag, "Send cmd: Replay ${gatt.device.address} fail, not found current uuid")
+                    Log.i(tag, "Send cmd: ${gatt.device.address} receive fail, not found current uuid")
                     return@launch
                 }
                 //  2、解析数据
                 val bleCmdMap = BleCmd(gatt.device.address, currentUuid.type, value, true).toMap()
                 BleEC.RECEIVE_DATA.event?.success(bleCmdMap)
-                Log.i(tag, "Send cmd: Replay ${gatt.device.address} success, type = ${currentUuid.type}, length = ${value.size}, value = ${value.toHexString()}, chartsType = ${characteristic.writeType}")
+                Log.i(tag, "Send cmd: ${gatt.device.address} receive success\n--type=${currentUuid.type}\n--length=${value.size}\n--chartsType=${characteristic.writeType}\n--data=${value.toHexString()}")
             }
         }
 
@@ -633,13 +659,11 @@ class BleManager private constructor() {
             super.onCharacteristicWrite(gatt, characteristic, status)
             val address = gatt?.device?.address
             if (address.isNullOrEmpty()) {
-                DataQueues.instance.clearQueues()
+                sendCmdQueue.clear()
                 return
             }
-            DataQueues.instance.popQueues(address)
-            val cmd = DataQueues.instance.getFirstCmd(address)
-            if (cmd != null) {
-                connectedDevices.firstOrNull { it.uuid == address }?.writeCharacteristic(cmd.data, cmd.type)
+            sendCmdQueue.poll()?.let { cmd ->
+                connectedDevices.firstOrNull { it.uuid == address }?.writeCharacteristic(cmd.data, cmd.psType)
             }
             Log.i(tag, "Send cmd: ${gatt.device.address}, write is success = ${status == BluetoothGatt.GATT_SUCCESS}")
         }
@@ -648,6 +672,57 @@ class BleManager private constructor() {
             super.onMtuChanged(gatt, mtu, status)
             myMtu = mtu
             Log.i(tag, "Connect call back: ${gatt?.device?.address}, change mtu ${if (status == BluetoothGatt. GATT_SUCCESS )  "success" else "fail"}, new mtu value = $mtu")
+        }
+
+        //* ============== User Method ============== *//
+
+        /**
+         * 队列处理 - 执行Descriptor
+         */
+        private fun processNextDescriptor(gatt: BluetoothGatt?) {
+            if (gatt == null) {
+                descriptorQueue.clear()
+                return
+            }
+            //  1、如果队列内容为空，就表示处理完成
+            if (descriptorQueue.isEmpty()) {
+                connectingFlowFinish(gatt)
+                return
+            }
+            //  2、执行写特征使能
+            val item = descriptorQueue.poll()
+            val descriptor = item!!.second
+            val isWrite = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothStatusCodes.SUCCESS
+            } else {
+                descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                gatt.writeDescriptor(descriptor)
+            }
+            Log.i(tag, "Connect call back: ${gatt.device.address}, psType=${item.first}, enable descriptor and write = $isWrite")
+        }
+
+        /**
+         * 连接流程执行完毕
+         */
+        private fun connectingFlowFinish(gatt: BluetoothGatt) {
+            val address = gatt.device.address
+            val device = findConnectedDevice(address)
+            val currentConfig = bleConfigs.first { it.name == device?.beLongConfig }
+            //  4、MTU大于0则发起MTU修改
+            if (currentConfig.mtu > 0) {
+                val changeMtu = gatt.requestMtu(currentConfig.mtu)
+                Log.i(tag, "Connect call back: ${device?.uuid}, change mtu to = ${currentConfig.mtu}, request success = $changeMtu")
+            }
+            //  6、如果是主动互动发起绑定则调用createBond，并通过绑定回调处理连接状态
+            if (currentConfig.initiateBinding && gatt.device.bondState != BluetoothDevice.BOND_BONDED) {
+                gatt.device.createBond()
+                Log.i(tag, "Connect call back: $address, start create bond")
+                handleConnectState(address!!, BleConnectState.START_BINDING)
+                return
+            }
+            //  - 6.1、如果不需要则直接连接成功
+            handleConnectState(address!!, BleConnectState.CONNECT_FINISH)
+            Log.i(tag, "Connect call back: $address, connect finish")
         }
     }
 
@@ -670,6 +745,8 @@ class BleManager private constructor() {
         connectTemp?.timeoutTimer?.cancel()
         connectTemp?.timeoutTimer = null
         waitingConnectDevices.remove(connectTemp)
+        //  清楚剩余所有队列数据
+        sendCmdQueue.clear()
     }
 
     /**
@@ -692,7 +769,7 @@ class BleManager private constructor() {
         //  3、非连接流程，查询是否有待连接设备，如果有就开始连接
         if (!state.isConnecting && !upgradeDevices.contains(uuid) && waitingConnectDevices.isNotEmpty()) {
             val waitingDevice = waitingConnectDevices.first()
-            connect(waitingDevice.uuid, waitingDevice.sn, true, waitingDevice.afterUpgrade)
+            connect(waitingDevice.belongConfig, waitingDevice.uuid, waitingDevice.sn, true, waitingDevice.afterUpgrade)
         }
         mainScope.launch {
             val connectModel = BleConnectModel(uuid, state)

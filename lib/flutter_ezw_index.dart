@@ -1,6 +1,5 @@
 library flutter_ezw;
 
-
 /// ThirdPart
 export 'package:flutter_ezw_ble/flutter_ezw_ble.dart';
 
@@ -15,6 +14,6 @@ export 'models/ble_connect_model.dart';
 export 'models/ble_connect_state.dart';
 export 'models/ble_device.dart';
 export 'models/ble_match_device.dart';
+export 'models/ble_private_service.dart';
 export 'models/ble_sn_rule.dart';
 export 'models/ble_status.dart';
-export 'models/ble_uuid.dart';

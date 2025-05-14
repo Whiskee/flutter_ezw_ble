@@ -3,7 +3,6 @@ import 'dart:typed_data';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_method_channel.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_platform_interface.dart';
 import 'package:flutter_ezw_ble/models/ble_config.dart';
-import 'package:flutter_ezw_ble/models/ble_uuid_type.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
@@ -21,12 +20,12 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
-  Future<void> enableConfig(BleConfig config) {
+  Future<void> initConfigs(List<BleConfig> configs) {
     throw UnimplementedError();
   }
 
   @override
-  Future<void> startScan() {
+  Future<void> startScan(String belongConfig) {
     throw UnimplementedError();
   }
 
@@ -36,7 +35,12 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
-  Future<void> connectDevice(String uuid, {String? sn, bool? afterUpgrade}) {
+  Future<void> connectDevice(
+    String belongConfig,
+    String uuid, {
+    String? sn,
+    bool? afterUpgrade,
+  }) {
     throw UnimplementedError();
   }
 
@@ -51,8 +55,11 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
-  Future<void> sendCmd(String uuid, Uint8List data,
-      {BleUuidType uuidType = BleUuidType.common}) {
+  Future<void> sendCmd(
+    String uuid,
+    Uint8List data, {
+    int psType = 0,
+  }) {
     throw UnimplementedError();
   }
 

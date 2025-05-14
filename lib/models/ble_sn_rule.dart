@@ -18,11 +18,12 @@ class BleSnRule {
   BleSnRule({
     this.byteLength = 0,
     this.startSubIndex = 0,
-    this.replaceRex = "",
+    this.replaceRex = "[\\x{00}-\\x{1F}\\x{7F}]",
     this.scanFilterMarks = const [],
     this.matchCount = 1,
   }) {
-    assert(byteLength == 0 || (byteLength > 0 && byteLength > startSubIndex), "ByteLength must be greater than startSubIndex");
+    assert(byteLength == 0 || (byteLength > 0 && byteLength > startSubIndex),
+        "ByteLength must be greater than startSubIndex");
     assert(matchCount > 0,
         "When matching mode is enabled, the number of matches must be greater than or equal to 1");
   }

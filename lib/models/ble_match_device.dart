@@ -7,10 +7,11 @@ part 'ble_match_device.g.dart';
 @JsonSerializable()
 class BleMatchDevice {
   final String sn;
-  final String belongConfig;
   final List<BleDevice> devices;
 
   ///========== Get
+  //  - 获取配置名称
+  String get belongConfig => devices.first.beLongConfig;
   //  - 是否正在连接
   bool get isConnecting =>
       devices.where((device) => device.connectState.isConnecting).isNotEmpty;
@@ -20,8 +21,7 @@ class BleMatchDevice {
       devices.length;
 
   BleMatchDevice(
-    this.sn,
-    this.belongConfig, {
+    this.sn, {
     this.devices = const [],
   });
 
@@ -30,6 +30,6 @@ class BleMatchDevice {
 
   Map<String, dynamic> toJson() => _$BleMatchDeviceToJson(this);
 
-  BleMatchDevice copy() => BleMatchDevice(sn, belongConfig,
+  BleMatchDevice copy() => BleMatchDevice(sn,
       devices: devices.map((match) => match.copy()).toList());
 }

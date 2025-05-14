@@ -9,7 +9,7 @@ part of 'ble_sn_rule.dart';
 BleSnRule _$BleSnRuleFromJson(Map<String, dynamic> json) => BleSnRule(
       byteLength: (json['byteLength'] as num?)?.toInt() ?? 0,
       startSubIndex: (json['startSubIndex'] as num?)?.toInt() ?? 0,
-      replaceRex: json['replaceRex'] as String? ?? "",
+      replaceRex: json['replaceRex'] as String? ?? "[\\x{00}-\\x{1F}\\x{7F}]",
       scanFilterMarks: (json['scanFilterMarks'] as List<dynamic>?)
               ?.map((e) => e as String)
               .toList() ??

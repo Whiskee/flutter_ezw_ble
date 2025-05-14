@@ -1,5 +1,6 @@
 package com.fzfstudio.flutter_ezw_ble
 
+import com.fzfstudio.ezw_ble.FlutterEzwBlePlugin
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import kotlin.test.Test

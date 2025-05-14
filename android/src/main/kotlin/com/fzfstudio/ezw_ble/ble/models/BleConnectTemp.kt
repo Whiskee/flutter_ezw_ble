@@ -4,6 +4,7 @@ import java.util.Timer
 
 /// 连接缓存数据
 data class BleConnectTemp(
+    val belongConfig: String,
     val uuid: String,
     val sn: String,
     var afterUpgrade: Boolean,

@@ -2,7 +2,6 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble.dart';
 import 'package:flutter_ezw_ble/models/ble_config.dart';
-import 'package:flutter_ezw_ble/models/ble_uuid_type.dart';
 
 import 'flutter_ezw_ble_platform_interface.dart';
 
@@ -20,21 +19,31 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
   Future<int> bleState() async => await methodChannel.invokeMethod("bleState");
 
   @override
-  Future<void> enableConfig(BleConfig config) async =>
-      methodChannel.invokeMethod("enableConfig", config.customToJson());
+  Future<void> initConfigs(List<BleConfig> configs) async =>
+      methodChannel.invokeMethod("initConfigs",
+          configs.map((config) => config.customToJson()).toList());
 
   @override
-  Future<void> startScan() async => methodChannel.invokeMethod("startScan");
+  Future<void> startScan(String belongConfig) async =>
+      methodChannel.invokeMethod("startScan", belongConfig);
 
   @override
   Future<void> stopScan() async => methodChannel.invokeMethod("stopScan");
 
   /// 参数 sn 仅在 Android 平台有效
   @override
-  Future<void> connectDevice(String uuid,
-          {String? sn, bool? afterUpgrade}) async =>
-      methodChannel.invokeMethod("connectDevice",
-          {"uuid": uuid, "sn": sn, "afterUpgrade": afterUpgrade});
+  Future<void> connectDevice(
+    String belongConfig,
+    String uuid, {
+    String? sn,
+    bool? afterUpgrade,
+  }) async =>
+      methodChannel.invokeMethod("connectDevice", {
+        "belongConfig": belongConfig,
+        "uuid": uuid,
+        "sn": sn,
+        "afterUpgrade": afterUpgrade
+      });
 
   @override
   Future<void> disconnectDevice(String uuid) async =>
@@ -45,12 +54,15 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       methodChannel.invokeMethod("deviceConnected", uuid);
 
   @override
-  Future<void> sendCmd(String uuid, Uint8List data,
-          {BleUuidType uuidType = BleUuidType.common}) async =>
+  Future<void> sendCmd(
+    String uuid,
+    Uint8List data, {
+    int psType = 0,
+  }) async =>
       methodChannel.invokeMethod<void>("sendCmd", {
         "uuid": uuid,
         "data": data,
-        "uuidType": uuidType.name,
+        "psType": 0,
       });
 
   @override

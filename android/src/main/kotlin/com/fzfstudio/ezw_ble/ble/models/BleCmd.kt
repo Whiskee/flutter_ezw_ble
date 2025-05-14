@@ -1,38 +1,42 @@
 package com.fzfstudio.ezw_ble.ble.models
 
-import com.fzfstudio.ezw_ble.ble.models.enums.BleUuidType
-import com.fzfstudio.ezw_utils.gson.GsonSerializable
 import com.fzfstudio.ezw_utils.gson.ByteArrayAdapter
+import com.fzfstudio.ezw_utils.gson.GsonSerializable
 import com.google.gson.annotations.JsonAdapter
 
 data class BleCmd(
     val uuid: String,
-    val type: BleUuidType,
+    //  Private Service 类型
+    val psType: Int,
     @JsonAdapter(ByteArrayAdapter::class)
     val data: ByteArray?,
     val isSuccess: Boolean,
 ): GsonSerializable() {
 
     companion object {
-        fun fail(uuid: String, type: BleUuidType): BleCmd = BleCmd(uuid, type, null, false)
+        fun fail(uuid: String, psType: Int): BleCmd = BleCmd(uuid, psType, null, false)
     }
 
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (javaClass != other?.javaClass) return false
         other as BleCmd
-        if (isSuccess != other.isSuccess) return false
         if (uuid != other.uuid) return false
-        if (type != other.type) return false
-        if (!data.contentEquals(other.data)) return false
+        if (psType != other.psType) return false
+        if (data != null) {
+            if (other.data == null) return false
+            if (!data.contentEquals(other.data)) return false
+        } else if (other.data != null) return false
+        if (isSuccess != other.isSuccess) return false
+
         return true
     }
 
     override fun hashCode(): Int {
-        var result = isSuccess.hashCode()
-        result = 31 * result + uuid.hashCode()
-        result = 31 * result + type.hashCode()
+        var result = uuid.hashCode()
+        result = 31 * result + psType
         result = 31 * result + (data?.contentHashCode() ?: 0)
+        result = 31 * result + isSuccess.hashCode()
         return result
     }
 
