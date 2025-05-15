@@ -7,6 +7,11 @@
 
 struct BleMatchDevice: Codable {
     let sn: String
-    let belongConfig: String
     let devices: [BleDevice]
+    
+    var belongConfig: String? {
+        get {
+            return devices.first?.belongConfig
+        }
+    }
 }

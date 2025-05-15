@@ -7,7 +7,7 @@ part of 'ble_device.dart';
 // **************************************************************************
 
 BleDevice _$BleDeviceFromJson(Map<String, dynamic> json) => BleDevice(
-      json['beLongConfig'] as String,
+      json['belongConfig'] as String,
       json['name'] as String,
       json['uuid'] as String,
       json['sn'] as String,
@@ -20,7 +20,7 @@ BleDevice _$BleDeviceFromJson(Map<String, dynamic> json) => BleDevice(
     );
 
 Map<String, dynamic> _$BleDeviceToJson(BleDevice instance) => <String, dynamic>{
-      'beLongConfig': instance.beLongConfig,
+      'belongConfig': instance.belongConfig,
       'name': instance.name,
       'uuid': instance.uuid,
       'sn': instance.sn,

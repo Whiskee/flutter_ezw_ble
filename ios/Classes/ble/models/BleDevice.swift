@@ -7,10 +7,10 @@
 
 /// 设备信息
 struct BleDevice: Codable {
+    let belongConfig: String
     let name: String
     let uuid: String
     let sn: String
-    let belongConfig: String
     let rssi: Int
     let mac: String
 }

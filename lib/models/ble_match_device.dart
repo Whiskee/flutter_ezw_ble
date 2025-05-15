@@ -11,7 +11,7 @@ class BleMatchDevice {
 
   ///========== Get
   //  - 获取配置名称
-  String get belongConfig => devices.first.beLongConfig;
+  String get belongConfig => devices.first.belongConfig;
   //  - 是否正在连接
   bool get isConnecting =>
       devices.where((device) => device.connectState.isConnecting).isNotEmpty;

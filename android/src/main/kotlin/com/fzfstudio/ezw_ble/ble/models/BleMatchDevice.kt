@@ -8,6 +8,6 @@ data class BleMatchDevice(
 ): GsonSerializable() {
 
     val belongConfig: String
-        get() = devices.first().beLongConfig
+        get() = devices.first().belongConfig
 
 }

@@ -9,7 +9,7 @@ part 'ble_device.g.dart';
 
 @JsonSerializable()
 class BleDevice {
-  final String beLongConfig;
+  final String belongConfig;
   final String name;
   //  iOS为UUID，Android为MAC地址
   final String uuid;
@@ -26,7 +26,7 @@ class BleDevice {
   BleDeviceHardware hardware = BleDeviceHardware();
 
   BleDevice(
-    this.beLongConfig,
+    this.belongConfig,
     this.name,
     this.uuid,
     this.sn,
@@ -45,7 +45,7 @@ class BleDevice {
   Map<String, dynamic> toJson() => _$BleDeviceToJson(this);
 
   BleDevice copy() => BleDevice(
-        beLongConfig,
+        belongConfig,
         name,
         uuid,
         sn,

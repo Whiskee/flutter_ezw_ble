@@ -9,7 +9,7 @@ struct BleConfig: Codable {
     //  配置名称
     let name: String
     //  设备特性
-    let uuids: [BleUuid]
+    let privateServices: [BlePrivateService]
     //  SN解析规则
     let snRule: BleSnRule
     //  是否主动发起设备绑定
@@ -21,10 +21,10 @@ struct BleConfig: Codable {
     //  MAC地址解析规则
     let macRule: BleMacRule?
     
-    init(name: String, uuids: [BleUuid], snRule: BleSnRule, initiateBinding: Bool = false, connectTimeout: TimeInterval = 15000, upgradeSwapTime: TimeInterval = 60000, macRule: BleMacRule?) {
+    init(name: String, privateServices: [BlePrivateService], snRule: BleSnRule, initiateBinding: Bool = false, connectTimeout: TimeInterval = 15000, upgradeSwapTime: TimeInterval = 60000, macRule: BleMacRule?) {
         self.name = name
-        self.uuids = uuids
-        assert(uuids.contains { $0.type == .common }, "Configuration must contain at least one UUID of common type")
+        self.privateServices = privateServices
+        assert(privateServices.contains { $0.type == 0 }, "Configuration must contain at least one UUID of common type")
         self.snRule = snRule
         self.initiateBinding = initiateBinding
         self.connectTimeout = connectTimeout
@@ -34,13 +34,13 @@ struct BleConfig: Codable {
     }
     
     static func empty() -> BleConfig {
-        return BleConfig(name: "", uuids: [], snRule: BleSnRule.empty(), macRule: nil)
+        return BleConfig(name: "", privateServices: [], snRule: BleSnRule.empty(), macRule: nil)
     }
     
     /**
      *  不能为空对象：配置名称，ServiceUUID，SN 长度
      */
     func isEmpty() -> Bool {
-        return name.isEmpty || uuids.isEmpty
+        return name.isEmpty || privateServices.isEmpty
     }
 }

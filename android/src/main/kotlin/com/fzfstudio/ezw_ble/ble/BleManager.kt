@@ -321,7 +321,7 @@ class BleManager private constructor() {
         if (!isWaitingDevice) {
             handleConnectState(uuid, BleConnectState.CONNECTING)
         }
-        Log.i(tag, "Start connect: $uuid connecting, belong config = ${bleDevice.beLongConfig}, after upgrade = $afterUpgrade")
+        Log.i(tag, "Start connect: $uuid connecting, belong config = ${bleDevice.belongConfig}, after upgrade = $afterUpgrade")
     }
 
     /**
@@ -472,7 +472,7 @@ class BleManager private constructor() {
                 handleConnectState(connectedDevice.uuid, BleConnectState.BOUND_FAIL)
                 return
             }
-            val belongConfig = bleConfigs.first { it.name == connectedDevice.beLongConfig }
+            val belongConfig = bleConfigs.first { it.name == connectedDevice.belongConfig }
             //  4、主动绑定时，需要进入CONNECT_FINISH流程，如果是眼镜主动绑定，则默认进入CONNECT_FINISH
             if (belongConfig.initiateBinding) {
                 handleConnectState(connectedDevice.uuid, BleConnectState.CONNECT_FINISH)
@@ -570,7 +570,7 @@ class BleManager private constructor() {
             //  - PrivateService是否处理状态
             isPsHandleFinish = true
             //  - 获取去设备蓝牙配置信息
-            val belongConfig = bleConfigs.first { it.name == currentDevice.beLongConfig }
+            val belongConfig = bleConfigs.first { it.name == currentDevice.belongConfig }
             belongConfig.privateServices.forEach { uuid ->
                 val service = uuid.service
                 //  2、获取读/写服务
@@ -635,7 +635,7 @@ class BleManager private constructor() {
             super.onCharacteristicChanged(gatt, characteristic, value)
             mainScope.launch {
                 val connectedDevice = findConnectedDevice(gatt.device.address)
-                val belongConfig = bleConfigs.first { it.name == connectedDevice?.beLongConfig }
+                val belongConfig = bleConfigs.first { it.name == connectedDevice?.belongConfig }
                 //  1、获取配置中的私有服务
                 val currentUuid = belongConfig.privateServices.firstOrNull { uuid ->
                     uuid.readCharsUUID == characteristic.uuid
@@ -707,7 +707,7 @@ class BleManager private constructor() {
         private fun connectingFlowFinish(gatt: BluetoothGatt) {
             val address = gatt.device.address
             val device = findConnectedDevice(address)
-            val currentConfig = bleConfigs.first { it.name == device?.beLongConfig }
+            val currentConfig = bleConfigs.first { it.name == device?.belongConfig }
             //  4、MTU大于0则发起MTU修改
             if (currentConfig.mtu > 0) {
                 val changeMtu = gatt.requestMtu(currentConfig.mtu)

@@ -7,15 +7,15 @@
 
 struct BleCmd: Codable {
     var uuid: String
-    var type: BleUuidType
+    var psType: Int
     var data: Data?
     var isSuccess: Bool = true
     
     func toMap() -> [String:Any] {
         var jsonMap: [String:Any] = [
-            "uuid":uuid,
-            "type":type.rawValue,
-            "isSuccess":isSuccess
+            "uuid": uuid,
+            "psType": psType,
+            "isSuccess": isSuccess
         ]
         if let data = data {
             jsonMap["data"] = data.base64EncodedString()

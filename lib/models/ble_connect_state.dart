@@ -16,6 +16,8 @@ enum BleConnectState {
   disconnectByUser,
   //  系统断连
   disconnectFromSys,
+  //  未发现相应的蓝牙配置
+  noBleConfigFound,
   //  空的UUID
   emptyUuid,
   //  未发现设备

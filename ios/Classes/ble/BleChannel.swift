@@ -23,8 +23,8 @@ enum BleMC: String {
     //  - poweredOff = 4
     //  - poweredOn = 5
     case bleState
-    //  开启蓝牙配置
-    case enableConfig
+    //  设置蓝牙配置
+    case initConfigs
     //  开始扫描设备
     case startScan
     //  停止扫描设备
@@ -59,23 +59,28 @@ enum BleMC: String {
         case .bleState:
             result(BleManager.shared.currentBleState)
             return
-        case .enableConfig:
-            let jsonData: [String:Any] = arguments as? [String:Any] ?? [:]
-            if let config: BleConfig = jsonData.decodeTo() {
-                BleManager.shared.enableConfig(config: config)
-            }
+        case .initConfigs:
+            let jsonArray: Array<[String:Any]> = arguments as? Array<[String:Any]> ?? []
+            let configs: Array<BleConfig?> = jsonArray
+                .map { jsonData in
+                    jsonData.decodeTo()
+                }
+                .filter { $0 != nil }
+            BleManager.shared.initConfigs(configs: configs.map { $0! })
             break
         case .startScan:
-            BleManager.shared.startScan()
+            let belongConfig: String = arguments as? String ?? ""
+            BleManager.shared.startScan(bleongConfig: belongConfig)
             break
         case .stopScan:
             BleManager.shared.stopScan()
             break
         case .connectDevice:
             let jsonData: [String:Any] = arguments as? [String:Any] ?? [:]
+            let belongConfig: String = jsonData["belongConfig"] as? String ?? ""
             let uuid = jsonData["uuid"] as? String ?? ""
             let afterUpgrade = jsonData["afterUpgrade"] as? Bool ?? false
-            BleManager.shared.connect(uuid: uuid, afterUpgrade: afterUpgrade)
+            BleManager.shared.connect(belongConfig: belongConfig, uuid: uuid, afterUpgrade: afterUpgrade)
             break
         case .deviceConnected:
             let uuid = arguments as? String ?? ""
@@ -88,10 +93,9 @@ enum BleMC: String {
         case .sendCmd:
             let jsonData: [String:Any] = arguments as? [String:Any] ?? [:]
             let uuid: String = jsonData["uuid"] as? String ?? ""
-            let isOtaCmd: Bool = jsonData["isOtaCmd"] as? Bool ?? false
-            let uuidType: String = jsonData["uuidType"] as? String ?? ""
+            let psType: Int = jsonData["psType"] as? Int ?? 0
             if let data = jsonData["data"] as? FlutterStandardTypedData {
-                BleManager.shared.sendCmd(uuid: uuid, data: data.data, uuidType: BleUuidType(rawValue: uuidType) ?? .common)
+                BleManager.shared.sendCmd(uuid: uuid, data: data.data, psType: psType)
             }
             break
         case .enterUpgradeState:

@@ -27,23 +27,25 @@ enum BleConnectState: String, Codable {
     case startBinding
     //  步骤6: 特征获取完毕，连接流程完成
     case connectFinish
-    //  用户主动断连
+    //  错误：用户主动断连
     case disconnectByUser
-    //  系统断连
+    //  错误：系统断连
     case disconnectFromSys
-    //  空的UUID
+    //  错误：空的UUID
     case emptyUuid
-    //  设备没被发现
+    //  错误：找不到蓝牙配置
+    case noBleConfigFound
+    //  错误：设备没被发现
     case noDeviceFound
-    //  已经被绑定
+    //  错误：已经被绑定
     case alreadyBound
-    //  绑定失败
+    //  错误：绑定失败
     case boundFail
-    //  获取服务发现失败
+    //  错误：获取服务发现失败
     case serviceFail
-    //  获取读写特征失败
+    //  错误：获取读写特征失败
     case charsFail
-    //  连接超时
+    //  错误：连接超时
     case timeout
     //  连接成功：
     //  - 由于不同设备连接成功标准不通，所以不主动返回连接成功

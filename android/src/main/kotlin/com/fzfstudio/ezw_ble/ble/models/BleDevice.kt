@@ -10,10 +10,10 @@ import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
 import com.fzfstudio.ezw_utils.extension.toHexString
 
 class BleDevice(
+    val belongConfig: String,
     val name: String,
     val uuid: String,
     val sn : String,
-    val beLongConfig: String,
     var rssi: Int,
     val connectState: BleConnectState,
 ) {
