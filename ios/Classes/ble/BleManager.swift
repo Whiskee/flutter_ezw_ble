@@ -19,20 +19,18 @@ class BleManager: NSObject {
     private var centralManager: CBCentralManager!
     //  - 缓存已连接的设备
     private lazy var connectedDevices: [BleConnectedDevice] = []
-    //  - 用于搜索时给搜索出的设备获取对应的蓝牙配置，主要用于 blongConfigTemp
-    private let SCAN_BELONG_CONFIG_KEY = "scanBelongConfigKey"
     
     //  =========== Variables
     //  - 蓝牙状态
     private lazy var bleState: Int = 0
     //  - 当前蓝牙基础配置，必须实现
     private lazy var bleConfigs: Array<BleConfig> = []
-    //  - 临时存储未设置蓝牙配置设备信息[SCAN_BELONG_CONFIG_KEY/UUID:蓝牙配置]
+    //  - 临时存储未设置蓝牙配置设备信息[UUID:蓝牙配置]
     private lazy var belongConfigTemp: [String:BleConfig] = [:]
     //  - 搜素：获取结果临时缓存(DeviceInfo, 蓝牙对象)
     private lazy var scanResultTemp: [(BleDevice, CBPeripheral)] = []
     //  - 发起连接信息(所属蓝牙配置名称，UUID， 发起时间， 是否是升级状态)
-    private lazy var startConnectInfos: [(String, String, TimeInterval, Bool)] = []
+    private lazy var startConnectInfos: [(BleConfig, String, TimeInterval, Bool)] = []
     //  - 连接超时定时器集合
     private lazy var connectingTimeoutTimers: [(String, Timer)] = []
     //  - 是否正在升级中
@@ -65,14 +63,11 @@ extension BleManager {
     /**
      * 开始扫描设备
      */
-    func startScan(bleongConfig: String) {
+    func startScan() {
         guard checkIsFunctionCanBeCalled() else {
             return
         }
         stopScan(isStartScan: true)
-        //  设置搜索时外设所属蓝牙配置
-        let bleConfig = bleConfigs.first { $0.name ==  bleongConfig }
-        belongConfigTemp[SCAN_BELONG_CONFIG_KEY] = bleConfig
         //  清空缓存
         scanResultTemp.removeAll()
         centralManager.scanForPeripherals(withServices: nil)
@@ -86,7 +81,6 @@ extension BleManager {
         guard checkIsFunctionCanBeCalled() else {
             return
         }
-        belongConfigTemp.removeValue(forKey: SCAN_BELONG_CONFIG_KEY)
         centralManager.stopScan()
         logger.info("\(isStartScan ? "BleManager::stopScan: checking if scan is already running, stopping it first if necessary" : "BleManager::stopScan")")
     }
@@ -108,13 +102,13 @@ extension BleManager {
             upgradeDevices?.removeAll(where: {$0 == uuid})
         }
         //  3、获取当前配置
-        guard let currentConfig = findCurrentBleConfig(belongConfig: belongConfig, uuid: uuid) else {
+        guard let bleConfig = findCurrentBleConfig(belongConfig: belongConfig, uuid: uuid) else {
             return
         }
         //  - 根据设备临时缓存配置
-        belongConfigTemp[uuid] = currentConfig
+        belongConfigTemp[uuid] = bleConfig
         //  - 3.1、获取基础的私有服务
-        let commonPs = currentConfig.privateServices.first { $0.type == 0 }
+        let commonPs = bleConfig.privateServices.first { $0.type == 0 }
         //  - 3.2、检查uuid和commonPs不能为空
         guard uuid.isNotEmpty, let commonPs = commonPs else {
             handleConnectState(uuid: uuid, state: .emptyUuid)
@@ -128,7 +122,7 @@ extension BleManager {
         }) {
             centralManager.connect(device.peripheral)
             // -- 执行连接倒计时
-            startConnectingCountdown(currentConfig: currentConfig, uuid: uuid, afterUpgrade: afterUpgrade)
+            startConnectingCountdown(currentConfig: bleConfig, uuid: uuid, afterUpgrade: afterUpgrade)
             logger.info("BleManage::connect(\(uuid)): From connected device list, after upgrade \(afterUpgrade)")
         }
         //  - 4.2、在缓存中查找对应的设备
@@ -137,24 +131,24 @@ extension BleManager {
         }) {
             centralManager.connect(temp.1)
             // -- 执行连接倒计时
-            startConnectingCountdown(currentConfig: currentConfig, uuid: uuid, afterUpgrade: afterUpgrade)
+            startConnectingCountdown(currentConfig: bleConfig, uuid: uuid, afterUpgrade: afterUpgrade)
             logger.info("BleManage::connect(\(uuid)): From scan resul temp, after upgrade \(afterUpgrade)")
         }
         //  - 4.3、获取蓝牙设置页面中是否有符合的设备
         else if let device = findPeripheralFromConnected(uuid: uuid, psUUID: commonPs.serviceUUID) {
             centralManager.connect(device)
             // -- 缓存对象
-            connectedDevices.append(BleConnectedDevice(belongConfig: belongConfig, peripheral: device))
+            connectedDevices.append(BleConnectedDevice(belongConfig: bleConfig, peripheral: device))
             // -- 执行连接倒计时
-            startConnectingCountdown(currentConfig: currentConfig, uuid: uuid, afterUpgrade: afterUpgrade)
+            startConnectingCountdown(currentConfig: bleConfig, uuid: uuid, afterUpgrade: afterUpgrade)
             logger.info("BleManage::connect(\(uuid)): From bluetooth setting, after upgrade \(afterUpgrade)")
         }
         //  - 4.4、通过ServiceUUID查询
         else {
             //  -- 添加待连接的设备
-            startConnectInfos.append((belongConfig, uuid, Date().timeIntervalSince1970, afterUpgrade))
+            startConnectInfos.append((bleConfig, uuid, Date().timeIntervalSince1970, afterUpgrade))
             //  -- 根据服务特征查询设备
-            startScan(bleongConfig: belongConfig)
+            startScan()
             logger.info("BleManage::connect(\(uuid)): No local device found, start scan device")
         }
         handleConnectState(uuid: uuid, state: .connecting)
@@ -366,26 +360,22 @@ extension BleManager {
         guard startConnectInfos.isNotEmpty else {
             return true
         }
-        //  执行设备连接
+        //  1、遍历执行设备连接
         for connectDevice in startConnectInfos {
-            //  1、优先检查是否能获取到对应的蓝牙配置
-            guard let currentConfig = findCurrentBleConfig(belongConfig: connectDevice.0, uuid: connectDevice.1) else {
-                continue
-            }
-            //  2、执行连接
+            //  - 1.1、执行连接
             let connectUuid: String = connectDevice.1
             var canRemove: Bool = false
-            //  - 设置搜索超时（时间戳获取到的余数为秒）
-            if Date().timeIntervalSince1970 - connectDevice.2 > currentConfig.connectTimeout / 1000 {
+            //  - 1.2、设置搜索超时（时间戳获取到的余数为秒）
+            if Date().timeIntervalSince1970 - connectDevice.2 > connectDevice.0.connectTimeout / 1000 {
                 handleConnectState(uuid: connectUuid, state: .noDeviceFound)
                 canRemove = true
                 logger.info("BleManager::centralManager - search: \(connectUuid), no device found")
             }
-            //  - 如果找到对应的UUID就执行连接
+            //  - 1.3、如果找到对应的UUID就执行连接
             else if connectDevice.1 == peripheral.identifier.uuidString {
                 centralManager.connect(peripheral)
                 //  -- 开始新的倒计时
-                startConnectingCountdown(currentConfig: currentConfig, uuid: connectUuid, afterUpgrade: connectDevice.3)
+                startConnectingCountdown(currentConfig:  connectDevice.0, uuid: connectUuid, afterUpgrade: connectDevice.3)
                 //  -- 默认添加到缓存中
                 if !connectedDevices.contains(where: { device in
                     device.peripheral.identifier.uuidString == peripheral.identifier.uuidString
@@ -398,7 +388,7 @@ extension BleManager {
             //  - 检查是否可以移除对象
             if (canRemove) {
                 startConnectInfos.removeAll { info in
-                    info.0 == connectUuid
+                    info.1 == connectUuid
                 }
                 if startConnectInfos.isEmpty {
                     stopScan()
@@ -547,33 +537,36 @@ extension BleManager: CBCentralManagerDelegate {
      * 设备发现回调
      */
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
-        //  1、如果没有蓝牙配置，取消搜索
-        guard let currentConfig = belongConfigTemp[SCAN_BELONG_CONFIG_KEY] else {
-            stopScan()
-            return
-        }
-        //  2、过滤名称为空的对象
+        //  1、过滤名称为空的对象
         guard peripheral.name?.isEmpty == false else {
             return
         }
-        //  3、发起连接处理：如果startConnectUuid不为空，说明本地查询不到设备，需要通过查询获取
+        //  2、发起连接处理：如果startConnectUuid不为空，说明本地查询不到设备，需要通过查询获取
         guard startConnectWithoutLocalStorage(peripheral: peripheral, rssi: RSSI.intValue) else {
             return
         }
-        //  4、已缓存的不再处理
+        //  3、已缓存的不再处理
         //  -- 由于已经过滤了重复项，所以不用担心会重复发送已经发送过的对象
         guard !scanResultTemp.contains(where: { info in
             info.0.uuid == peripheral.identifier.uuidString
         }) else {
             return
         }
+        //  4、获取蓝牙配置：根据scan内容去筛选是匹配的设备，如果不是不进行下一步
+        guard let bleConfig = bleConfigs.first(where: { config in
+            config.scan.nameFilters.first { filter in
+                peripheral.name?.contains(filter) == true
+            } != nil
+        }) else {
+            return
+        }
         //  5、规则解析
         let manufactureData = advertisementData["kCBAdvDataManufacturerData"] as? Data
         //  - 5.1、获取MAC地址
-        let deviceMac = parseDataToMac(manufactureData: manufactureData, macRule: currentConfig.macRule)
+        let deviceMac = parseDataToMac(manufactureData: manufactureData, macRule: bleConfig.scan.macRule)
         //  - 5.2、根据SN组装蓝牙数据
-        let snRule = currentConfig.snRule
-        let deviceSn = parseDataToObtainSn(manufactureData: manufactureData, snRule: currentConfig.snRule)
+        let snRule = bleConfig.scan.snRule
+        let deviceSn = parseDataToObtainSn(manufactureData: manufactureData, snRule: snRule)
         //  - 5.2.1、阻断发送到Flutter
         //  -- a、SN无法被解析的
         //  -- b、不包含标识的设备
@@ -587,7 +580,7 @@ extension BleManager: CBCentralManagerDelegate {
         //  6、发送设备到Flutter
         //  - 6.1、创建设备自定义模型对象,并缓存
         let bleDevice = peripheral.toBleDevice(
-            belongConfig: currentConfig.name,
+            belongConfig: bleConfig.name,
             sn: deviceSn,
             rssi: RSSI.intValue,
             mac: deviceMac,
@@ -632,19 +625,19 @@ extension BleManager: CBCentralManagerDelegate {
      */
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         //  1、检查是否获取到了蓝牙配置
-        guard let currentConfig = belongConfigTemp[peripheral.identifier.uuidString] else {
+        guard let bleConfig = belongConfigTemp[peripheral.identifier.uuidString] else {
             handleConnectState(uuid: peripheral.identifier.uuidString, state: .noBleConfigFound)
             return
         }
         //  2、与设备取得首次连接,缓存连接设备
-        if !connectedDevices.contains(where: { device in
-            device.peripheral.identifier.uuidString == peripheral.identifier.uuidString
-        }) {
-            connectedDevices.append(BleConnectedDevice(belongConfig: currentConfig.name, peripheral: peripheral))
+        let uuid = peripheral.identifier.uuidString
+        connectedDevices.removeAll { device in
+            device.peripheral.identifier.uuidString == uuid
         }
+        connectedDevices.append(BleConnectedDevice(belongConfig: bleConfig, peripheral: peripheral))
         //  3、获取设备服务
         peripheral.delegate = self
-        let services = currentConfig.privateServices.map { $0.serviceUUID }
+        let services = bleConfig.privateServices.map { $0.serviceUUID }
         peripheral.discoverServices(services)
         //  4、发送日志
         handleConnectState(uuid: peripheral.identifier.uuidString, state: .searchService)
@@ -709,7 +702,7 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             handleConnectState(uuid: peripheral.identifier.uuidString, state: .serviceFail)
             return
         }
-        guard let currentConfig = belongConfigTemp[peripheral.identifier.uuidString] else {
+        guard let belongConfig = belongConfigTemp[peripheral.identifier.uuidString] else {
             handleConnectState(uuid: peripheral.identifier.uuidString, state: .noBleConfigFound)
             return
         }
@@ -719,7 +712,7 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
         }
         //  2、只获取需要注册的服务
         let myServices = services.filter { service in
-            currentConfig.privateServices.contains { ps in
+            belongConfig.privateServices.contains { ps in
                 ps.service == service.uuid.uuidString
             }
         }
@@ -747,7 +740,7 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             return
         }
         //  3、不处理不在配置中的私有服务
-        guard let currentConfig = currentConfig.privateServices.first(where: { uuid in
+        guard let privateService = currentConfig.privateServices.first(where: { uuid in
             uuid.serviceUUID == service.uuid
         }) else {
             handleConnectState(uuid: peripheral.identifier.uuidString, state: .charsFail)
@@ -756,18 +749,18 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
         }
         //  4、获取读写特征
         let writeChars = service.characteristics?.first { write in
-            write.uuid == currentConfig.writeCharUUID
+            write.uuid == privateService.writeCharUUID
         }
         let readChars = service.characteristics?.first { read in
-            read.uuid == currentConfig.readCharUUID
+            read.uuid == privateService.readCharUUID
         }
         if writeChars == nil || readChars == nil {
             handleConnectState(uuid: peripheral.identifier.uuidString, state: .charsFail)
             logger.error("BleManager::didDiscoverCharacteristicsFor: \(peripheral.identifier.uuidString), error = Chars not found")
             return
         }
-        updateConnectedDevice(uuid: peripheral.identifier.uuidString, writeChars: writeChars, readChars: readChars, psType: currentConfig.type)
-        logger.info("BleManager::didDiscoverCharacteristicsFor: \(peripheral.identifier.uuidString), psType = \(currentConfig.type), write = \(writeChars!.uuid.uuidString), read = \(readChars!.uuid.uuidString)")
+        updateConnectedDevice(uuid: peripheral.identifier.uuidString, writeChars: writeChars, readChars: readChars, psType: privateService.type)
+        logger.info("BleManager::didDiscoverCharacteristicsFor: \(peripheral.identifier.uuidString), psType = \(privateService.type), write = \(writeChars!.uuid.uuidString), read = \(readChars!.uuid.uuidString)")
     }
     
     /**

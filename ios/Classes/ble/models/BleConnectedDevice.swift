@@ -9,7 +9,7 @@ import CoreBluetooth
 
 /// 连接成功后缓存的设备信息
 struct BleConnectedDevice {
-    var belongConfig: String
+    var belongConfig: BleConfig
     //  连接后缓存的对象
     var peripheral: CBPeripheral
     var writeCharsDic: [Int: CBCharacteristic] = [:]
@@ -19,7 +19,7 @@ struct BleConnectedDevice {
     /**
      *  更新连接设备信息
      */
-    func update(belongConfig: String, writeChars: [Int: CBCharacteristic], readChars: [Int: CBCharacteristic]) -> BleConnectedDevice {
+    func update(belongConfig: BleConfig, writeChars: [Int: CBCharacteristic], readChars: [Int: CBCharacteristic]) -> BleConnectedDevice {
         return BleConnectedDevice(belongConfig: belongConfig, peripheral: peripheral, writeCharsDic: writeChars, readCharsDic: readChars, isConnected: isConnected)
    }
    
@@ -33,6 +33,6 @@ struct BleConnectedDevice {
        let readCharsStr = readCharsDic.map { (key, value) in
            "\"\(key)\":\"\(value)\""
        }.joined(separator: ",")
-       return "[\"belongConfig\":  \(belongConfig), \"uuid\": \(peripheral.identifier.uuidString), \"writeChars\": {\(writeCharsStr)}, \"readChars\": {\(readCharsStr)}, \"isConnected\": \(isConnected)]"
+       return "[\"belongConfig\":  \(belongConfig.name), \"uuid\": \(peripheral.identifier.uuidString), \"writeChars\": {\(writeCharsStr)}, \"readChars\": {\(readCharsStr)}, \"isConnected\": \(isConnected)]"
    }
 }

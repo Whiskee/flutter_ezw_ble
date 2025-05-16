@@ -7,35 +7,16 @@ PODS:
     - Flutter
   - integration_test (0.0.1):
     - Flutter
-  - iOSMcuManagerLibrary (1.6):
-    - SwiftCBOR (= 0.4.4)
-  - mcumgr_flutter (0.0.2):
-    - Flutter
-    - iOSMcuManagerLibrary (= 1.6)
-    - SwiftProtobuf
-  - path_provider_foundation (0.0.1):
-    - Flutter
-    - FlutterMacOS
   - shared_preferences_foundation (0.0.1):
     - Flutter
     - FlutterMacOS
-  - SwiftCBOR (0.4.4)
-  - SwiftProtobuf (1.28.2)
 
 DEPENDENCIES:
   - Flutter (from `Flutter`)
   - flutter_ezw_ble (from `.symlinks/plugins/flutter_ezw_ble/ios`)
   - flutter_ezw_utils (from `.symlinks/plugins/flutter_ezw_utils/ios`)
   - integration_test (from `.symlinks/plugins/integration_test/ios`)
-  - mcumgr_flutter (from `.symlinks/plugins/mcumgr_flutter/ios`)
-  - path_provider_foundation (from `.symlinks/plugins/path_provider_foundation/darwin`)
   - shared_preferences_foundation (from `.symlinks/plugins/shared_preferences_foundation/darwin`)
-
-SPEC REPOS:
-  trunk:
-    - iOSMcuManagerLibrary
-    - SwiftCBOR
-    - SwiftProtobuf
 
 EXTERNAL SOURCES:
   Flutter:
@@ -46,10 +27,6 @@ EXTERNAL SOURCES:
     :path: ".symlinks/plugins/flutter_ezw_utils/ios"
   integration_test:
     :path: ".symlinks/plugins/integration_test/ios"
-  mcumgr_flutter:
-    :path: ".symlinks/plugins/mcumgr_flutter/ios"
-  path_provider_foundation:
-    :path: ".symlinks/plugins/path_provider_foundation/darwin"
   shared_preferences_foundation:
     :path: ".symlinks/plugins/shared_preferences_foundation/darwin"
 
@@ -58,12 +35,7 @@ SPEC CHECKSUMS:
   flutter_ezw_ble: 684455e64acc3989dc94ffdce397da3ab10d4179
   flutter_ezw_utils: 02f8ed48d61b2f9b7643407e97047dba1455abf4
   integration_test: 4a889634ef21a45d28d50d622cf412dc6d9f586e
-  iOSMcuManagerLibrary: 4102a4595be1c69e5286d7f1520a733c82c30b0a
-  mcumgr_flutter: 8c4a598cb1b4d10a9adbc0f13288334297185506
-  path_provider_foundation: 080d55be775b7414fd5a5ef3ac137b97b097e564
   shared_preferences_foundation: 9e1978ff2562383bd5676f64ec4e9aa8fa06a6f7
-  SwiftCBOR: ce5354ec8b660da2d6fc754462881119dbe1f963
-  SwiftProtobuf: 4dbaffec76a39a8dc5da23b40af1a5dc01a4c02d
 
 PODFILE CHECKSUM: 4305caec6b40dde0ae97be1573c53de1882a07e5
 

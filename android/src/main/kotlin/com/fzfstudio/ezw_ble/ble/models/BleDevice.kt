@@ -6,17 +6,22 @@ import android.bluetooth.BluetoothStatusCodes
 import android.os.Build
 import android.util.Log
 import com.fzfstudio.ezw_ble.ble.BleEC
+import com.fzfstudio.ezw_ble.ble.models.enums.BleConfigOutAdapter
 import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
 import com.fzfstudio.ezw_utils.extension.toHexString
+import com.fzfstudio.ezw_utils.gson.GsonSerializable
+import com.google.gson.annotations.JsonAdapter
 
 class BleDevice(
-    val belongConfig: String,
+    //  序列化时只输出名称
+    @JsonAdapter(BleConfigOutAdapter::class)
+    val belongConfig: BleConfig,
     val name: String,
     val uuid: String,
     val sn : String,
     var rssi: Int,
     val connectState: BleConnectState,
-) {
+): GsonSerializable() {
 
     private val tag = "BleDevice"
 

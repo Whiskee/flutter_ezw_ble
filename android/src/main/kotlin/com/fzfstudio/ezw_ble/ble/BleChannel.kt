@@ -68,8 +68,7 @@ enum class BleMC {
                 }
             }
             START_SCAN -> {
-                val belongConfig = arguments as String? ?: ""
-                BleManager.instance.startScan(belongConfig)
+                BleManager.instance.startScan()
             }
             STOP_SCAN -> BleManager.instance.stopScan()
             CONNECT_DEVICE -> {

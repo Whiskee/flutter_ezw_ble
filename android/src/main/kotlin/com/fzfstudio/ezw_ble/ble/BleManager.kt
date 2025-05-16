@@ -81,7 +81,57 @@ class BleManager private constructor() {
     //  - 系统蓝牙状态监听
     private lateinit var bleStateListener: BleStateListener
     //  - 蓝牙搜索回调
-    private var scanCallback: ScanCallback? = null
+    private var scanCallback: ScanCallback = object : ScanCallback() {
+        override fun onScanResult(callbackType: Int, result: ScanResult) {
+            val device = result.device
+            //  1、过滤：无名称设备
+            if (device.name.isNullOrEmpty()) {
+                return
+            }
+            //  2、过滤已经缓存过的对象
+            //  -- 由于已经过滤了重复项，所以不用担心会重复发送已经发送过的对象
+            if (scanResultTemp.firstOrNull { it.uuid == device.address } != null) {
+                return
+            }
+            //  3、通过蓝牙配置文件中的scan获取目标设备
+            val bleConfig = bleConfigs.firstOrNull { config -> config.scan.nameFilters.firstOrNull { filter ->
+                device.name.contains(filter)
+                }  != null
+            }
+            if (bleConfig == null) {
+                return
+            }
+            //  3、组装蓝牙数据
+            //  - 3.1、获取SN数据
+            val snRule = bleConfig.scan.snRule
+            val deviceSn = parseDataToObtainSn(result.scanRecord?.bytes, snRule)
+            //  - 3.2、阻断发送到Flutter
+            //  -- a、SN无法被解析的
+            //  -- b、不包含标识的设备
+            if (deviceSn.isEmpty() ||
+                (snRule.scanFilterMarks.isNotEmpty() && !snRule.scanFilterMarks.any { deviceSn.contains(it) })) {
+                return
+            }
+            //  4、发送设备到Flutter
+            //  - 4.1、创建设备自定义模型对象,并缓存
+            val bleDevice = device.toBleDevice(bleConfig, deviceSn, result.rssi)
+            scanResultTemp.add(bleDevice)
+            //  - 4.2、判断是否需要根据SN组合设备，不需要就直接提交
+            if (snRule.matchCount < 2) {
+                sendMatchDevices(deviceSn, listOf(bleDevice))
+                return
+            }
+            //  - 4.3、从缓存中获取到相同的sn,
+            val matchDevices = scanResultTemp.filter { it.sn == bleDevice.sn }
+            //  -- 判断是否达到组合设备数量上限后，如果没有达到就不处理
+            if (matchDevices.size != snRule.matchCount) {
+                return
+            }
+            sendMatchDevices(deviceSn, matchDevices)
+        }
+        override fun onBatchScanResults(results: List<ScanResult>) { Log.i(tag, "Start scan: batch = $results") }
+        override fun onScanFailed(errorCode: Int) { Log.e(tag, "Start scan: error = $errorCode") }
+    }
     //  - 当前蓝牙状态,默认无状态
     private var bleState: Int = 0
     //  - 当前蓝牙权限,默认无权限
@@ -182,60 +232,15 @@ class BleManager private constructor() {
     /**
      *  开启扫描
      */
-    fun startScan(belongConfig: String) {
+    fun startScan() {
         if (!checkIsFunctionCanBeCalled()) {
             return
         }
-        //  执行搜索先优先执行停止搜索
+        //  1、执行搜索先优先执行停止搜索
         stopScan()
-        //  移除历史记录
+        //  2、移除历史记录
         scanResultTemp.clear()
-        //  创建搜索回调
-        scanCallback = object : ScanCallback() {
-            override fun onScanResult(callbackType: Int, result: ScanResult) {
-                val device = result.device
-                //  1、过滤：无名称设备
-                if (device.name.isNullOrEmpty()) {
-                    return
-                }
-                //  2、过滤已经缓存过的对象
-                //  -- 由于已经过滤了重复项，所以不用担心会重复发送已经发送过的对象
-                if (scanResultTemp.firstOrNull { it.uuid == device.address } != null) {
-                    return
-                }
-                val myBleConfig = bleConfigs.firstOrNull { it.name == belongConfig } ?: bleConfigs.first()
-                //  3、组装蓝牙数据
-                //  - 3.1、获取SN数据
-                val snRule = myBleConfig.snRule
-                val deviceSn = parseDataToObtainSn(result.scanRecord?.bytes, myBleConfig.snRule)
-                //  - 3.2、阻断发送到Flutter
-                //  -- a、SN无法被解析的
-                //  -- b、不包含标识的设备
-                if (deviceSn.isEmpty() ||
-                    (snRule.scanFilterMarks.isNotEmpty() && !snRule.scanFilterMarks.any { deviceSn.contains(it) })) {
-                    return
-                }
-                //  4、发送设备到Flutter
-                //  - 4.1、创建设备自定义模型对象,并缓存
-                val bleDevice = device.toBleDevice(myBleConfig.name, deviceSn, result.rssi)
-                scanResultTemp.add(bleDevice)
-                //  - 4.2、判断是否需要根据SN组合设备，不需要就直接提交
-                if (snRule.matchCount < 2) {
-                    sendMatchDevices(deviceSn, listOf(bleDevice))
-                    return
-                }
-                //  - 4.3、从缓存中获取到相同的sn,
-                val matchDevices = scanResultTemp.filter { it.sn == bleDevice.sn }
-                //  -- 判断是否达到组合设备数量上限后，如果没有达到就不处理
-                if (matchDevices.size != snRule.matchCount) {
-                    return
-                }
-                sendMatchDevices(deviceSn, matchDevices)
-            }
-            override fun onBatchScanResults(results: List<ScanResult>) { Log.i(tag, "Start scan: batch = $results") }
-            override fun onScanFailed(errorCode: Int) { Log.e(tag, "Start scan: error = $errorCode") }
-        }
-        //  执行搜索
+        //  3、执行搜索
         bluetoothAdapter.bluetoothLeScanner?.startScan(null, scanSettings, scanCallback)
         Log.i(tag, "Start scan: success")
     }
@@ -247,9 +252,7 @@ class BleManager private constructor() {
         if (!checkIsFunctionCanBeCalled()) {
             return
         }
-        scanCallback?.let {
-            bluetoothAdapter.bluetoothLeScanner?.stopScan(it)
-        }
+        bluetoothAdapter.bluetoothLeScanner?.stopScan(scanCallback)
         Log.i(tag, if (isStartScan) "Start scan: checking if scan is already running, stopping it first if necessary" else "Stop scan: success")
     }
 
@@ -267,13 +270,20 @@ class BleManager private constructor() {
             Log.w(tag,"Start connect: $uuid, Empty uuid")
             return
         }
+        //  2、获取蓝牙配置
+        val bleConfig = bleConfigs.firstOrNull { it.name == belongConfig }
+        if (bleConfig == null) {
+            handleConnectState(uuid, BleConnectState.NO_BLE_CONFIG_FOUND)
+            Log.w(tag,"Start connect: $uuid, no config")
+            return
+        }
         //  3、如果非升级模式下有升级状态的数据需要清除
         if (!afterUpgrade && upgradeDevices.contains(uuid)) {
             upgradeDevices.remove(uuid)
         }
         //  4、缓存连接对象，如果缓存中超过1个就等待考前的连接完成后再开始执行
         if (!waitingConnectDevices.any { it.uuid == uuid }) {
-            waitingConnectDevices.add(BleConnectTemp(belongConfig, uuid, sn, afterUpgrade))
+            waitingConnectDevices.add(BleConnectTemp(bleConfig, uuid, sn, afterUpgrade))
         }
         if (waitingConnectDevices.size > 1) {
             val currentIndex = waitingConnectDevices.indexOfFirst { it.uuid == uuid }
@@ -293,10 +303,9 @@ class BleManager private constructor() {
         }
         //  5、获取BleDevice，并执行连接
         if (bleDevice == null) {
-            bleDevice = remoteDevice.toBleDevice(belongConfig, sn, 0)
+            bleDevice = remoteDevice.toBleDevice(bleConfig, sn, 0)
             connectedDevices.add(bleDevice)
         }
-        val belongConfig = bleConfigs.firstOrNull { it.name == belongConfig }?: bleConfigs.first()
         //  6、执行连接:默认获取基础私有服务的Gatt进行处理
         val connectCallBack = createConnectCallBack()
         val gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -315,7 +324,7 @@ class BleManager private constructor() {
                 Log.i(tag, "Start connect: $uuid, connect time out")
                 disconnectDevice(uuid)
             }
-        }, belongConfig.connectTimeout.toLong() + (if (afterUpgrade) belongConfig.upgradeSwapTime.toLong() else 0),)
+        }, bleConfig.connectTimeout.toLong() + (if (afterUpgrade) bleConfig.upgradeSwapTime.toLong() else 0),)
         waitingConnectDevices.firstOrNull { it.uuid == uuid }?.timeoutTimer = timeoutTimer
         //  9、待连接中的设备已经处于连接中，不再发送
         if (!isWaitingDevice) {
@@ -415,13 +424,23 @@ class BleManager private constructor() {
     }
 
     /**
+     * 检查蓝牙是否可用
+     */
+    private fun checkBleStatus(): Boolean {
+        if (bleState != 5) {
+            Log.e(tag, "CheckIsFunctionCanBeCalled: ble status = $bleState")
+            return false
+        }
+        return true
+    }
+
+    /**
      * 检查是否可以调用方法
      *
      * @exception 1、检查蓝牙状态，2、检查是否启用蓝牙配置
      */
     private fun checkIsFunctionCanBeCalled(): Boolean {
-        if (bleState != 5) {
-            Log.e(tag, "CheckIsFunctionCanBeCalled: ble status = $bleState")
+        if (!checkBleStatus()) {
             return false
         }
         if (!checkBleConfigIsConfigured()) {
@@ -472,9 +491,8 @@ class BleManager private constructor() {
                 handleConnectState(connectedDevice.uuid, BleConnectState.BOUND_FAIL)
                 return
             }
-            val belongConfig = bleConfigs.first { it.name == connectedDevice.belongConfig }
             //  4、主动绑定时，需要进入CONNECT_FINISH流程，如果是眼镜主动绑定，则默认进入CONNECT_FINISH
-            if (belongConfig.initiateBinding) {
+            if (connectedDevice.belongConfig.initiateBinding) {
                 handleConnectState(connectedDevice.uuid, BleConnectState.CONNECT_FINISH)
             }
             Log.i( tag, "Ble status listener - bond state: ${device.address} is bonded, ${connectedDevice.myGatt}, finish connect")
@@ -570,8 +588,7 @@ class BleManager private constructor() {
             //  - PrivateService是否处理状态
             isPsHandleFinish = true
             //  - 获取去设备蓝牙配置信息
-            val belongConfig = bleConfigs.first { it.name == currentDevice.belongConfig }
-            belongConfig.privateServices.forEach { uuid ->
+            currentDevice.belongConfig.privateServices.forEach { uuid ->
                 val service = uuid.service
                 //  2、获取读/写服务
                 val server = gatt.getService(uuid.serviceUUID)
@@ -635,9 +652,8 @@ class BleManager private constructor() {
             super.onCharacteristicChanged(gatt, characteristic, value)
             mainScope.launch {
                 val connectedDevice = findConnectedDevice(gatt.device.address)
-                val belongConfig = bleConfigs.first { it.name == connectedDevice?.belongConfig }
                 //  1、获取配置中的私有服务
-                val currentUuid = belongConfig.privateServices.firstOrNull { uuid ->
+                val currentUuid = connectedDevice?.belongConfig?.privateServices?.firstOrNull { uuid ->
                     uuid.readCharsUUID == characteristic.uuid
                 }
                 if (currentUuid == null) {
@@ -707,14 +723,17 @@ class BleManager private constructor() {
         private fun connectingFlowFinish(gatt: BluetoothGatt) {
             val address = gatt.device.address
             val device = findConnectedDevice(address)
-            val currentConfig = bleConfigs.first { it.name == device?.belongConfig }
+            if (device == null) {
+                return
+            }
+            val belongConfig = device.belongConfig
             //  4、MTU大于0则发起MTU修改
-            if (currentConfig.mtu > 0) {
-                val changeMtu = gatt.requestMtu(currentConfig.mtu)
-                Log.i(tag, "Connect call back: ${device?.uuid}, change mtu to = ${currentConfig.mtu}, request success = $changeMtu")
+            if (belongConfig.mtu > 0) {
+                val changeMtu = gatt.requestMtu(belongConfig.mtu)
+                Log.i(tag, "Connect call back: ${device.uuid}, change mtu to = ${belongConfig.mtu}, request success = $changeMtu")
             }
             //  6、如果是主动互动发起绑定则调用createBond，并通过绑定回调处理连接状态
-            if (currentConfig.initiateBinding && gatt.device.bondState != BluetoothDevice.BOND_BONDED) {
+            if (belongConfig.initiateBinding && gatt.device.bondState != BluetoothDevice.BOND_BONDED) {
                 gatt.device.createBond()
                 Log.i(tag, "Connect call back: $address, start create bond")
                 handleConnectState(address!!, BleConnectState.START_BINDING)
@@ -769,7 +788,7 @@ class BleManager private constructor() {
         //  3、非连接流程，查询是否有待连接设备，如果有就开始连接
         if (!state.isConnecting && !upgradeDevices.contains(uuid) && waitingConnectDevices.isNotEmpty()) {
             val waitingDevice = waitingConnectDevices.first()
-            connect(waitingDevice.belongConfig, waitingDevice.uuid, waitingDevice.sn, true, waitingDevice.afterUpgrade)
+            connect(waitingDevice.belongConfig.name, waitingDevice.uuid, waitingDevice.sn, true, waitingDevice.afterUpgrade)
         }
         mainScope.launch {
             val connectModel = BleConnectModel(uuid, state)

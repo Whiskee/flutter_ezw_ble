@@ -3,11 +3,12 @@ package com.fzfstudio.ezw_ble.ble.models
 import com.fzfstudio.ezw_utils.gson.GsonSerializable
 
 data class BleConfig(
+    //  属性配置名称
     val name: String,
+    //  蓝牙搜索
+    val scan: BleScan,
     //  配置多个私有服务
     val privateServices: List<BlePrivateService>,
-    //  如果设置了匹配规则，cd
-    val snRule: BleSnRule,
     //  是否主动发起设备绑定
     val initiateBinding: Boolean,
     //  毫秒
@@ -19,7 +20,7 @@ data class BleConfig(
 ): GsonSerializable() {
 
     companion object {
-        fun empty(): BleConfig = BleConfig("", listOf(), BleSnRule.empty(), true, 15000.0, 60000.0, 512)
+        fun empty(): BleConfig = BleConfig("", BleScan.empty(), listOf(), true, 15000.0, 60000.0, 512)
     }
 
     /**

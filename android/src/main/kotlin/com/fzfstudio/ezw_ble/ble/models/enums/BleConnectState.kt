@@ -23,6 +23,8 @@ enum class BleConnectState {
     DISCONNECT_FROM_SYS,
     //  空的UUID
     EMPTY_UUID,
+    //  错误：找不到蓝牙配置
+    NO_BLE_CONFIG_FOUND,
     //  设备没被发现
     NO_DEVICE_FOUND,
     //  已经被绑定

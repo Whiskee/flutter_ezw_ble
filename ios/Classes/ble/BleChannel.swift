@@ -69,8 +69,7 @@ enum BleMC: String {
             BleManager.shared.initConfigs(configs: configs.map { $0! })
             break
         case .startScan:
-            let belongConfig: String = arguments as? String ?? ""
-            BleManager.shared.startScan(bleongConfig: belongConfig)
+            BleManager.shared.startScan()
             break
         case .stopScan:
             BleManager.shared.stopScan()
