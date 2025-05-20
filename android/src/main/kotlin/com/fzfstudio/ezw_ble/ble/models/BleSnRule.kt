@@ -10,9 +10,7 @@ data class BleSnRule(
     //  自定义正则修正字符
     val replaceRex: String,
     //  扫描设备时，只返回SN含有过滤标识的对象
-    val scanFilterMarks: List<String>,
-    //  组合设备数:总数，如果为1不执行匹配，返回单个设备，如果大于2则默认开启匹配模式
-    val matchCount: Int,
+    val filters: List<String>,
 ): Serializable {
     companion object {
         fun empty() = BleSnRule(0, 0, "", listOf(), 1)

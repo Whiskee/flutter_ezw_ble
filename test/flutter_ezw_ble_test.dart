@@ -25,7 +25,7 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
-  Future<void> startScan(String belongConfig) {
+  Future<void> startScan() {
     throw UnimplementedError();
   }
 

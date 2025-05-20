@@ -8,10 +8,10 @@ part of 'ble_config.dart';
 
 BleConfig _$BleConfigFromJson(Map<String, dynamic> json) => BleConfig(
       json['name'] as String,
+      BleScan.fromJson(json['scan'] as Map<String, dynamic>),
       (json['privateServices'] as List<dynamic>)
           .map((e) => BlePrivateService.fromJson(e as Map<String, dynamic>))
           .toList(),
-      BleScan.fromJson(json['scan'] as Map<String, dynamic>),
       initiateBinding: json['initiateBinding'] as bool? ?? false,
       connectTimeout: (json['connectTimeout'] as num?)?.toDouble() ?? 15000,
       upgradeSwapTime: (json['upgradeSwapTime'] as num?)?.toDouble() ?? 60000,
@@ -20,8 +20,8 @@ BleConfig _$BleConfigFromJson(Map<String, dynamic> json) => BleConfig(
 
 Map<String, dynamic> _$BleConfigToJson(BleConfig instance) => <String, dynamic>{
       'name': instance.name,
-      'privateServices': instance.privateServices,
       'scan': instance.scan,
+      'privateServices': instance.privateServices,
       'initiateBinding': instance.initiateBinding,
       'connectTimeout': instance.connectTimeout,
       'upgradeSwapTime': instance.upgradeSwapTime,

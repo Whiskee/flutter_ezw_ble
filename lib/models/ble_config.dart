@@ -1,9 +1,7 @@
 import 'dart:convert';
 
-import 'package:flutter_ezw_ble/models/ble_mac_rule.dart';
 import 'package:flutter_ezw_ble/models/ble_private_service.dart';
 import 'package:flutter_ezw_ble/models/ble_scan.dart';
-import 'package:flutter_ezw_ble/models/ble_sn_rule.dart';
 import 'package:json_annotation/json_annotation.dart';
 
 part 'ble_config.g.dart';
@@ -11,10 +9,10 @@ part 'ble_config.g.dart';
 @JsonSerializable()
 class BleConfig {
   final String name;
-  //  可用私有服务
-  final List<BlePrivateService> privateServices;
   //  如果设置了匹配规则
   final BleScan scan;
+  //  可用私有服务
+  final List<BlePrivateService> privateServices;
   //  是否要主动发送绑定
   final bool initiateBinding;
   //  毫秒
@@ -26,8 +24,8 @@ class BleConfig {
 
   BleConfig(
     this.name,
-    this.privateServices,
-    this.scan, {
+    this.scan,
+    this.privateServices, {
     this.initiateBinding = false,
     this.connectTimeout = 15000,
     this.upgradeSwapTime = 60000,

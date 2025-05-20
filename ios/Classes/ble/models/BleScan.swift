@@ -12,8 +12,17 @@ class BleScan: Codable {
     let snRule: BleSnRule
     //  MAC解析规则
     let macRule: BleMacRule?
+    //  组合设备数:总数，如果为1不执行匹配，返回单个设备，如果大于2则默认开启匹配模式
+    let matchCount: Int
+    
+    init(nameFilters: Array<String>, snRule: BleSnRule, macRule: BleMacRule?, matchCount: Int) {
+        self.nameFilters = nameFilters
+        self.snRule = snRule
+        self.macRule = macRule
+        self.matchCount = matchCount
+    }
     
     static func empty() -> BleScan {
-        return BleScan(nameFilters: [], snRule: BleSnRule.empty(), macRule: nil)
+        return BleScan(nameFilters: [], snRule: BleSnRule.empty(), macRule: nil, matchCount: 0)
     }
 }

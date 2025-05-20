@@ -571,8 +571,8 @@ extension BleManager: CBCentralManagerDelegate {
         //  -- a、SN无法被解析的
         //  -- b、不包含标识的设备
         if deviceSn.isEmpty ||
-            snRule.scanFilterMarks.isNotEmpty,
-           !snRule.scanFilterMarks.contains(where: { mark in
+            snRule.filters.isNotEmpty,
+           !snRule.filters.contains(where: { mark in
                return deviceSn.contains(mark)
            }) {
             return
@@ -587,7 +587,7 @@ extension BleManager: CBCentralManagerDelegate {
         )
         scanResultTemp.append((bleDevice, peripheral))
         //  - 6.2、判断是否需要根据SN组合设备，不需要就直接提交
-        guard snRule.matchCount > 1 else {
+        guard bleConfig.scan.matchCount > 1 else {
             sendMatchDevices(sn: deviceSn, devices: [bleDevice])
             return
         }
@@ -598,7 +598,7 @@ extension BleManager: CBCentralManagerDelegate {
             info.0
         }
         //  -- 判断是否达到组合设备数量上限后，如果没有达到就不处理
-        guard matchDevices.count >= snRule.matchCount else {
+        guard matchDevices.count >= bleConfig.scan.matchCount else {
             return
         }
         sendMatchDevices(sn: deviceSn, devices: matchDevices)

@@ -38,7 +38,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     throw UnimplementedError('initConfig() has not been implemented.');
   }
 
-  Future<void> startScan(String belongConfig) {
+  Future<void> startScan() {
     throw UnimplementedError('startScan() has not been implemented.');
   }
 

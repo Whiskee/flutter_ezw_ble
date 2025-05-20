@@ -24,8 +24,8 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
           configs.map((config) => config.customToJson()).toList());
 
   @override
-  Future<void> startScan(String belongConfig) async =>
-      methodChannel.invokeMethod("startScan", belongConfig);
+  Future<void> startScan() async =>
+      methodChannel.invokeMethod("startScan");
 
   @override
   Future<void> stopScan() async => methodChannel.invokeMethod("stopScan");

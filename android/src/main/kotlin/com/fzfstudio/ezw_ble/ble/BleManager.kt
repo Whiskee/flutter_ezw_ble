@@ -109,7 +109,7 @@ class BleManager private constructor() {
             //  -- a、SN无法被解析的
             //  -- b、不包含标识的设备
             if (deviceSn.isEmpty() ||
-                (snRule.scanFilterMarks.isNotEmpty() && !snRule.scanFilterMarks.any { deviceSn.contains(it) })) {
+                (snRule.filters.isNotEmpty() && !snRule.filters.any { deviceSn.contains(it) })) {
                 return
             }
             //  4、发送设备到Flutter
@@ -117,14 +117,14 @@ class BleManager private constructor() {
             val bleDevice = device.toBleDevice(bleConfig, deviceSn, result.rssi)
             scanResultTemp.add(bleDevice)
             //  - 4.2、判断是否需要根据SN组合设备，不需要就直接提交
-            if (snRule.matchCount < 2) {
+            if (bleConfig.scan.matchCount < 2) {
                 sendMatchDevices(deviceSn, listOf(bleDevice))
                 return
             }
             //  - 4.3、从缓存中获取到相同的sn,
             val matchDevices = scanResultTemp.filter { it.sn == bleDevice.sn }
             //  -- 判断是否达到组合设备数量上限后，如果没有达到就不处理
-            if (matchDevices.size != snRule.matchCount) {
+            if (matchDevices.size != bleConfig.scan.matchCount) {
                 return
             }
             sendMatchDevices(deviceSn, matchDevices)

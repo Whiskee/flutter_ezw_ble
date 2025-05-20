@@ -6,18 +6,23 @@ part 'ble_scan.g.dart';
 
 @JsonSerializable()
 class BleScan {
-  //  名字过滤条件
+  //  设备名称过滤条件
   final List<String> nameFilters;
   //  SN设置了匹配规则
   final BleSnRule snRule;
   //  仅iOS使用，解析MAC地址
   final BleMacRule? macRule;
+  //  组合设备数:总数, 如果为1，则不开启匹配模式，返回单个设备，如果大于2，则表示默认开启匹配模式，组成一个设备
+  final int matchCount;
 
   BleScan(
     this.nameFilters,
     this.snRule, {
     this.macRule,
-  }) : assert(nameFilters.isNotEmpty, "nameFilters is empty");
+    this.matchCount = 1,
+  })  : assert(nameFilters.isNotEmpty, "nameFilters is empty"),
+        assert(matchCount > 0,
+            "When matching mode is enabled, the number of matches must be greater than or equal to 1");
 
   factory BleScan.fromJson(Map<String, dynamic> json) =>
       _$BleScanFromJson(json);

@@ -10,5 +10,5 @@ struct BleMacRule: Codable {
     let startIndex: Int
     let endIndex: Int
     //  是否反转
-    let isReverse: Bool = false
+    var isReverse: Bool = false
 }
