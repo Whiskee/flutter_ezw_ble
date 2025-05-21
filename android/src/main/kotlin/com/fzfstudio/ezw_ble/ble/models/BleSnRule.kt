@@ -13,6 +13,6 @@ data class BleSnRule(
     val filters: List<String>,
 ): Serializable {
     companion object {
-        fun empty() = BleSnRule(0, 0, "", listOf(), 1)
+        fun empty() = BleSnRule(0, 0, "", listOf())
     }
 }

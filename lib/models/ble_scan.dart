@@ -28,4 +28,11 @@ class BleScan {
       _$BleScanFromJson(json);
 
   Map<String, dynamic> toJson() => _$BleScanToJson(this);
+
+  Map<String, dynamic> customToJson() {
+    final map = toJson();
+    map["snRule"] = snRule.toJson();
+    map["macRule"] = macRule?.toJson() ?? {};
+    return map;
+  }
 }

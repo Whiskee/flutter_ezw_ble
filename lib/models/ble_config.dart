@@ -40,7 +40,7 @@ class BleConfig {
   Map<String, dynamic> customToJson() {
     final map = toJson();
     map["privateServices"] = privateServices.map((e) => e.toJson()).toList();
-    map["scan"] = scan.toJson();
+    map["scan"] = scan.customToJson();
     return map;
   }
 
