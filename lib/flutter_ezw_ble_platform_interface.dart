@@ -1,6 +1,6 @@
 import 'dart:typed_data';
 
-import 'package:flutter_ezw_ble/models/ble_config.dart';
+import 'package:flutter_ezw_ble/core/models/ble_config.dart';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
 import 'flutter_ezw_ble_method_channel.dart';

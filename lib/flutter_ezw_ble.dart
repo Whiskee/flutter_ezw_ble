@@ -1,9 +1,9 @@
 import 'package:flutter_ezw_ble/flutter_ezw_ble_event_channel.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_method_channel.dart';
-import 'package:flutter_ezw_ble/models/ble_cmd.dart';
-import 'package:flutter_ezw_ble/models/ble_connect_model.dart';
-import 'package:flutter_ezw_ble/models/ble_match_device.dart';
-import 'package:flutter_ezw_ble/models/ble_status.dart';
+import 'package:flutter_ezw_ble/core/models/ble_cmd.dart';
+import 'package:flutter_ezw_ble/core/models/ble_connect_model.dart';
+import 'package:flutter_ezw_ble/core/models/ble_match_device.dart';
+import 'package:flutter_ezw_ble/core/models/ble_status.dart';
 import 'package:flutter_ezw_utils/extension/string_ext.dart';
 
 const String ezwBleTag = "flutter_ezw_ble";

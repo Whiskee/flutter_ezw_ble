@@ -1,7 +1,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble.dart';
-import 'package:flutter_ezw_ble/models/ble_config.dart';
+import 'package:flutter_ezw_ble/core/models/ble_config.dart';
 
 import 'flutter_ezw_ble_platform_interface.dart';
 
@@ -24,8 +24,7 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
           configs.map((config) => config.customToJson()).toList());
 
   @override
-  Future<void> startScan() async =>
-      methodChannel.invokeMethod("startScan");
+  Future<void> startScan() async => methodChannel.invokeMethod("startScan");
 
   @override
   Future<void> stopScan() async => methodChannel.invokeMethod("stopScan");

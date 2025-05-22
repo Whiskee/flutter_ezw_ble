@@ -1,5 +1,5 @@
-import 'package:flutter_ezw_ble/models/ble_mac_rule.dart';
-import 'package:flutter_ezw_ble/models/ble_sn_rule.dart';
+import 'package:flutter_ezw_ble/core/models/ble_mac_rule.dart';
+import 'package:flutter_ezw_ble/core/models/ble_sn_rule.dart';
 import 'package:flutter_ezw_utils/flutter_ezw_index.dart';
 
 part 'ble_scan.g.dart';

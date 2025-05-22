@@ -1,5 +1,5 @@
-import 'package:flutter_ezw_ble/models/ble_connect_state.dart';
-import 'package:flutter_ezw_ble/models/ble_device.dart';
+import 'package:flutter_ezw_ble/core/models/ble_connect_state.dart';
+import 'package:flutter_ezw_ble/core/models/ble_device.dart';
 import 'package:json_annotation/json_annotation.dart';
 
 part 'ble_match_device.g.dart';
