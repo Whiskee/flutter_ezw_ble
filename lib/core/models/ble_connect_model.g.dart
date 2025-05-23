@@ -11,6 +11,7 @@ BleConnectModel _$BleConnectModelFromJson(Map<String, dynamic> json) =>
       json['uuid'] as String,
       const ConnectStateListConverter()
           .fromJson(json['connectState'] as String),
+      mtu: (json['mtu'] as num?)?.toInt() ?? 512,
     );
 
 Map<String, dynamic> _$BleConnectModelToJson(BleConnectModel instance) =>
@@ -18,4 +19,5 @@ Map<String, dynamic> _$BleConnectModelToJson(BleConnectModel instance) =>
       'uuid': instance.uuid,
       'connectState':
           const ConnectStateListConverter().toJson(instance.connectState),
+      'mtu': instance.mtu,
     };

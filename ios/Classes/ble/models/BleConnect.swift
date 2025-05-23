@@ -12,6 +12,7 @@
 struct BleConnectModel: Codable {
     var uuid: String
     var connectState: BleConnectState
+    var mtu: Int = 512
 }
 
 enum BleConnectState: String, Codable {
@@ -71,6 +72,13 @@ enum BleConnectState: String, Codable {
      */
     func isConnected() -> Bool {
         return self == .connected || self == .upgrade
+    }
+    
+    /**
+     *  是否纯连接成功
+     */
+    func isPureConnected() -> Bool {
+        return self == .connected
     }
     
     /**

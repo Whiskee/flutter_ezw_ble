@@ -202,7 +202,7 @@ extension BleManager {
         device.peripheral.writeValue(data, for: writeChars, type: .withoutResponse)
         logger.info("BleManage::sendCmd: \(uuid), type=\(psType), \(data.hexString())")
     }
-        
+
     /**
      *  进入升级模式
      */
@@ -329,8 +329,8 @@ extension BleManager {
             if snRule.byteLength > 0, manufactureData.count > snRule.byteLength {
                 endIndex = snRule.byteLength
             }
-            let subrange = startIndex..<endIndex
-            manufactureData = manufactureData.subdata(in: subrange)
+            let subRange = startIndex..<endIndex
+            manufactureData = manufactureData.subdata(in: subRange)
             sn = String(data: manufactureData, encoding: .utf8) ?? ""
         }
         return replaceControlCharacters(in: sn, snRule: snRule)
@@ -494,7 +494,7 @@ extension BleManager {
     /**
      *  连接状态打印
      */
-    private func handleConnectState(uuid: String, state: BleConnectState) {
+    private func handleConnectState(uuid: String, state: BleConnectState, mtu: Int = 512) {
         //  1、超时定时器处理
         //  - 缓存中有定时器数据
         //  - 失败或者连接成功就要停止（即非连接状态）
@@ -514,9 +514,20 @@ extension BleManager {
             connectedDevices[index] = device
         }
         //  3、发送连接状态
-        let connectModel = BleConnectModel(uuid: uuid, connectState: state)
+        let connectModel = BleConnectModel(uuid: uuid, connectState: state, mtu: mtu)
         let jsonString = try? connectModel.toJsonString() ?? ""
         BleEC.connectStatus.event()?(jsonString)
+    }
+    
+    /**
+     * 获取设备的 MTU 值
+     */
+    private func getDeviceMTU(peripheral: CBPeripheral) -> Int {
+        // 方法1: 通过 maximumWriteValueLength 获取 (推荐)
+        let maxWriteLength = peripheral.maximumWriteValueLength(for: .withoutResponse)
+        let attMTU = maxWriteLength + 3  // ATT_MTU = 数据载荷 + 3字节ATT头部
+        logger.info("BleManager::getDeviceMTU: \(peripheral.identifier.uuidString), mtu = \(attMTU), max write length = \(maxWriteLength)")
+        return attMTU
     }
 }
 
@@ -649,7 +660,7 @@ extension BleManager: CBCentralManagerDelegate {
      */
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         handleConnectState(uuid: peripheral.identifier.uuidString, state: .disconnectFromSys)
-        logger.info("BleManager::didFailToConnect(\(peripheral.identifier.uuidString)): Error = \(error)")
+        logger.info("BleManager::didFailToConnect：\(peripheral.identifier.uuidString), Error = \(error)")
     }
 
     /**
@@ -664,19 +675,19 @@ extension BleManager: CBCentralManagerDelegate {
             if connectedDevices.first(where: {$0.peripheral.identifier.uuidString == peripheral.identifier.uuidString})?.isConnected ?? false,
                 upgradeDevices?.contains(where: {$0 == peripheral.identifier.uuidString}) != true {
                 handleConnectState(uuid: peripheral.identifier.uuidString, state: .disconnectByUser)
-                logger.error("BleManager::didFailToConnect(\(peripheral.identifier.uuidString)): No error when disconnect by user")
+                logger.error("BleManager::didFailToConnect: \(peripheral.identifier.uuidString), No error when disconnect by user")
             }
             return
         }
         //  2、设备已经被绑定
         if error.code == 14 {
             handleConnectState(uuid: peripheral.identifier.uuidString, state: .alreadyBound)
-            logger.error("BleManager::didFailToConnect(\(peripheral.identifier.uuidString)): Error = alread bound")
+            logger.error("BleManager::didFailToConnect: \(peripheral.identifier.uuidString), Error = alread bound")
             return
         }
         //  3、其它原因断连
         handleConnectState(uuid: peripheral.identifier.uuidString, state: .disconnectFromSys)
-        logger.error("BleManager::didFailToConnect(\(peripheral.identifier.uuidString)): Error = \(error.localizedDescription)")
+        logger.error("BleManager::didFailToConnect: \(peripheral.identifier.uuidString), error = \(error.localizedDescription)")
     }
     
 }
@@ -787,7 +798,9 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
         if let connectedDevice = connectedDevices.first(where: { device  in
             device.peripheral.identifier.uuidString == peripheral.identifier.uuidString
         }), connectedDevice.writeCharsDic.keys.count == currentConfig.privateServices.count, !connectedDevice.isConnected {
-            self.handleConnectState(uuid: peripheral.identifier.uuidString, state: .connectFinish)
+            //  获取MTU
+            let mtu = getDeviceMTU(peripheral: peripheral)
+            self.handleConnectState(uuid: peripheral.identifier.uuidString, state: .connectFinish, mtu: mtu)
         }
         logger.info("BleManager::update notification state: \(peripheral.identifier.uuidString), chars = \(characteristic.uuid.uuidString)")
     }
@@ -815,10 +828,6 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
         let bleCmdMap = BleCmd(uuid: peripheral.identifier.uuidString, psType: privateService.type, data: data, isSuccess: error == nil).toMap()
         BleEC.receiveData.event()?(bleCmdMap)
         logger.info("BleManager::cmd response: \(peripheral.identifier.uuidString), chars = \(characteristic.uuid.uuidString), data = \(data.hexString())")
-    }
-    
-    func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: (any Error)?) {
-        logger.info("BleManager::cmd write status: \(peripheral.identifier.uuidString), chars = \(characteristic.uuid.uuidString), error = \(error?.localizedDescription ?? "")")
     }
     
 }

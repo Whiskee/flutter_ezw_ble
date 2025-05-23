@@ -32,7 +32,7 @@ class BleScan {
   Map<String, dynamic> customToJson() {
     final map = toJson();
     map["snRule"] = snRule.toJson();
-    map["macRule"] = macRule?.toJson() ?? {};
+    map["macRule"] = macRule?.toJson();
     return map;
   }
 }

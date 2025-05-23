@@ -14,7 +14,7 @@ extension CBPeripheral {
      */
     func toBleDevice(belongConfig: String, sn: String, rssi: Int, mac: String = "") -> BleDevice {
         return BleDevice(
-            belongConfig: String,
+            belongConfig: belongConfig,
             name: name ?? "",
             uuid: identifier.uuidString,
             sn: sn,

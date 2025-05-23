@@ -684,12 +684,6 @@ class BleManager private constructor() {
             Log.i(tag, "Send cmd: ${gatt.device.address}, write is success = ${status == BluetoothGatt.GATT_SUCCESS}")
         }
 
-        override fun onMtuChanged(gatt: BluetoothGatt?, mtu: Int, status: Int) {
-            super.onMtuChanged(gatt, mtu, status)
-            myMtu = mtu
-            Log.i(tag, "Connect call back: ${gatt?.device?.address}, change mtu ${if (status == BluetoothGatt. GATT_SUCCESS )  "success" else "fail"}, new mtu value = $mtu")
-        }
-
         //* ============== User Method ============== *//
 
         /**
@@ -702,7 +696,7 @@ class BleManager private constructor() {
             }
             //  1、如果队列内容为空，就表示处理完成
             if (descriptorQueue.isEmpty()) {
-                connectingFlowFinish(gatt)
+                requestDeviceMtu(gatt)
                 return
             }
             //  2、执行写特征使能
@@ -717,21 +711,39 @@ class BleManager private constructor() {
             Log.i(tag, "Connect call back: ${gatt.device.address}, psType=${item.first}, enable descriptor and write = $isWrite")
         }
 
+        override fun onMtuChanged(gatt: BluetoothGatt?, mtu: Int, status: Int) {
+            super.onMtuChanged(gatt, mtu, status)
+            Log.i(tag, "Connect call back: ${gatt?.device?.address}, change mtu ${if (status == BluetoothGatt. GATT_SUCCESS )  "success" else "fail"}, new mtu value = $mtu, connecting flow is finish")
+            gatt?.let {
+                connectingFlowFinish(it, mtu)
+            }
+        }
+
+        /**
+         * 请求设备mtu
+         */
+        private fun requestDeviceMtu(gatt: BluetoothGatt) {
+            val device = findConnectedDevice(gatt.device.address)
+            if (device == null) {
+                return
+            }
+            val belongConfig = device.belongConfig
+            //  4、MTU大于0则发起MTU修改
+            gatt.requestMtu(belongConfig.mtu)
+            Log.i(tag, "Connect call back: ${device.uuid}, enable all descriptor, request mtu to = ${belongConfig.mtu}")
+        }
+
         /**
          * 连接流程执行完毕
          */
-        private fun connectingFlowFinish(gatt: BluetoothGatt) {
+        private fun connectingFlowFinish(gatt: BluetoothGatt, mtu: Int) {
+            //  1、获取链接设备
             val address = gatt.device.address
             val device = findConnectedDevice(address)
             if (device == null) {
                 return
             }
             val belongConfig = device.belongConfig
-            //  4、MTU大于0则发起MTU修改
-            if (belongConfig.mtu > 0) {
-                val changeMtu = gatt.requestMtu(belongConfig.mtu)
-                Log.i(tag, "Connect call back: ${device.uuid}, change mtu to = ${belongConfig.mtu}, request success = $changeMtu")
-            }
             //  6、如果是主动互动发起绑定则调用createBond，并通过绑定回调处理连接状态
             if (belongConfig.initiateBinding && gatt.device.bondState != BluetoothDevice.BOND_BONDED) {
                 gatt.device.createBond()
@@ -740,9 +752,10 @@ class BleManager private constructor() {
                 return
             }
             //  - 6.1、如果不需要则直接连接成功
-            handleConnectState(address!!, BleConnectState.CONNECT_FINISH)
+            handleConnectState(address!!, BleConnectState.CONNECT_FINISH, mtu = mtu)
             Log.i(tag, "Connect call back: $address, connect finish")
         }
+
     }
 
     /**
@@ -771,7 +784,7 @@ class BleManager private constructor() {
     /**
      *  处理连接状态
      */
-    private fun handleConnectState(uuid: String, state: BleConnectState) {
+    private fun handleConnectState(uuid: String, state: BleConnectState, mtu: Int = 512) {
         //  1、处理断连和错误连接
         if (state.isDisconnected || state.isError) {
             disconnectDevice(uuid)
@@ -791,7 +804,7 @@ class BleManager private constructor() {
             connect(waitingDevice.belongConfig.name, waitingDevice.uuid, waitingDevice.sn, true, waitingDevice.afterUpgrade)
         }
         mainScope.launch {
-            val connectModel = BleConnectModel(uuid, state)
+            val connectModel = BleConnectModel(uuid, state, mtu)
             BleEC.CONNECT_STATUS.event?.success(connectModel.toJson())
         }
     }
