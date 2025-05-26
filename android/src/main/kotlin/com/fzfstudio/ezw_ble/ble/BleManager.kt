@@ -341,7 +341,6 @@ class BleManager private constructor() {
             return
         }
         //  1、执行设备断连
-        disconnectDevice(uuid)
         handleConnectState(uuid, BleConnectState.DISCONNECT_BY_MYSELF)
         Log.i(tag, "Disconnect: $uuid, finish")
     }
@@ -611,7 +610,7 @@ class BleManager private constructor() {
                 Log.i(tag, "Connect call back: $address, ${service}, set chars notify success = $setCharsNotifySuccess")
                 //  4、开启写服务数据监听
                 //  获取与给定 BluetoothGattCharacteristic 关联的描述符。描述符本质上是与特性相关的附加信息，可以包括例如 客户端配置描述符（Client Characteristic Configuration Descriptor，简称 CCCD）或 描述特性的格式、权限
-                var descriptor = readChars.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
+                val descriptor = readChars.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
                 descriptorQueue.add(Pair(uuid.type, descriptor))
                 //  缓存读写特征
                 currentDevice.gattMap[uuid.type] = BleGatt(gatt, writeChars, readChars)
