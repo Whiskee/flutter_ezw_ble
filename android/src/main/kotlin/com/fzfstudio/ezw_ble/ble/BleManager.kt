@@ -57,7 +57,7 @@ class BleManager private constructor() {
     }
     //  - 搜索配置
     private val scanSettings by lazy {
-        ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_POWER).build()
+        ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
     }
     //  - 缓存已连接的设备
     private val connectedDevices: MutableList<BleDevice> = mutableListOf()
@@ -96,7 +96,7 @@ class BleManager private constructor() {
             //  3、通过蓝牙配置文件中的scan获取目标设备
             val bleConfig = bleConfigs.firstOrNull { config -> config.scan.nameFilters.firstOrNull { filter ->
                 device.name.contains(filter)
-                }  != null
+            }  != null
             }
             if (bleConfig == null) {
                 return
@@ -379,6 +379,7 @@ class BleManager private constructor() {
             sendCmdQueue.poll()
             connectedDevices.firstOrNull { it.uuid == uuid }?.writeCharacteristic(data, psType)
         }
+        Log.i(tag, "Send cmd: $uuid\n--type=$psType\n--length=${data.size}\n\n--data=${data.toHexString()}")
     }
 
     /**
@@ -656,13 +657,13 @@ class BleManager private constructor() {
                     uuid.readCharsUUID == characteristic.uuid
                 }
                 if (currentUuid == null) {
-                    Log.i(tag, "Send cmd: ${gatt.device.address} receive fail, not found current uuid")
+                    Log.i(tag, "Receive cmd: ${gatt.device.address} receive fail, not found current uuid")
                     return@launch
                 }
                 //  2、解析数据
                 val bleCmdMap = BleCmd(gatt.device.address, currentUuid.type, value, true).toMap()
                 BleEC.RECEIVE_DATA.event?.success(bleCmdMap)
-                Log.i(tag, "Send cmd: ${gatt.device.address} receive success\n--type=${currentUuid.type}\n--length=${value.size}\n--chartsType=${characteristic.writeType}\n--data=${value.toHexString()}")
+                Log.i(tag, "Receive cmd: ${gatt.device.address}\n--type=${currentUuid.type}\n--length=${value.size}\n--chartsType=${characteristic.writeType}\n--data=${value.toHexString()}")
             }
         }
 
