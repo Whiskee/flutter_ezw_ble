@@ -57,7 +57,7 @@ class BleManager private constructor() {
     }
     //  - 搜索配置
     private val scanSettings by lazy {
-        ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_BALANCED).build()
+        ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_POWER).build()
     }
     //  - 缓存已连接的设备
     private val connectedDevices: MutableList<BleDevice> = mutableListOf()
