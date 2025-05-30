@@ -576,17 +576,20 @@ extension BleManager: CBCentralManagerDelegate {
         //  - 5.1、获取MAC地址
         let deviceMac = parseDataToMac(manufactureData: manufactureData, macRule: bleConfig.scan.macRule)
         //  - 5.2、根据SN组装蓝牙数据
+        var deviceSn = peripheral.name ?? ""
         let snRule = bleConfig.scan.snRule
-        let deviceSn = parseDataToObtainSn(manufactureData: manufactureData, snRule: snRule)
-        //  - 5.2.1、阻断发送到Flutter
-        //  -- a、SN无法被解析的
-        //  -- b、不包含标识的设备
-        if deviceSn.isEmpty ||
-            snRule.filters.isNotEmpty,
-           !snRule.filters.contains(where: { mark in
-               return deviceSn.contains(mark)
-           }) {
-            return
+        if let snRule = snRule {
+            deviceSn = parseDataToObtainSn(manufactureData: manufactureData, snRule: snRule)
+            //  - 5.2.1、阻断发送到Flutter
+            //  -- a、SN无法被解析的
+            //  -- b、不包含标识的设备
+            if deviceSn.isEmpty ||
+                snRule.filters.isNotEmpty,
+               !snRule.filters.contains(where: { mark in
+                   return deviceSn.contains(mark)
+               }) {
+                return
+            }
         }
         //  6、发送设备到Flutter
         //  - 6.1、创建设备自定义模型对象,并缓存

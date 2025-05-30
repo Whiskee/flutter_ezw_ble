@@ -8,7 +8,9 @@ part of 'ble_scan.dart';
 
 BleScan _$BleScanFromJson(Map<String, dynamic> json) => BleScan(
       (json['nameFilters'] as List<dynamic>).map((e) => e as String).toList(),
-      BleSnRule.fromJson(json['snRule'] as Map<String, dynamic>),
+      snRule: json['snRule'] == null
+          ? null
+          : BleSnRule.fromJson(json['snRule'] as Map<String, dynamic>),
       macRule: json['macRule'] == null
           ? null
           : BleMacRule.fromJson(json['macRule'] as Map<String, dynamic>),

@@ -102,15 +102,18 @@ class BleManager private constructor() {
                 return
             }
             //  3、组装蓝牙数据
+            var deviceSn = device.name
             //  - 3.1、获取SN数据
             val snRule = bleConfig.scan.snRule
-            val deviceSn = parseDataToObtainSn(result.scanRecord?.bytes, snRule)
-            //  - 3.2、阻断发送到Flutter
-            //  -- a、SN无法被解析的
-            //  -- b、不包含标识的设备
-            if (deviceSn.isEmpty() ||
-                (snRule.filters.isNotEmpty() && !snRule.filters.any { deviceSn.contains(it) })) {
-                return
+            if (snRule != null) {
+                deviceSn = parseDataToObtainSn(result.scanRecord?.bytes, snRule)
+                //  - 3.2、阻断发送到Flutter
+                //  -- a、SN无法被解析的
+                //  -- b、不包含标识的设备
+                if (deviceSn.isEmpty() ||
+                    (snRule.filters.isNotEmpty() && !snRule.filters.any { deviceSn.contains(it) })) {
+                    return
+                }
             }
             //  4、发送设备到Flutter
             //  - 4.1、创建设备自定义模型对象,并缓存
@@ -516,7 +519,6 @@ class BleManager private constructor() {
         if (snRule.byteLength > 0 && endIndex > (snRule.byteLength - startIndex)) {
             endIndex = snRule.byteLength
         }
-        sn = String(bytes, Charsets.UTF_8)
         sn = String(bytes.copyOfRange(startIndex, endIndex), Charsets.UTF_8)
         return replaceControlCharacters(sn, snRule)
     }

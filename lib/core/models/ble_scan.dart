@@ -9,15 +9,15 @@ class BleScan {
   //  设备名称过滤条件
   final List<String> nameFilters;
   //  SN设置了匹配规则
-  final BleSnRule snRule;
+  final BleSnRule? snRule;
   //  仅iOS使用，解析MAC地址
   final BleMacRule? macRule;
   //  组合设备数:总数, 如果为1，则不开启匹配模式，返回单个设备，如果大于2，则表示默认开启匹配模式，组成一个设备
   final int matchCount;
 
   BleScan(
-    this.nameFilters,
-    this.snRule, {
+    this.nameFilters, {
+    this.snRule,
     this.macRule,
     this.matchCount = 1,
   })  : assert(nameFilters.isNotEmpty, "nameFilters is empty"),
@@ -31,7 +31,7 @@ class BleScan {
 
   Map<String, dynamic> customToJson() {
     final map = toJson();
-    map["snRule"] = snRule.toJson();
+    map["snRule"] = snRule?.toJson();
     map["macRule"] = macRule?.toJson();
     return map;
   }
