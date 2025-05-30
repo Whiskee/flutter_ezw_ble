@@ -379,7 +379,7 @@ class BleManager private constructor() {
             sendCmdQueue.poll()
             connectedDevices.firstOrNull { it.uuid == uuid }?.writeCharacteristic(data, psType)
         }
-        Log.i(tag, "Send cmd: $uuid\n--type=$psType\n--length=${data.size}\n\n--data=${data.toHexString()}")
+        Log.i(tag, "Send cmd: $uuid\n--type=$psType\n--length=${data.size}\n--data=${data.toHexString()}")
     }
 
     /**
