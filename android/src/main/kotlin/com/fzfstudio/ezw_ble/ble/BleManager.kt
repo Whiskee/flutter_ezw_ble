@@ -31,7 +31,6 @@ import com.fzfstudio.ezw_ble.ble.models.BleSnRule
 import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
 import com.fzfstudio.ezw_ble.ble.services.BleStateListener
 import com.fzfstudio.ezw_ble.ble.services.BleStateListener.BluetoothStateCallback
-import com.fzfstudio.ezw_utils.extension.toHexString
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.launch
 import java.lang.ref.WeakReference
@@ -382,7 +381,6 @@ class BleManager private constructor() {
             sendCmdQueue.poll()
             connectedDevices.firstOrNull { it.uuid == uuid }?.writeCharacteristic(data, psType)
         }
-        Log.i(tag, "Send cmd: $uuid\n--type=$psType\n--length=${data.size}\n--data=${data.toHexString()}")
     }
 
     /**
@@ -552,6 +550,7 @@ class BleManager private constructor() {
     /**
      * 连接回调
      */
+    @OptIn(ExperimentalStdlibApi::class)
     private fun createConnectCallBack() = object : BluetoothGattCallback() {
 
         /// 是否服务处理状态
@@ -683,7 +682,7 @@ class BleManager private constructor() {
             sendCmdQueue.poll()?.let { cmd ->
                 connectedDevices.firstOrNull { it.uuid == address }?.writeCharacteristic(cmd.data, cmd.psType)
             }
-            Log.i(tag, "Send cmd: ${gatt.device.address}, write is success = ${status == BluetoothGatt.GATT_SUCCESS}")
+            Log.i(tag, "Send cmd: ${gatt.device.address}, write call back is success = ${status == BluetoothGatt.GATT_SUCCESS}")
         }
 
         //* ============== User Method ============== *//

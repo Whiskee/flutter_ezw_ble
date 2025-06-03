@@ -8,7 +8,6 @@ import android.util.Log
 import com.fzfstudio.ezw_ble.ble.BleEC
 import com.fzfstudio.ezw_ble.ble.models.enums.BleConfigOutAdapter
 import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
-import com.fzfstudio.ezw_utils.extension.toHexString
 import com.fzfstudio.ezw_utils.gson.GsonSerializable
 import com.google.gson.annotations.JsonAdapter
 
@@ -42,6 +41,7 @@ class BleDevice(
      * @param psType 私有服务类型
      *
      */
+    @OptIn(ExperimentalStdlibApi::class)
     fun writeCharacteristic(data: ByteArray?, psType: Int): Boolean {
         //  1、初始化发送内容
         if (data == null) {
@@ -49,14 +49,13 @@ class BleDevice(
             return false
         }
         //  - 1.1、准备打印内容
-        val dataHex = data.toHexString()
         //  - 1.2、获取GATT和写服务
         val bleGatt = gattMap[psType]
         val gatt = bleGatt?.gatt
         val writeChars = bleGatt?.writeChars
         if (gatt == null || writeChars == null) {
             BleEC.RECEIVE_DATA.event?.success(BleCmd.fail(uuid, psType).toMap())
-            Log.i(tag, "Send cmd: $uuid, PS type=$psType, $dataHex, no write chars found")
+            Log.i(tag, "Send cmd: $uuid, PS type=$psType, $data, no write chars found")
             return false
         }
         //  2、执行写操作
@@ -70,7 +69,7 @@ class BleDevice(
         if (!isSuccess) {
             BleEC.RECEIVE_DATA.event?.success(BleCmd.fail(uuid, psType).toMap())
         }
-        Log.i(tag, "Send cmd: $uuid is success = ${isSuccess}\n--type=$psType\n--data=$dataHex")
+        Log.i(tag, "Send cmd: $uuid is success = ${isSuccess}\n--type=$psType\n--length=${data.size}\n--data=${data.toHexString()}")
         return true
     }
 }
