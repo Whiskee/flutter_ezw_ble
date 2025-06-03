@@ -753,7 +753,7 @@ class BleManager private constructor() {
                 handleConnectState(address!!, BleConnectState.START_BINDING)
                 return
             }
-            //  - 6.1、如果不需要则直接连接成功
+            //  - 6.1、如果不需要则直接完成连接流程
             handleConnectState(address!!, BleConnectState.CONNECT_FINISH, mtu = mtu)
             Log.i(tag, "Connect call back: $address, connect finish")
         }

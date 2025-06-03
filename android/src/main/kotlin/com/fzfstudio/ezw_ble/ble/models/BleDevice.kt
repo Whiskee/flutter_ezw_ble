@@ -60,7 +60,7 @@ class BleDevice(
             return false
         }
         //  2、执行写操作
-        var isSuccess = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        val isSuccess = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             val status = gatt.writeCharacteristic(writeChars, data, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
             status == BluetoothStatusCodes.SUCCESS
         } else {
