@@ -61,7 +61,7 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       methodChannel.invokeMethod<void>("sendCmd", {
         "uuid": uuid,
         "data": data,
-        "psType": 0,
+        "psType": psType,
       });
 
   @override

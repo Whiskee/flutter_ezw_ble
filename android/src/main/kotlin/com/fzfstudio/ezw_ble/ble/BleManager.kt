@@ -371,7 +371,7 @@ class BleManager private constructor() {
         if (!checkIsFunctionCanBeCalled() || uuid.isEmpty()) {
             return
         }
-        if (upgradeDevices.contains(uuid) && psType == 1) {
+        if (upgradeDevices.contains(uuid) && psType != 1) {
             Log.i(tag, "Send cmd: $uuid, Cannot send commands during upgrade")
             return
         }
