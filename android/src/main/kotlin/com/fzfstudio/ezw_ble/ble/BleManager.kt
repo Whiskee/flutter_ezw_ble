@@ -564,10 +564,6 @@ class BleManager private constructor() {
                 handleConnectState(device.address, BleConnectState.SEARCH_SERVICE)
                 Log.i(tag, "Connect call back: ${device.address}, had contact device, state = STATE_CONNECTED(code:2), start search services")
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                //  升级中的对象不处理
-                if (upgradeDevices.contains(device.address)) {
-                    return
-                }
                 connectCallBacks.removeAll { it.first == device.address  }
                 handleConnectState(device.address, BleConnectState.DISCONNECT_FROM_SYS)
                 Log.e(tag, "Connect call back: ${gatt.device.address}, state = STATE_DISCONNECTED(code:0)")
@@ -674,15 +670,12 @@ class BleManager private constructor() {
             status: Int
         ) {
             super.onCharacteristicWrite(gatt, characteristic, status)
-            val address = gatt?.device?.address
-            if (address.isNullOrEmpty()) {
-                sendCmdQueue.clear()
-                return
+            gatt?.device?.address?.let { uuid ->
+                sendCmdQueue.poll()?.let { cmd ->
+                    connectedDevices.firstOrNull { it.uuid == uuid }?.writeCharacteristic(cmd.data, cmd.psType)
+                }
+                Log.i(tag, "Send cmd: ${gatt.device.address}, write call back is success = ${status == BluetoothGatt.GATT_SUCCESS}")
             }
-            sendCmdQueue.poll()?.let { cmd ->
-                connectedDevices.firstOrNull { it.uuid == address }?.writeCharacteristic(cmd.data, cmd.psType)
-            }
-            Log.i(tag, "Send cmd: ${gatt.device.address}, write call back is success = ${status == BluetoothGatt.GATT_SUCCESS}")
         }
 
         //* ============== User Method ============== *//

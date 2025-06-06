@@ -675,8 +675,7 @@ extension BleManager: CBCentralManagerDelegate {
             //  不执行执行断连
             //  - 已经断连就不再处理
             //  - 没有退出升级状态的不用处理
-            if connectedDevices.first(where: {$0.peripheral.identifier.uuidString == peripheral.identifier.uuidString})?.isConnected ?? false,
-                upgradeDevices?.contains(where: {$0 == peripheral.identifier.uuidString}) != true {
+            if connectedDevices.first(where: {$0.peripheral.identifier.uuidString == peripheral.identifier.uuidString})?.isConnected ?? false {
                 handleConnectState(uuid: peripheral.identifier.uuidString, state: .disconnectByUser)
                 logger.error("BleManager::didFailToConnect: \(peripheral.identifier.uuidString), No error when disconnect by user")
             }
