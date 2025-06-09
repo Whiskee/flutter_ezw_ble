@@ -22,6 +22,9 @@ class BleMatchDevice {
   //  - 是否连接出错
   bool get isConnectError =>
       devices.where((device) => device.connectState.isError).isNotEmpty;
+  //  - 是否断连
+  bool get isDisconnected =>
+      devices.where((device) => device.connectState.isDisconnected).isNotEmpty;
 
   BleMatchDevice(
     this.sn, {
