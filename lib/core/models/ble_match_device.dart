@@ -7,6 +7,7 @@ part 'ble_match_device.g.dart';
 @JsonSerializable()
 class BleMatchDevice {
   final String sn;
+  final String remarks;
   final List<BleDevice> devices;
 
   ///========== Get
@@ -28,6 +29,7 @@ class BleMatchDevice {
 
   BleMatchDevice(
     this.sn, {
+    this.remarks = "",
     this.devices = const [],
   });
 
