@@ -102,11 +102,11 @@ extension BleConnectStateExt on BleConnectState {
       this == BleConnectState.connected || this == BleConnectState.upgrade;
 
   //  连接流程：纯连接状态
-  bool get isPureConnected =>
-      this == BleConnectState.connected;
+  bool get isPureConnected => this == BleConnectState.connected;
 
   //  是否断连
   bool get isDisconnected =>
+      this == BleConnectState.none ||
       this == BleConnectState.disconnectByUser ||
       this == BleConnectState.disconnectFromSys;
 

@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter_ezw_ble/core/models/ble_connect_state.dart';
 import 'package:flutter_ezw_ble/core/models/ble_device.dart';
 import 'package:json_annotation/json_annotation.dart';
@@ -40,4 +42,7 @@ class BleMatchDevice {
 
   BleMatchDevice copy() => BleMatchDevice(sn,
       devices: devices.map((match) => match.copy()).toList());
+
+  @override
+  String toString() => jsonEncode(toJson());
 }
