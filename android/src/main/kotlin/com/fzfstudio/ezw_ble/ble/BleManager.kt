@@ -143,10 +143,6 @@ class BleManager private constructor() {
     //  - 当前蓝牙基础配置，必须实现
     private var bleConfigs: List<BleConfig> = listOf()
 
-    /// =========== Public Variable
-    //  - 设备回复最大的MTU
-    var myMtu = 0
-
     /// =========== Get
     //  - 蓝牙状态
     val currentBleState
