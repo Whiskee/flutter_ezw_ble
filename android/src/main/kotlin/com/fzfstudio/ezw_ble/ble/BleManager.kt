@@ -398,6 +398,7 @@ class BleManager private constructor() {
         if (!upgradeDevices.contains(uuid)){
             return
         }
+        handleConnectState(uuid, BleConnectState.CONNECTED)
         upgradeDevices.remove(uuid)
         Log.i(tag, "QuiteUpgradeState: $uuid had quite upgrade state")
     }
@@ -482,13 +483,18 @@ class BleManager private constructor() {
                 handleConnectState(connectedDevice.uuid, BleConnectState.BOUND_FAIL)
                 return
             }
-            //  3、检查当前设备连接状态，如果出现异常就不处理
+            //  3、如果眼镜已经连接了就不再执行绑定
+            if (connectedDevice.connectState.isConnected) {
+                Log.e( tag, "Ble status listener - bond state: ${device.address} bind success")
+                return
+            }
+            //  4、检查当前设备连接状态，如果出现异常就不处理
             if (connectedDevice.connectState.isError) {
                 Log.i( tag, "Ble status listener - bond state: ${device.address} is ${connectedDevice.connectState}, bound failure")
                 handleConnectState(connectedDevice.uuid, BleConnectState.BOUND_FAIL)
                 return
             }
-            //  4、主动绑定时，需要进入CONNECT_FINISH流程，如果是眼镜主动绑定，则默认进入CONNECT_FINISH
+            //  5、主动绑定时，需要进入CONNECT_FINISH流程，如果是眼镜主动绑定，则默认进入CONNECT_FINISH
             if (connectedDevice.belongConfig.initiateBinding) {
                 handleConnectState(connectedDevice.uuid, BleConnectState.CONNECT_FINISH)
             }
@@ -560,7 +566,11 @@ class BleManager private constructor() {
                 handleConnectState(device.address, BleConnectState.SEARCH_SERVICE)
                 Log.i(tag, "Connect call back: ${device.address}, had contact device, state = STATE_CONNECTED(code:2), start search services")
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                connectCallBacks.removeAll { it.first == device.address  }
+                val isMyDevice = connectedDevices.any { it.uuid == device.address  }
+                if (!isMyDevice) {
+                    Log.e(tag, "Connect call back: ${gatt.device.address}, not my connected device, state = STATE_DISCONNECTED(code:0)")
+                    return
+                }
                 handleConnectState(device.address, BleConnectState.DISCONNECT_FROM_SYS)
                 Log.e(tag, "Connect call back: ${gatt.device.address}, state = STATE_DISCONNECTED(code:0)")
             }

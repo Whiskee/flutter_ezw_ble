@@ -670,24 +670,29 @@ extension BleManager: CBCentralManagerDelegate {
      *  设备断连回调
      */
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        //  1、如果error为空，说明为用户主动操作断连
+        //  1、获取我正在连接的设备
+        guard let myDevice = connectedDevices.first(where: {$0.peripheral.identifier.uuidString == peripheral.identifier.uuidString}) else {
+            logger.error("BleManager::didFailToConnect: \(peripheral.identifier.uuidString), not my connected device")
+            return
+        }
+        //  2、如果error为空，说明为用户主动操作断连
         guard let error = error as? NSError else {
             //  不执行执行断连
             //  - 已经断连就不再处理
             //  - 没有退出升级状态的不用处理
-            if connectedDevices.first(where: {$0.peripheral.identifier.uuidString == peripheral.identifier.uuidString})?.isConnected ?? false {
+            if myDevice.isConnected {
                 handleConnectState(uuid: peripheral.identifier.uuidString, state: .disconnectByUser)
                 logger.error("BleManager::didFailToConnect: \(peripheral.identifier.uuidString), No error when disconnect by user")
             }
             return
         }
-        //  2、设备已经被绑定
+        //  3、设备已经被绑定
         if error.code == 14 {
             handleConnectState(uuid: peripheral.identifier.uuidString, state: .alreadyBound)
             logger.error("BleManager::didFailToConnect: \(peripheral.identifier.uuidString), Error = alread bound")
             return
         }
-        //  3、其它原因断连
+        //  4、其它原因断连
         handleConnectState(uuid: peripheral.identifier.uuidString, state: .disconnectFromSys)
         logger.error("BleManager::didFailToConnect: \(peripheral.identifier.uuidString), error = \(error.localizedDescription)")
     }
