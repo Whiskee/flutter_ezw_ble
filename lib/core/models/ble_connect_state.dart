@@ -110,6 +110,15 @@ extension BleConnectStateExt on BleConnectState {
       this == BleConnectState.disconnectByUser ||
       this == BleConnectState.disconnectFromSys;
 
+  //  是否系统断连
+  bool get isDisconnectFromSys => this == BleConnectState.disconnectFromSys;
+
+  //  是否连接错误
+  bool get isConnectError =>
+      this == BleConnectState.serviceFail ||
+      this == BleConnectState.charsFail ||
+      this == BleConnectState.timeout;
+
   //  连接异常状态
   bool get isError =>
       this == BleConnectState.emptyUuid ||

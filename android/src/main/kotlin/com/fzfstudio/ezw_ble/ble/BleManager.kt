@@ -556,7 +556,7 @@ class BleManager private constructor() {
     private fun createConnectCallBack() = object : BluetoothGattCallback() {
 
         /// 是否服务处理状态
-        private var isPsHandleFinish = true
+        private var isPsHandleFinish = false
 
         //  连接状态监听
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
@@ -632,6 +632,9 @@ class BleManager private constructor() {
             status: Int
         ) {
             super.onDescriptorWrite(gatt, descriptor, status)
+            if (!isPsHandleFinish) {
+                return;
+            }
             Log.i(tag, "Connect call back: ${gatt?.device?.address}, is descriptor write success = ${status == BluetoothGatt. GATT_SUCCESS}")
             processNextDescriptor(gatt)
         }
@@ -684,6 +687,17 @@ class BleManager private constructor() {
             }
         }
 
+        override fun onMtuChanged(gatt: BluetoothGatt?, mtu: Int, status: Int) {
+            super.onMtuChanged(gatt, mtu, status)
+            if (!isPsHandleFinish) {
+                return
+            }
+            Log.i(tag, "Connect call back: ${gatt?.device?.address}, change mtu ${if (status == BluetoothGatt. GATT_SUCCESS )  "success" else "fail"}, new mtu value = $mtu, connecting flow is finish")
+            gatt?.let {
+                connectingFlowFinish(it, mtu)
+            }
+        }
+
         //* ============== User Method ============== *//
 
         /**
@@ -709,14 +723,6 @@ class BleManager private constructor() {
                 gatt.writeDescriptor(descriptor)
             }
             Log.i(tag, "Connect call back: ${gatt.device.address}, psType=${item.first}, enable descriptor and write = $isWrite")
-        }
-
-        override fun onMtuChanged(gatt: BluetoothGatt?, mtu: Int, status: Int) {
-            super.onMtuChanged(gatt, mtu, status)
-            Log.i(tag, "Connect call back: ${gatt?.device?.address}, change mtu ${if (status == BluetoothGatt. GATT_SUCCESS )  "success" else "fail"}, new mtu value = $mtu, connecting flow is finish")
-            gatt?.let {
-                connectingFlowFinish(it, mtu)
-            }
         }
 
         /**
