@@ -566,6 +566,7 @@ class BleManager private constructor() {
                 handleConnectState(device.address, BleConnectState.SEARCH_SERVICE)
                 Log.i(tag, "Connect call back: ${device.address}, had contact device, state = STATE_CONNECTED(code:2), start search services")
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                isPsHandleFinish = false
                 val isMyDevice = connectedDevices.any { it.uuid == device.address  }
                 if (!isMyDevice) {
                     Log.e(tag, "Connect call back: ${gatt.device.address}, not my connected device, state = STATE_DISCONNECTED(code:0)")
