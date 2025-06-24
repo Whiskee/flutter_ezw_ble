@@ -45,6 +45,12 @@ enum class BleConnectState {
     NONE;
 
     /**
+     * 是否正开启连接
+     */
+    val isStartConnect: Boolean
+        get() = this == CONNECTING
+
+    /**
      *  是否正在连接中
      */
     val isConnecting: Boolean
