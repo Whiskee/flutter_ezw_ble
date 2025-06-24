@@ -32,6 +32,7 @@ import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
 import com.fzfstudio.ezw_ble.ble.services.BleStateListener
 import com.fzfstudio.ezw_ble.ble.services.BleStateListener.BluetoothStateCallback
 import kotlinx.coroutines.MainScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.lang.ref.WeakReference
 import java.util.LinkedList
@@ -562,9 +563,12 @@ class BleManager private constructor() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             val device = gatt.device
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                gatt.discoverServices()
-                handleConnectState(device.address, BleConnectState.SEARCH_SERVICE)
-                Log.i(tag, "Connect call back: ${device.address}, had contact device, state = STATE_CONNECTED(code:2), start search services")
+                mainScope.launch {
+                    delay(500)
+                    gatt.discoverServices()
+                    handleConnectState(device.address, BleConnectState.SEARCH_SERVICE)
+                    Log.i(tag, "Connect call back: ${device.address}, had contact device, state = STATE_CONNECTED(code:2), start search services")
+                }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 isPsHandleFinish = false
                 val isMyDevice = connectedDevices.any { it.uuid == device.address  }
