@@ -78,8 +78,9 @@ enum BleMC: String {
             let jsonData: [String:Any] = arguments as? [String:Any] ?? [:]
             let belongConfig: String = jsonData["belongConfig"] as? String ?? ""
             let uuid = jsonData["uuid"] as? String ?? ""
+            let name = jsonData["name"] as? String  ?? ""
             let afterUpgrade = jsonData["afterUpgrade"] as? Bool ?? false
-            BleManager.shared.connect(belongConfig: belongConfig, uuid: uuid, afterUpgrade: afterUpgrade)
+            BleManager.shared.connect(belongConfig: belongConfig, uuid: uuid, name: name, afterUpgrade: afterUpgrade)
             break
         case .deviceConnected:
             let uuid = arguments as? String ?? ""

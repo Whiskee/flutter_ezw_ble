@@ -1,7 +1,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_ezw_ble/flutter_ezw_ble.dart';
 import 'package:flutter_ezw_ble/core/models/ble_config.dart';
+import 'package:flutter_ezw_ble/flutter_ezw_ble.dart';
 
 import 'flutter_ezw_ble_platform_interface.dart';
 
@@ -29,17 +29,21 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
   @override
   Future<void> stopScan() async => methodChannel.invokeMethod("stopScan");
 
-  /// 参数 sn 仅在 Android 平台有效
+  /// 连接设备
+  /// - name 仅在 iOS 平台有效
+  /// - sn 仅在 Android 平台有效
   @override
   Future<void> connectDevice(
     String belongConfig,
     String uuid, {
+    String? name,
     String? sn,
     bool? afterUpgrade,
   }) async =>
       methodChannel.invokeMethod("connectDevice", {
         "belongConfig": belongConfig,
         "uuid": uuid,
+        "name": name,
         "sn": sn,
         "afterUpgrade": afterUpgrade
       });

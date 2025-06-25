@@ -29,8 +29,8 @@ class BleManager: NSObject {
     private lazy var belongConfigTemp: [String:BleConfig] = [:]
     //  - 搜素：获取结果临时缓存(DeviceInfo, 蓝牙对象)
     private lazy var scanResultTemp: [(BleDevice, CBPeripheral)] = []
-    //  - 发起连接信息(所属蓝牙配置名称，UUID， 发起时间， 是否是升级状态)
-    private lazy var startConnectInfos: [(BleConfig, String, TimeInterval, Bool)] = []
+    //  - 发起连接信息(所属蓝牙配置名称，UUID，设备名称, 发起时间， 是否是升级状态)
+    private lazy var startConnectInfos: [(BleConfig, String, String, TimeInterval, Bool)] = []
     //  - 连接超时定时器集合
     private lazy var connectingTimeoutTimers: [(String, Timer)] = []
     //  - 是否正在升级中
@@ -89,7 +89,7 @@ extension BleManager {
      *  连接设备
      *  - 注意：需要在info.list中配置NSBluetoothPeripheralUsageDescription，否则无法发起连接
      */
-    func connect(belongConfig: String, uuid: String, afterUpgrade: Bool = false) {
+    func connect(belongConfig: String, uuid: String, name: String, afterUpgrade: Bool = false) {
         //  1、默认功能检查
         guard checkIsFunctionCanBeCalled() else {
             return
@@ -110,7 +110,7 @@ extension BleManager {
         //  - 3.1、获取基础的私有服务
         let commonPs = bleConfig.privateServices.first { $0.type == 0 }
         //  - 3.2、检查uuid和commonPs不能为空
-        guard uuid.isNotEmpty, let commonPs = commonPs else {
+        guard uuid.isNotEmpty || name.isNotEmpty, let commonPs = commonPs else {
             handleConnectState(uuid: uuid, state: .emptyUuid)
             logger.error("BleManage::connect: Empty uuid")
             return
@@ -146,7 +146,7 @@ extension BleManager {
         //  - 4.4、通过ServiceUUID查询
         else {
             //  -- 添加待连接的设备
-            startConnectInfos.append((bleConfig, uuid, Date().timeIntervalSince1970, afterUpgrade))
+            startConnectInfos.append((bleConfig, uuid, name, Date().timeIntervalSince1970, afterUpgrade))
             //  -- 根据服务特征查询设备
             startScan()
             logger.info("BleManage::connect(\(uuid)): No local device found, start scan device")
@@ -364,31 +364,38 @@ extension BleManager {
         for connectDevice in startConnectInfos {
             //  - 1.1、执行连接
             let connectUuid: String = connectDevice.1
+            let connectName: String = connectDevice.2
+            print("BleManager-------\(peripheral.name ?? "")")
             var canRemove: Bool = false
             //  - 1.2、设置搜索超时（时间戳获取到的余数为秒）
-            if Date().timeIntervalSince1970 - connectDevice.2 > connectDevice.0.connectTimeout / 1000 {
+            if Date().timeIntervalSince1970 - connectDevice.3 > connectDevice.0.connectTimeout / 1000 {
                 handleConnectState(uuid: connectUuid, state: .noDeviceFound)
                 canRemove = true
-                logger.info("BleManager::centralManager - search: \(connectUuid), no device found")
+                logger.info("BleManager::centralManager - search: \(connectUuid)-\(connectName), no device found")
             }
             //  - 1.3、如果找到对应的UUID就执行连接
-            else if connectDevice.1 == peripheral.identifier.uuidString {
+            else if connectUuid == peripheral.identifier.uuidString || connectName == peripheral.name {
+                //  -- 1.3.1、获取新的uuid
+                let newUuidConnect = peripheral.identifier.uuidString
+                //  -- 1.3.2、 重新配置uuid
+                belongConfigTemp[newUuidConnect] = connectDevice.0
+                //  -- 1.3.3、开始连接
                 centralManager.connect(peripheral)
-                //  -- 开始新的倒计时
-                startConnectingCountdown(currentConfig:  connectDevice.0, uuid: connectUuid, afterUpgrade: connectDevice.3)
+                //  -- 1.3.4、开始新的倒计时
+                startConnectingCountdown(currentConfig:  connectDevice.0, uuid: newUuidConnect, afterUpgrade: connectDevice.4)
                 //  -- 默认添加到缓存中
                 if !connectedDevices.contains(where: { device in
-                    device.peripheral.identifier.uuidString == peripheral.identifier.uuidString
+                    device.peripheral.identifier.uuidString == peripheral.identifier.uuidString || connectName == peripheral.name
                 }) {
                     connectedDevices.append(BleConnectedDevice(belongConfig: connectDevice.0, peripheral: peripheral))
                 }
                 canRemove = true
-                logger.info("BleManager::centralManager - search: \(connectUuid), device has been found, start connecting, after upgrade \(connectDevice.2)")
+                logger.info("BleManager::centralManager - search: \(newUuidConnect)-\(connectName), device has been found, start connecting, after upgrade \(connectDevice.4)")
             }
             //  - 检查是否可以移除对象
             if (canRemove) {
                 startConnectInfos.removeAll { info in
-                    info.1 == connectUuid
+                    info.1 == connectUuid || info.2 == connectName
                 }
                 if startConnectInfos.isEmpty {
                     stopScan()
