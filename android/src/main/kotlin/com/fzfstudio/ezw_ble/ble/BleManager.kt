@@ -480,7 +480,7 @@ class BleManager private constructor() {
             }
             //  2、如果没有绑定成功就结束
             if (!isBonded) {
-                if (connectedDevice.connectState.isStartConnect) {
+                if (connectedDevice.connectState.isConnecting) {
                     return
                 }
                 Log.e( tag, "Ble status listener - bond state: ${device.address} unable to bind")
