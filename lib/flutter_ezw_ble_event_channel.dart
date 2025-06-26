@@ -8,6 +8,7 @@ enum BleEventChannel {
   scanResult,
   connectStatus,
   receiveData,
+  logger,
 }
 
 extension BleEventChannelExt on BleEventChannel {

@@ -10,6 +10,7 @@ import com.fzfstudio.ezw_ble.ble.models.enums.BleConfigOutAdapter
 import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
 import com.fzfstudio.ezw_utils.gson.GsonSerializable
 import com.google.gson.annotations.JsonAdapter
+import java.util.concurrent.ConcurrentHashMap
 
 class BleDevice(
     //  序列化时只输出名称
@@ -25,7 +26,7 @@ class BleDevice(
     private val tag = "BleDevice"
 
     /// 缓存设备所含有的Gatt
-    val gattMap: MutableMap<Int, BleGatt> = mutableMapOf()
+    val gattMap: ConcurrentHashMap<Int, BleGatt> = ConcurrentHashMap()
 
     ///========== Get
     val myGatt: BluetoothGatt?

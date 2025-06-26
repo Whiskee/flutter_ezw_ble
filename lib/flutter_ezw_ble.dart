@@ -18,6 +18,8 @@ class EzwBle {
   //  - 蓝牙状态
   Stream<BleState> bleStateEC =
       BleEventChannel.bleState.ec.map((data) => BleStateExt.from(data));
+  //  - iOS日志
+  Stream<String> blePrintEC = BleEventChannel.logger.ec.map((data) => data as String);
   //  - 蓝牙搜索结果
   Stream<BleMatchDevice> scanResultEC =
       BleEventChannel.scanResult.ec.map((data) {

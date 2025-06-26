@@ -140,6 +140,8 @@ enum BleEC: String, CaseIterable {
     case connectStatus
     //  接收数据
     case receiveData
+    //  打印iOS日志
+    case logger
     
     private var eventLabel: String {
         get {

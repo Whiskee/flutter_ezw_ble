@@ -40,6 +40,7 @@ import java.util.Queue
 import java.util.Timer
 import java.util.TimerTask
 import java.util.UUID
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.regex.Pattern
 
 class BleManager private constructor() {
@@ -70,7 +71,7 @@ class BleManager private constructor() {
     //  - 是否正在升级中
     private val upgradeDevices: MutableList<String> = mutableListOf()
     //  - 指令发送队列
-    private val sendCmdQueue: Queue<BleCmd> = LinkedList()
+    private val sendCmdQueue: ConcurrentLinkedQueue<BleCmd> = ConcurrentLinkedQueue()
 
     /// =========== Private Variables
     private var weakContext: WeakReference<Context>? = null
@@ -79,60 +80,7 @@ class BleManager private constructor() {
     //  - 系统蓝牙状态监听
     private lateinit var bleStateListener: BleStateListener
     //  - 蓝牙搜索回调
-    private var scanCallback: ScanCallback = object : ScanCallback() {
-        override fun onScanResult(callbackType: Int, result: ScanResult) {
-            val device = result.device
-            //  1、过滤：无名称设备
-            if (device.name.isNullOrEmpty()) {
-                return
-            }
-            //  2、过滤已经缓存过的对象
-            //  -- 由于已经过滤了重复项，所以不用担心会重复发送已经发送过的对象
-            if (scanResultTemp.firstOrNull { it.uuid == device.address } != null) {
-                return
-            }
-            //  3、通过蓝牙配置文件中的scan获取目标设备
-            val bleConfig = bleConfigs.firstOrNull { config -> config.scan.nameFilters.firstOrNull { filter ->
-                device.name.contains(filter)
-            }  != null
-            }
-            if (bleConfig == null) {
-                return
-            }
-            //  3、组装蓝牙数据
-            var deviceSn = device.name
-            //  - 3.1、获取SN数据
-            val snRule = bleConfig.scan.snRule
-            if (snRule != null) {
-                deviceSn = parseDataToObtainSn(result.scanRecord?.bytes, snRule)
-                //  - 3.2、阻断发送到Flutter
-                //  -- a、SN无法被解析的
-                //  -- b、不包含标识的设备
-                if (deviceSn.isEmpty() ||
-                    (snRule.filters.isNotEmpty() && !snRule.filters.any { deviceSn.contains(it) })) {
-                    return
-                }
-            }
-            //  4、发送设备到Flutter
-            //  - 4.1、创建设备自定义模型对象,并缓存
-            val bleDevice = device.toBleDevice(bleConfig, deviceSn, result.rssi)
-            scanResultTemp.add(bleDevice)
-            //  - 4.2、判断是否需要根据SN组合设备，不需要就直接提交
-            if (bleConfig.scan.matchCount < 2) {
-                sendMatchDevices(deviceSn, listOf(bleDevice))
-                return
-            }
-            //  - 4.3、从缓存中获取到相同的sn,
-            val matchDevices = scanResultTemp.filter { it.sn == bleDevice.sn }
-            //  -- 判断是否达到组合设备数量上限后，如果没有达到就不处理
-            if (matchDevices.size != bleConfig.scan.matchCount) {
-                return
-            }
-            sendMatchDevices(deviceSn, matchDevices)
-        }
-        override fun onBatchScanResults(results: List<ScanResult>) { Log.i(tag, "Start scan: batch = $results") }
-        override fun onScanFailed(errorCode: Int) { Log.e(tag, "Start scan: error = $errorCode") }
-    }
+    private var scanCallback: ScanCallback? = null
     //  - 当前蓝牙状态,默认无状态
     private var bleState: Int = 0
     //  - 当前蓝牙权限,默认无权限
@@ -238,6 +186,7 @@ class BleManager private constructor() {
         //  2、移除历史记录
         scanResultTemp.clear()
         //  3、执行搜索
+        scanCallback = createScanCallBack()
         bluetoothAdapter.bluetoothLeScanner?.startScan(null, scanSettings, scanCallback)
         Log.i(tag, "Start scan: success")
     }
@@ -250,6 +199,7 @@ class BleManager private constructor() {
             return
         }
         bluetoothAdapter.bluetoothLeScanner?.stopScan(scanCallback)
+        scanCallback = null
         Log.i(tag, if (isStartScan) "Start scan: checking if scan is already running, stopping it first if necessary" else "Stop scan: success")
     }
 
@@ -294,12 +244,14 @@ class BleManager private constructor() {
         //  4、获取新的连接对象
         val remoteDevice = bluetoothAdapter.getRemoteDevice(uuid)
         if (retryWhenNoFoudDevice && (remoteDevice == null || remoteDevice.name == null)) {
+            handleConnectState(uuid, BleConnectState.CONNECTING)
             startScan()
             mainScope.launch {
                 delay(3500)
                 stopScan()
                 connect(belongConfig, uuid, sn, isWaitingDevice, afterUpgrade, false)
             }
+            Log.w(tag,"Start connect: $uuid, can not get device from remote, start scan device to retry")
             return
         }
         if (remoteDevice == null || remoteDevice.name == null) {
@@ -513,6 +465,62 @@ class BleManager private constructor() {
         }
     }
 
+    /// 创建蓝牙搜索回调
+    private fun createScanCallBack(): ScanCallback = object : ScanCallback() {
+        override fun onScanResult(callbackType: Int, result: ScanResult) {
+            val device = result.device
+            //  1、过滤：无名称设备
+            if (device.name.isNullOrEmpty()) {
+                return
+            }
+            //  2、过滤已经缓存过的对象
+            //  -- 由于已经过滤了重复项，所以不用担心会重复发送已经发送过的对象
+            if (scanResultTemp.firstOrNull { it.uuid == device.address } != null) {
+                return
+            }
+            //  3、通过蓝牙配置文件中的scan获取目标设备
+            val bleConfig = bleConfigs.firstOrNull { config -> config.scan.nameFilters.firstOrNull { filter ->
+                device.name.contains(filter)
+            }  != null
+            }
+            if (bleConfig == null) {
+                return
+            }
+            //  3、组装蓝牙数据
+            var deviceSn = device.name
+            //  - 3.1、获取SN数据
+            val snRule = bleConfig.scan.snRule
+            if (snRule != null) {
+                deviceSn = parseDataToObtainSn(result.scanRecord?.bytes, snRule)
+                //  - 3.2、阻断发送到Flutter
+                //  -- a、SN无法被解析的
+                //  -- b、不包含标识的设备
+                if (deviceSn.isEmpty() ||
+                    (snRule.filters.isNotEmpty() && !snRule.filters.any { deviceSn.contains(it) })) {
+                    return
+                }
+            }
+            //  4、发送设备到Flutter
+            //  - 4.1、创建设备自定义模型对象,并缓存
+            val bleDevice = device.toBleDevice(bleConfig, deviceSn, result.rssi)
+            scanResultTemp.add(bleDevice)
+            //  - 4.2、判断是否需要根据SN组合设备，不需要就直接提交
+            if (bleConfig.scan.matchCount < 2) {
+                sendMatchDevices(deviceSn, listOf(bleDevice))
+                return
+            }
+            //  - 4.3、从缓存中获取到相同的sn,
+            val matchDevices = scanResultTemp.filter { it.sn == bleDevice.sn }
+            //  -- 判断是否达到组合设备数量上限后，如果没有达到就不处理
+            if (matchDevices.size != bleConfig.scan.matchCount) {
+                return
+            }
+            sendMatchDevices(deviceSn, matchDevices)
+        }
+        override fun onBatchScanResults(results: List<ScanResult>) { Log.i(tag, "Start scan: batch = $results") }
+        override fun onScanFailed(errorCode: Int) { Log.e(tag, "Start scan: error = $errorCode") }
+    }
+
     /**
      *  解析数据获取SN
      */
@@ -581,9 +589,14 @@ class BleManager private constructor() {
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 isPsHandleFinish = false
-                val isMyDevice = connectedDevices.any { it.uuid == device.address  }
-                if (!isMyDevice) {
+                val myDevice = connectedDevices.firstOrNull { it.uuid == device.address  }
+                if (myDevice == null)   {
                     Log.e(tag, "Connect call back: ${gatt.device.address}, not my connected device, state = STATE_DISCONNECTED(code:$status)")
+                    return
+                }
+                //  如果断连发生时已经在连接中了，就不要断连
+                if (myDevice.connectState.isConnecting) {
+                    Log.e(tag, "Connect call back: ${gatt.device.address}, is start new connecting, stop disconnect flow, keep connecting")
                     return
                 }
                 handleConnectState(device.address, BleConnectState.DISCONNECT_FROM_SYS)
@@ -783,23 +796,46 @@ class BleManager private constructor() {
      * 移除连接舍比gatt数据
      */
     private fun disconnectDevice(uuid: String) {
-        //  1、执行设备断连
+        // 假设 connectedDevices 是 CopyOnWriteArrayList
         val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
-        //  - 1.1、断连所有GATT
-        connectedDevice?.gattMap?.values?.forEach { gatt ->
-            gatt.gatt?.disconnect()
-            gatt.gatt?.close()
+        // connectedDevice 本身可能为 null，需要安全调用
+        connectedDevice?.let { device ->
+            // gattMap 是 ConcurrentHashMap，其 values 的迭代器是弱一致性的，forEach 是安全的
+            // gattMap.values 返回的是一个 Collection，可以安全迭代
+            device.gattMap.values.forEach { bleGatt -> // 重命名 gatt 变量以避免与 bleGatt.gatt 混淆
+                try {
+                    bleGatt.gatt?.disconnect()
+                } catch (e: Exception) {
+                    Log.w(tag, "Exception during gatt.disconnect for $uuid: ${e.message}")
+                }
+                try {
+                    bleGatt.gatt?.close()
+                } catch (e: Exception) {
+                    Log.w(tag, "Exception during gatt.close for $uuid: ${e.message}")
+                }
+            }
+            // ConcurrentHashMap.clear() 是线程安全的
+            device.gattMap.clear()
         }
-        connectedDevice?.gattMap?.clear()
-        //  2、移除待连接设备对象
-        val connectTemp =  waitingConnectDevices.firstOrNull {
-            it.uuid == uuid
+        // 假设 waitingConnectDevices 是 CopyOnWriteArrayList
+        // 为了更安全地移除，可以先找到再移除，或者使用 removeIf
+        var removedWaitingDevice: BleConnectTemp? = null
+        val iterator = waitingConnectDevices.iterator()
+        while (iterator.hasNext()) {
+            val temp = iterator.next()
+            if (temp.uuid == uuid) {
+                removedWaitingDevice = temp
+                // waitingConnectDevices.remove(temp) // CopyOnWriteArrayList 的迭代器不支持 remove
+                break // 假设 uuid 是唯一的，找到就跳出
+            }
         }
-        connectTemp?.timeoutTimer?.cancel()
-        connectTemp?.timeoutTimer = null
-        waitingConnectDevices.remove(connectTemp)
-        //  清楚剩余所有队列数据
-        sendCmdQueue.clear()
+        removedWaitingDevice?.let {
+            it.timeoutTimer?.cancel()
+            it.timeoutTimer = null
+            waitingConnectDevices.remove(it) // 在 CopyOnWriteArrayList 上 remove 对象是安全的
+        }
+        // 假设 sendCmdQueue 是 ConcurrentLinkedQueue
+        sendCmdQueue.clear() // ConcurrentLinkedQueue.clear() 是线程安全的
     }
 
     /**
