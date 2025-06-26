@@ -61,8 +61,6 @@ class BleManager private constructor() {
     }
     //  - 缓存已连接的设备
     private val connectedDevices: MutableList<BleDevice> = mutableListOf()
-    //  - 蓝牙连接回调
-    private val connectCallBacks: MutableList<Pair<String, BluetoothGattCallback>> = mutableListOf()
     //  - 搜素结果临时缓存(DeviceInfo, 蓝牙对象)
     private val scanResultTemp: MutableList<BleDevice> = mutableListOf()
     //  - 待连接设备缓存（UUID，SN）
@@ -259,7 +257,7 @@ class BleManager private constructor() {
      *  连接设备
      */
     @Synchronized
-    fun connect(belongConfig: String, uuid: String, sn: String, isWaitingDevice: Boolean = false, afterUpgrade: Boolean = false) {
+    fun connect(belongConfig: String, uuid: String, sn: String, isWaitingDevice: Boolean = false, afterUpgrade: Boolean = false, retryWhenNoFoudDevice: Boolean = true) {
         if (!checkIsFunctionCanBeCalled() ) {
             return
         }
@@ -295,6 +293,15 @@ class BleManager private constructor() {
         var bleDevice = connectedDevices.firstOrNull { it.uuid == uuid }
         //  4、获取新的连接对象
         val remoteDevice = bluetoothAdapter.getRemoteDevice(uuid)
+        if (retryWhenNoFoudDevice && (remoteDevice == null || remoteDevice.name == null)) {
+            startScan()
+            mainScope.launch {
+                delay(3500)
+                stopScan()
+                connect(belongConfig, uuid, sn, isWaitingDevice, afterUpgrade, false)
+            }
+            return
+        }
         if (remoteDevice == null || remoteDevice.name == null) {
             handleConnectState(uuid, BleConnectState.NO_DEVICE_FOUND)
             Log.w(tag,"Start connect: $uuid, no device found")
@@ -576,11 +583,11 @@ class BleManager private constructor() {
                 isPsHandleFinish = false
                 val isMyDevice = connectedDevices.any { it.uuid == device.address  }
                 if (!isMyDevice) {
-                    Log.e(tag, "Connect call back: ${gatt.device.address}, not my connected device, state = STATE_DISCONNECTED(code:0)")
+                    Log.e(tag, "Connect call back: ${gatt.device.address}, not my connected device, state = STATE_DISCONNECTED(code:$status)")
                     return
                 }
                 handleConnectState(device.address, BleConnectState.DISCONNECT_FROM_SYS)
-                Log.e(tag, "Connect call back: ${gatt.device.address}, state = STATE_DISCONNECTED(code:0)")
+                Log.e(tag, "Connect call back: ${gatt.device.address}, state = STATE_DISCONNECTED(code:$status)")
             }
         }
 
