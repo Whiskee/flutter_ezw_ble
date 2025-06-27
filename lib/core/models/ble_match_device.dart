@@ -18,6 +18,10 @@ class BleMatchDevice {
   //  - 是否正在连接
   bool get isConnecting =>
       devices.where((device) => device.connectState.isConnecting).isNotEmpty;
+  //  - 是否连接流程完成
+  bool get isConnectFinish =>
+      devices.where((device) => device.connectState.isConnectFinish).length ==
+      devices.length;
   //  - 是否已经连接上
   bool get isConnected =>
       devices.where((device) => device.connectState.isConnected).length ==
