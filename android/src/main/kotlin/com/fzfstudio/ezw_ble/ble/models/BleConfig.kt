@@ -20,7 +20,7 @@ data class BleConfig(
 ): GsonSerializable() {
 
     companion object {
-        fun empty(): BleConfig = BleConfig("", BleScan.empty(), listOf(), true, 15000.0, 60000.0, 512)
+        fun empty(): BleConfig = BleConfig("", BleScan.empty(), listOf(), true, 15000.0, 60000.0, 247)
     }
 
     /**

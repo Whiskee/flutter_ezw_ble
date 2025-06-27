@@ -12,7 +12,7 @@
 struct BleConnectModel: Codable {
     var uuid: String
     var connectState: BleConnectState
-    var mtu: Int = 512
+    var mtu: Int = 247
 }
 
 enum BleConnectState: String, Codable {

@@ -15,6 +15,13 @@ struct BleConnectedDevice {
     var writeCharsDic: [Int: CBCharacteristic] = [:]
     var readCharsDic: [Int: CBCharacteristic] = [:]
     var isConnected: Bool = false
+    var readCharsNotify: Int = 0
+    
+    var isReadCharsNotifySuccess: Bool {
+        get {
+            return readCharsNotify == readCharsDic.count
+        }
+    }
     
     /**
      *  更新连接设备信息
