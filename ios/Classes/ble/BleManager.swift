@@ -659,19 +659,22 @@ extension BleManager: CBCentralManagerDelegate {
             handleConnectState(uuid: peripheral.identifier.uuidString, state: .noBleConfigFound)
             return
         }
-        //  2、与设备取得首次连接,缓存连接设备
-        let uuid = peripheral.identifier.uuidString
-        connectedDevices.removeAll { device in
-            device.peripheral.identifier.uuidString == uuid
+        //  2、等待1秒后再执行服务搜索
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            //  2、与设备取得首次连接,缓存连接设备
+            let uuid = peripheral.identifier.uuidString
+            self?.connectedDevices.removeAll { device in
+                device.peripheral.identifier.uuidString == uuid
+            }
+            self?.connectedDevices.append(BleConnectedDevice(belongConfig: bleConfig, peripheral: peripheral))
+            //  3、获取设备服务
+            peripheral.delegate = self
+            let services = bleConfig.privateServices.map { $0.serviceUUID }
+            peripheral.discoverServices(services)
+            //  4、发送日志
+            self?.handleConnectState(uuid: peripheral.identifier.uuidString, state: .searchService)
+            self?.logger?("[d]-BleManager::didConnect: \(peripheral.identifier.uuidString)")
         }
-        connectedDevices.append(BleConnectedDevice(belongConfig: bleConfig, peripheral: peripheral))
-        //  3、获取设备服务
-        peripheral.delegate = self
-        let services = bleConfig.privateServices.map { $0.serviceUUID }
-        peripheral.discoverServices(services)
-        //  4、发送日志
-        handleConnectState(uuid: peripheral.identifier.uuidString, state: .searchService)
-        logger?("[d]-BleManager::didConnect: \(peripheral.identifier.uuidString)")
     }
 
     /**
@@ -829,11 +832,11 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
         var connectedDevice = connectedDevices[connectedIndex]
         connectedDevice.readCharsNotify += 1
         connectedDevices[connectedIndex] = connectedDevice
-        if connectedDevice.writeCharsDic.keys.count == currentConfig.privateServices.count, connectedDevice.isReadCharsNotifySuccess, !connectedDevice.isConnected {
+        if connectedDevice.isReadCharsNotifySuccess, !connectedDevice.isConnected {
             //  获取MTU
             let mtu = getDeviceMTU(peripheral: peripheral)
             self.handleConnectState(uuid: peripheral.identifier.uuidString, state: .connectFinish, mtu: mtu)
-            logger?("[d]-BleManager::update notification state: \(peripheral.identifier.uuidString), connect finish = writeCharsCount = \(connectedDevice.writeCharsDic.keys.count), ps = \(currentConfig.privateServices.count)")
+            logger?("[d]-BleManager::update notification state: \(peripheral.identifier.uuidString), connect finish, writeCharsCount = \(connectedDevice.writeCharsDic.keys.count), ps = \(currentConfig.privateServices.count)")
         }
 
     }

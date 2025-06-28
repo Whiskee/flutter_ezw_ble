@@ -28,6 +28,7 @@ import com.fzfstudio.ezw_ble.ble.models.BleDevice
 import com.fzfstudio.ezw_ble.ble.models.BleGatt
 import com.fzfstudio.ezw_ble.ble.models.BleMatchDevice
 import com.fzfstudio.ezw_ble.ble.models.BleSnRule
+import com.fzfstudio.ezw_ble.ble.models.BluetoothGattStatus
 import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
 import com.fzfstudio.ezw_ble.ble.services.BleStateListener
 import com.fzfstudio.ezw_ble.ble.services.BleStateListener.BluetoothStateCallback
@@ -600,7 +601,7 @@ class BleManager private constructor() {
                     return
                 }
                 handleConnectState(device.address, BleConnectState.DISCONNECT_FROM_SYS)
-                Log.e(tag, "Connect call back: ${gatt.device.address}, state = STATE_DISCONNECTED(code:$status)")
+                Log.e(tag, "Connect call back: ${gatt.device.address}, state = STATE_DISCONNECTED(code:${BluetoothGattStatus.getStatusDescription(status)})")
             }
         }
 
