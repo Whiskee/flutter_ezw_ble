@@ -702,6 +702,7 @@ class BleManager private constructor() {
             }
         }
 
+        /// 写入数据回调
         override fun onCharacteristicWrite(
             gatt: BluetoothGatt?,
             characteristic: BluetoothGattCharacteristic?,
