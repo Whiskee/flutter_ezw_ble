@@ -842,7 +842,7 @@ class BleManager private constructor() {
     /**
      *  处理连接状态
      */
-    private fun handleConnectState(uuid: String, state: BleConnectState, mtu: Int = 512) {
+    private fun handleConnectState(uuid: String, state: BleConnectState, mtu: Int = 247) {
         //  1、处理断连和错误连接
         if (state.isDisconnected || state.isError) {
             disconnectDevice(uuid)
