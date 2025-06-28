@@ -668,39 +668,56 @@ class BleManager private constructor() {
             processNextDescriptor(gatt)
         }
 
-        override fun onCharacteristicRead(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            value: ByteArray,
-            status: Int
+        //  发送数据后回调(未来会被废弃，但是目前是可以兼容所有蓝牙推送)
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt?,
+            characteristic: BluetoothGattCharacteristic?
         ) {
-            super.onCharacteristicRead(gatt, characteristic, value, status)
-            Log.i(tag, "Connect call back: ${gatt.device.address}, read uuid = ${characteristic.uuid}, read chars value = ${value.toHexString()}, status = $status")
+            super.onCharacteristicChanged(gatt, characteristic)
+            if (gatt == null || characteristic == null) {
+                Log.i(tag, "Receive cmd: ${gatt?.device?.address} receive fail, gatt or characteristic is null")
+                return
+            }
+            val connectedDevice = findConnectedDevice(gatt.device.address)
+            //  1、获取配置中的私有服务
+            val currentUuid = connectedDevice?.belongConfig?.privateServices?.firstOrNull { uuid ->
+                uuid.readCharsUUID == characteristic.uuid
+            }
+            if (currentUuid == null) {
+                Log.i(tag, "Receive cmd: ${gatt.device.address} receive fail, not found current uuid")
+                return
+            }
+            //  2、解析数据
+            val bleCmdMap = BleCmd(gatt.device.address, currentUuid.type, characteristic.value, true).toMap()
+            mainScope.launch {
+                BleEC.RECEIVE_DATA.event?.success(bleCmdMap)
+            }
+            Log.i(tag, "Receive cmd: ${gatt.device.address}\n--type=${currentUuid.type}\n--length=${characteristic.value.size}\n--chartsType=${characteristic.writeType}\n--data=${characteristic.value.toHexString()}")
         }
 
-        //  发送数据后回调
-        override fun onCharacteristicChanged(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            value: ByteArray
-        ) {
-            super.onCharacteristicChanged(gatt, characteristic, value)
-            mainScope.launch {
-                val connectedDevice = findConnectedDevice(gatt.device.address)
-                //  1、获取配置中的私有服务
-                val currentUuid = connectedDevice?.belongConfig?.privateServices?.firstOrNull { uuid ->
-                    uuid.readCharsUUID == characteristic.uuid
-                }
-                if (currentUuid == null) {
-                    Log.i(tag, "Receive cmd: ${gatt.device.address} receive fail, not found current uuid")
-                    return@launch
-                }
-                //  2、解析数据
-                val bleCmdMap = BleCmd(gatt.device.address, currentUuid.type, value, true).toMap()
-                BleEC.RECEIVE_DATA.event?.success(bleCmdMap)
-                Log.i(tag, "Receive cmd: ${gatt.device.address}\n--type=${currentUuid.type}\n--length=${value.size}\n--chartsType=${characteristic.writeType}\n--data=${value.toHexString()}")
-            }
-        }
+//        //  发送数据后回调（新指令推送接口，有不兼容风险）
+//        override fun onCharacteristicChanged(
+//            gatt: BluetoothGatt,
+//            characteristic: BluetoothGattCharacteristic,
+//            value: ByteArray
+//        ) {
+//            super.onCharacteristicChanged(gatt, characteristic, value)
+//            val connectedDevice = findConnectedDevice(gatt.device.address)
+//            //  1、获取配置中的私有服务
+//            val currentUuid = connectedDevice?.belongConfig?.privateServices?.firstOrNull { uuid ->
+//                uuid.readCharsUUID == characteristic.uuid
+//            }
+//            if (currentUuid == null) {
+//                Log.i(tag, "Receive cmd: ${gatt.device.address} receive fail, not found current uuid")
+//                return
+//            }
+//            //  2、解析数据
+//            val bleCmdMap = BleCmd(gatt.device.address, currentUuid.type, value, true).toMap()
+//            mainScope.launch {
+//                BleEC.RECEIVE_DATA.event?.success(bleCmdMap)
+//            }
+//            Log.i(tag, "Receive cmd: ${gatt.device.address}\n--type=${currentUuid.type}\n--length=${value.size}\n--chartsType=${characteristic.writeType}\n--data=${value.toHexString()}")
+//        }
 
         /// 写入数据回调
         override fun onCharacteristicWrite(
@@ -712,8 +729,8 @@ class BleManager private constructor() {
             gatt?.device?.address?.let { uuid ->
                 sendCmdQueue.poll()?.let { cmd ->
                     connectedDevices.firstOrNull { it.uuid == uuid }?.writeCharacteristic(cmd.data, cmd.psType)
+                    Log.i(tag, "Send cmd: ${gatt.device.address}, write call back is success = ${status == BluetoothGatt.GATT_SUCCESS}")
                 }
-                Log.i(tag, "Send cmd: ${gatt.device.address}, write call back is success = ${status == BluetoothGatt.GATT_SUCCESS}")
             }
         }
 

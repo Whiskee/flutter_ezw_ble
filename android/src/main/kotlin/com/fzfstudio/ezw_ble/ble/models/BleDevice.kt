@@ -70,7 +70,7 @@ class BleDevice(
         if (!isSuccess) {
             BleEC.RECEIVE_DATA.event?.success(BleCmd.fail(uuid, psType).toMap())
         }
-        Log.i(tag, "Send cmd: $uuid is success = ${isSuccess}\n--type=$psType\n--length=${data.size}\n--data=${data.toHexString()}")
+        Log.i(tag, "Send cmd: $uuid is success = ${isSuccess}\n--name=$name\n--type=$psType\n--length=${data.size}\n--data=${data.toHexString()}")
         return true
     }
 }
