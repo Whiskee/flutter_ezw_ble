@@ -692,7 +692,7 @@ class BleManager private constructor() {
             mainScope.launch {
                 BleEC.RECEIVE_DATA.event?.success(bleCmdMap)
             }
-            Log.i(tag, "Receive cmd: ${gatt.device.address}\n--type=${currentUuid.type}\n--length=${characteristic.value.size}\n--chartsType=${characteristic.writeType}\n--data=${characteristic.value.toHexString()}")
+            Log.i(tag, "Receive cmd（old）: ${gatt.device.address}\n--type=${currentUuid.type}\n--length=${characteristic.value.size}\n--chartsType=${characteristic.writeType}\n--data=${characteristic.value.toHexString()}")
         }
 
 //        //  发送数据后回调（新指令推送接口，有不兼容风险）
@@ -716,7 +716,7 @@ class BleManager private constructor() {
 //            mainScope.launch {
 //                BleEC.RECEIVE_DATA.event?.success(bleCmdMap)
 //            }
-//            Log.i(tag, "Receive cmd: ${gatt.device.address}\n--type=${currentUuid.type}\n--length=${value.size}\n--chartsType=${characteristic.writeType}\n--data=${value.toHexString()}")
+//            Log.i(tag, "Receive cmd（new）: ${gatt.device.address}\n--type=${currentUuid.type}\n--length=${value.size}\n--chartsType=${characteristic.writeType}\n--data=${value.toHexString()}")
 //        }
 
         /// 写入数据回调

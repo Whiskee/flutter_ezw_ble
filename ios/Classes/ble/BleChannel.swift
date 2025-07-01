@@ -1,6 +1,6 @@
 //
 //  BleChannel.swift
-//  Pods
+//  flutter_ezw_ble
 //
 //  Created by Whiskee on 2025/1/3.
 //
@@ -76,11 +76,10 @@ enum BleMC: String {
             break
         case .connectDevice:
             let jsonData: [String:Any] = arguments as? [String:Any] ?? [:]
-            let belongConfig: String = jsonData["belongConfig"] as? String ?? ""
-            let uuid = jsonData["uuid"] as? String ?? ""
-            let name = jsonData["name"] as? String  ?? ""
-            let afterUpgrade = jsonData["afterUpgrade"] as? Bool ?? false
-            BleManager.shared.connect(belongConfig: belongConfig, uuid: uuid, name: name, afterUpgrade: afterUpgrade)
+            let easyConnect: BleEasyConnect? = jsonData.decodeTo()
+            if let easyConnect: BleEasyConnect = jsonData.decodeTo() {
+                BleManager.shared.connect(easyConnect: easyConnect)
+            }
             break
         case .deviceConnected:
             let uuid = arguments as? String ?? ""

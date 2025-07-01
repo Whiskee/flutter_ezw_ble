@@ -1,6 +1,6 @@
 //
 //  BleConnectState.swift
-//  EvenConnect
+//  flutter_ezw_ble
 //
 //  特别说明：
 //  1、本连接流程是系统蓝牙连接的标准流程，如有业务上的连接需求，请在Connected完成后自行处理

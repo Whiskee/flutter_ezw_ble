@@ -1,6 +1,6 @@
 //
 //  CBPeripheral+.swift
-//  EvenConnect
+//  flutter_ezw_ble
 //
 //  Created by Whiskee on 2025/1/3.
 //
