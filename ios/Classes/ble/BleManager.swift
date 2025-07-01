@@ -909,24 +909,29 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             logger?("[e]-BleManager::cmd response: \(peripheral.identifier.uuidString), error = \(String(describing: error))")
             return
         }
-        //  1、获取对应的私有服务类型
-        guard let currentConfig = waitingConnectDevices.first(where: { easyConnect in
-            easyConnect.uuid == peripheral.identifier.uuidString
-        })?.bleConfig,
-                let privateService = currentConfig.privateServices.first(where: { uuid in
+        //  1、检查是否有应答数据
+        guard let data = characteristic.value else {
+            logger?("[e]-BleManager::cmd response: \(peripheral.identifier.uuidString), error = No data")
+            return
+        }
+        //  2、设备是否存在并连接中
+        guard let device = connectedDevices.first(where: { device in
+            device.peripheral.identifier.uuidString == peripheral.identifier.uuidString
+        }), device.isConnected else {
+            logger?("[e]-BleManager::cmd response: \(peripheral.identifier.uuidString), device had already disconnected")
+            return
+        }
+        //  3、获取对应的私有服务类型
+        guard let privateService = device.belongConfig.privateServices.first(where: { uuid in
             uuid.readCharUUID == characteristic.uuid
         }) else {
             logger?("[e]-BleManager::cmd response: \(peripheral.identifier.uuidString), can not find chars")
             return
         }
-        //  2、检查是否有应答数据
-        guard let data = characteristic.value else {
-            logger?("[e]-BleManager::cmd response: \(peripheral.identifier.uuidString), error = No data")
-            return
-        }
+        //  4、发送指令到flutter
         let bleCmdMap = BleCmd(uuid: peripheral.identifier.uuidString, psType: privateService.type, data: data, isSuccess: error == nil).toMap()
         BleEC.receiveData.event()?(bleCmdMap)
-        logger?("[d]-BleManager::cmd response: \(peripheral.identifier.uuidString), chars = \(characteristic.uuid.uuidString), data = \(data.hexString())")
+        logger?("[d]-BleManager::cmd response（char）: \(peripheral.identifier.uuidString), chars = \(characteristic.uuid.uuidString), data = \(data.hexString())")
     }
     
 }
