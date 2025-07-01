@@ -917,7 +917,7 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
         //  2、设备是否存在并连接中
         guard let device = connectedDevices.first(where: { device in
             device.peripheral.identifier.uuidString == peripheral.identifier.uuidString
-        }), device.isConnected else {
+        }) else {
             logger?("[e]-BleManager::cmd response: \(peripheral.identifier.uuidString), device had already disconnected")
             return
         }
