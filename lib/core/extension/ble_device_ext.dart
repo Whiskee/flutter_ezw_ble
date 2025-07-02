@@ -17,8 +17,4 @@ extension RxMatchDeviceExt on Rx<BleMatchDevice?> {
     device?.connectState = connectModel.connectState;
     value = oldDevice;
   }
-
-  ///  进入升级状态
-  void otaUpgrading(String uuid) =>
-      update(BleConnectModel(uuid, BleConnectState.upgrade));
 }

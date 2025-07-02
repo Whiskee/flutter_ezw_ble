@@ -7,12 +7,14 @@ part 'ble_connect_model.g.dart';
 @JsonSerializable()
 class BleConnectModel {
   final String uuid;
+  final String name;
   @ConnectStateListConverter()
   final BleConnectState connectState;
   final int mtu;
 
   BleConnectModel(
     this.uuid,
+    this.name,
     this.connectState, {
     this.mtu = 512,
   });

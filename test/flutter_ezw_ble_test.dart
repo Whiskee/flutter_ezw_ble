@@ -1,8 +1,8 @@
 import 'dart:typed_data';
 
+import 'package:flutter_ezw_ble/core/models/ble_config.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_method_channel.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_platform_interface.dart';
-import 'package:flutter_ezw_ble/core/models/ble_config.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
@@ -38,6 +38,7 @@ class MockFlutterEzwBlePlatform
   Future<void> connectDevice(
     String belongConfig,
     String uuid, {
+    String? name,
     String? sn,
     bool? afterUpgrade,
   }) {

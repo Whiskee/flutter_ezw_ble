@@ -10,11 +10,11 @@ part 'ble_device.g.dart';
 @JsonSerializable()
 class BleDevice {
   final String belongConfig;
-  final String name;
   //  iOS为UUID，Android为MAC地址
-  final String uuid;
-  final String sn;
-  final int rssi;
+  String uuid;
+  String name;
+  String sn;
+  int rssi;
   //  MAC地址，Android MAC地址等于UUID
   String mac;
 
@@ -27,8 +27,8 @@ class BleDevice {
 
   BleDevice(
     this.belongConfig,
-    this.name,
     this.uuid,
+    this.name,
     this.sn,
     this.rssi, {
     this.mac = '',
@@ -46,8 +46,8 @@ class BleDevice {
 
   BleDevice copy() => BleDevice(
         belongConfig,
-        name,
         uuid,
+        name,
         sn,
         rssi,
         mac: mac,

@@ -11,6 +11,7 @@
 
 struct BleConnectModel: Codable {
     var uuid: String
+    var name: String
     var connectState: BleConnectState
     var mtu: Int = 247
 }
