@@ -75,10 +75,11 @@ enum class BleMC {
                 val jsonMap = arguments as Map<*, *>?
                 val belongConfig = jsonMap?.get("belongConfig") as String??: ""
                 val uuid = jsonMap?.get("uuid") as String? ?: ""
+                val name = jsonMap?.get("name") as String? ?: ""
                 val sn = jsonMap?.get("sn") as String? ?: ""
                 val afterUpgrade = jsonMap?.get("afterUpgrade") as Boolean? == true
                 if (uuid.isNotEmpty() && sn.isNotEmpty()) {
-                    BleManager.instance.connect(belongConfig, uuid, sn, afterUpgrade = afterUpgrade)
+                    BleManager.instance.connect(belongConfig, uuid, name, sn, afterUpgrade = afterUpgrade)
                 }
             }
             DISCONNECT_DEVICE -> {

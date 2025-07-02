@@ -35,8 +35,8 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
   @override
   Future<void> connectDevice(
     String belongConfig,
-    String uuid, {
-    String? name,
+    String uuid,
+    String name, {
     String? sn,
     bool? afterUpgrade,
   }) async =>

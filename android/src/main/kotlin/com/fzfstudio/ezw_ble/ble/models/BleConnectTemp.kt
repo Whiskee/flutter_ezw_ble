@@ -6,6 +6,7 @@ import java.util.Timer
 data class BleConnectTemp(
     val belongConfig: BleConfig,
     val uuid: String,
+    val name: String,
     val sn: String,
     var afterUpgrade: Boolean,
 ) {
