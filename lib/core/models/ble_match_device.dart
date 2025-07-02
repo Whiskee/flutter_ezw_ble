@@ -49,4 +49,12 @@ class BleMatchDevice {
 
   @override
   String toString() => jsonEncode(toJson());
+
+  /// 是否是同一个设备
+  bool isSameDevice(BleMatchDevice other) {
+    return sn == other.sn &&
+        devices.length == other.devices.length &&
+        devices.every((device) => other.devices
+            .any((otherDevice) => otherDevice.uuid == device.uuid));
+  }
 }
