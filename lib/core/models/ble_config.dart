@@ -29,7 +29,7 @@ class BleConfig {
     this.initiateBinding = false,
     this.connectTimeout = 15000,
     this.upgradeSwapTime = 60000,
-    this.mtu = 512,
+    this.mtu = 247,
   });
 
   factory BleConfig.fromJson(Map<String, dynamic> json) =>
