@@ -8,8 +8,8 @@
 /// 简单连接参数
 struct BleEasyConnect: Codable {
     let belongConfig: String
-    let uuid: String
-    let name: String
+    var uuid: String
+    var name: String
     var afterUpgrade: Bool = false
     var time: TimeInterval?
     
