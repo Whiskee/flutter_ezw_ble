@@ -585,9 +585,9 @@ class BleManager private constructor() {
         //  连接状态监听
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             val device = gatt.device
+            descriptorQueue.clear()
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 mainScope.launch {
-                    descriptorQueue.clear()
                     delay(500)
                     gatt.discoverServices()
                     handleConnectState(device.address, device.name, BleConnectState.SEARCH_SERVICE)
