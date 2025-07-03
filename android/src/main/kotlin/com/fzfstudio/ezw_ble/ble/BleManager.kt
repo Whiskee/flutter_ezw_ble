@@ -775,7 +775,7 @@ class BleManager private constructor() {
                 descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                 gatt.writeDescriptor(descriptor)
             }
-            Log.i(tag, "Connect call back: ${gatt.device.address}, psType=${item.first}, enable descriptor and write = $isWrite")
+            Log.i(tag, "Connect call back: ${gatt.device.address}, desUuid = ${descriptor.uuid}, chars = ${descriptor.characteristic.uuid}, psType=${item.first}, enable descriptor and write = $isWrite")
         }
 
         /**
