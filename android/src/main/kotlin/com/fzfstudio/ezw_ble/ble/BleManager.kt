@@ -587,6 +587,7 @@ class BleManager private constructor() {
             val device = gatt.device
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 mainScope.launch {
+                    descriptorQueue.clear()
                     delay(500)
                     gatt.discoverServices()
                     handleConnectState(device.address, device.name, BleConnectState.SEARCH_SERVICE)
