@@ -444,7 +444,11 @@ class BleManager private constructor() {
             }
             //  2、如果没有绑定成功就结束
             if (!isBonded) {
-                if (connectedDevice.connectState.isConnecting) {
+                //  - 存在已经配对过的设备，蓝牙密钥信息丢失，
+                //  - 发起连接会立马返回断连或则绑定失败，导致执行了断连，此时超时连接定时器已经关闭
+                //  - 但是此时服务搜索又可以执行，会使连接进入连接中，一直无法退出
+                //  - 所以阻断执行boundFail的流程，等待超时关闭连接
+                if (connectedDevice.connectState.isConnecting || connectedDevice.connectState.isDisconnected) {
                     return
                 }
                 Log.e( tag, "Ble status listener - bond state: ${device.address} unable to bind")
