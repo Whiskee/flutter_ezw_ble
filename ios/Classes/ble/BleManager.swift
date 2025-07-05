@@ -22,8 +22,6 @@ class BleManager: NSObject {
     private lazy var connectedDevices: [BleConnectedDevice] = []
     
     //  =========== Variables
-    //  - 蓝牙状态
-    private lazy var bleState: Int = 0
     //  - 当前蓝牙基础配置，必须实现
     private lazy var bleConfigs: [BleConfig] = []
     //  - 搜素：获取结果临时缓存(DeviceInfo, 蓝牙对象)
@@ -41,7 +39,7 @@ class BleManager: NSObject {
     //  - 当前蓝牙状态
     var currentBleState: Int {
         get {
-            return bleState
+            return centralManager.state.rawValue
         }
     }
     // - flutte日志
@@ -294,8 +292,8 @@ extension BleManager {
      * 1、检查蓝牙状态，2、检查是否启用蓝牙配置
     */
     private func checkIsFunctionCanBeCalled() -> Bool {
-           if (bleState != 5) {
-               logger?("[d]-BleManager::checkBleConfigIsConfigured: ble status = \(self.bleState)")
+           if (currentBleState != 5) {
+               logger?("[d]-BleManager::checkBleConfigIsConfigured: ble status = \(currentBleState)")
                return false
            }
            if (!checkBleConfigIsConfigured()) {
@@ -618,8 +616,7 @@ extension BleManager: CBCentralManagerDelegate {
      *  蓝牙状态监听
      */
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        bleState = central.state.rawValue
-        BleEC.bleState.event()?(bleState)
+        BleEC.bleState.event()?(central.state.rawValue)
         logger?("[d]-BleManager::centralManagerDidUpdateState: State = \(central.state.label), code = \(central.state.rawValue)")
     }
     
