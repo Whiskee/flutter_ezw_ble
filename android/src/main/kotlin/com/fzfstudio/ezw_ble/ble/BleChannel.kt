@@ -139,7 +139,9 @@ enum class BleEC {
     //  连接状态
     CONNECT_STATUS,
     //  接收数据
-    RECEIVE_DATA;
+    RECEIVE_DATA,
+    //  日志
+    LOGGER;
 
     //  自定义事件名称
     private val eventLabel: String
