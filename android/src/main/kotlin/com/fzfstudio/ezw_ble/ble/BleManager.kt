@@ -372,7 +372,7 @@ class BleManager private constructor() {
      *  检查是否添加了蓝牙配置
      */
     private fun checkBleConfigIsConfigured(): Boolean {
-        val commonPs = bleConfigs.first().privateServices.firstOrNull()
+        val commonPs = bleConfigs.firstOrNull()?.privateServices?.firstOrNull()
         if (commonPs == null) {
             sendLog(BleLoggerTag.e, "CheckBleConfigIsConfigured: Bluetooth configuration has not been configured or not setting private service yet")
             return false
