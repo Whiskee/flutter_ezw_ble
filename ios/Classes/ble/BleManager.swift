@@ -431,7 +431,7 @@ extension BleManager {
                 //  -- 1.3.3、检查待连接设备的uuid是否为空，如果为空就补全
                 if var easyConnect = waitingConnectDevices.first(where: { easyConnect in
                     easyConnect.uuid == peripheral.identifier.uuidString || easyConnect.name == peripheral.name
-                }), easyConnect.uuid.isEmpty  {
+                }), easyConnect.uuid.isEmpty || easyConnect.uuid != peripheral.identifier.uuidString  {
                     easyConnect.uuid = peripheral.identifier.uuidString
                 }
                 //  -- 1.3.4、再次更新连接状态
