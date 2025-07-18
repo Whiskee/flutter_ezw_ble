@@ -101,10 +101,7 @@ extension BleManager {
         guard checkIsFunctionCanBeCalled() else {
             return
         }
-        //  2、前置操作
-        //  - 2.1、停止搜索
-        stopScan()
-        //  - 2.1、非升级状态需要移除升级设备
+        //  2、非升级状态需要移除升级设备
         if !easyConnect.afterUpgrade {
             upgradeDevices?.removeAll(where: {$0 == easyConnect.uuid})
         }
@@ -139,8 +136,10 @@ extension BleManager {
             logger?("[d]-BleManage::connect-flow: \(easyConnect.uuid), will start connect when last conect finish")
             return
         }
-        //  4、执行连接
-        //  - 4.1、查询已连接的设备
+        //  4、停止搜索
+        stopScan()
+        //  5、开始执行连接
+        //  - 5.1、查询已连接的设备
         if let device = connectedDevices.first(where: { device in
             device.peripheral.identifier.uuidString == easyConnect.uuid || device.peripheral.name == easyConnect.name
         }) {
@@ -150,7 +149,7 @@ extension BleManager {
             startConnectingCountdown(currentConfig: bleConfig, uuid: newEasyConnect.uuid, name: newEasyConnect.name, afterUpgrade: easyConnect.afterUpgrade)
             logger?("[d]-BleManage::connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), from connected device list, after upgrade \(easyConnect.afterUpgrade)")
         }
-        //  - 4.2、在缓存中查找对应的设备
+        //  - 5.2、在缓存中查找对应的设备
         else if let temp = scanResultTemp.first(where: { info in
             return info.0.uuid == easyConnect.uuid || info.1.name == easyConnect.name
         }) {
@@ -160,7 +159,7 @@ extension BleManager {
             startConnectingCountdown(currentConfig: bleConfig, uuid: newEasyConnect.uuid, name: newEasyConnect.name, afterUpgrade: easyConnect.afterUpgrade)
             logger?("[d]-BleManage::connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), from scan resul temp, after upgrade \(easyConnect.afterUpgrade)")
         }
-        //  - 4.3、获取蓝牙设置页面中是否有符合的设备
+        //  - 5.3、获取蓝牙设置页面中是否有符合的设备
         else if let device = findPeripheralFromConnected(uuid: easyConnect.uuid, name: easyConnect.name, psUUID: commonPs.serviceUUID) {
             newEasyConnect.uuid = device.identifier.uuidString
             centralManager.connect(device)
@@ -170,7 +169,7 @@ extension BleManager {
             startConnectingCountdown(currentConfig: bleConfig, uuid: newEasyConnect.uuid, name: newEasyConnect.name, afterUpgrade: easyConnect.afterUpgrade)
             logger?("[d]-BleManage::connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), from bluetooth setting, after upgrade \(easyConnect.afterUpgrade)")
         }
-        //  - 4.4、通过ServiceUUID查询
+        //  - 5.4、通过ServiceUUID查询
         else {
             //  -- 添加待连接的设备
             startConnectInfos.append(newEasyConnect)
@@ -689,7 +688,7 @@ extension BleManager: CBCentralManagerDelegate {
             info.0
         }
         //  -- 判断是否达到组合设备数量上限后，如果没有达到就不处理
-        guard matchDevices.count >= bleConfig.scan.matchCount else {
+        guard matchDevices.count == bleConfig.scan.matchCount else {
             return
         }
         sendMatchDevices(sn: deviceSn, devices: matchDevices)
