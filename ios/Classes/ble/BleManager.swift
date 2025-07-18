@@ -225,7 +225,7 @@ extension BleManager {
             return
         }
         // 如果设备在升级中且不是OTA指令，则不允许发送
-        guard upgradeDevices?.contains(where: {$0 == uuid}) != true || psType != 1 else {
+        guard upgradeDevices?.contains(where: {$0 == uuid}) != true || psType == 1 else {
             logger?("[d]-BleManage::sendCmd: \(uuid), type=\(psType), cannot send non-OTA commands during upgrade")
             return
         }
