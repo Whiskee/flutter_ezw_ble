@@ -41,6 +41,8 @@ enum class BleConnectState {
     CONNECTED,
     //  升级状态
     UPGRADE,
+    //  系统错误
+    SYSTEM_ERROR,
     //  无状态
     NONE;
 
@@ -83,5 +85,6 @@ enum class BleConnectState {
                 this == BOUND_FAIL ||
                 this == SERVICE_FAIL ||
                 this == CHARS_FAIL ||
-                this == TIMEOUT
+                this == TIMEOUT ||
+                this == SYSTEM_ERROR
 }

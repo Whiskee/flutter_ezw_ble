@@ -55,6 +55,8 @@ enum BleConnectState: String, Codable {
     case connected
     //  升级模式
     case upgrade
+    //  系统错误
+    case systemError
     
     /**
      *  是否正在连接中
@@ -100,6 +102,7 @@ enum BleConnectState: String, Codable {
         self == .boundFail ||
         self == .serviceFail ||
         self == .charsFail ||
-        self == .timeout
+        self == .timeout ||
+        self == .systemError
     }
 }

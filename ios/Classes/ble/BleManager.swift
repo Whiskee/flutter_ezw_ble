@@ -578,12 +578,18 @@ extension BleManager {
             waitingConnectDevices.removeAll { easyConnect in
                 easyConnect.uuid == uuid || easyConnect.name == name
             }
-            //  -- 3.2、如果连接失败或断连，则移除所有等待连接设备
-            if state.isError() {
+            //  -- 3.2、如果连接失败(超时除外)，则移除所有等待连接设备
+            if state.isError() && state != .timeout {
+                //  设置所有设备为连接失败
+                waitingConnectDevices.forEach { connect in
+                    let connectModel = BleConnectModel(uuid: uuid, name: name, connectState: state, mtu: mtu)
+                    let jsonString = try? connectModel.toJsonString() ?? ""
+                    BleEC.connectStatus.event()?(jsonString)
+                }
                 waitingConnectDevices.removeAll()
             }
-            //  -- 3.3、如果连接成功，则连接下一个
-            else if state.isConnected(), let newConnect = waitingConnectDevices.first {
+            //  -- 3.3 、没有成功也要连接下一个，避免一致下一次重连进不来
+            else if let newConnect = waitingConnectDevices.first {
                 connect(easyConnect: newConnect)
             }
             //  打印待连接设备数量
@@ -741,7 +747,7 @@ extension BleManager: CBCentralManagerDelegate {
      * 设备连接失败回调
      */
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .disconnectFromSys)
+        handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .systemError)
         logger?("[e]-BleManager::didFailToConnect：\(peripheral.identifier.uuidString), Error = \(String(describing: error))")
     }
 
