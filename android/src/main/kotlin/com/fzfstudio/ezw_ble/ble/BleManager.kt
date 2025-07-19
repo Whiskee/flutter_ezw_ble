@@ -232,10 +232,11 @@ class BleManager private constructor() {
             waitingConnectDevices.add(BleConnectTemp(bleConfig, uuid, name, sn, afterUpgrade))
         }
         if (waitingConnectDevices.size > 1) {
-            val currentIndex = waitingConnectDevices.indexOfFirst { it.uuid == uuid }
-            val lastDevice = waitingConnectDevices[currentIndex - 1]
+            //  - 4.1、设置待连接设备进入连接状态，并等待上一个设备完成
             handleConnectState(uuid, name, BleConnectState.CONNECTING)
-            sendLog(BleLoggerTag.e, "Start connect: $uuid, waiting ${lastDevice.uuid} finish connecting")
+            //  - 4.2、打印上一个正在连接的设备
+            val lastDevice = waitingConnectDevices.firstOrNull { it.uuid != uuid }
+            sendLog(BleLoggerTag.d, "Start connect: $uuid, waiting ${lastDevice?.uuid} finish connecting")
             return
         }
         //  3、查询设备是否已经在连接缓存中
