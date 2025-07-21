@@ -295,9 +295,6 @@ class BleManager private constructor() {
      * 断连设备
      */
     fun disconnect(uuid: String) {
-        if (!checkIsFunctionCanBeCalled() ) {
-            return
-        }
         //  1、执行设备断连
         val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
         handleConnectState(uuid, connectedDevice?.name ?: "", BleConnectState.DISCONNECT_BY_MYSELF)

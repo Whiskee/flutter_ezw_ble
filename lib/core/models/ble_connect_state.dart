@@ -12,11 +12,11 @@ enum BleConnectState {
   //  步骤5: 特征获取完毕，连接流程完成
   connectFinish,
   //  错误码：
-  //  主动断连
+  //  - 主动断连
   disconnectByUser,
-  //  系统断连
+  //  - 系统断连
   disconnectFromSys,
-  //  未发现相应的蓝牙配置
+  //  - 未发现相应的蓝牙配置
   noBleConfigFound,
   //  空的UUID
   emptyUuid,
@@ -32,6 +32,10 @@ enum BleConnectState {
   charsFail,
   //  连接超时
   timeout,
+  //  蓝牙错误
+  bleError,
+  //  系统错误
+  systemError,
   //  已连接
   connected,
   //  升级状态
@@ -127,7 +131,9 @@ extension BleConnectStateExt on BleConnectState {
       this == BleConnectState.boundFail ||
       this == BleConnectState.serviceFail ||
       this == BleConnectState.charsFail ||
-      this == BleConnectState.timeout;
+      this == BleConnectState.timeout ||
+      this == BleConnectState.bleError ||
+      this == BleConnectState.systemError;
 
   //  是否在升级模式
   bool get isUpgrade => this == BleConnectState.upgrade;

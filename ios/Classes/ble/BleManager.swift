@@ -197,9 +197,6 @@ extension BleManager {
      *  断连
      */
     func disconnect(uuid: String) {
-        guard checkIsFunctionCanBeCalled() else {
-            return
-        }
         //  移除待连接设备
         waitingConnectDevices.removeAll { easyConnect in
             easyConnect.uuid == uuid
@@ -622,6 +619,14 @@ extension BleManager: CBCentralManagerDelegate {
      */
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         BleEC.bleState.event()?(central.state.rawValue)
+        //  1、如果蓝牙状态不是开启，则将所有已连接的设备设置为非连接状态
+        if central.state != .poweredOn {
+            connectedDevices.forEach { matchDevice in
+                if matchDevice.isConnected {
+                    handleConnectState(uuid: matchDevice.peripheral.identifier.uuidString, name: matchDevice.peripheral.name ?? "", state: .bleError)
+                }
+            }
+        }
         logger?("[d]-BleManager::centralManagerDidUpdateState: State = \(central.state.label), code = \(central.state.rawValue)")
     }
     

@@ -49,14 +49,16 @@ enum BleConnectState: String, Codable {
     case charsFail
     //  错误：连接超时
     case timeout
+    //  错误：蓝牙异常
+    case bleError
+    //  错误：系统错误
+    case systemError
     //  连接成功：
     //  - 由于不同设备连接成功标准不通，所以不主动返回连接成功
     //  - 提供了setConnected，由用户告知是否连接成功
     case connected
     //  升级模式
     case upgrade
-    //  系统错误
-    case systemError
     
     /**
      *  是否正在连接中
@@ -103,6 +105,7 @@ enum BleConnectState: String, Codable {
         self == .serviceFail ||
         self == .charsFail ||
         self == .timeout ||
+        self == .bleError ||
         self == .systemError
     }
 }

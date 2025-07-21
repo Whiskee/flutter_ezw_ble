@@ -17,32 +17,34 @@ enum class BleConnectState {
     //  步骤5: 特征获取完毕，连接流程完成
     CONNECT_FINISH,
     //  错误码：
-    //  主动断连
+    //  - 主动断连
     DISCONNECT_BY_MYSELF,
-    //  系统断连
+    //  - 系统断连
     DISCONNECT_FROM_SYS,
-    //  空的UUID
+    //  - 空的UUID
     EMPTY_UUID,
-    //  错误：找不到蓝牙配置
+    //  - 找不到蓝牙配置
     NO_BLE_CONFIG_FOUND,
-    //  设备没被发现
+    //  - 设备没被发现
     NO_DEVICE_FOUND,
-    //  已经被绑定
+    //  - 已经被绑定
     ALREADY_BOUND,
-    //  绑定失败
+    //  - 绑定失败
     BOUND_FAIL,
-    //  获取服务发现失败
+    //  - 获取服务发现失败
     SERVICE_FAIL,
-    //  获取读写特征失败
+    //  - 获取读写特征失败
     CHARS_FAIL,
-    //  连接超时
+    //  - 连接超时
     TIMEOUT,
+    //  - 蓝牙错误
+    BLE_ERROR,
+    //  - 系统错误
+    SYSTEM_ERROR,
     //  已连接
     CONNECTED,
     //  升级状态
     UPGRADE,
-    //  系统错误
-    SYSTEM_ERROR,
     //  无状态
     NONE;
 
@@ -86,5 +88,6 @@ enum class BleConnectState {
                 this == SERVICE_FAIL ||
                 this == CHARS_FAIL ||
                 this == TIMEOUT ||
+                this == BLE_ERROR ||
                 this == SYSTEM_ERROR
 }
