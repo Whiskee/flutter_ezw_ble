@@ -15,7 +15,7 @@ BleConfig _$BleConfigFromJson(Map<String, dynamic> json) => BleConfig(
       initiateBinding: json['initiateBinding'] as bool? ?? false,
       connectTimeout: (json['connectTimeout'] as num?)?.toDouble() ?? 15000,
       upgradeSwapTime: (json['upgradeSwapTime'] as num?)?.toDouble() ?? 60000,
-      mtu: (json['mtu'] as num?)?.toInt() ?? 512,
+      mtu: (json['mtu'] as num?)?.toInt() ?? 247,
     );
 
 Map<String, dynamic> _$BleConfigToJson(BleConfig instance) => <String, dynamic>{

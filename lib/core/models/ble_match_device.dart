@@ -9,8 +9,10 @@ part 'ble_match_device.g.dart';
 @JsonSerializable()
 class BleMatchDevice {
   final String sn;
-  final String remark;
   final List<BleDevice> devices;
+
+  //  设备备注
+  String remark = "";
 
   ///========== Get
   //  - 获取配置名称
@@ -42,7 +44,6 @@ class BleMatchDevice {
 
   BleMatchDevice(
     this.sn, {
-    this.remark = "",
     this.devices = const [],
   });
 
@@ -51,17 +52,17 @@ class BleMatchDevice {
 
   Map<String, dynamic> toJson() => _$BleMatchDeviceToJson(this);
 
-  BleMatchDevice copy() => BleMatchDevice(sn,
-      devices: devices.map((match) => match.copy()).toList());
+  BleMatchDevice copy() =>
+      BleMatchDevice(sn, devices: devices.map((match) => match.copy()).toList())
+        ..remark = remark;
 
   @override
   String toString() => jsonEncode(toJson());
 
   /// 是否是同一个设备
-  bool isSameDevice(BleMatchDevice other) {
-    return sn == other.sn &&
-        devices.length == other.devices.length &&
-        devices.every((device) => other.devices
-            .any((otherDevice) => otherDevice.uuid == device.uuid));
-  }
+  bool isSameDevice(BleMatchDevice other) =>
+      sn == other.sn &&
+      devices.length == other.devices.length &&
+      devices.every((device) =>
+          other.devices.any((otherDevice) => otherDevice.uuid == device.uuid));
 }
