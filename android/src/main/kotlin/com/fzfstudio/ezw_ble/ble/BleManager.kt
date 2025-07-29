@@ -426,6 +426,11 @@ class BleManager private constructor() {
                 //  BluetoothAdapter.STATE_TURNING_ON
                 else -> return
             }
+            if (bleState != 5) {
+                connectedDevices.forEach {
+                    handleConnectState(it.uuid, it.name, BleConnectState.BLE_ERROR)
+                }
+            }
             sendLog(BleLoggerTag.d, "Ble statue listener: Original state = $state, to even state = $bleState")
             //  检查蓝牙权限
             checkBluetoothPermission()

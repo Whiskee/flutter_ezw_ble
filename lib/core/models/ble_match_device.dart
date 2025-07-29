@@ -26,12 +26,19 @@ class BleMatchDevice {
   bool get isConnected =>
       devices.where((device) => device.connectState.isConnected).length ==
       devices.length;
+  //  - 是否纯连接
+  bool get isPureConnected =>
+      devices.where((device) => device.connectState.isPureConnected).length ==
+      devices.length;
   //  - 是否连接出错
   bool get isConnectError =>
       devices.where((device) => device.connectState.isError).isNotEmpty;
   //  - 是否断连
   bool get isDisconnected =>
       devices.where((device) => device.connectState.isDisconnected).isNotEmpty;
+  //  - 是否有升级中
+  bool get isOtaUpgrading =>
+      devices.where((device) => device.connectState.isUpgrade).isNotEmpty;
 
   BleMatchDevice(
     this.sn, {
