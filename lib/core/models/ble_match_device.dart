@@ -12,6 +12,7 @@ class BleMatchDevice {
   final List<BleDevice> devices;
 
   //  设备备注
+  @JsonKey(includeFromJson: false, includeToJson: false)
   String remark = "";
 
   ///========== Get

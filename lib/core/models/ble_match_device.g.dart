@@ -13,11 +13,10 @@ BleMatchDevice _$BleMatchDeviceFromJson(Map<String, dynamic> json) =>
               ?.map((e) => BleDevice.fromJson(e as Map<String, dynamic>))
               .toList() ??
           const [],
-    )..remark = json['remark'] as String;
+    );
 
 Map<String, dynamic> _$BleMatchDeviceToJson(BleMatchDevice instance) =>
     <String, dynamic>{
       'sn': instance.sn,
       'devices': instance.devices,
-      'remark': instance.remark,
     };
