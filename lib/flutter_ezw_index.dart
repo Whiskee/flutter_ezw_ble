@@ -17,3 +17,4 @@ export 'core/models/ble_match_device.dart';
 export 'core/models/ble_private_service.dart';
 export 'core/models/ble_sn_rule.dart';
 export 'core/models/ble_status.dart';
+export 'core/models/ble_device_hardware.dart';
