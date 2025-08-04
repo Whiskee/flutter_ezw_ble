@@ -36,9 +36,13 @@ class BleMatchDevice {
   //  - 是否连接出错
   bool get isConnectError =>
       devices.where((device) => device.connectState.isError).isNotEmpty;
-  //  - 是否断连
+  //  - 是否断连(任意一边断连就算断开
   bool get isDisconnected =>
       devices.where((device) => device.connectState.isDisconnected).isNotEmpty;
+  //  - 是否完全断连
+  bool get isAllDisconnected =>
+      devices.where((device) => device.connectState.isDisconnected).length ==
+      devices.length;
   //  - 是否系统断连
   bool get isDisconnectFromSys => devices
       .where((device) => device.connectState.isDisconnectFromSys)
