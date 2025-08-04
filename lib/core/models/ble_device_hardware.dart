@@ -38,6 +38,9 @@ class BleDeviceHardware {
   //  - 是否获取眼镜信息成功
   bool isSuccess = false;
 
+  //  系统版本号:（跟devVer0～5字段能力一致，区别是不用拼装， 当前主要给G2使用）
+  String version = "";
+
   //* ============== Get ============== *//
   //  - 获取设备版本
   String get deviceVer =>
