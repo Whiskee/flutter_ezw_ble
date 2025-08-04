@@ -58,7 +58,10 @@ class BleManager private constructor() {
     }
     //  - 搜索配置
     private val scanSettings by lazy {
-        ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
+        ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_BALANCED)
+            .setReportDelay(0)
+            .build()
     }
     //  - 缓存已连接的设备
     private val connectedDevices: MutableList<BleDevice> = mutableListOf()
@@ -79,6 +82,8 @@ class BleManager private constructor() {
     private lateinit var bluetoothManager: BluetoothManager
     //  - 系统蓝牙状态监听
     private lateinit var bleStateListener: BleStateListener
+    //  - 蓝牙搜索状态，是否正在搜索中
+    private var isScanning = false
     //  - 蓝牙搜索回调
     private var scanCallback: ScanCallback? = null
     //  - 当前蓝牙状态,默认无状态
@@ -177,14 +182,16 @@ class BleManager private constructor() {
      *  开启扫描
      */
     fun startScan() {
-        if (!checkIsFunctionCanBeCalled()) {
+        if (!checkIsFunctionCanBeCalled() || isScanning) {
             return
         }
         //  1、执行搜索先优先执行停止搜索
         stopScan()
-        //  2、移除历史记录
+        //  2、执行搜索
+        isScanning = true
+        //  3、移除历史记录
         scanResultTemp.clear()
-        //  3、执行搜索
+        //  4、执行搜索
         scanCallback = createScanCallBack()
         bluetoothAdapter.bluetoothLeScanner?.startScan(null, scanSettings, scanCallback)
         sendLog(BleLoggerTag.d, "Start scan: success")
@@ -197,6 +204,7 @@ class BleManager private constructor() {
         if (!checkIsFunctionCanBeCalled()) {
             return
         }
+        isScanning = false
         bluetoothAdapter.bluetoothLeScanner?.stopScan(scanCallback)
         scanCallback = null
         sendLog(BleLoggerTag.d, if (isStartScan) "Start scan: checking if scan is already running, stopping it first if necessary" else "Stop scan: success")
