@@ -99,5 +99,6 @@ class BleDeviceHardware {
     ..bleVer0 = bleVer0
     ..bleVer1 = bleVer1
     ..bleHwVer = bleHwVer
-    ..isSuccess = isSuccess;
+    ..isSuccess = isSuccess
+    ..version = version;
 }
