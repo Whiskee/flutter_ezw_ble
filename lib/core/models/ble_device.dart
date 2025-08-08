@@ -1,8 +1,8 @@
 import 'dart:io';
 
-import 'package:flutter_ezw_ble/core/tools/connect_state_converter.dart';
 import 'package:flutter_ezw_ble/core/models/ble_connect_state.dart';
 import 'package:flutter_ezw_ble/core/models/ble_device_hardware.dart';
+import 'package:flutter_ezw_ble/core/tools/connect_state_converter.dart';
 import 'package:json_annotation/json_annotation.dart';
 
 part 'ble_device.g.dart';
@@ -39,10 +39,20 @@ class BleDevice {
     }
   }
 
-  factory BleDevice.fromJson(Map<String, dynamic> json) =>
-      _$BleDeviceFromJson(json);
+  factory BleDevice.fromJson(Map<String, dynamic> json) {
+    final newBleDevice = _$BleDeviceFromJson(json);
+    final hardwareMap = json['hardware'] as Map<String, dynamic>?;
+    if (hardwareMap != null) {
+      newBleDevice.hardware = BleDeviceHardware.fromJson(hardwareMap);
+    }
+    return newBleDevice;
+  }
 
-  Map<String, dynamic> toJson() => _$BleDeviceToJson(this);
+  Map<String, dynamic> toJson() {
+    final deviceMap = _$BleDeviceToJson(this);
+    deviceMap["hardware"] = hardware.toJson();
+    return deviceMap;
+  }
 
   BleDevice copy() => BleDevice(
         belongConfig,

@@ -6,13 +6,13 @@ import 'package:json_annotation/json_annotation.dart';
 
 part 'ble_match_device.g.dart';
 
-@JsonSerializable()
+@JsonSerializable(explicitToJson: true)
 class BleMatchDevice {
   final String sn;
   final List<BleDevice> devices;
 
   //  设备备注
-  @JsonKey(includeFromJson: false, includeToJson: false)
+  @JsonKey(includeToJson: false, includeFromJson: false)
   String remark = "";
 
   ///========== Get
@@ -57,9 +57,10 @@ class BleMatchDevice {
   });
 
   factory BleMatchDevice.fromJson(Map<String, dynamic> json) =>
-      _$BleMatchDeviceFromJson(json);
+      _$BleMatchDeviceFromJson(json)..remark = json['remark'] as String? ?? "";
 
-  Map<String, dynamic> toJson() => _$BleMatchDeviceToJson(this);
+  Map<String, dynamic> toJson() =>
+      _$BleMatchDeviceToJson(this)..[remark] = remark;
 
   BleMatchDevice copy() =>
       BleMatchDevice(sn, devices: devices.map((match) => match.copy()).toList())

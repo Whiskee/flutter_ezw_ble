@@ -1,5 +1,11 @@
+import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:json_annotation/json_annotation.dart';
+
+part 'ble_device_hardware.g.dart';
+
+@JsonSerializable()
 class BleDeviceHardware {
   //  master电量状态，0~100
   int batteryStatus0 = 0;
@@ -101,4 +107,12 @@ class BleDeviceHardware {
     ..bleHwVer = bleHwVer
     ..isSuccess = isSuccess
     ..version = version;
+
+  factory BleDeviceHardware.fromJson(Map<String, dynamic> json) =>
+      _$BleDeviceHardwareFromJson(json);
+
+  Map<String, dynamic> toJson() => _$BleDeviceHardwareToJson(this);
+
+  @override
+  String toString() => jsonEncode(toJson());
 }

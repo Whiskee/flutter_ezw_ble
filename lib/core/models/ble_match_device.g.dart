@@ -18,5 +18,5 @@ BleMatchDevice _$BleMatchDeviceFromJson(Map<String, dynamic> json) =>
 Map<String, dynamic> _$BleMatchDeviceToJson(BleMatchDevice instance) =>
     <String, dynamic>{
       'sn': instance.sn,
-      'devices': instance.devices,
+      'devices': instance.devices.map((e) => e.toJson()).toList(),
     };
