@@ -59,8 +59,7 @@ class BleManager private constructor() {
     //  - 搜索配置
     private val scanSettings by lazy {
         ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_BALANCED)
-            .setReportDelay(0)
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
     }
     //  - 缓存已连接的设备
