@@ -21,9 +21,6 @@ class BleDevice {
   //  连接状态
   @ConnectStateListConverter()
   BleConnectState connectState;
-  //  硬件信息
-  @JsonKey(includeFromJson: false, includeToJson: false)
-  BleDeviceHardware hardware = BleDeviceHardware();
 
   BleDevice(
     this.belongConfig,
@@ -39,20 +36,10 @@ class BleDevice {
     }
   }
 
-  factory BleDevice.fromJson(Map<String, dynamic> json) {
-    final newBleDevice = _$BleDeviceFromJson(json);
-    final hardwareMap = json['hardware'] as Map<String, dynamic>?;
-    if (hardwareMap != null) {
-      newBleDevice.hardware = BleDeviceHardware.fromJson(hardwareMap);
-    }
-    return newBleDevice;
-  }
+  factory BleDevice.fromJson(Map<String, dynamic> json) =>
+      _$BleDeviceFromJson(json);
 
-  Map<String, dynamic> toJson() {
-    final deviceMap = _$BleDeviceToJson(this);
-    deviceMap["hardware"] = hardware.toJson();
-    return deviceMap;
-  }
+  Map<String, dynamic> toJson() => _$BleDeviceToJson(this);
 
   BleDevice copy() => BleDevice(
         belongConfig,
@@ -62,5 +49,5 @@ class BleDevice {
         rssi,
         mac: mac,
         connectState: connectState,
-      )..hardware = hardware.copy();
+      );
 }
