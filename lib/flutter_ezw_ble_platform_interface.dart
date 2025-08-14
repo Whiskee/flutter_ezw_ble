@@ -59,7 +59,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     throw UnimplementedError('connectDevice() has not been implemented.');
   }
 
-  Future<void> disconnectDevice(String uuid) {
+  Future<void> disconnectDevice(String uuid, String name) {
     throw UnimplementedError('disconnectDevice() has not been implemented.');
   }
 
@@ -89,5 +89,9 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
 
   Future<void> openAppSettings() {
     throw UnimplementedError('openAppSettings() has not been implemented.');
+  }
+
+  Future<void> resetBle() {
+    throw UnimplementedError('resetBle() has not been implemented.');
   }
 }

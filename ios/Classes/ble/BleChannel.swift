@@ -45,6 +45,8 @@ enum BleMC: String {
     case openBleSettings
     //  打开App设置页面
     case openAppSettings
+    //  重置
+    case resetBle
     //  未知
     case unknown
     
@@ -86,8 +88,10 @@ enum BleMC: String {
             BleManager.shared.setConnected(uuid: uuid)
             break
         case .disconnectDevice:
-            let uuid = arguments as? String ?? ""
-            BleManager.shared.disconnect(uuid: uuid)
+            let jsonData = arguments as? [String:Any] ?? [:]
+            let uuid: String = jsonData["uuid"] as? String ?? ""
+            let name: String = jsonData["name"] as? String ?? ""
+            BleManager.shared.disconnect(uuid: uuid,name: name)
             break
         case .sendCmd:
             let jsonData: [String:Any] = arguments as? [String:Any] ?? [:]
@@ -108,6 +112,9 @@ enum BleMC: String {
         case .quiteUpgradeState:
             let uuid = arguments as? String ?? ""
             BleManager.shared.quiteUpgradeState(uuid: uuid)
+            break
+        case .resetBle:
+            BleManager.shared.reset()
             break
         case .openBleSettings:
             if let url = URL(string: "App-Prefs:root=Bluetooth"), UIApplication.shared.canOpenURL(url) {

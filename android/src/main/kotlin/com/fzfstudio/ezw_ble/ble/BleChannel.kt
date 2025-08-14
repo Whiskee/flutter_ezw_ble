@@ -38,6 +38,8 @@ enum class BleMC {
     ENTER_UPGRADE_STATE,
     //  退出升级模式
     QUITE_UPGRADE_STATE,
+    //  重置蓝牙
+    RESET_BLE,
     //  打开蓝牙设置页面
     OPEN_BLE_SETTINGS,
     //  打开App设置页面
@@ -83,7 +85,8 @@ enum class BleMC {
                 }
             }
             DISCONNECT_DEVICE -> {
-                val uuid = arguments as String? ?: ""
+                val jsonMap = arguments as Map<*, *>?
+                val uuid = jsonMap?.get("uuid") as String? ?: ""
                 BleManager.instance.disconnect(uuid)
             }
             SEND_CMD -> {
@@ -104,6 +107,9 @@ enum class BleMC {
             DEVICE_CONNECTED -> {
                 val uuid = arguments as String? ?: ""
                 BleManager.instance.setConnected(uuid)
+            }
+            RESET_BLE -> {
+                BleManager.instance.reset()
             }
             OPEN_BLE_SETTINGS -> {
                 val intent = Intent(Settings.ACTION_BLUETOOTH_SETTINGS).apply {

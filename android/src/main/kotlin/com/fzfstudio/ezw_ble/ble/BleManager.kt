@@ -203,10 +203,14 @@ class BleManager private constructor() {
         if (!checkIsFunctionCanBeCalled()) {
             return
         }
+        if (scanCallback == null) {
+            sendLog(BleLoggerTag.d, "Stop scan: scan call back is null")
+            return
+        }
         isScanning = false
         bluetoothAdapter.bluetoothLeScanner?.stopScan(scanCallback)
         scanCallback = null
-        sendLog(BleLoggerTag.d, if (isStartScan) "Start scan: checking if scan is already running, stopping it first if necessary" else "Stop scan: success")
+        sendLog(BleLoggerTag.d, if (isStartScan) "Stop scan: checking if scan is already running, stopping it first if necessary" else "Stop scan: success")
     }
 
     /*
@@ -369,6 +373,23 @@ class BleManager private constructor() {
         handleConnectState(uuid, connectedDevice?.name ?: "", BleConnectState.CONNECTED)
         upgradeDevices.remove(uuid)
         sendLog(BleLoggerTag.d, "QuiteUpgradeState: $uuid had quite upgrade state")
+    }
+
+    /**
+     * 重置
+     */
+    fun reset() {
+        stopScan()
+        connectedDevices.forEach {
+            disconnect(it.uuid)
+        }
+        connectedDevices.clear()
+        scanResultTemp.clear()
+        waitingConnectDevices.clear()
+        descriptorQueue.clear()
+        upgradeDevices.clear()
+        sendCmdQueue.clear()
+        sendLog(BleLoggerTag.d, "Reset: success")
     }
 
     /// =========== Method: Private

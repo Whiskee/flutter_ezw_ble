@@ -49,8 +49,11 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       });
 
   @override
-  Future<void> disconnectDevice(String uuid) async =>
-      methodChannel.invokeMethod("disconnectDevice", uuid);
+  Future<void> disconnectDevice(String uuid, String name) async =>
+      methodChannel.invokeMethod("disconnectDevice", {
+        "uuid": uuid,
+        "name": name,
+      });
 
   @override
   Future<void> deviceConnected(String uuid) async =>
@@ -83,4 +86,7 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
   @override
   Future<void> openAppSettings() async =>
       methodChannel.invokeMethod("openAppSettings");
+
+  @override
+  Future<void> resetBle() async => methodChannel.invokeMethod("resetBle");
 }
