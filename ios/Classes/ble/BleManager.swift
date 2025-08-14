@@ -416,6 +416,8 @@ extension BleManager {
             }
             //  - 1.3、如果找到对应的UUID就执行连接
             else if connectDevice.uuid == peripheral.identifier.uuidString || connectDevice.name == peripheral.name! {
+                //  -- 1.3.1、立马停止
+                stopScan()
                 //  -- 1.3.2、开始新的倒计时
                 startConnectingCountdown(currentConfig: bleConfig, uuid: peripheral.identifier.uuidString, name: peripheral.name!, afterUpgrade: connectDevice.afterUpgrade)
                 //  -- 默认添加到缓存中
@@ -433,7 +435,9 @@ extension BleManager {
                 //  -- 1.3.4、再次更新连接状态
                 handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? connectDevice.name, state: .connecting, tag: "from search device")
                 //  -- 1.3.5、开始连接
-                centralManager.connect(peripheral)
+                DispatchQueue.main.async { [weak self] in
+                    self?.centralManager.connect(peripheral)
+                }
                 canRemove = true
                 logger?("[d]-BleManager::centralManager - search: \(connectDevice.uuid)-\(connectDevice.name), device has been found, start connecting, after upgrade \(connectDevice.afterUpgrade)")
             }
