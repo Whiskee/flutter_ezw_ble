@@ -2,14 +2,17 @@ package com.fzfstudio.ezw_ble.ble.models
 
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothStatusCodes
 import android.os.Build
 import android.util.Log
 import com.fzfstudio.ezw_ble.ble.BleEC
+import com.fzfstudio.ezw_ble.ble.BleManager
 import com.fzfstudio.ezw_ble.ble.models.enums.BleConfigOutAdapter
 import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
 import com.fzfstudio.ezw_utils.gson.GsonSerializable
 import com.google.gson.annotations.JsonAdapter
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 class BleDevice(
@@ -72,6 +75,23 @@ class BleDevice(
         }
         Log.i(tag, "Send cmd: $uuid is success = ${isSuccess}\n--name=$name\n--type=$psType\n--length=${data.size}\n--data=${data.toHexString()}")
         return true
+    }
+
+    /**
+     * 执行CCCD操作
+     */
+    fun requestCCCD(): Boolean {
+        val bleGatt = gattMap[0]
+        //  CCCD特征读取
+        val descriptor = bleGatt?.readChars?.getDescriptor(BleManager.cccdDescriptor)
+        return if (descriptor == null) {
+            false
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            bleGatt.gatt?.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothStatusCodes.SUCCESS
+        } else {
+            descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            bleGatt.gatt?.writeDescriptor(descriptor) ?: false
+        }
     }
 }
 

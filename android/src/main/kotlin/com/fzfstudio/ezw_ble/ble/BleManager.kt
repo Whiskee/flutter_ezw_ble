@@ -49,6 +49,8 @@ class BleManager private constructor() {
 
     companion object {
         val instance: BleManager = BleManager()
+        //  CCCD特征符号UUID
+        val cccdDescriptor = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     }
 
     /// =========== Constants
@@ -499,7 +501,12 @@ class BleManager private constructor() {
             if (connectedDevice.belongConfig.initiateBinding) {
                 handleConnectState(connectedDevice.uuid, connectedDevice.name, BleConnectState.CONNECT_FINISH)
             }
-            sendLog(BleLoggerTag.d, "Ble status listener - bond state: ${device.address} is bonded, ${connectedDevice.myGatt}, finish connect")
+            //  6、TODO：专门给BCL戒指做的配对流程：由于EVEN R1新固件会在拉取特征时弹出配对，导致特征无法立马回调，需要再次主动发起
+            if (connectedDevice.belongConfig.name == "ring_bcl_1") {
+                //  - 获取基础服务的CCCD
+                connectedDevice.requestCCCD()
+            }
+            sendLog(BleLoggerTag.d, "Ble status listener - bond state: ${device.address} is bonded, state = ${connectedDevice.connectState}, finish connect")
         }
     }
 
@@ -679,7 +686,7 @@ class BleManager private constructor() {
                 sendLog(BleLoggerTag.d, "Connect call back: $address, ${service}, set chars notify success = $setCharsNotifySuccess")
                 //  4、开启写服务数据监听
                 //  获取与给定 BluetoothGattCharacteristic 关联的描述符。描述符本质上是与特性相关的附加信息，可以包括例如 客户端配置描述符（Client Characteristic Configuration Descriptor，简称 CCCD）或 描述特性的格式、权限
-                val descriptor = readChars.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
+                val descriptor = readChars.getDescriptor(cccdDescriptor)
                 descriptorQueue.add(Pair(uuid.type, descriptor))
                 //  缓存读写特征
                 currentDevice.gattMap[uuid.type] = BleGatt(gatt, writeChars, readChars)
@@ -696,6 +703,7 @@ class BleManager private constructor() {
             descriptor: BluetoothGattDescriptor?,
             status: Int
         ) {
+            sendLog(BleLoggerTag.d, "Connect call back: ${gatt?.device?.address}, is descriptor write success = ${status == BluetoothGatt. GATT_SUCCESS}")
             super.onDescriptorWrite(gatt, descriptor, status)
             if (!isPsHandleFinish) {
                 return
@@ -744,7 +752,7 @@ class BleManager private constructor() {
 //                uuid.readCharsUUID == characteristic.uuid
 //            }
 //            if (currentUuid == null) {
-//                Log.i(tag, "Receive cmd: ${gatt.device.address} receive fail, not found current uuid")
+//                sendLog(BleLoggerTag.e,"Receive cmd: ${gatt.device.address} receive fail, not found current uuid")
 //                return
 //            }
 //            //  2、解析数据
@@ -752,7 +760,7 @@ class BleManager private constructor() {
 //            mainScope.launch {
 //                BleEC.RECEIVE_DATA.event?.success(bleCmdMap)
 //            }
-//            Log.i(tag, "Receive cmd（new）: ${gatt.device.address}\n--type=${currentUuid.type}\n--length=${value.size}\n--chartsType=${characteristic.writeType}\n--data=${value.toHexString()}")
+//            sendLog(BleLoggerTag.d,"Receive cmd（new）: ${gatt.device.address}\n--type=${currentUuid.type}\n--length=${value.size}\n--chartsType=${characteristic.writeType}\n--data=${value.toHexString()}")
 //        }
 
         /// 写入数据回调

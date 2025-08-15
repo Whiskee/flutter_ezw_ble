@@ -52,7 +52,7 @@ class BleDeviceHardware {
   String get deviceVer =>
       isMaster ? "$devVer0.$devVer1.$devVer2" : "$devVer3.$devVer4.$devVer5";
   //  - 版本号是否正确
-  bool get versionCorrect => deviceVer != "0.0.0";
+  bool get versionCorrect => deviceVer != "";
 
   BleDeviceHardware();
 
