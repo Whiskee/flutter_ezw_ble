@@ -501,11 +501,6 @@ class BleManager private constructor() {
             if (connectedDevice.belongConfig.initiateBinding) {
                 handleConnectState(connectedDevice.uuid, connectedDevice.name, BleConnectState.CONNECT_FINISH)
             }
-            //  6、TODO：专门给BCL戒指做的配对流程：由于EVEN R1新固件会在拉取特征时弹出配对，导致特征无法立马回调，需要再次主动发起
-            if (connectedDevice.belongConfig.name == "ring_bcl_1") {
-                //  - 获取基础服务的CCCD
-                connectedDevice.requestCCCD()
-            }
             sendLog(BleLoggerTag.d, "Ble status listener - bond state: ${device.address} is bonded, state = ${connectedDevice.connectState}, finish connect")
         }
     }
@@ -703,7 +698,6 @@ class BleManager private constructor() {
             descriptor: BluetoothGattDescriptor?,
             status: Int
         ) {
-            sendLog(BleLoggerTag.d, "Connect call back: ${gatt?.device?.address}, is descriptor write success = ${status == BluetoothGatt. GATT_SUCCESS}")
             super.onDescriptorWrite(gatt, descriptor, status)
             if (!isPsHandleFinish) {
                 return
