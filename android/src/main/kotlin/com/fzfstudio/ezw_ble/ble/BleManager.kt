@@ -256,11 +256,13 @@ class BleManager private constructor() {
         var bleDevice = connectedDevices.firstOrNull { it.uuid == uuid }
         //  4、获取新的连接对象
         val remoteDevice = bluetoothAdapter.getRemoteDevice(uuid)
+        //  - bondState = 12
+        sendLog(BleLoggerTag.e, "Start connect: $uuid, remote device = ${remoteDevice.name}, state = ${remoteDevice.bondState}")
         if (retryWhenNoFoudDevice && (remoteDevice == null || remoteDevice.name == null)) {
             handleConnectState(uuid, name, BleConnectState.CONNECTING)
             startScan()
             mainScope.launch {
-                delay(3500)
+                delay(5)
                 stopScan()
                 connect(belongConfig, uuid, name, sn, isWaitingDevice, afterUpgrade, false)
             }
@@ -280,7 +282,7 @@ class BleManager private constructor() {
         //  6、执行连接:默认获取基础私有服务的Gatt进行处理
         val connectCallBack = createConnectCallBack()
         val gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            remoteDevice.connectGatt(weakContext?.get(), false, connectCallBack, BluetoothDevice.TRANSPORT_LE)
+            remoteDevice.connectGatt(weakContext?.get(), false, connectCallBack, BluetoothDevice.TRANSPORT_LE, BluetoothDevice.PHY_LE_2M)
         } else {
             remoteDevice.connectGatt(weakContext?.get(), false, connectCallBack)
         }
@@ -863,17 +865,20 @@ class BleManager private constructor() {
             device.gattMap.values.forEach { bleGatt -> // 重命名 gatt 变量以避免与 bleGatt.gatt 混淆
                 try {
                     bleGatt.gatt?.disconnect()
+                    sendLog(BleLoggerTag.d, "${device.name} had disconnected")
                 } catch (e: Exception) {
                     sendLog(BleLoggerTag.e, "Exception during gatt.disconnect for $uuid: ${e.message}")
                 }
                 try {
                     bleGatt.gatt?.close()
+                    sendLog(BleLoggerTag.d, "${device.name} had close")
                 } catch (e: Exception) {
                     sendLog(BleLoggerTag.e, "Exception during gatt.close for $uuid: ${e.message}")
                 }
             }
             // ConcurrentHashMap.clear() 是线程安全的
             device.gattMap.clear()
+            sendLog(BleLoggerTag.d, "${device.name} clear all gatt")
         }
         // 假设 waitingConnectDevices 是 CopyOnWriteArrayList
         // 为了更安全地移除，可以先找到再移除，或者使用 removeIf
