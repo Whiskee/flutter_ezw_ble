@@ -26,7 +26,8 @@ object BluetoothGattStatus {
         22 to "GATT_CONN_LMP_TIMEOUT", // Connection failed to be established due to LMP response timeout
         34 to "GATT_CONN_FAIL_ESTABLISHMENT", // Connection fail to establish
         62 to "GATT_CONN_TERMINATE_LOCAL_HOST", // Connection terminated by local host
-        133 to "GATT_ERROR" // Generic error. This is a very common one for various unspecified issues.
+        133 to "GATT_ERROR", // Generic error. This is a very common one for various unspecified issues.
+        257 to "GATT_CONN_CANCELLED_BY_LOCAL_CLIENT", // Connection cancelled by local client
         // 你可以根据需要添加更多... 查阅 Android 源码中的 gatt_api.h 和 hci_error_code.h 会有更全面的列表
     )
 

@@ -262,7 +262,7 @@ class BleManager private constructor() {
             handleConnectState(uuid, name, BleConnectState.CONNECTING)
             startScan()
             mainScope.launch {
-                delay(5)
+                delay(5000)
                 stopScan()
                 connect(belongConfig, uuid, name, sn, isWaitingDevice, afterUpgrade, false)
             }
@@ -286,6 +286,7 @@ class BleManager private constructor() {
         } else {
             remoteDevice.connectGatt(weakContext?.get(), false, connectCallBack)
         }
+        //  - 缓存刷新的gatt
         bleDevice.gattMap[0] = BleGatt(gatt)
         //  7、读取信号值
         gatt?.readRemoteRssi()
@@ -484,6 +485,10 @@ class BleManager private constructor() {
                 if (connectedDevice.connectState.isConnecting || connectedDevice.connectState.isDisconnected) {
                     return
                 }
+                //  - 只有连接成功后才执行搜索，确保再次连接设备时设备能被重新刷新，避免连接旧的连接信息
+                mainScope.launch {
+                    startScan()
+                }
                 sendLog(BleLoggerTag.e, "Ble status listener - bond state: ${device.address} unable to bind")
                 handleConnectState(connectedDevice.uuid, connectedDevice.name, BleConnectState.BOUND_FAIL)
                 return
@@ -628,8 +633,6 @@ class BleManager private constructor() {
                 handleConnectState(device.address, device.name, BleConnectState.SEARCH_SERVICE)
                 sendLog(BleLoggerTag.d, "Connect call back: ${device.address}, had contact device, state = STATE_CONNECTED(code:2), start search services")
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                //  1、这很重要，gatt.disconnect执行断连后，回调了再执行close才能保证gatt真正被释放
-                gatt.close()
                 isPsHandleFinish = false
                 val myDevice = connectedDevices.firstOrNull { it.uuid == device.address  }
                 if (myDevice == null)   {
@@ -641,8 +644,20 @@ class BleManager private constructor() {
                     sendLog(BleLoggerTag.e, "Connect call back: ${gatt.device.address}, is start new connecting, stop disconnect flow, keep connecting")
                     return
                 }
-                handleConnectState(device.address, device.name,BleConnectState.DISCONNECT_FROM_SYS)
+                //  - 如果报授权问题，刷新gatt
+                if (status == BluetoothGatt.GATT_INSUFFICIENT_AUTHORIZATION) {
+                    refreshDeviceCache(gatt)
+                }
+                //  -- 这很重要，gatt.disconnect执行断连后，回调了再执行close才能保证gatt真正被释放
+                gatt.close()
+                //  -- 打印
                 sendLog(BleLoggerTag.e, "Connect call back: ${gatt.device.address}, state = STATE_DISCONNECTED(code:${BluetoothGattStatus.getStatusDescription(status)})")
+                //  -- GATT_CONN_LMP_TIMEOUT, 移除配对导致的出现的GATT_CONN_LMP_TIMEOUT，就不执行操作
+                if (status == 22) {
+                    return
+                }
+                //  -- 执行连接状态处理
+                handleConnectState(device.address, device.name,BleConnectState.DISCONNECT_FROM_SYS)
             }
         }
 
@@ -857,28 +872,28 @@ class BleManager private constructor() {
     /**
      * 移除连接舍比gatt数据
      */
-    private fun disconnectDevice(uuid: String) {
+    private fun disconnectDevice(uuid: String, isFromSysDisconnect: Boolean = false) {
         // 假设 connectedDevices 是 CopyOnWriteArrayList
         val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
         // connectedDevice 本身可能为 null，需要安全调用
         connectedDevice?.let { device ->
-            // gattMap 是 ConcurrentHashMap，其 values 的迭代器是弱一致性的，forEach 是安全的
-            // gattMap.values 返回的是一个 Collection，可以安全迭代
-            device.gattMap.values.forEach { bleGatt -> // 重命名 gatt 变量以避免与 bleGatt.gatt 混淆
-                try {
-                    // 会执行onConnectionStateChange
-                    bleGatt.gatt?.disconnect()
-                    sendLog(BleLoggerTag.d, "${device.name} had disconnected")
-                } catch (e: Exception) {
-                    sendLog(BleLoggerTag.e, "Exception during gatt.disconnect for $uuid: ${e.message}")
+            //  - 只处理主动断连的事件
+            if (!isFromSysDisconnect) {
+                // gattMap 是 ConcurrentHashMap，其 values 的迭代器是弱一致性的，forEach 是安全的
+                // gattMap.values 返回的是一个 Collection，可以安全迭代
+                device.gattMap.values.forEach { bleGatt -> // 重命名 gatt 变量以避免与 bleGatt.gatt 混淆
+                    try {
+                        // 会执行onConnectionStateChange
+                        bleGatt.gatt?.disconnect()
+                        sendLog(BleLoggerTag.d, "${device.name} had disconnected")
+                    } catch (e: Exception) {
+                        sendLog(BleLoggerTag.e, "Exception during gatt.disconnect for $uuid: ${e.message}")
+                    }
                 }
             }
-            // ConcurrentHashMap.clear() 是线程安全的
             device.gattMap.clear()
             sendLog(BleLoggerTag.d, "${device.name} clear all gatt")
         }
-        //  从已连接中的缓存中移除设备
-        connectedDevices.remove(connectedDevice)
         // 假设 waitingConnectDevices 是 CopyOnWriteArrayList
         // 为了更安全地移除，可以先找到再移除，或者使用 removeIf
         var removedWaitingDevice: BleConnectTemp? = null
@@ -906,7 +921,7 @@ class BleManager private constructor() {
     private fun handleConnectState(uuid: String, name: String, state: BleConnectState, mtu: Int = 247) {
         //  1、处理断连和错误连接
         if (state.isDisconnected || state.isError) {
-            disconnectDevice(uuid)
+            disconnectDevice(uuid, state == BleConnectState.DISCONNECT_FROM_SYS)
         }
         //  2、处理连接成功
         else if (state.isConnected) {
@@ -951,20 +966,19 @@ class BleManager private constructor() {
         return false
     }
 
-//    /**
-//     *  移除配对
-//     */
-//    private fun removeBond(address: String) {
-//        val device: BluetoothDevice = bluetoothAdapter.getRemoteDevice(address)
-//        try {
-//            val method = device.javaClass.getMethod("removeBond")
-//            val result = method.invoke(device) as Boolean
-//            Log.d("BLE", "Remove bond result: $result")
-//            sendLog(BleLoggerTag.d, "$address, remove bond result: $result")
-//        } catch (e: Exception) {
-//            sendLog(BleLoggerTag.e, "$address, remove bond error: ${e.message}")
-//        }
-//    }
+    /**
+     *  移除配对
+     */
+    private fun removeBond(address: String) {
+        val device: BluetoothDevice = bluetoothAdapter.getRemoteDevice(address)
+        try {
+            val method = device.javaClass.getMethod("removeBond")
+            val result = method.invoke(device) as Boolean
+            sendLog(BleLoggerTag.d, "$address, remove bond result: $result")
+        } catch (e: Exception) {
+            sendLog(BleLoggerTag.e, "$address, remove bond error: ${e.message}")
+        }
+    }
 
     /**
      *  处理日志
