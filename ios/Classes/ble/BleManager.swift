@@ -86,6 +86,10 @@ extension BleManager {
             loggerD(msg: "stopScan: is not scanning")
             return
         }
+        guard startConnectInfos.isEmpty else {
+            loggerD(msg: "stopScan: connecting with scanning, not handle stop")
+            return
+        }
         centralManager.stopScan()
         loggerD(msg: "\(isStartScan ? "checking if scan is already running, stopping it first if necessary" : "stop scan")")
     }
@@ -278,6 +282,7 @@ extension BleManager {
         upgradeDevices?.removeAll()
         loggerD(msg: "Reset: success")
     }
+    
 }
 
 // MARK: - Private Methods
