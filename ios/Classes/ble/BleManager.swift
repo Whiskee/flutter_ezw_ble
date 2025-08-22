@@ -157,6 +157,9 @@ extension BleManager {
         else if let temp = scanResultTemp.first(where: { info in
             return info.0.uuid == easyConnect.uuid || info.1.name == easyConnect.name
         }) {
+            if temp.1.state == .connected {
+                centralManager.cancelPeripheralConnection(temp.1)
+            }
             newEasyConnect.uuid = temp.1.identifier.uuidString
             centralManager.connect(temp.1)
             // -- 执行连接倒计时
@@ -165,6 +168,9 @@ extension BleManager {
         }
         //  - 5.3、获取蓝牙设置页面中是否有符合的设备
         else if let device = findPeripheralFromConnected(uuid: easyConnect.uuid, name: easyConnect.name, psUUID: commonPs.serviceUUID) {
+            if device.state == .connected {
+                centralManager.cancelPeripheralConnection(device)
+            }
             newEasyConnect.uuid = device.identifier.uuidString
             centralManager.connect(device)
             // -- 缓存对象
