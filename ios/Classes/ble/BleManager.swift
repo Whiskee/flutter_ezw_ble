@@ -71,7 +71,7 @@ extension BleManager {
         stopScan(isStartScan: true)
         //  清空缓存
         scanResultTemp.removeAll()
-        centralManager.scanForPeripherals(withServices: nil)
+        centralManager.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
         loggerD(msg: "startScan")
     }
     
