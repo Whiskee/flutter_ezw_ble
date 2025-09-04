@@ -819,7 +819,10 @@ class BleManager private constructor() {
             }
             //  2、执行写特征使能
             val item = descriptorQueue.poll()
-            val descriptor = item!!.second
+            if (item == null)  {
+                return
+            }
+            val descriptor = item.second
             val isWrite = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothStatusCodes.SUCCESS
             } else {
