@@ -912,7 +912,9 @@ class BleManager private constructor() {
         removedWaitingDevice?.let {
             it.timeoutTimer?.cancel()
             it.timeoutTimer = null
-            waitingConnectDevices.remove(it) // 在 CopyOnWriteArrayList 上 remove 对象是安全的
+            if (waitingConnectDevices.contains(it)) {
+                waitingConnectDevices.remove(it) // 在 CopyOnWriteArrayList 上 remove 对象是安全的
+            }
         }
         // 假设 sendCmdQueue 是 ConcurrentLinkedQueue
         sendCmdQueue.clear() // ConcurrentLinkedQueue.clear() 是线程安全的
