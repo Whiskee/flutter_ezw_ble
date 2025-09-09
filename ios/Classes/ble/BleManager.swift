@@ -727,8 +727,11 @@ extension BleManager: CBCentralManagerDelegate {
         }
         //  5、规则解析
         let manufactureData = advertisementData["kCBAdvDataManufacturerData"] as? Data
-        //  - 5.1、获取MAC地址
+        //  - 5.1、获取MAC地址(有些设备的广播需要二次读取才能获取到)
         let deviceMac = parseDataToMac(manufactureData: manufactureData, macRule: bleConfig.scan.macRule)
+        guard deviceMac.isNotEmpty else {
+            return
+        }
         //  - 5.2、根据SN组装蓝牙数据
         var deviceSn = peripheral.name ?? ""
         let snRule = bleConfig.scan.snRule
