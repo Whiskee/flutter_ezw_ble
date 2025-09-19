@@ -240,7 +240,28 @@ class BleManager private constructor() {
         if (!afterUpgrade && upgradeDevices.contains(uuid)) {
             upgradeDevices.remove(uuid)
         }
-        //  4、缓存连接对象，如果缓存中超过1个就等待考前的连接完成后再开始执行
+        //  4、查询设备是否已经在连接缓存中
+        var bleDevice = connectedDevices.firstOrNull { it.uuid == uuid }
+        //  5、获取新的连接对象
+        val remoteDevice = bluetoothAdapter.getRemoteDevice(uuid)
+        //  - bondState = 12
+        sendLog(BleLoggerTag.e, "Start connect: $uuid, remote device = ${remoteDevice.name}, state = ${remoteDevice.bondState}")
+        if (retryWhenNoFoudDevice && (remoteDevice == null || remoteDevice.name == null)) {
+            handleConnectState(uuid, name, BleConnectState.CONNECTING)
+            startScan()
+            mainScope.launch {
+                delay(5000)
+                connect(belongConfig, uuid, name, sn, isWaitingDevice, afterUpgrade, false)
+            }
+            sendLog(BleLoggerTag.e, "Start connect: $uuid, can not get device from remote, start scan device to retry")
+            return
+        }
+        if (remoteDevice == null || remoteDevice.name == null) {
+            handleConnectState(uuid, name, BleConnectState.NO_DEVICE_FOUND)
+            sendLog(BleLoggerTag.e, "Start connect: $uuid, no device found")
+            return
+        }
+        //  6、缓存连接对象，如果缓存中超过1个就等待考前的连接完成后再开始执行
         if (!waitingConnectDevices.any { it.uuid == uuid }) {
             waitingConnectDevices.add(BleConnectTemp(bleConfig, uuid, name, sn, afterUpgrade))
         }
@@ -252,34 +273,12 @@ class BleManager private constructor() {
             sendLog(BleLoggerTag.d, "Start connect: $uuid, waiting ${lastDevice?.uuid} finish connecting")
             return
         }
-        //  3、查询设备是否已经在连接缓存中
-        var bleDevice = connectedDevices.firstOrNull { it.uuid == uuid }
-        //  4、获取新的连接对象
-        val remoteDevice = bluetoothAdapter.getRemoteDevice(uuid)
-        //  - bondState = 12
-        sendLog(BleLoggerTag.e, "Start connect: $uuid, remote device = ${remoteDevice.name}, state = ${remoteDevice.bondState}")
-        if (retryWhenNoFoudDevice && (remoteDevice == null || remoteDevice.name == null)) {
-            handleConnectState(uuid, name, BleConnectState.CONNECTING)
-            startScan()
-            mainScope.launch {
-                delay(5000)
-                stopScan()
-                connect(belongConfig, uuid, name, sn, isWaitingDevice, afterUpgrade, false)
-            }
-            sendLog(BleLoggerTag.e, "Start connect: $uuid, can not get device from remote, start scan device to retry")
-            return
-        }
-        if (remoteDevice == null || remoteDevice.name == null) {
-            handleConnectState(uuid, name, BleConnectState.NO_DEVICE_FOUND)
-            sendLog(BleLoggerTag.e, "Start connect: $uuid, no device found")
-            return
-        }
-        //  5、获取BleDevice，并执行连接
+        //  7、获取BleDevice，并执行连接
         if (bleDevice == null) {
             bleDevice = remoteDevice.toBleDevice(bleConfig, sn, 0)
             connectedDevices.add(bleDevice)
         }
-        //  6、执行连接:默认获取基础私有服务的Gatt进行处理
+        //  8、执行连接:默认获取基础私有服务的Gatt进行处理
         val connectCallBack = createConnectCallBack()
         val gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             remoteDevice.connectGatt(weakContext?.get(), false, connectCallBack, BluetoothDevice.TRANSPORT_LE, BluetoothDevice.PHY_LE_2M)
@@ -288,9 +287,9 @@ class BleManager private constructor() {
         }
         //  - 缓存刷新的gatt
         bleDevice.gattMap[0] = BleGatt(gatt)
-        //  7、读取信号值
+        //  9、读取信号值
         gatt?.readRemoteRssi()
-        //  8、开启连接超时定时器
+        //  10、开启连接超时定时器
         val timeoutTimer = Timer()
         timeoutTimer.schedule(object : TimerTask() {
             override fun run() {
@@ -300,7 +299,7 @@ class BleManager private constructor() {
             }
         }, bleConfig.connectTimeout.toLong() + (if (afterUpgrade) bleConfig.upgradeSwapTime.toLong() else 0),)
         waitingConnectDevices.firstOrNull { it.uuid == uuid }?.timeoutTimer = timeoutTimer
-        //  9、待连接中的设备已经处于连接中，不再发送
+        //  11、待连接中的设备已经处于连接中，不再发送
         if (!isWaitingDevice) {
             handleConnectState(uuid, name, BleConnectState.CONNECTING)
         }
