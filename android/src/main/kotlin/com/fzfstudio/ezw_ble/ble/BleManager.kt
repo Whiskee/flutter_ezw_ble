@@ -115,11 +115,6 @@ class BleManager private constructor() {
         } else {
             context.getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
         }
-        if (!bluetoothAdapter.isEnabled) {
-            val enableBtIntent = Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)
-            context.startActivity(enableBtIntent)
-            sendLog(BleLoggerTag.d, "Init: bluetooth not enable, try enable ")
-        }
         //  主动查询蓝牙工具状态
         bleState = if (bluetoothAdapter.isEnabled) 5 else 4
         //  注册监听：蓝牙状态
