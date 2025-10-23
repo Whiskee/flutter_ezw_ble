@@ -45,6 +45,8 @@ enum BleMC: String {
     case openBleSettings
     //  打开App设置页面
     case openAppSettings
+    //  清除连接缓存
+    case cleanConnectCache
     //  重置
     case resetBle
     //  未知
@@ -112,6 +114,9 @@ enum BleMC: String {
         case .quiteUpgradeState:
             let uuid = arguments as? String ?? ""
             BleManager.shared.quiteUpgradeState(uuid: uuid)
+            break
+        case .cleanConnectCache:
+            BleManager.shared.cleanConnectCache()
             break
         case .resetBle:
             BleManager.shared.reset()

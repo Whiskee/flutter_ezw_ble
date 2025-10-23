@@ -89,4 +89,7 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
 
   @override
   Future<void> resetBle() async => methodChannel.invokeMethod("resetBle");
+
+  @override
+  Future<void> cleanConnectCache() async => methodChannel.invokeMethod("cleanConnectCache");
 }

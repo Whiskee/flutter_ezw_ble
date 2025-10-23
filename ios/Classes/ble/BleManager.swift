@@ -268,6 +268,18 @@ extension BleManager {
     }
     
     /**
+     * 清除连接缓存
+     */
+    func cleanConnectCache() {
+        waitingConnectDevices.removeAll()
+        startConnectInfos.removeAll()
+        connectingTimeoutTimers.forEach { (uuid, name, timer) in
+            timer.invalidate()
+        }
+        connectingTimeoutTimers.removeAll()
+    }
+    
+    /**
      * 重置
      */
     func reset() {
@@ -278,6 +290,9 @@ extension BleManager {
         connectedDevices.removeAll()
         waitingConnectDevices.removeAll()
         startConnectInfos.removeAll()
+        connectingTimeoutTimers.forEach { (uuid, name, timer) in
+            timer.invalidate()
+        }
         connectingTimeoutTimers.removeAll()
         upgradeDevices?.removeAll()
         loggerD(msg: "Reset: success")
@@ -525,7 +540,7 @@ extension BleManager {
         }
         //  3、如果error为空，说明为用户主动操作断连
         guard let error = error as? NSError else {
-            //  不执行执行断连
+            //  不执行断连
             //  - 已经断连就不再处理
             //  - 没有退出升级状态的不用处理
             if myDevice.isConnected {

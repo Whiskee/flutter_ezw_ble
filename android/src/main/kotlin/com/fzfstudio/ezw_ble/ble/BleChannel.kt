@@ -38,6 +38,8 @@ enum class BleMC {
     ENTER_UPGRADE_STATE,
     //  退出升级模式
     QUITE_UPGRADE_STATE,
+    //  清除连接缓存
+    CLEAN_CONNECT_CACHE,
     //  重置蓝牙
     RESET_BLE,
     //  打开蓝牙设置页面
@@ -107,6 +109,9 @@ enum class BleMC {
             DEVICE_CONNECTED -> {
                 val uuid = arguments as String? ?: ""
                 BleManager.instance.setConnected(uuid)
+            }
+            CLEAN_CONNECT_CACHE -> {
+                BleManager.instance.cleanConnectCache()
             }
             RESET_BLE -> {
                 BleManager.instance.reset()

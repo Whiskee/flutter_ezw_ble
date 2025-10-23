@@ -375,6 +375,16 @@ class BleManager private constructor() {
     }
 
     /**
+     * 清除连接缓存
+     */
+    fun cleanConnectCache() {
+        waitingConnectDevices.forEach {
+            it.timeoutTimer?.cancel()
+        }
+        waitingConnectDevices.clear()
+    }
+
+    /**
      * 重置
      */
     fun reset() {
@@ -384,7 +394,7 @@ class BleManager private constructor() {
         }
         connectedDevices.clear()
         scanResultTemp.clear()
-        waitingConnectDevices.clear()
+        cleanConnectCache()
         descriptorQueue.clear()
         upgradeDevices.clear()
         sendCmdQueue.clear()
@@ -812,10 +822,7 @@ class BleManager private constructor() {
                 return
             }
             //  2、执行写特征使能
-            val item = descriptorQueue.poll()
-            if (item == null)  {
-                return
-            }
+            val item = descriptorQueue.poll() ?: return
             val descriptor = item.second
             val isWrite = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothStatusCodes.SUCCESS
@@ -830,10 +837,7 @@ class BleManager private constructor() {
          * 请求设备mtu
          */
         private fun requestDeviceMtu(gatt: BluetoothGatt) {
-            val device = findConnectedDevice(gatt.device.address)
-            if (device == null) {
-                return
-            }
+            val device = findConnectedDevice(gatt.device.address) ?: return
             val belongConfig = device.belongConfig
             //  4、MTU大于0则发起MTU修改
             gatt.requestMtu(belongConfig.mtu)
@@ -847,10 +851,7 @@ class BleManager private constructor() {
             //  1、获取链接设备
             val address = gatt.device.address
             val name = gatt.device.name
-            val device = findConnectedDevice(address)
-            if (device == null) {
-                return
-            }
+            val device = findConnectedDevice(address) ?: return
             val belongConfig = device.belongConfig
             //  6、如果是主动互动发起绑定则调用createBond，并通过绑定回调处理连接状态
             if (belongConfig.initiateBinding && gatt.device.bondState != BluetoothDevice.BOND_BONDED) {
@@ -891,24 +892,13 @@ class BleManager private constructor() {
             device.gattMap.clear()
             sendLog(BleLoggerTag.d, "${device.name} clear all gatt")
         }
-        // 假设 waitingConnectDevices 是 CopyOnWriteArrayList
-        // 为了更安全地移除，可以先找到再移除，或者使用 removeIf
-        var removedWaitingDevice: BleConnectTemp? = null
-        val iterator = waitingConnectDevices.iterator()
-        while (iterator.hasNext()) {
-            val temp = iterator.next()
+        // 安全移除等待连接的设备，并清理其定时器
+        waitingConnectDevices.removeAll { temp ->
             if (temp.uuid == uuid) {
-                removedWaitingDevice = temp
-                // waitingConnectDevices.remove(temp) // CopyOnWriteArrayList 的迭代器不支持 remove
-                break // 假设 uuid 是唯一的，找到就跳出
-            }
-        }
-        removedWaitingDevice?.let {
-            it.timeoutTimer?.cancel()
-            it.timeoutTimer = null
-            if (waitingConnectDevices.contains(it)) {
-                waitingConnectDevices.remove(it) // 在 CopyOnWriteArrayList 上 remove 对象是安全的
-            }
+                temp.timeoutTimer?.cancel()
+                temp.timeoutTimer = null
+                true
+            } else false
         }
         // 假设 sendCmdQueue 是 ConcurrentLinkedQueue
         sendCmdQueue.clear() // ConcurrentLinkedQueue.clear() 是线程安全的

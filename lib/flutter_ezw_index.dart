@@ -5,6 +5,7 @@ export 'package:flutter_ezw_ble/flutter_ezw_ble.dart';
 
 /// Core
 export 'core/extension/ble_device_ext.dart';
+export 'core/extension/string_ext.dart';
 export 'core/tools/connect_state_converter.dart';
 
 /// Models

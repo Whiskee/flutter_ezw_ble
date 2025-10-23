@@ -94,4 +94,8 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   Future<void> resetBle() {
     throw UnimplementedError('resetBle() has not been implemented.');
   }
+
+  Future<void> cleanConnectCache() {
+    throw UnimplementedError('cleanConnectCache() has not been implemented.');
+  }
 }
