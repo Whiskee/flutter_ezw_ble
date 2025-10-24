@@ -16,10 +16,8 @@ import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.Context.BLUETOOTH_SERVICE
-import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
-import android.util.Log
 import com.fzfstudio.ezw_ble.ble.extension.toBleDevice
 import com.fzfstudio.ezw_ble.ble.models.BleCmd
 import com.fzfstudio.ezw_ble.ble.models.BleConfig
@@ -44,6 +42,7 @@ import java.util.TimerTask
 import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.regex.Pattern
+import kotlin.time.Duration.Companion.milliseconds
 
 class BleManager private constructor() {
 
@@ -95,6 +94,8 @@ class BleManager private constructor() {
     private var bleLocation: Boolean = false
     //  - 当前蓝牙基础配置，必须实现
     private var bleConfigs: List<BleConfig> = listOf()
+    //  - 正在执行断连的设备
+    private var disconnectingDevices: MutableList<Pair<String, BleConnectState>> = mutableListOf()
 
     /// =========== Get
     //  - 蓝牙状态
@@ -235,9 +236,7 @@ class BleManager private constructor() {
         if (!afterUpgrade && upgradeDevices.contains(uuid)) {
             upgradeDevices.remove(uuid)
         }
-        //  4、查询设备是否已经在连接缓存中
-        var bleDevice = connectedDevices.firstOrNull { it.uuid == uuid }
-        //  5、获取新的连接对象
+        //  4、获取新的连接对象
         val remoteDevice = bluetoothAdapter.getRemoteDevice(uuid)
         //  - bondState = 12
         sendLog(BleLoggerTag.e, "Start connect: $uuid, remote device = ${remoteDevice.name}, state = ${remoteDevice.bondState}")
@@ -268,7 +267,8 @@ class BleManager private constructor() {
             sendLog(BleLoggerTag.d, "Start connect: $uuid, waiting ${lastDevice?.uuid} finish connecting")
             return
         }
-        //  7、获取BleDevice，并执行连接
+        //  7、查询设备是否已经在连接缓存中，如果不在就创建
+        var bleDevice = connectedDevices.firstOrNull { it.uuid == uuid }
         if (bleDevice == null) {
             bleDevice = remoteDevice.toBleDevice(bleConfig, sn, 0)
             connectedDevices.add(bleDevice)
@@ -288,9 +288,8 @@ class BleManager private constructor() {
         val timeoutTimer = Timer()
         timeoutTimer.schedule(object : TimerTask() {
             override fun run() {
-                handleConnectState(uuid, name, BleConnectState.TIMEOUT)
                 sendLog(BleLoggerTag.e, "Start connect: $uuid, connect time out")
-                disconnectDevice(uuid)
+                handleConnectState(uuid, name, BleConnectState.TIMEOUT)
             }
         }, bleConfig.connectTimeout.toLong() + (if (afterUpgrade) bleConfig.upgradeSwapTime.toLong() else 0),)
         waitingConnectDevices.firstOrNull { it.uuid == uuid }?.timeoutTimer = timeoutTimer
@@ -305,10 +304,16 @@ class BleManager private constructor() {
      * 断连设备
      */
     fun disconnect(uuid: String) {
-        //  1、执行设备断连
+        sendLog(BleLoggerTag.d, "Star disconnect: $uuid by user")
+        waitingConnectDevices.removeAll {
+            if (it.uuid == uuid) {
+                it.timeoutTimer?.cancel()
+                it.timeoutTimer = null
+                true
+            } else false
+        }
         val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
-        handleConnectState(uuid, connectedDevice?.name ?: "", BleConnectState.DISCONNECT_BY_MYSELF)
-        sendLog(BleLoggerTag.d, "Disconnect: $uuid, finish")
+        handleConnectState(uuid, connectedDevice?.name ?: "", BleConnectState.DISCONNECT_BY_USER)
     }
 
     /**
@@ -318,9 +323,9 @@ class BleManager private constructor() {
         if (!checkIsFunctionCanBeCalled() || uuid.isEmpty()) {
             return
         }
+        sendLog(BleLoggerTag.d, "$uuid is already connected")
         val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
         handleConnectState(uuid, connectedDevice?.name ?: "", BleConnectState.CONNECTED)
-        sendLog(BleLoggerTag.d, "Connected: $uuid, finish")
     }
 
     /**
@@ -382,6 +387,7 @@ class BleManager private constructor() {
             it.timeoutTimer?.cancel()
         }
         waitingConnectDevices.clear()
+        disconnectingDevices.clear()
     }
 
     /**
@@ -398,6 +404,7 @@ class BleManager private constructor() {
         descriptorQueue.clear()
         upgradeDevices.clear()
         sendCmdQueue.clear()
+        disconnectingDevices.clear()
         sendLog(BleLoggerTag.d, "Reset: success")
     }
 
@@ -635,27 +642,34 @@ class BleManager private constructor() {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 gatt.discoverServices()
                 handleConnectState(device.address, device.name, BleConnectState.SEARCH_SERVICE)
-                sendLog(BleLoggerTag.d, "Connect call back: ${device.address}, had contact device, state = STATE_CONNECTED(code:2), start search services")
+                sendLog(BleLoggerTag.d, "Connect call back: ${device.address} had contact device, state = STATE_CONNECTED(code:2), start search services")
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 isPsHandleFinish = false
                 val myDevice = connectedDevices.firstOrNull { it.uuid == device.address  }
                 if (myDevice == null)   {
-                    sendLog(BleLoggerTag.e, "Connect call back: ${gatt.device.address}, not my connected device, state = STATE_DISCONNECTED(code:$status)")
+                    sendLog(BleLoggerTag.e, "Connect call back: ${gatt.device.address} not my connected device, state = STATE_DISCONNECTED(code:$status)")
                     return
                 }
                 //  如果断连发生时已经在连接中了，就不要断连
                 if (myDevice.connectState.isConnecting) {
-                    sendLog(BleLoggerTag.e, "Connect call back: ${gatt.device.address}, is start new connecting, stop disconnect flow, keep connecting")
+                    sendLog(BleLoggerTag.e, "Connect call back: ${gatt.device.address} is start new connecting, stop disconnect flow, keep connecting")
                     return
                 }
+                //  如果断连的设备是手动断连的，就不再执行系统断连处理
+                val disconnectDevice = disconnectingDevices.firstOrNull { it.first == myDevice.uuid }
+                if (disconnectDevice != null) {
+                    disconnectingDevices.remove(disconnectDevice)
+                    sendLog(BleLoggerTag.e, "Connect call back: ${gatt.device.address} is disconnecting witch state = ${disconnectDevice.second}, stop disconnect flow form system")
+                    return
+                }
+                //  - 执行断开连接，确保被释放
+                gatt.close()
                 //  - 如果报授权问题，刷新gatt
                 if (status == BluetoothGatt.GATT_INSUFFICIENT_AUTHORIZATION) {
                     refreshDeviceCache(gatt)
                 }
-                //  -- 这很重要，gatt.disconnect执行断连后，回调了再执行close才能保证gatt真正被释放
-                gatt.close()
                 //  -- 打印
-                sendLog(BleLoggerTag.e, "Connect call back: ${gatt.device.address}, state = STATE_DISCONNECTED(code:${BluetoothGattStatus.getStatusDescription(status)})")
+                sendLog(BleLoggerTag.e, "Connect call back: ${gatt.device.address} state = STATE_DISCONNECTED(code:${BluetoothGattStatus.getStatusDescription(status)})")
                 //  -- GATT_CONN_LMP_TIMEOUT, 移除配对导致的出现的GATT_CONN_LMP_TIMEOUT，就不执行操作
                 if (status == 22) {
                     return
@@ -725,7 +739,7 @@ class BleManager private constructor() {
             if (!isPsHandleFinish) {
                 return
             }
-            sendLog(BleLoggerTag.d, "Connect call back: ${gatt?.device?.address}, is descriptor write success = ${status == BluetoothGatt. GATT_SUCCESS}")
+            sendLog(BleLoggerTag.d, "Connect call back: ${gatt?.device?.address} is descriptor write success = ${status == BluetoothGatt. GATT_SUCCESS}")
             processNextDescriptor(gatt)
         }
 
@@ -800,7 +814,7 @@ class BleManager private constructor() {
             if (!isPsHandleFinish) {
                 return
             }
-            sendLog(BleLoggerTag.d, "Connect call back: ${gatt?.device?.address}, change mtu ${if (status == BluetoothGatt. GATT_SUCCESS )  "success" else "fail"}, new mtu value = $mtu, connecting flow is finish")
+            sendLog(BleLoggerTag.d, "Connect call back: ${gatt?.device?.address} change mtu ${if (status == BluetoothGatt. GATT_SUCCESS )  "success" else "fail"}, new mtu value = $mtu, connecting flow is finish")
             gatt?.let {
                 connectingFlowFinish(it, mtu)
             }
@@ -830,7 +844,7 @@ class BleManager private constructor() {
                 descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                 gatt.writeDescriptor(descriptor)
             }
-            sendLog(BleLoggerTag.d, "Connect call back: ${gatt.device.address}, desUuid = ${descriptor.uuid}, chars = ${descriptor.characteristic.uuid}, psType=${item.first}, enable descriptor and write = $isWrite")
+            sendLog(BleLoggerTag.d, "Connect call back: ${gatt.device.address} desUuid = ${descriptor.uuid}, chars = ${descriptor.characteristic.uuid}, psType=${item.first}, enable descriptor and write = $isWrite")
         }
 
         /**
@@ -841,7 +855,7 @@ class BleManager private constructor() {
             val belongConfig = device.belongConfig
             //  4、MTU大于0则发起MTU修改
             gatt.requestMtu(belongConfig.mtu)
-            sendLog(BleLoggerTag.d, "Connect call back: ${device.uuid}, enable all descriptor, request mtu to = ${belongConfig.mtu}")
+            sendLog(BleLoggerTag.d, "Connect call back: ${device.uuid} enable all descriptor, request mtu to = ${belongConfig.mtu}")
         }
 
         /**
@@ -870,29 +884,34 @@ class BleManager private constructor() {
     /**
      * 移除连接舍比gatt数据
      */
-    private fun disconnectDevice(uuid: String, isFromSysDisconnect: Boolean = false) {
-        // 假设 connectedDevices 是 CopyOnWriteArrayList
+    private fun disconnectDevice(uuid: String, state: BleConnectState   ) {
+        //  1、执行设备断连(系统传入的不处理即便添加了也不会有问题)
+        if (state != BleConnectState.DISCONNECT_FROM_SYS && disconnectingDevices.firstOrNull { it.first == uuid } == null) {
+            disconnectingDevices.add(Pair(uuid, state))
+        }
+        //  2、假设 connectedDevices 是 CopyOnWriteArrayList
         val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
-        // connectedDevice 本身可能为 null，需要安全调用
+        //  - 2.1、connectedDevice 本身可能为 null，需要安全调用
         connectedDevice?.let { device ->
             //  - 只处理主动断连的事件
-            if (!isFromSysDisconnect) {
-                // gattMap 是 ConcurrentHashMap，其 values 的迭代器是弱一致性的，forEach 是安全的
-                // gattMap.values 返回的是一个 Collection，可以安全迭代
-                device.gattMap.values.forEach { bleGatt -> // 重命名 gatt 变量以避免与 bleGatt.gatt 混淆
-                    try {
-                        // 会执行onConnectionStateChange
-                        bleGatt.gatt?.disconnect()
-                        sendLog(BleLoggerTag.d, "${device.name} had disconnected")
-                    } catch (e: Exception) {
-                        sendLog(BleLoggerTag.e, "Exception during gatt.disconnect for $uuid: ${e.message}")
-                    }
+            //  gattMap 是 ConcurrentHashMap，其 values 的迭代器是弱一致性的，forEach 是安全的
+            //  gattMap.values 返回的是一个 Collection，可以安全迭代
+            device.gattMap.values.forEach { bleGatt -> // 重命名 gatt 变量以避免与 bleGatt.gatt 混淆
+                try {
+                    //  会执行onConnectionStateChange
+                    bleGatt.gatt?.disconnect()
+                    //  必须要close，否则会无法释放句柄 (强制休眠200ms，让gatt有时间处理)
+                    Thread.sleep(200)
+                    bleGatt.gatt?.close()
+                    sendLog(BleLoggerTag.d, "${device.name} had disconnected")
+                } catch (e: Exception) {
+                    sendLog(BleLoggerTag.e, "Exception during gatt.disconnect for $uuid: ${e.message}")
                 }
             }
             device.gattMap.clear()
             sendLog(BleLoggerTag.d, "${device.name} clear all gatt")
         }
-        // 安全移除等待连接的设备，并清理其定时器
+        //  3、安全移除等待连接的设备，并清理其定时器
         waitingConnectDevices.removeAll { temp ->
             if (temp.uuid == uuid) {
                 temp.timeoutTimer?.cancel()
@@ -910,15 +929,17 @@ class BleManager private constructor() {
     private fun handleConnectState(uuid: String, name: String, state: BleConnectState, mtu: Int = 247) {
         //  1、处理断连和错误连接
         if (state.isDisconnected || state.isError) {
-            disconnectDevice(uuid, state == BleConnectState.DISCONNECT_FROM_SYS)
+            disconnectDevice(uuid, state)
         }
         //  2、处理连接成功
         else if (state.isConnected) {
-            //  移除待连接中的对象
+            // 安全移除等待连接的设备，并清理其定时器
             waitingConnectDevices.removeAll {
-                it.timeoutTimer?.cancel()
-                it.timeoutTimer = null
-                it.uuid == uuid
+                if (it.uuid == uuid) {
+                    it.timeoutTimer?.cancel()
+                    it.timeoutTimer = null
+                    true
+                } else false
             }
         }
         //  3、非连接流程，查询是否有待连接设备，如果有就开始连接

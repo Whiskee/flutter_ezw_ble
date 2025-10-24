@@ -18,7 +18,7 @@ enum class BleConnectState {
     CONNECT_FINISH,
     //  错误码：
     //  - 主动断连
-    DISCONNECT_BY_MYSELF,
+    DISCONNECT_BY_USER,
     //  - 系统断连
     DISCONNECT_FROM_SYS,
     //  - 空的UUID
@@ -74,7 +74,7 @@ enum class BleConnectState {
      *  是否已经断连
      */
     val isDisconnected: Boolean
-        get() = this == DISCONNECT_BY_MYSELF ||
+        get() = this == DISCONNECT_BY_USER ||
                 this == DISCONNECT_FROM_SYS
 
     /**
