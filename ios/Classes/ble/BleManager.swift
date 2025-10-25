@@ -127,7 +127,8 @@ extension BleManager {
             uuid: newUuid,
             name: easyConnect.name,
             afterUpgrade: easyConnect.afterUpgrade,
-            time: Date().timeIntervalSince1970)
+            time: Date().timeIntervalSince1970,
+        )
         newEasyConnect.bleConfig = bleConfig
         //  -- 如果不存在就缓存起来
         if !waitingConnectDevices.contains(where: { easyConnect in
@@ -437,7 +438,7 @@ extension BleManager {
             guard let bleConfig = connectDevice.bleConfig else {
                 startConnectInfos.removeAll()
                 stopScan()
-                handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .noBleConfigFound)
+                handleConnectState(uuid: connectDevice.uuid, name: connectDevice.name, state: .noBleConfigFound)
                 loggerE(msg: "centralManager - search: \(connectDevice.uuid)-\(connectDevice.name), no config found")
                 return false
             }
@@ -446,9 +447,9 @@ extension BleManager {
             var canRemove: Bool = false
             //  - 1.2、设置搜索超时（时间戳获取到的余数为秒）
             if Date().timeIntervalSince1970 - connectDevice.time! > bleConfig.connectTimeout / 1000 {
-                handleConnectState(uuid: connectDevice.uuid, name: peripheral.name ?? "", state: .noDeviceFound)
-                canRemove = true
                 loggerD(msg: "centralManager - search: \(connectDevice.uuid)-\(connectDevice.name), no device found")
+                handleConnectState(uuid: connectDevice.uuid, name: connectDevice.name, state: .noDeviceFound)
+                canRemove = true
             }
             //  - 1.3、如果找到对应的UUID就执行连接
             else if connectDevice.uuid == peripheral.identifier.uuidString || connectDevice.name == peripheral.name! {
