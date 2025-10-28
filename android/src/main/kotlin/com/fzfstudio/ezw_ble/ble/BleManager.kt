@@ -884,7 +884,7 @@ class BleManager private constructor() {
     /**
      * 移除连接舍比gatt数据
      */
-    private fun disconnectDevice(uuid: String, state: BleConnectState   ) {
+    private fun disconnectDevice(uuid: String, state: BleConnectState) {
         //  1、执行设备断连(系统传入的不处理即便添加了也不会有问题)
         if (state != BleConnectState.DISCONNECT_FROM_SYS && disconnectingDevices.firstOrNull { it.first == uuid } == null) {
             disconnectingDevices.add(Pair(uuid, state))
@@ -898,12 +898,21 @@ class BleManager private constructor() {
             //  gattMap.values 返回的是一个 Collection，可以安全迭代
             device.gattMap.values.forEach { bleGatt -> // 重命名 gatt 变量以避免与 bleGatt.gatt 混淆
                 try {
-                    //  会执行onConnectionStateChange
-                    bleGatt.gatt?.disconnect()
-                    //  必须要close，否则会无法释放句柄 (强制休眠200ms，让gatt有时间处理)
-                    Thread.sleep(200)
-                    bleGatt.gatt?.close()
-                    sendLog(BleLoggerTag.d, "${device.name} had disconnected")
+                    val gatt = bleGatt.gatt
+                    if (gatt != null) {
+                        //  会执行onConnectionStateChange
+                        gatt.disconnect()
+                        mainScope.launch {
+                            //  延迟释放 GATT，避免阻塞调用线程
+                            delay(200L)
+                            try {
+                                gatt.close()
+                                sendLog(BleLoggerTag.d, "${device.name} had disconnected")
+                            } catch (closeError: Exception) {
+                                sendLog(BleLoggerTag.e, "Exception during gatt.close for $uuid: ${closeError.message}")
+                            }
+                        }
+                    }
                 } catch (e: Exception) {
                     sendLog(BleLoggerTag.e, "Exception during gatt.disconnect for $uuid: ${e.message}")
                 }
