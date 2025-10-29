@@ -101,6 +101,8 @@ extension BleManager {
     func connect(easyConnect: BleEasyConnect) {
         //  1、默认功能检查
         guard checkIsFunctionCanBeCalled() else {
+            loggerE(msg: "connect-flow: \(easyConnect.uuid) ble error")
+            handleConnectState(uuid: easyConnect.uuid, name: easyConnect.name, state: .bleError)
             return
         }
         //  2、非升级状态需要移除升级设备
@@ -108,19 +110,22 @@ extension BleManager {
             upgradeDevices?.removeAll(where: {$0 == easyConnect.uuid})
         }
         //  3、获取当前配置
+        //  - 3.1、查询蓝牙配置是否存在
         guard let bleConfig = findCurrentBleConfig(belongConfig: easyConnect.belongConfig, uuid: easyConnect.uuid, name: easyConnect.name) else {
+            loggerE(msg: "connect-flow: \(easyConnect.uuid) no bleConfig find")
+            handleConnectState(uuid: easyConnect.uuid, name: easyConnect.name, state: .noBleConfigFound)
             return
         }
-        //  - 3.1、获取基础的私有服务
+        //  - 3.2、获取基础的私有服务
         let commonPs = bleConfig.privateServices.first { $0.type == 0 }
-        //  - 3.2、检查uuid和commonPs不能为空
+        //  - 3.3、检查uuid和commonPs不能为空
         guard easyConnect.uuid.isNotEmpty || easyConnect.name.isNotEmpty, let commonPs = commonPs else {
+            loggerE(msg: "connect-flow: \(easyConnect.uuid) can not find")
             handleConnectState(uuid: easyConnect.uuid, name: easyConnect.name, state: .emptyUuid)
-            loggerE(msg: "connect-flow: Empty uuid")
             return
         }
         //  4、缓存待连接数据
-        //  - 如果存在uuid为空，就创建一个UUID，避免空的uuid导致无法添加新的连接到waitingConnectDevices
+        //  - 4.1、如果存在uuid为空，就创建一个UUID，避免空的uuid导致无法添加新的连接到waitingConnectDevices
         let newUuid = easyConnect.uuid.isEmpty ? "temp-\(UUID().uuidString)" : easyConnect.uuid
         var newEasyConnect = BleEasyConnect(
             configName: bleConfig.name,
@@ -130,58 +135,63 @@ extension BleManager {
             time: Date().timeIntervalSince1970,
         )
         newEasyConnect.bleConfig = bleConfig
-        //  -- 如果不存在就缓存起来
+        //  - 4.2、如果不存在就缓存起来
         if !waitingConnectDevices.contains(where: { easyConnect in
             easyConnect.uuid == newEasyConnect.uuid || easyConnect.name == newEasyConnect.name
         }) {
             waitingConnectDevices.append(newEasyConnect)
         }
-        //  - 4.1、如果缓存对象只有一个，立马执行连接，如果没有就进入等待
+        //  - 4.3、如果缓存对象只有一个，立马执行连接，如果没有就进入等待
         if (waitingConnectDevices.count > 1) {
             loggerD(msg: "connect-flow: \(easyConnect.uuid)-\(easyConnect.name), will start connect when last conect finish")
             return
         }
-        //  4、停止搜索
-        stopScan()
-        //  5、开始执行连接
-        //  - 5.1、查询已连接的设备
+        //  6、开始执行连接
+        //  - 6.1、设置连接标志
+        var tag = "start connect: "
+        //  - 6.2、获取带连接的设备
+        var oldPeripheral: CBPeripheral?
+        //  - 6.3、查询已连接的设备
+        //  -- 6.3.1、从已连接的设备连接获取设备
         if let device = connectedDevices.first(where: { device in
             device.peripheral.identifier.uuidString == easyConnect.uuid || device.peripheral.name == easyConnect.name
         }) {
-            newEasyConnect.uuid = device.peripheral.identifier.uuidString
-            centralManager.connect(device.peripheral)
-            // -- 执行连接倒计时
-            startConnectingCountdown(currentConfig: bleConfig, uuid: newEasyConnect.uuid, name: newEasyConnect.name, afterUpgrade: easyConnect.afterUpgrade)
-            loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), from connected device list, after upgrade \(easyConnect.afterUpgrade)")
+            tag += "from connected device list"
+            oldPeripheral = device.peripheral
         }
-        //  - 5.2、在缓存中查找对应的设备
+        //  -- 6.3.2、在缓存中查找对应的设备
         else if let temp = scanResultTemp.first(where: { info in
             return info.0.uuid == easyConnect.uuid || info.1.name == easyConnect.name
         }) {
-            newEasyConnect.uuid = temp.1.identifier.uuidString
-            centralManager.connect(temp.1)
-            // -- 执行连接倒计时
-            startConnectingCountdown(currentConfig: bleConfig, uuid: newEasyConnect.uuid, name: newEasyConnect.name, afterUpgrade: easyConnect.afterUpgrade)
-            loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), from scan resul temp, after upgrade \(easyConnect.afterUpgrade)")
+            tag += "from scan result temp"
+            oldPeripheral = temp.1
         }
-        //  - 5.3、获取蓝牙设置页面中是否有符合的设备
+        //  -- 6.3.3、获取蓝牙设置页面中是否有符合的设备
         else if let device = findPeripheralFromConnected(uuid: easyConnect.uuid, name: easyConnect.name, psUUID: commonPs.serviceUUID) {
-            newEasyConnect.uuid = device.identifier.uuidString
-            centralManager.connect(device)
-            // -- 缓存对象
-            connectedDevices.append(BleConnectedDevice(belongConfig: bleConfig, peripheral: device))
-            // -- 执行连接倒计时
-            startConnectingCountdown(currentConfig: bleConfig, uuid: newEasyConnect.uuid, name: newEasyConnect.name, afterUpgrade: easyConnect.afterUpgrade)
-            loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), from bluetooth setting, after upgrade \(easyConnect.afterUpgrade)")
+            tag += "from bluetooth setting"
+            oldPeripheral = device
         }
-        //  - 5.4、通过ServiceUUID查询
-        else {
+        //  - 6.4、查询是否获取到设备，如果没有就开启搜索
+        guard let oldPeripheral = oldPeripheral else {
+            tag += "no local device found, start scan device"
             //  -- 添加待连接的设备
             startConnectInfos.append(newEasyConnect)
             //  -- 根据服务特征查询设备
             startScan()
-            loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), no local device found, start scan device")
+            loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), \(tag)")
+            return
         }
+        //  - 6.5、检查是否是否已经处于连接状态，如果是就直接发起服务发现, 不是就发起连接
+        tag += ", afterUpdate: \(newEasyConnect.afterUpgrade)"
+        loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), \(tag)")
+        if oldPeripheral.state == .connected {
+            handleAlreadyConnected(peripheral: oldPeripheral, bleConfig: bleConfig, deviceName: easyConnect.name, tag: "start connect")
+        } else {
+            centralManager.connect(oldPeripheral)
+        }
+        //  - 6.6、执行连接倒计时
+        startConnectingCountdown(currentConfig: bleConfig, uuid: newEasyConnect.uuid, name: newEasyConnect.name, afterUpgrade: easyConnect.afterUpgrade)
+        //  - 6.7、更新设备连接状态
         handleConnectState(uuid: newEasyConnect.uuid, name: easyConnect.name, state: .connecting)
     }
     
@@ -354,7 +364,7 @@ extension BleManager {
     private func findPeripheralFromConnected(uuid: String, name: String, psUUID: CBUUID)-> CBPeripheral? {
         let connectedPeripherals = centralManager.retrieveConnectedPeripherals(withServices: [psUUID])
         return connectedPeripherals.first { device in
-            device.identifier.uuidString == uuid || device.name == name
+            device.name == name || device.identifier.uuidString == uuid
         }
     }
     
@@ -424,6 +434,24 @@ extension BleManager {
         let nsString = preSn as NSString
         let sn = regex.stringByReplacingMatches(in: preSn, options: [], range: NSRange(location: 0, length: nsString.length), withTemplate: "")
         return sn
+    }
+
+    /**
+     *  处理已经连接的设备
+     */
+    private func handleAlreadyConnected(peripheral: CBPeripheral,  bleConfig: BleConfig, deviceName: String, tag: String = "") {
+        //  1、更新连接状态
+        handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .searchService, tag: tag)
+        //  2、更新已连接缓存设备信息
+        let uuid = peripheral.identifier.uuidString
+        connectedDevices.removeAll { device in
+            device.peripheral.identifier.uuidString == uuid || device.peripheral.name == deviceName
+        }
+        connectedDevices.append(BleConnectedDevice(belongConfig: bleConfig, peripheral: peripheral))
+        //  3、获取设备服务
+        peripheral.delegate = self
+        let services = bleConfig.privateServices.map { $0.serviceUUID }
+        peripheral.discoverServices(services)
     }
     
     /**
@@ -628,43 +656,44 @@ extension BleManager {
             let timer = connectingTimeoutTimers[index]
             timer.2.invalidate()
             connectingTimeoutTimers.remove(at: index)
-            loggerD(msg: "connect-flow: \(uuid)-\(name), state = \(state.rawValue), stop connect timer \(fromTag)")
+            loggerD(msg: "connect-flow: \(uuid)-\(name), state = \(state.rawValue), stop connect timer, tag = \(fromTag)")
         }
         //  2、设备连接状态为失败或断连就要设置连接设备连接状态为false
         if state.isError() || state.isDisconnected(), let index = connectedDevices.firstIndex(where: { $0.peripheral.identifier.uuidString == uuid || $0.peripheral.name == name }) {
             var device = connectedDevices[index]
             device.isConnected = false
+            //  移除所有订阅状态，确保都释放
+            for (_, readChar) in device.readCharsDic {
+                device.peripheral.setNotifyValue(false, for: readChar)
+            }
             device.readCharsNotify = 0
             connectedDevices[index] = device
-            loggerD(msg: "connect-flow: \(uuid)-\(name), state = \(state) \(fromTag)")
-        }
-        //  3、移除待连接设备
-        if !state.isConnecting() {
-            //  -- 3.1、断连则移除当前待连接设备
-            waitingConnectDevices.removeAll { easyConnect in
-                easyConnect.uuid == uuid || easyConnect.name == name
-            }
-            //  -- 3.2、如果连接失败(超时除外)，则移除所有等待连接设备
-            if state.isError() && state != .timeout {
-                //  设置所有设备为连接失败
-                waitingConnectDevices.forEach { connect in
-                    let connectModel = BleConnectModel(uuid: uuid, name: name, connectState: state, mtu: mtu)
-                    let jsonString = try? connectModel.toJsonString() ?? ""
-                    BleEC.connectStatus.event()?(jsonString)
-                }
-                waitingConnectDevices.removeAll()
-            }
-            //  -- 3.3 、没有成功也要连接下一个，避免一致下一次重连进不来
-            else if let newConnect = waitingConnectDevices.first {
-                connect(easyConnect: newConnect)
-            }
-            //  打印待连接设备数量
-            loggerD(msg: "connect-flow: \(uuid)-\(name), remove from waiting connect device list, remaining count = \(waitingConnectDevices.count) \(fromTag)")
+            loggerD(msg: "connect-flow: \(uuid)-\(name), state = \(state), tag = \(fromTag)")
         }
         //  3、发送连接状态
-        let connectModel = BleConnectModel(uuid: uuid, name: name, connectState: state, mtu: mtu)
-        let jsonString = try? connectModel.toJsonString() ?? ""
-        BleEC.connectStatus.event()?(jsonString)
+        sendConnectStateToFlutter(uuid: uuid, name: name, state: state, mtu: mtu)
+        //  -- 如果设备正在连接就不处理
+        guard !state.isConnecting() else {
+            return
+        }
+        //  4、处理设备连接不成功
+        //  - 4.1、断连则移除当前待连接设备
+        waitingConnectDevices.removeAll { easyConnect in
+            easyConnect.uuid == uuid || easyConnect.name == name
+        }
+        loggerD(msg: "connect-flow: \(uuid)-\(name), remove from waiting connect device list, remaining count = \(waitingConnectDevices.count), tag = \(fromTag)")
+        //  - 4.2、如果连接失败(超时除外)，则移除所有等待连接设备
+        if state.isError() && state != .timeout {
+            //  设置所有设备为连接失败
+            waitingConnectDevices.forEach { connect in
+                sendConnectStateToFlutter(uuid: uuid, name: name, state: state, mtu: mtu)
+            }
+            waitingConnectDevices.removeAll()
+        }
+        //  - 4.3、没有成功也要连接下一个，避免一致下一次重连进不来
+        else if let newConnect = waitingConnectDevices.first {
+            connect(easyConnect: newConnect)
+        }
     }
     
     /**
@@ -676,6 +705,15 @@ extension BleManager {
         let attMTU = maxWriteLength + 3  // ATT_MTU = 数据载荷 + 3字节ATT头部
         loggerD(msg: "\(peripheral.identifier.uuidString), mtu = \(attMTU), max write length = \(maxWriteLength)")
         return attMTU
+    }
+    
+    /**
+     * 发送连接状态
+     */
+    private func sendConnectStateToFlutter(uuid: String, name: String, state: BleConnectState, mtu: Int) {
+        let connectModel = BleConnectModel(uuid: uuid, name: name, connectState: state, mtu: mtu)
+        let jsonString = try? connectModel.toJsonString() ?? ""
+        BleEC.connectStatus.event()?(jsonString)
     }
     
     /**
@@ -813,25 +851,15 @@ extension BleManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         let tag = "didConnect"
         //  1、检查是否获取到了蓝牙配置
-        guard let bleConfig = waitingConnectDevices.first(where: { easyConnect in
+        guard let waitingConnectDevice = waitingConnectDevices.first(where: { easyConnect in
             easyConnect.uuid == peripheral.identifier.uuidString || easyConnect.name == peripheral.name
-        })?.bleConfig else {
+        }), let bleConfig = waitingConnectDevice.bleConfig else {
             handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .noBleConfigFound, tag: tag)
             return
         }
-        //  2、更新已连接缓存设备信息
-        let uuid = peripheral.identifier.uuidString
-        connectedDevices.removeAll { device in
-            device.peripheral.identifier.uuidString == uuid
-        }
-        connectedDevices.append(BleConnectedDevice(belongConfig: bleConfig, peripheral: peripheral))
-        //  3、获取设备服务
-        peripheral.delegate = self
-        let services = bleConfig.privateServices.map { $0.serviceUUID }
-        peripheral.discoverServices(services)
-        //  4、发送日志
-        handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .searchService, tag: tag)
+        //  2、发起服务发现
         loggerD(msg: "didConnect: \(peripheral.identifier.uuidString)")
+        handleAlreadyConnected(peripheral: peripheral, bleConfig: bleConfig, deviceName: waitingConnectDevice.name, tag: tag)
     }
 
     /**
