@@ -170,6 +170,7 @@ extension BleManager {
         else if let device = findPeripheralFromConnected(uuid: easyConnect.uuid, name: easyConnect.name, psUUID: commonPs.serviceUUID) {
             tag += "from bluetooth setting"
             oldPeripheral = device
+            connectedDevices.append(BleConnectedDevice(belongConfig: bleConfig, peripheral: device))
         }
         //  - 6.4、查询是否获取到设备，如果没有就开启搜索
         guard let oldPeripheral = oldPeripheral else {
@@ -548,7 +549,6 @@ extension BleManager {
             })?.isConnected != true else {
                 return
             }
-            self?.disconnect(uuid: uuid, name: name)
             self?.handleConnectState(uuid: uuid, name: name, state: .timeout)
         }
         connectingTimeoutTimers.append((uuid, name, timer))
@@ -633,7 +633,6 @@ extension BleManager {
             }
             //  - 发起断连
             else {
-                centralManager.cancelPeripheralConnection(connectedDevice.peripheral)
                 handleConnectState(uuid: uuid, name: name, state: updateByUser ? .disconnectByUser : .disconnectFromSys)
             }
         }
@@ -660,14 +659,19 @@ extension BleManager {
         }
         //  2、设备连接状态为失败或断连就要设置连接设备连接状态为false
         if state.isError() || state.isDisconnected(), let index = connectedDevices.firstIndex(where: { $0.peripheral.identifier.uuidString == uuid || $0.peripheral.name == name }) {
+            //  - 2.1、获取待移除
             var device = connectedDevices[index]
+            //  - 2.2、设置为断连
             device.isConnected = false
-            //  移除所有订阅状态，确保都释放
+            //  - 2.3、移除所有订阅状态，确保都释放
             for (_, readChar) in device.readCharsDic {
                 device.peripheral.setNotifyValue(false, for: readChar)
             }
+            //  - 2.4、清除已订阅的信息
             device.readCharsNotify = 0
             connectedDevices[index] = device
+            //  - 2.5、执行断连
+            centralManager.cancelPeripheralConnection(device.peripheral)
             loggerD(msg: "connect-flow: \(uuid)-\(name), state = \(state), tag = \(fromTag)")
         }
         //  3、发送连接状态
