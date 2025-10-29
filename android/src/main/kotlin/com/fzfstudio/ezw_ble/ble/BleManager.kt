@@ -35,6 +35,7 @@ import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.lang.ref.WeakReference
+import java.util.Collections
 import java.util.LinkedList
 import java.util.Queue
 import java.util.Timer
@@ -64,7 +65,7 @@ class BleManager private constructor() {
             .build()
     }
     //  - 缓存已连接的设备
-    private val connectedDevices: MutableList<BleDevice> = mutableListOf()
+    private val connectedDevices: MutableList<BleDevice> = Collections.synchronizedList(mutableListOf())
     //  - 搜素结果临时缓存(DeviceInfo, 蓝牙对象)
     private val scanResultTemp: MutableList<BleDevice> = mutableListOf()
     //  - 待连接设备缓存（UUID，SN）
@@ -395,7 +396,9 @@ class BleManager private constructor() {
      */
     fun reset() {
         stopScan()
-        connectedDevices.forEach {
+        // 创建副本避免并发修改异常
+        val devicesToDisconnect = connectedDevices.toList()
+        devicesToDisconnect.forEach {
             disconnect(it.uuid)
         }
         connectedDevices.clear()
@@ -469,11 +472,6 @@ class BleManager private constructor() {
                 //  BluetoothAdapter.STATE_TURNING_OFF
                 //  BluetoothAdapter.STATE_TURNING_ON
                 else -> return
-            }
-            if (bleState != 5) {
-                connectedDevices.forEach {
-                    handleConnectState(it.uuid, it.name, BleConnectState.BLE_ERROR)
-                }
             }
             sendLog(BleLoggerTag.d, "Ble statue listener: Original state = $state, to even state = $bleState")
             //  检查蓝牙权限
