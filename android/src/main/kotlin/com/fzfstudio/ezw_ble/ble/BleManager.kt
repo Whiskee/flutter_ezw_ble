@@ -207,7 +207,7 @@ class BleManager private constructor() {
             return
         }
         isScanning = false
-        bluetoothAdapter.bluetoothLeScanner?.stopScan(scanCallback)
+                bluetoothAdapter.bluetoothLeScanner?.stopScan(scanCallback)
         scanCallback = null
         sendLog(BleLoggerTag.d, if (isStartScan) "Stop scan: checking if scan is already running, stopping it first if necessary" else "Stop scan: success")
     }
@@ -456,6 +456,15 @@ class BleManager private constructor() {
     }
 
     /**
+     * 检查系统蓝牙是否开启（避免在蓝牙关闭/崩溃时触发 Binder 调用导致 DeadObjectException）
+     */
+    private fun isBluetoothEnabled(): Boolean = try {
+        bluetoothAdapter.isEnabled
+    } catch (e: Exception) {
+        false
+    }
+
+    /**
      * 创建蓝牙状态监听器
      */
     private fun createBleStateListener(): BluetoothStateCallback = object : BluetoothStateCallback {
@@ -661,7 +670,11 @@ class BleManager private constructor() {
                     return
                 }
                 //  - 执行断开连接，确保被释放
-                gatt.close()
+                try {
+                    gatt.close()
+                } catch (closeError: Exception) {
+                    sendLog(BleLoggerTag.e, "Connect call back: ${gatt.device.address} close gatt exception: ${closeError.message}")
+                }
                 //  - 如果报授权问题，刷新gatt
                 if (status == BluetoothGatt.GATT_INSUFFICIENT_AUTHORIZATION) {
                     refreshDeviceCache(gatt)
@@ -891,28 +904,29 @@ class BleManager private constructor() {
         val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
         //  - 2.1、connectedDevice 本身可能为 null，需要安全调用
         connectedDevice?.let { device ->
-            //  - 只处理主动断连的事件
-            //  gattMap 是 ConcurrentHashMap，其 values 的迭代器是弱一致性的，forEach 是安全的
-            //  gattMap.values 返回的是一个 Collection，可以安全迭代
-            device.gattMap.values.forEach { bleGatt -> // 重命名 gatt 变量以避免与 bleGatt.gatt 混淆
-                try {
-                    val gatt = bleGatt.gatt
-                    if (gatt != null) {
-                        //  会执行onConnectionStateChange
-                        gatt.disconnect()
-                        mainScope.launch {
-                            //  延迟释放 GATT，避免阻塞调用线程
-                            delay(200L)
-                            try {
-                                gatt.close()
-                                sendLog(BleLoggerTag.d, "${device.name} had disconnected")
-                            } catch (closeError: Exception) {
-                                sendLog(BleLoggerTag.e, "Exception during gatt.close for $uuid: ${closeError.message}")
+             //  - 如果蓝牙为开启，所有的Gatt就不会有任何连接，所以不需要断连
+            if (isBluetoothEnabled()) {
+                device.gattMap.values.forEach { bleGatt -> 
+                    //  - 重命名 gatt 变量以避免与 bleGatt.gatt 混淆
+                    try {
+                        val gatt = bleGatt.gatt
+                        if (gatt != null) {
+                            //  会执行onConnectionStateChange
+                            gatt.disconnect()
+                            mainScope.launch {
+                                //  延迟释放 GATT，避免断连操作未完成导致无法释放
+                                delay(200L)
+                                try {
+                                    gatt.close()
+                                    sendLog(BleLoggerTag.d, "${device.name} had disconnected")
+                                } catch (closeError: Exception) {
+                                    sendLog(BleLoggerTag.e, "Exception during gatt.close for $uuid: ${closeError.message}")
+                                }
                             }
                         }
+                    } catch (e: Exception) {
+                        sendLog(BleLoggerTag.e, "Exception during gatt.disconnect for $uuid: ${e.message}")
                     }
-                } catch (e: Exception) {
-                    sendLog(BleLoggerTag.e, "Exception during gatt.disconnect for $uuid: ${e.message}")
                 }
             }
             device.gattMap.clear()
