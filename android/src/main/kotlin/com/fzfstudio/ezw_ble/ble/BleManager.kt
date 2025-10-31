@@ -207,7 +207,7 @@ class BleManager private constructor() {
             return
         }
         isScanning = false
-                bluetoothAdapter.bluetoothLeScanner?.stopScan(scanCallback)
+        bluetoothAdapter.bluetoothLeScanner?.stopScan(scanCallback)
         scanCallback = null
         sendLog(BleLoggerTag.d, if (isStartScan) "Stop scan: checking if scan is already running, stopping it first if necessary" else "Stop scan: success")
     }
@@ -482,6 +482,11 @@ class BleManager private constructor() {
                 //  BluetoothAdapter.STATE_TURNING_ON
                 else -> return
             }
+            if (bleState != 5) {
+                connectedDevices.forEach {
+                    disconnect(it.uuid)
+                }
+            }
             sendLog(BleLoggerTag.d, "Ble statue listener: Original state = $state, to even state = $bleState")
             //  检查蓝牙权限
             checkBluetoothPermission()
@@ -651,6 +656,10 @@ class BleManager private constructor() {
                 handleConnectState(device.address, device.name, BleConnectState.SEARCH_SERVICE)
                 sendLog(BleLoggerTag.d, "Connect call back: ${device.address} had contact device, state = STATE_CONNECTED(code:2), start search services")
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                if (!isBluetoothEnabled()) {
+                    sendLog(BleLoggerTag.e, "Connect call back: ${gatt.device.address}, not handle disconnect form state change, will call disconnect method in the ble state Listener")
+                    return
+                }
                 isPsHandleFinish = false
                 val myDevice = connectedDevices.firstOrNull { it.uuid == device.address  }
                 if (myDevice == null)   {
@@ -905,28 +914,26 @@ class BleManager private constructor() {
         //  - 2.1、connectedDevice 本身可能为 null，需要安全调用
         connectedDevice?.let { device ->
              //  - 如果蓝牙为开启，所有的Gatt就不会有任何连接，所以不需要断连
-            if (isBluetoothEnabled()) {
-                device.gattMap.values.forEach { bleGatt -> 
-                    //  - 重命名 gatt 变量以避免与 bleGatt.gatt 混淆
-                    try {
-                        val gatt = bleGatt.gatt
-                        if (gatt != null) {
-                            //  会执行onConnectionStateChange
-                            gatt.disconnect()
-                            mainScope.launch {
-                                //  延迟释放 GATT，避免断连操作未完成导致无法释放
-                                delay(200L)
-                                try {
-                                    gatt.close()
-                                    sendLog(BleLoggerTag.d, "${device.name} had disconnected")
-                                } catch (closeError: Exception) {
-                                    sendLog(BleLoggerTag.e, "Exception during gatt.close for $uuid: ${closeError.message}")
-                                }
+             device.gattMap.values.forEach { bleGatt -> 
+                //  - 重命名 gatt 变量以避免与 bleGatt.gatt 混淆
+                try {
+                    val gatt = bleGatt.gatt
+                    if (gatt != null) {
+                        //  会执行onConnectionStateChange
+                        gatt.disconnect()
+                        mainScope.launch {
+                            //  延迟释放 GATT，避免断连操作未完成导致无法释放
+                            delay(200L)
+                            try {
+                                gatt.close()
+                                sendLog(BleLoggerTag.d, "${device.name} had disconnected")
+                            } catch (closeError: Exception) {
+                                sendLog(BleLoggerTag.e, "Exception during gatt.close for $uuid: ${closeError.message}")
                             }
                         }
-                    } catch (e: Exception) {
-                        sendLog(BleLoggerTag.e, "Exception during gatt.disconnect for $uuid: ${e.message}")
                     }
+                } catch (e: Exception) {
+                    sendLog(BleLoggerTag.e, "Exception during gatt.disconnect for $uuid: ${e.message}")
                 }
             }
             device.gattMap.clear()
