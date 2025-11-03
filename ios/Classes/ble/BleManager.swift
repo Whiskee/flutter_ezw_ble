@@ -585,7 +585,7 @@ extension BleManager {
         } else {
             handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .disconnectFromSys, tag: tag)
         }
-        loggerE(msg: "\(logHead) \(peripheral.identifier.uuidString), error = \(error.localizedDescription)")
+        loggerE(msg: "\(logHead) \(peripheral.identifier.uuidString), error code = \(error.code), msg = \(error.localizedDescription)")
     }
     
     /**
