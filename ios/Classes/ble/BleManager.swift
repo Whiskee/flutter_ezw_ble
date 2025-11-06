@@ -175,6 +175,8 @@ extension BleManager {
         //  - 6.4、查询是否获取到设备，如果没有就开启搜索
         guard let oldPeripheral = oldPeripheral else {
             tag += "no local device found, start scan device"
+            //  -- 展示连接中
+            handleConnectState(uuid: newEasyConnect.uuid, name: easyConnect.name, state: .connecting)
             //  -- 添加待连接的设备
             startConnectInfos.append(newEasyConnect)
             //  -- 根据服务特征查询设备
