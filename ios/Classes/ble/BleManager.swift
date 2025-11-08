@@ -748,6 +748,9 @@ extension BleManager: CBCentralManagerDelegate {
         BleEC.bleState.event()?(central.state.rawValue)
         //  1、如果蓝牙状态不是开启，则将所有已连接的设备设置为非连接状态
         if central.state != .poweredOn {
+            //  - 1.1、移除所有升级设备，避免退出OTA时，重置会连接状态的设备
+            upgradeDevices?.removeAll()
+            //  - 1.2、断连所有设备：若设备已经断连了，就不再处理，避免状态重复断连
             connectedDevices.forEach { matchDevice in
                 if matchDevice.isConnected {
                     handleConnectState(uuid: matchDevice.peripheral.identifier.uuidString, name: matchDevice.peripheral.name ?? "", state: .bleError)

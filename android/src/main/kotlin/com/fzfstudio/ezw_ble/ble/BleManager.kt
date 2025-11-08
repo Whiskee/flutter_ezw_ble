@@ -483,8 +483,13 @@ class BleManager private constructor() {
                 else -> return
             }
             if (bleState != 5) {
+                //  清除所有升级设备数据，避免执行OTA退出时出现状态回连问题
+                upgradeDevices.clear()
+                //  断连所有设备: 若设备已经断连了，就不再处理，避免状态重复断连
                 connectedDevices.forEach {
-                    disconnect(it.uuid)
+                    if (it.isConnected) {
+                        disconnect(it.uuid)
+                    }
                 }
             }
             sendLog(BleLoggerTag.d, "Ble statue listener: Original state = $state, to even state = $bleState")
