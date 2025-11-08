@@ -72,7 +72,9 @@ enum class BleMC {
                 }
             }
             START_SCAN -> {
-                BleManager.instance.startScan()
+                val jsonMap = arguments as Map<*, *>?
+                val turnOnPureModel = jsonMap?.get("turnOnPureModel") as? Boolean ?: false
+                BleManager.instance.startScan(pureModel = turnOnPureModel)
             }
             STOP_SCAN -> BleManager.instance.stopScan()
             CONNECT_DEVICE -> {

@@ -44,6 +44,7 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.regex.Pattern
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.uuid.Uuid
 
 class BleManager private constructor() {
 
@@ -85,6 +86,8 @@ class BleManager private constructor() {
     private lateinit var bleStateListener: BleStateListener
     //  - 蓝牙搜索状态，是否正在搜索中
     private var isScanning = false
+    //  - 搜索纯净模式
+    private var scanPureMode: Boolean = false
     //  - 蓝牙搜索回调
     private var scanCallback: ScanCallback? = null
     //  - 当前蓝牙状态,默认无状态
@@ -179,18 +182,21 @@ class BleManager private constructor() {
     /**
      *  开启扫描
      */
-    fun startScan() {
+    fun startScan(pureModel: Boolean = false) {
         if (!checkIsFunctionCanBeCalled() || isScanning) {
             return
         }
-        //  1、执行搜索先优先执行停止搜索
+        //  1、是否开启纯净搜索模式
+        scanPureMode = pureModel
+        //  2、执行搜索先优先执行停止搜索
         stopScan()
-        //  2、执行搜索
+        //  3、执行搜索
         isScanning = true
-        //  3、移除历史记录
+        //  4、移除历史记录
         scanResultTemp.clear()
-        //  4、执行搜索
+        //  5、创建搜索回调
         scanCallback = createScanCallBack()
+        //  6、开始搜索
         bluetoothAdapter.bluetoothLeScanner?.startScan(null, scanSettings, scanCallback)
         sendLog(BleLoggerTag.d, "Start scan: success")
     }
@@ -206,6 +212,8 @@ class BleManager private constructor() {
             sendLog(BleLoggerTag.d, "Stop scan: scan call back is null")
             return
         }
+        //  停止时关闭纯净模式
+        scanPureMode = false
         isScanning = false
         bluetoothAdapter.bluetoothLeScanner?.stopScan(scanCallback)
         scanCallback = null
@@ -561,13 +569,23 @@ class BleManager private constructor() {
             if (bleConfig == null) {
                 return
             }
-            //  3、组装蓝牙数据
+            //  4、检查是否是纯净模式
+            if (scanPureMode) {
+                val deviceSn = UUID.randomUUID().toString()
+                //  - 4.1、创建设备自定义模型对象,并缓存
+                val bleDevice = device.toBleDevice(bleConfig, deviceSn, result.rssi)
+                scanResultTemp.add(bleDevice)
+                //  - 4.2、判断是否需要根据SN组合设备，不需要就直接提交
+                sendMatchDevices(deviceSn, listOf(bleDevice))
+                return
+            }
+            //  5、组装蓝牙数据
             var deviceSn = device.name
-            //  - 3.1、获取SN数据
+            //  - 5.1、获取SN数据
             val snRule = bleConfig.scan.snRule
             if (snRule != null) {
                 deviceSn = parseDataToObtainSn(result.scanRecord?.bytes, snRule)
-                //  - 3.2、阻断发送到Flutter
+                //  - 5.2、阻断发送到Flutter
                 //  -- a、SN无法被解析的
                 //  -- b、不包含标识的设备
                 if (deviceSn.isEmpty() ||
@@ -575,16 +593,16 @@ class BleManager private constructor() {
                     return
                 }
             }
-            //  4、发送设备到Flutter
-            //  - 4.1、创建设备自定义模型对象,并缓存
+            //  6、发送设备到Flutter
+            //  - 6.1、创建设备自定义模型对象,并缓存
             val bleDevice = device.toBleDevice(bleConfig, deviceSn, result.rssi)
             scanResultTemp.add(bleDevice)
-            //  - 4.2、判断是否需要根据SN组合设备，不需要就直接提交
+            //  - 6.2、判断是否需要根据SN组合设备，不需要就直接提交
             if (bleConfig.scan.matchCount < 2) {
                 sendMatchDevices(deviceSn, listOf(bleDevice))
                 return
             }
-            //  - 4.3、从缓存中获取到相同的sn,
+            //  - 6.3、从缓存中获取到相同的sn,
             val matchDevices = scanResultTemp.filter { it.sn == bleDevice.sn }
             //  -- 判断是否达到组合设备数量上限后，如果没有达到就不处理
             if (matchDevices.size != bleConfig.scan.matchCount) {

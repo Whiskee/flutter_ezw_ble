@@ -24,6 +24,8 @@ class BleManager: NSObject {
     //  =========== Variables
     //  - 当前蓝牙基础配置，必须实现
     private lazy var bleConfigs: [BleConfig] = []
+    //  - 搜索：纯净搜索模式，只返回单个设备，且只有名称，uuid
+    private lazy var scanPureModel: Bool = false
     //  - 搜素：获取结果临时缓存(DeviceInfo, 蓝牙对象)
     private lazy var scanResultTemp: [(BleDevice, CBPeripheral)] = []
     //  - 待连接设备
@@ -63,11 +65,16 @@ extension BleManager {
     
     /**
      * 开始扫描设备
+     *
+     * [param] pureModel 是否开启纯净模式（只返回设备名称，UUID）
      */
-    func startScan() {
+    func startScan(pureModel: Bool = false) {
         guard checkIsFunctionCanBeCalled() else {
             return
         }
+        //  是否开启纯净模式
+        scanPureModel = pureModel
+        //  开始搜索
         stopScan(isStartScan: true)
         //  清空缓存
         scanResultTemp.removeAll()
@@ -90,6 +97,8 @@ extension BleManager {
             loggerD(msg: "stopScan: connecting with scanning, not handle stop")
             return
         }
+        //  关闭纯净模式
+        scanPureModel = false
         centralManager.stopScan()
         loggerD(msg: "\(isStartScan ? "checking if scan is already running, stopping it first if necessary" : "stop scan")")
     }
@@ -786,6 +795,23 @@ extension BleManager: CBCentralManagerDelegate {
                 peripheral.name?.contains(filter) == true
             } != nil
         }) else {
+            return
+        }
+        //  5、检查是否开启了纯净模式，如果没有开启，就直接返回
+        guard !scanPureModel else {
+            //  - 5.1、创建随机SN
+            let pureSn = UUID().uuidString
+            //  - 5.2、创建外设
+            let bleDevice = peripheral.toBleDevice(
+                belongConfig: bleConfig.name,
+                sn: pureSn,
+                rssi: RSSI.intValue,
+                mac: "",
+            )
+            //  - 5.3、避免重复查询
+            scanResultTemp.append((bleDevice, peripheral))
+            //  - 5.4、发送设备
+            sendMatchDevices(sn: pureSn, devices: [bleDevice])
             return
         }
         //  5、规则解析

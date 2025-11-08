@@ -24,7 +24,12 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
           configs.map((config) => config.customToJson()).toList());
 
   @override
-  Future<void> startScan() async => methodChannel.invokeMethod("startScan");
+  Future<void> startScan({
+    bool turnOnPureModel = false,
+  }) async =>
+      methodChannel.invokeMethod("startScan", {
+        "turnOnPureModel": turnOnPureModel,
+      });
 
   @override
   Future<void> stopScan() async => methodChannel.invokeMethod("stopScan");
@@ -91,5 +96,6 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
   Future<void> resetBle() async => methodChannel.invokeMethod("resetBle");
 
   @override
-  Future<void> cleanConnectCache() async => methodChannel.invokeMethod("cleanConnectCache");
+  Future<void> cleanConnectCache() async =>
+      methodChannel.invokeMethod("cleanConnectCache");
 }
