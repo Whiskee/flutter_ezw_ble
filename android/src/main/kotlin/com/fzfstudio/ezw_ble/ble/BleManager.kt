@@ -298,6 +298,12 @@ class BleManager private constructor() {
         timeoutTimer.schedule(object : TimerTask() {
             override fun run() {
                 sendLog(BleLoggerTag.e, "Start connect: $uuid, connect time out")
+                //  1、超时断连则记录断连状态，避免系统断连导致重复执行断连状态
+                disconnectingDevices.removeAll {
+                    it.first == uuid
+                }
+                disconnectingDevices.add(Pair(uuid, BleConnectState.TIMEOUT))
+                //  2、执行超时断连
                 handleConnectState(uuid, name, BleConnectState.TIMEOUT)
             }
         }, bleConfig.connectTimeout.toLong() + (if (afterUpgrade) bleConfig.upgradeSwapTime.toLong() else 0),)
@@ -314,14 +320,9 @@ class BleManager private constructor() {
      */
     fun disconnect(uuid: String) {
         sendLog(BleLoggerTag.d, "Star disconnect: $uuid by user")
-        waitingConnectDevices.removeAll {
-            if (it.uuid == uuid) {
-                it.timeoutTimer?.cancel()
-                it.timeoutTimer = null
-                true
-            } else false
-        }
+        //  1、获取已连接设备
         val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
+        //  2、执行断连
         handleConnectState(uuid, connectedDevice?.name ?: "", BleConnectState.DISCONNECT_BY_USER)
     }
 
@@ -928,11 +929,14 @@ class BleManager private constructor() {
      * 移除连接舍比gatt数据
      */
     private fun disconnectDevice(uuid: String, state: BleConnectState) {
-        //  1、执行设备断连(系统传入的不处理即便添加了也不会有问题)
-        if (state != BleConnectState.DISCONNECT_FROM_SYS && disconnectingDevices.firstOrNull { it.first == uuid } == null) {
+        //  1、除了系统断连的状态，其它状态发起断连，都要加入到断连中
+        if (state != BleConnectState.DISCONNECT_FROM_SYS) {
+            disconnectingDevices.removeAll {
+                it.first == uuid
+            }
             disconnectingDevices.add(Pair(uuid, state))
         }
-        //  2、假设 connectedDevices 是 CopyOnWriteArrayList
+        //  2、获取已连接的设备并执行断连
         val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
         //  - 2.1、connectedDevice 本身可能为 null，需要安全调用
         connectedDevice?.let { device ->
@@ -978,11 +982,17 @@ class BleManager private constructor() {
      *  处理连接状态
      */
     private fun handleConnectState(uuid: String, name: String, state: BleConnectState, mtu: Int = 247) {
-        //  1、处理断连和错误连接
+        //  1、处理正在连接
+        if (state.isConnecting) {
+            disconnectingDevices.removeAll {
+                it.first == uuid
+            }
+        }
+        //  2、处理断连和错误连接
         if (state.isDisconnected || state.isError) {
             disconnectDevice(uuid, state)
         }
-        //  2、处理连接成功
+        //  3、处理连接成功
         else if (state.isConnected) {
             // 安全移除等待连接的设备，并清理其定时器
             waitingConnectDevices.removeAll {
@@ -992,12 +1002,17 @@ class BleManager private constructor() {
                     true
                 } else false
             }
+            //  从断连中设备列表中移除当前设备
+            disconnectingDevices.removeAll {
+                it.first == uuid
+            }
         }
-        //  3、非连接流程，查询是否有待连接设备，如果有就开始连接
+        //  4、非连接流程，查询是否有待连接设备，如果有就开始连接
         if (!state.isConnecting && !upgradeDevices.contains(uuid) && waitingConnectDevices.isNotEmpty()) {
             val waitingDevice = waitingConnectDevices.first()
             connect(waitingDevice.belongConfig.name, waitingDevice.uuid, waitingDevice.name, waitingDevice.sn, true, waitingDevice.afterUpgrade)
         }
+        //  5、发送连接状态
         mainScope.launch {
             val connectModel = BleConnectModel(uuid,  name, state, mtu)
             BleEC.CONNECT_STATUS.event?.success(connectModel.toJson())
