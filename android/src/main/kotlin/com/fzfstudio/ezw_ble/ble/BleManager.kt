@@ -989,7 +989,7 @@ class BleManager private constructor() {
             }
         }
         //  2、处理断连和错误连接
-        if (state.isDisconnected || state.isError) {
+        else if (state.isDisconnected || state.isError) {
             disconnectDevice(uuid, state)
         }
         //  3、处理连接成功
