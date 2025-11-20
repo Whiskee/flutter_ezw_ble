@@ -54,10 +54,15 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       });
 
   @override
-  Future<void> disconnectDevice(String uuid, String name) async =>
+  Future<void> disconnectDevice(
+    String uuid,
+    String name, {
+    bool removeBond = false,
+  }) async =>
       methodChannel.invokeMethod("disconnectDevice", {
         "uuid": uuid,
         "name": name,
+        "removeBond": removeBond,
       });
 
   @override

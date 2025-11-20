@@ -91,7 +91,8 @@ enum class BleMC {
             DISCONNECT_DEVICE -> {
                 val jsonMap = arguments as Map<*, *>?
                 val uuid = jsonMap?.get("uuid") as String? ?: ""
-                BleManager.instance.disconnect(uuid)
+                val removeBond = jsonMap?.get("removeBond") as Boolean? ?: false
+                BleManager.instance.disconnect(uuid, removeBond)
             }
             SEND_CMD -> {
                 val jsonMap = arguments as Map<*, *>?

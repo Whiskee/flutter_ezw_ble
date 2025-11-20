@@ -318,12 +318,12 @@ class BleManager private constructor() {
     /**
      * 断连设备
      */
-    fun disconnect(uuid: String) {
+    fun disconnect(uuid: String, removeBond: Boolean = false) {
         sendLog(BleLoggerTag.d, "Star disconnect: $uuid by user")
         //  1、获取已连接设备
         val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
         //  2、执行断连
-        handleConnectState(uuid, connectedDevice?.name ?: "", BleConnectState.DISCONNECT_BY_USER)
+        handleConnectState(uuid, connectedDevice?.name ?: "", BleConnectState.DISCONNECT_BY_USER, removeBond)
     }
 
     /**
@@ -928,7 +928,7 @@ class BleManager private constructor() {
     /**
      * 移除连接舍比gatt数据
      */
-    private fun disconnectDevice(uuid: String, state: BleConnectState) {
+    private fun disconnectDevice(uuid: String, state: BleConnectState, removeBond: Boolean = false) {
         //  1、除了系统断连的状态，其它状态发起断连，都要加入到断连中
         if (state != BleConnectState.DISCONNECT_FROM_SYS) {
             disconnectingDevices.removeAll {
@@ -946,11 +946,11 @@ class BleManager private constructor() {
                 try {
                     val gatt = bleGatt.gatt
                     if (gatt != null) {
-                        //  会执行onConnectionStateChange
-                        gatt.disconnect()
                         mainScope.launch {
+                            //  会执行onConnectionStateChange
+                            gatt.disconnect()
                             //  延迟释放 GATT，避免断连操作未完成导致无法释放
-                            delay(200L)
+                            delay(300L)
                             try {
                                 gatt.close()
                                 sendLog(BleLoggerTag.d, "${device.name} had disconnected")
@@ -962,6 +962,10 @@ class BleManager private constructor() {
                 } catch (e: Exception) {
                     sendLog(BleLoggerTag.e, "Exception during gatt.disconnect for $uuid: ${e.message}")
                 }
+            }
+            //  - 执行移除配对
+            if (removeBond) {
+                removeBond(device.uuid)
             }
             device.gattMap.clear()
             sendLog(BleLoggerTag.d, "${device.name} clear all gatt")
@@ -981,7 +985,7 @@ class BleManager private constructor() {
     /**
      *  处理连接状态
      */
-    private fun handleConnectState(uuid: String, name: String, state: BleConnectState, mtu: Int = 247) {
+    private fun handleConnectState(uuid: String, name: String, state: BleConnectState, removeBond: Boolean = false, mtu: Int = 247) {
         //  1、处理正在连接
         if (state.isConnecting) {
             disconnectingDevices.removeAll {
@@ -990,7 +994,7 @@ class BleManager private constructor() {
         }
         //  2、处理断连和错误连接
         else if (state.isDisconnected || state.isError) {
-            disconnectDevice(uuid, state)
+            disconnectDevice(uuid, state, removeBond)
         }
         //  3、处理连接成功
         else if (state.isConnected) {
