@@ -552,64 +552,68 @@ class BleManager private constructor() {
     /// 创建蓝牙搜索回调
     private fun createScanCallBack(): ScanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
-            val device = result.device
-            //  1、过滤：无名称设备
-            if (device.name.isNullOrEmpty()) {
-                return
-            }
-            //  2、过滤已经缓存过的对象
-            //  -- 由于已经过滤了重复项，所以不用担心会重复发送已经发送过的对象
-            if (scanResultTemp.firstOrNull { it.uuid == device.address } != null) {
-                return
-            }
-            //  3、通过蓝牙配置文件中的scan获取目标设备
-            val bleConfig = bleConfigs.firstOrNull { config -> config.scan.nameFilters.firstOrNull { filter ->
-                device.name.contains(filter)
-            }  != null
-            }
-            if (bleConfig == null) {
-                return
-            }
-            //  4、检查是否是纯净模式
-            if (scanPureMode) {
-                val deviceSn = UUID.randomUUID().toString()
-                //  - 4.1、创建设备自定义模型对象,并缓存
-                val bleDevice = device.toBleDevice(bleConfig, deviceSn, result.rssi)
-                scanResultTemp.add(bleDevice)
-                //  - 4.2、判断是否需要根据SN组合设备，不需要就直接提交
-                sendMatchDevices(deviceSn, listOf(bleDevice))
-                return
-            }
-            //  5、组装蓝牙数据
-            var deviceSn = device.name
-            //  - 5.1、获取SN数据
-            val snRule = bleConfig.scan.snRule
-            if (snRule != null) {
-                deviceSn = parseDataToObtainSn(result.scanRecord?.bytes, snRule)
-                //  - 5.2、阻断发送到Flutter
-                //  -- a、SN无法被解析的
-                //  -- b、不包含标识的设备
-                if (deviceSn.isEmpty() ||
-                    (snRule.filters.isNotEmpty() && !snRule.filters.any { deviceSn.contains(it) })) {
+            try {
+                val device = result.device
+                //  1、过滤：无名称设备
+                if (device.name.isNullOrEmpty()) {
                     return
                 }
+                //  2、过滤已经缓存过的对象
+                //  -- 由于已经过滤了重复项，所以不用担心会重复发送已经发送过的对象
+                if (scanResultTemp.firstOrNull { it.uuid == device.address } != null) {
+                    return
+                }
+                //  3、通过蓝牙配置文件中的scan获取目标设备
+                val bleConfig = bleConfigs.firstOrNull { config -> config.scan.nameFilters.firstOrNull { filter ->
+                    device.name.contains(filter)
+                }  != null
+                }
+                if (bleConfig == null) {
+                    return
+                }
+                //  4、检查是否是纯净模式
+                if (scanPureMode) {
+                    val deviceSn = UUID.randomUUID().toString()
+                    //  - 4.1、创建设备自定义模型对象,并缓存
+                    val bleDevice = device.toBleDevice(bleConfig, deviceSn, result.rssi)
+                    scanResultTemp.add(bleDevice)
+                    //  - 4.2、判断是否需要根据SN组合设备，不需要就直接提交
+                    sendMatchDevices(deviceSn, listOf(bleDevice))
+                    return
+                }
+                //  5、组装蓝牙数据
+                var deviceSn = device.name
+                //  - 5.1、获取SN数据
+                val snRule = bleConfig.scan.snRule
+                if (snRule != null) {
+                    deviceSn = parseDataToObtainSn(result.scanRecord?.bytes, snRule)
+                    //  - 5.2、阻断发送到Flutter
+                    //  -- a、SN无法被解析的
+                    //  -- b、不包含标识的设备
+                    if (deviceSn.isEmpty() ||
+                        (snRule.filters.isNotEmpty() && !snRule.filters.any { deviceSn.contains(it) })) {
+                        return
+                    }
+                }
+                //  6、发送设备到Flutter
+                //  - 6.1、创建设备自定义模型对象,并缓存
+                val bleDevice = device.toBleDevice(bleConfig, deviceSn, result.rssi)
+                scanResultTemp.add(bleDevice)
+                //  - 6.2、判断是否需要根据SN组合设备，不需要就直接提交
+                if (bleConfig.scan.matchCount < 2) {
+                    sendMatchDevices(deviceSn, listOf(bleDevice))
+                    return
+                }
+                //  - 6.3、从缓存中获取到相同的sn,
+                val matchDevices = scanResultTemp.filter { it.sn == bleDevice.sn }
+                //  -- 判断是否达到组合设备数量上限后，如果没有达到就不处理
+                if (matchDevices.size != bleConfig.scan.matchCount) {
+                    return
+                }
+                sendMatchDevices(deviceSn, matchDevices)
+            } catch (error: Exception) {
+                sendLog(BleLoggerTag.e, "Start scan: scanning error = ${error.message}")
             }
-            //  6、发送设备到Flutter
-            //  - 6.1、创建设备自定义模型对象,并缓存
-            val bleDevice = device.toBleDevice(bleConfig, deviceSn, result.rssi)
-            scanResultTemp.add(bleDevice)
-            //  - 6.2、判断是否需要根据SN组合设备，不需要就直接提交
-            if (bleConfig.scan.matchCount < 2) {
-                sendMatchDevices(deviceSn, listOf(bleDevice))
-                return
-            }
-            //  - 6.3、从缓存中获取到相同的sn,
-            val matchDevices = scanResultTemp.filter { it.sn == bleDevice.sn }
-            //  -- 判断是否达到组合设备数量上限后，如果没有达到就不处理
-            if (matchDevices.size != bleConfig.scan.matchCount) {
-                return
-            }
-            sendMatchDevices(deviceSn, matchDevices)
         }
         override fun onBatchScanResults(results: List<ScanResult>) { sendLog(BleLoggerTag.d, "Start scan: batch = $results") }
         override fun onScanFailed(errorCode: Int) { sendLog(BleLoggerTag.e, "Start scan: error = $errorCode") }
