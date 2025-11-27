@@ -2,18 +2,15 @@ package com.fzfstudio.ezw_ble.ble.models
 
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCharacteristic
-import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothStatusCodes
 import android.os.Build
 import android.util.Log
 import com.fzfstudio.ezw_ble.ble.BleEC
-import com.fzfstudio.ezw_ble.ble.BleManager
 import com.fzfstudio.ezw_ble.ble.models.enums.BleConfigOutAdapter
 import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
 import com.fzfstudio.ezw_utils.gson.GsonSerializable
 import com.google.gson.annotations.JsonAdapter
-import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.delay
 
 class BleDevice(
     //  序列化时只输出名称
@@ -29,14 +26,47 @@ class BleDevice(
     private val tag = "BleDevice"
 
     /// 缓存设备所含有的Gatt
-    val gattMap: ConcurrentHashMap<Int, BleGatt> = ConcurrentHashMap()
+    private var gatt: BluetoothGatt? = null
+    private val writeAndReadList: MutableList<BleWriteAndRead> = mutableListOf()
 
     ///========== Get
     val myGatt: BluetoothGatt?
-        get() = gattMap[0]?.gatt
+        get() = gatt
     //  是否已经连接
     val isConnected: Boolean
         get() = myGatt?.connect() == true
+
+    /**
+     * 添加Gatt及其读写配置
+     */
+    fun update(gatt: BluetoothGatt, psType: Int? = null, write: BluetoothGattCharacteristic? = null, read: BluetoothGattCharacteristic? = null) {
+        //  1、更新Gatt
+        this.gatt = gatt
+        //  2、检查是否要更新读写
+        if (psType == null || write == null || read == null) {
+            return
+        }
+        //  3、更新
+        writeAndReadList.removeAll { it.psType == psType }
+        writeAndReadList.add(BleWriteAndRead(psType, write, read))
+    }
+
+    /**
+     * 释放Gatt并清空所有读写服务
+     *
+     *  disconnect是用来断连设备但是不释放，便于重连，而且执行onConnectionStateChange的回调
+     *  close是用来释放设备的，避免其他设备无法搜索以及连接
+     *
+     *  在这个函数的场景中，disconnect是不会执行onConnectionStateChange回调的，因为立马执行了close，主动做了释放
+     */
+    fun releaseAndClear() {
+        //  disconnect是用来断连设备但是不释放，便于重连，而且执行onConnectionStateChange的回调
+        gatt?.disconnect()
+        //  close是用来释放设备的，避免其他设备无法搜索以及连接
+        gatt?.close()
+        gatt = null
+        writeAndReadList.clear()
+    }
 
     /**
      * 执行写操作
@@ -52,10 +82,10 @@ class BleDevice(
             Log.i(tag, "Send cmd: $uuid, PS type=$psType, data is null")
             return false
         }
+        //  2、执行发送
         //  - 1.1、准备打印内容
         //  - 1.2、获取GATT和写服务
-        val bleGatt = gattMap[psType]
-        val gatt = bleGatt?.gatt
+        val bleGatt = writeAndReadList.firstOrNull { it.psType == psType }
         val writeChars = bleGatt?.writeChars
         if (gatt == null || writeChars == null) {
             BleEC.RECEIVE_DATA.event?.success(BleCmd.fail(uuid, psType).toMap())
@@ -64,11 +94,11 @@ class BleDevice(
         }
         //  2、执行写操作
         val isSuccess = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val status = gatt.writeCharacteristic(writeChars, data, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+            val status = gatt?.writeCharacteristic(writeChars, data, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) ?: BluetoothStatusCodes.ERROR_UNKNOWN
             status == BluetoothStatusCodes.SUCCESS
         } else {
             writeChars.value = data
-            gatt.writeCharacteristic(writeChars)
+            gatt?.writeCharacteristic(writeChars) ?: false
         }
         if (!isSuccess) {
             BleEC.RECEIVE_DATA.event?.success(BleCmd.fail(uuid, psType).toMap())
@@ -77,27 +107,12 @@ class BleDevice(
         return true
     }
 
-    /**
-     * 执行CCCD操作
-     */
-    fun requestCCCD(): Boolean {
-        val bleGatt = gattMap[0]
-        //  CCCD特征读取
-        val descriptor = bleGatt?.readChars?.getDescriptor(BleManager.cccdDescriptor)
-        return if (descriptor == null) {
-            false
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            bleGatt.gatt?.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothStatusCodes.SUCCESS
-        } else {
-            descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-            bleGatt.gatt?.writeDescriptor(descriptor) ?: false
-        }
-    }
 }
 
 ///
-class BleGatt(
-    val gatt: BluetoothGatt?,
+class BleWriteAndRead(
+    //  服务类型
+    var psType: Int? = null,
     var writeChars: BluetoothGattCharacteristic? = null,
     var readChars: BluetoothGattCharacteristic? = null,
 )

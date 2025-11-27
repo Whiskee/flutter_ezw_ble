@@ -24,7 +24,6 @@ import com.fzfstudio.ezw_ble.ble.models.BleConfig
 import com.fzfstudio.ezw_ble.ble.models.BleConnectModel
 import com.fzfstudio.ezw_ble.ble.models.BleConnectTemp
 import com.fzfstudio.ezw_ble.ble.models.BleDevice
-import com.fzfstudio.ezw_ble.ble.models.BleGatt
 import com.fzfstudio.ezw_ble.ble.models.BleMatchDevice
 import com.fzfstudio.ezw_ble.ble.models.BleSnRule
 import com.fzfstudio.ezw_ble.ble.models.BluetoothGattStatus
@@ -43,8 +42,6 @@ import java.util.TimerTask
 import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.regex.Pattern
-import kotlin.time.Duration.Companion.milliseconds
-import kotlin.uuid.Uuid
 
 class BleManager private constructor() {
 
@@ -98,8 +95,6 @@ class BleManager private constructor() {
     private var bleLocation: Boolean = false
     //  - 当前蓝牙基础配置，必须实现
     private var bleConfigs: List<BleConfig> = listOf()
-    //  - 正在执行断连的设备
-    private var disconnectingDevices: MutableList<Pair<String, BleConnectState>> = mutableListOf()
 
     /// =========== Get
     //  - 蓝牙状态
@@ -290,7 +285,7 @@ class BleManager private constructor() {
             remoteDevice.connectGatt(weakContext?.get(), false, connectCallBack)
         }
         //  - 缓存刷新的gatt
-        bleDevice.gattMap[0] = BleGatt(gatt)
+        bleDevice.update(gatt)
         //  9、读取信号值
         gatt?.readRemoteRssi()
         //  10、开启连接超时定时器
@@ -298,12 +293,7 @@ class BleManager private constructor() {
         timeoutTimer.schedule(object : TimerTask() {
             override fun run() {
                 sendLog(BleLoggerTag.e, "Start connect: $uuid, connect time out")
-                //  1、超时断连则记录断连状态，避免系统断连导致重复执行断连状态
-                disconnectingDevices.removeAll {
-                    it.first == uuid
-                }
-                disconnectingDevices.add(Pair(uuid, BleConnectState.TIMEOUT))
-                //  2、执行超时断连
+                //  1、执行超时断连
                 handleConnectState(uuid, name, BleConnectState.TIMEOUT)
             }
         }, bleConfig.connectTimeout.toLong() + (if (afterUpgrade) bleConfig.upgradeSwapTime.toLong() else 0),)
@@ -397,7 +387,6 @@ class BleManager private constructor() {
             it.timeoutTimer?.cancel()
         }
         waitingConnectDevices.clear()
-        disconnectingDevices.clear()
     }
 
     /**
@@ -416,7 +405,6 @@ class BleManager private constructor() {
         descriptorQueue.clear()
         upgradeDevices.clear()
         sendCmdQueue.clear()
-        disconnectingDevices.clear()
         sendLog(BleLoggerTag.d, "Reset: success")
     }
 
@@ -469,7 +457,7 @@ class BleManager private constructor() {
      */
     private fun isBluetoothEnabled(): Boolean = try {
         bluetoothAdapter.isEnabled
-    } catch (e: Exception) {
+    } catch (_: Exception) {
         false
     }
 
@@ -699,13 +687,6 @@ class BleManager private constructor() {
                     sendLog(BleLoggerTag.e, "Connect call back: ${gatt.device.address} is start new connecting, stop disconnect flow, keep connecting")
                     return
                 }
-                //  如果断连的设备是手动断连的，就不再执行系统断连处理
-                val disconnectDevice = disconnectingDevices.firstOrNull { it.first == myDevice.uuid }
-                if (disconnectDevice != null) {
-                    disconnectingDevices.remove(disconnectDevice)
-                    sendLog(BleLoggerTag.e, "Connect call back: ${gatt.device.address} is disconnecting witch state = ${disconnectDevice.second}, stop disconnect flow form system")
-                    return
-                }
                 //  - 执行断开连接，确保被释放
                 try {
                     gatt.close()
@@ -769,7 +750,7 @@ class BleManager private constructor() {
                 val descriptor = readChars.getDescriptor(cccdDescriptor)
                 descriptorQueue.add(Pair(uuid.type, descriptor))
                 //  缓存读写特征
-                currentDevice.gattMap[uuid.type] = BleGatt(gatt, writeChars, readChars)
+                currentDevice.update(gatt, uuid.type, writeChars, readChars)
             }
             if (!isPsHandleFinish) {
                 return
@@ -933,48 +914,17 @@ class BleManager private constructor() {
      * 移除连接舍比gatt数据
      */
     private fun disconnectDevice(uuid: String, state: BleConnectState, removeBond: Boolean = false) {
-        //  1、除了系统断连的状态，其它状态发起断连，都要加入到断连中
-        if (state != BleConnectState.DISCONNECT_FROM_SYS) {
-            disconnectingDevices.removeAll {
-                it.first == uuid
-            }
-            disconnectingDevices.add(Pair(uuid, state))
-        }
-        //  2、获取已连接的设备并执行断连
+        //  1、获取已连接的设备并执行断连
         val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
-        //  - 2.1、connectedDevice 本身可能为 null，需要安全调用
+        //  - 1.1、connectedDevice 本身可能为 null，需要安全调用
         connectedDevice?.let { device ->
-             //  - 如果蓝牙为开启，所有的Gatt就不会有任何连接，所以不需要断连
-             device.gattMap.values.forEach { bleGatt -> 
-                //  - 重命名 gatt 变量以避免与 bleGatt.gatt 混淆
-                try {
-                    val gatt = bleGatt.gatt
-                    if (gatt != null) {
-                        mainScope.launch {
-                            //  会执行onConnectionStateChange
-                            gatt.disconnect()
-                            //  延迟释放 GATT，避免断连操作未完成导致无法释放
-                            delay(300L)
-                            try {
-                                gatt.close()
-                                sendLog(BleLoggerTag.d, "${device.name} had disconnected")
-                            } catch (closeError: Exception) {
-                                sendLog(BleLoggerTag.e, "Exception during gatt.close for $uuid: ${closeError.message}")
-                            }
-                        }
-                    }
-                } catch (e: Exception) {
-                    sendLog(BleLoggerTag.e, "Exception during gatt.disconnect for $uuid: ${e.message}")
-                }
-            }
-            //  - 执行移除配对
+            device.releaseAndClear()
             if (removeBond) {
                 removeBond(device.uuid)
             }
-            device.gattMap.clear()
             sendLog(BleLoggerTag.d, "${device.name} clear all gatt")
         }
-        //  3、安全移除等待连接的设备，并清理其定时器
+        //  2、安全移除等待连接的设备，并清理其定时器
         waitingConnectDevices.removeAll { temp ->
             if (temp.uuid == uuid) {
                 temp.timeoutTimer?.cancel()
@@ -990,14 +940,8 @@ class BleManager private constructor() {
      *  处理连接状态
      */
     private fun handleConnectState(uuid: String, name: String, state: BleConnectState, removeBond: Boolean = false, mtu: Int = 247) {
-        //  1、处理正在连接
-        if (state.isConnecting) {
-            disconnectingDevices.removeAll {
-                it.first == uuid
-            }
-        }
-        //  2、处理断连和错误连接
-        else if (state.isDisconnected || state.isError) {
+        //  1、处理断连和错误连接
+        if (state.isDisconnected || state.isError) {
             disconnectDevice(uuid, state, removeBond)
         }
         //  3、处理连接成功
@@ -1009,10 +953,6 @@ class BleManager private constructor() {
                     it.timeoutTimer = null
                     true
                 } else false
-            }
-            //  从断连中设备列表中移除当前设备
-            disconnectingDevices.removeAll {
-                it.first == uuid
             }
         }
         //  4、非连接流程，查询是否有待连接设备，如果有就开始连接

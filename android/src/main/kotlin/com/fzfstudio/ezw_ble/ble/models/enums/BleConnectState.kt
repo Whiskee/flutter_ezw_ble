@@ -90,4 +90,10 @@ enum class BleConnectState {
                 this == TIMEOUT ||
                 this == BLE_ERROR ||
                 this == SYSTEM_ERROR
+
+    /**
+     * 是否是升级状态
+     */
+    val isUpgrade: Boolean
+        get() = this == UPGRADE
 }
