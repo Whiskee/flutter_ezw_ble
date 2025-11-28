@@ -249,14 +249,14 @@ extension BleManager {
         }
         // 如果设备在升级中且不是OTA指令，则不允许发送
         guard upgradeDevices?.contains(where: {$0 == uuid}) != true || psType == 1 else {
-            loggerD(msg: "sendCmd: \(uuid), type=\(psType), cannot send non-OTA commands during upgrade")
+            loggerE(msg: "sendCmd: \(uuid), type=\(psType), cannot send non-OTA commands during upgrade")
             return
         }
         //  通过uuid无法查询设备和特征，都被视为查找不到设备
         guard let device = connectedDevices.first(where: { device in
             device.peripheral.identifier.uuidString == uuid
         }), let writeChars = device.writeCharsDic[psType] else {
-            loggerD(msg: "sendCmd: \(uuid), type=\(psType), device not found")
+            loggerE(msg: "sendCmd: \(uuid), type=\(psType), device not found")
             return
         }
         //  根据不同uuid类型获取不同的服务特征
