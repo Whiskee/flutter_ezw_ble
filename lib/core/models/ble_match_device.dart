@@ -51,6 +51,9 @@ class BleMatchDevice {
   bool get isDisconnectFromSys => devices
       .where((device) => device.connectState.isDisconnectFromSys)
       .isNotEmpty;
+  //  - 是否已经绑定的设备
+  bool get isBound =>
+      devices.where((device) => device.connectState.isBound).isNotEmpty;
   //  - 是否有升级中
   bool get isOtaUpgrading =>
       devices.where((device) => device.connectState.isUpgrade).isNotEmpty;

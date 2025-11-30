@@ -135,6 +135,9 @@ extension BleConnectStateExt on BleConnectState {
       this == BleConnectState.bleError ||
       this == BleConnectState.systemError;
 
+  //  是否已经绑定的设备
+  bool get isBound => this == BleConnectState.alreadyBound;
+
   //  是否在升级模式
   bool get isUpgrade => this == BleConnectState.upgrade;
 }
