@@ -167,6 +167,10 @@ extension BleManager {
         }) {
             tag += "from connected device list"
             oldPeripheral = device.peripheral
+            guard !device.isConnected else {
+                loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), is already connected, \(tag)")
+                return
+            }
         }
         //  -- 6.3.2、在缓存中查找对应的设备
         else if let temp = scanResultTemp.first(where: { info in

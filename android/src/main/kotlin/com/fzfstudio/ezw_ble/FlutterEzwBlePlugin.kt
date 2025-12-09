@@ -56,6 +56,9 @@ class FlutterEzwBlePlugin: FlutterPlugin, MethodCallHandler {
   /**
    * MARK - Interface MethodCallHandler
    */
-  override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) = channel.setMethodCallHandler(null)
+  override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+      channel.setMethodCallHandler(null)
+      BleManager.instance.release()
+  }
 
 }

@@ -30,8 +30,11 @@ import com.fzfstudio.ezw_ble.ble.models.BluetoothGattStatus
 import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
 import com.fzfstudio.ezw_ble.ble.services.BleStateListener
 import com.fzfstudio.ezw_ble.ble.services.BleStateListener.BluetoothStateCallback
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.MainScope
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.lang.ref.WeakReference
 import java.util.Collections
@@ -53,9 +56,7 @@ class BleManager private constructor() {
 
     /// =========== Constants
     //  - 主线程工局
-    private val mainScope by lazy {
-        MainScope()
-    }
+    private lateinit var mainScope: CoroutineScope
     //  - 搜索配置
     private val scanSettings by lazy {
         ScanSettings.Builder()
@@ -67,13 +68,16 @@ class BleManager private constructor() {
     //  - 搜素结果临时缓存(DeviceInfo, 蓝牙对象)
     private val scanResultTemp: MutableList<BleDevice> = mutableListOf()
     //  - 待连接设备缓存（UUID，SN）
-    private val waitingConnectDevices: MutableList<BleConnectTemp> = mutableListOf()
+    private val waitingConnectDevices: MutableList<BleConnectTemp> = Collections.synchronizedList(mutableListOf())
     //  - 私有服务读写操作队列(私有服务类型，Descriptor)
     private val descriptorQueue: Queue<Pair<Int, BluetoothGattDescriptor>> = LinkedList()
     //  - 是否正在升级中
-    private val upgradeDevices: MutableList<String> = mutableListOf()
+    private val upgradeDevices: MutableList<String> = Collections.synchronizedList(mutableListOf())
     //  - 指令发送队列
     private val sendCmdQueue: ConcurrentLinkedQueue<BleCmd> = ConcurrentLinkedQueue()
+    //  - 正在执行断连的设备
+    private val disconnectingDevices: MutableList<Pair<String, BleConnectState>> = Collections.synchronizedList(mutableListOf())
+
 
     /// =========== Private Variables
     private var weakContext: WeakReference<Context>? = null
@@ -95,8 +99,6 @@ class BleManager private constructor() {
     private var bleLocation: Boolean = false
     //  - 当前蓝牙基础配置，必须实现
     private var bleConfigs: List<BleConfig> = listOf()
-    //  - 正在执行断连的设备
-    private var disconnectingDevices: MutableList<Pair<String, BleConnectState>> = mutableListOf()
 
     /// =========== Get
     //  - 蓝牙状态
@@ -110,6 +112,7 @@ class BleManager private constructor() {
      * 初始化工具
      */
     fun init(context: Context) {
+        mainScope = MainScope()
         weakContext = WeakReference(context)
         //  初始化蓝牙工具
         bluetoothManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -273,11 +276,14 @@ class BleManager private constructor() {
             sendLog(BleLoggerTag.d, "Start connect: $uuid, waiting ${lastDevice?.uuid} finish connecting")
             return
         }
-        //  7、查询设备是否已经在连接缓存中，如果不在就创建
+        //  7、查询设备是否已经在连接缓存中，如果不在就创建；如果有且已经连接了就不再继续连接
         var bleDevice = connectedDevices.firstOrNull { it.uuid == uuid }
         if (bleDevice == null) {
             bleDevice = remoteDevice.toBleDevice(bleConfig, sn, 0)
             connectedDevices.add(bleDevice)
+        } else if (bleDevice.isConnected) {
+            sendLog(BleLoggerTag.d, "Start connect: $uuid, device is already connected")
+            return
         }
         //  8、执行连接:默认获取基础私有服务的Gatt进行处理
         val connectCallBack = createConnectCallBack()
@@ -415,6 +421,29 @@ class BleManager private constructor() {
         disconnectingDevices.clear()
         sendLog(BleLoggerTag.d, "Reset: success")
     }
+
+    /**
+     * 释放/销毁 BleManager
+     *
+     * 在Flutter引擎分离时调用，以释放所有资源，确保单例可以被重新初始化。
+     */
+    fun release() {
+        // 1. 调用现有的 reset 逻辑，断开所有连接并清空队列
+        reset()
+        // 2. 注销蓝牙状态监听器，防止内存泄漏
+        if (this::bleStateListener.isInitialized) {
+            bleStateListener.unregister()
+        }
+        // 3. 取消所有正在进行的协程任务
+        if (this::mainScope.isInitialized) {
+            mainScope.cancel()
+        }
+        // 4. 释放 Context 引用
+        weakContext?.clear()
+        weakContext = null
+        sendLog(BleLoggerTag.d, "Release: BleManager completely released")
+    }
+
 
     /// =========== Method: Private
 
@@ -1040,6 +1069,7 @@ class BleManager private constructor() {
      *  处理日志
      */
     private fun sendLog(tag: BleLoggerTag, log: String) {
+        if (!this::mainScope.isInitialized || !mainScope.isActive) return
         mainScope.launch {
             BleEC.LOGGER.event?.success("${tag.tag}BleManager::$log")
         }

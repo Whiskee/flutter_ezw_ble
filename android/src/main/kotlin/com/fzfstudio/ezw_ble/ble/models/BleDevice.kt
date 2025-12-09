@@ -11,6 +11,7 @@ import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
 import com.fzfstudio.ezw_utils.gson.GsonSerializable
 import com.google.gson.annotations.JsonAdapter
 import kotlinx.coroutines.delay
+import java.util.Collections
 
 class BleDevice(
     //  序列化时只输出名称
@@ -27,7 +28,7 @@ class BleDevice(
 
     /// 缓存设备所含有的Gatt
     private var gatt: BluetoothGatt? = null
-    private val writeAndReadList: MutableList<BleWriteAndRead> = mutableListOf()
+    private val writeAndReadList: MutableList<BleWriteAndRead> = Collections.synchronizedList(mutableListOf())
 
     ///========== Get
     val myGatt: BluetoothGatt?
