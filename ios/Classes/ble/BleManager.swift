@@ -168,6 +168,9 @@ extension BleManager {
             tag += "from connected device list"
             oldPeripheral = device.peripheral
             guard !device.isConnected else {
+                waitingConnectDevices.removeAll { easyConnect in
+                    device.peripheral.identifier.uuidString == easyConnect.uuid || device.peripheral.name == easyConnect.name
+                }
                 loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), is already connected, \(tag)")
                 return
             }

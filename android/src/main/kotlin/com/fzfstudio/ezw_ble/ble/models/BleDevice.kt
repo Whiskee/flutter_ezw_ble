@@ -35,7 +35,8 @@ class BleDevice(
         get() = gatt
     //  是否已经连接
     val isConnected: Boolean
-        get() = myGatt?.connect() == true
+        get() = connectState == BleConnectState.CONNECTED
+
 
     /**
      * 添加Gatt及其读写配置

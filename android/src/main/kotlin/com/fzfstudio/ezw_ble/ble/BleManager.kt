@@ -282,6 +282,13 @@ class BleManager private constructor() {
             bleDevice = remoteDevice.toBleDevice(bleConfig, sn, 0)
             connectedDevices.add(bleDevice)
         } else if (bleDevice.isConnected) {
+            waitingConnectDevices.removeAll {
+                if (it.uuid == bleDevice.uuid) {
+                    it.timeoutTimer?.cancel()
+                    it.timeoutTimer = null
+                    true
+                } else false
+            }
             sendLog(BleLoggerTag.d, "Start connect: $uuid, device is already connected")
             return
         }
