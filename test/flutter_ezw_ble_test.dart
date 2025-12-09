@@ -25,7 +25,7 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
-  Future<void> startScan() {
+  Future<void> startScan({bool turnOnPureModel = false}) {
     throw UnimplementedError();
   }
 
@@ -46,7 +46,8 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
-  Future<void> disconnectDevice(String uuid) {
+  Future<void> disconnectDevice(String uuid, String name,
+      {bool removeBond = false}) {
     throw UnimplementedError();
   }
 
@@ -81,6 +82,16 @@ class MockFlutterEzwBlePlatform
 
   @override
   Future<void> quiteUpgradeState(String uuid) {
+    throw UnimplementedError();
+  }
+  
+  @override
+  Future<void> cleanConnectCache() {
+    throw UnimplementedError();
+  }
+  
+  @override
+  Future<void> resetBle() {
     throw UnimplementedError();
   }
 }
