@@ -21,7 +21,7 @@ class BleDevice(
     val uuid: String,
     val sn : String,
     var rssi: Int,
-    val connectState: BleConnectState,
+    var connectState: BleConnectState,
 ): GsonSerializable() {
 
     private val tag = "BleDevice"

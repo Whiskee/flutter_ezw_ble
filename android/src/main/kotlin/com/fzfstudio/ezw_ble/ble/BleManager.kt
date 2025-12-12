@@ -51,7 +51,7 @@ class BleManager private constructor() {
     companion object {
         val instance: BleManager = BleManager()
         //  CCCD特征符号UUID
-        val cccdDescriptor = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+        val cccdDescriptor: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     }
 
     /// =========== Constants
@@ -343,7 +343,7 @@ class BleManager private constructor() {
         if (!checkIsFunctionCanBeCalled() || uuid.isEmpty()) {
             return
         }
-        sendLog(BleLoggerTag.d, "$uuid is already connected")
+        sendLog(BleLoggerTag.d, "Set $uuid connected")
         val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
         handleConnectState(uuid, connectedDevice?.name ?: "", BleConnectState.CONNECTED)
     }
@@ -708,6 +708,7 @@ class BleManager private constructor() {
         private var isPsHandleFinish = false
 
         //  连接状态监听
+        @Synchronized
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             val device = gatt.device
             descriptorQueue.clear()
@@ -998,17 +999,23 @@ class BleManager private constructor() {
      *  处理连接状态
      */
     private fun handleConnectState(uuid: String, name: String, state: BleConnectState, removeBond: Boolean = false, mtu: Int = 247) {
-        //  1、处理正在连接
+        //  1、更新连接设备的状态
+        connectedDevices.forEach {
+            if (it.uuid == uuid) {
+                it.connectState = state
+            }
+        }
+        //  2、处理正在连接
         if (state.isConnecting) {
             disconnectingDevices.removeAll {
                 it.first == uuid
             }
         }
-        //  2、处理断连和错误连接
+        //  3、处理断连和错误连接
         else if (state.isDisconnected || state.isError) {
             disconnectDevice(uuid, state, removeBond)
         }
-        //  3、处理连接成功
+        //  4、处理连接成功
         else if (state.isConnected) {
             // 安全移除等待连接的设备，并清理其定时器
             waitingConnectDevices.removeAll {
@@ -1023,12 +1030,12 @@ class BleManager private constructor() {
                 it.first == uuid
             }
         }
-        //  4、非连接流程，查询是否有待连接设备，如果有就开始连接
+        //  5、非连接流程，查询是否有待连接设备，如果有就开始连接
         if (!state.isConnecting && !upgradeDevices.contains(uuid) && waitingConnectDevices.isNotEmpty()) {
             val waitingDevice = waitingConnectDevices.first()
             connect(waitingDevice.belongConfig.name, waitingDevice.uuid, waitingDevice.name, waitingDevice.sn, true, waitingDevice.afterUpgrade)
         }
-        //  5、发送连接状态
+        //  6、发送连接状态
         mainScope.launch {
             val connectModel = BleConnectModel(uuid,  name, state, mtu)
             BleEC.CONNECT_STATUS.event?.success(connectModel.toJson())
