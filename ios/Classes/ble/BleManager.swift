@@ -268,7 +268,7 @@ extension BleManager {
         }
         //  根据不同uuid类型获取不同的服务特征
         device.peripheral.writeValue(data, for: writeChars, type: .withoutResponse)
-        loggerD(msg: "sendCmd: \(uuid), type=\(psType), \(data.hexString())")
+        loggerD(msg: "sendCmd: \(uuid), type=\(psType), writeChars=\(writeChars.uuid.uuidString), data length =\(data.count)")
     }
 
     /**
@@ -1087,7 +1087,7 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
         //  4、发送指令到flutter
         let bleCmdMap = BleCmd(uuid: peripheral.identifier.uuidString, psType: privateService.type, data: data, isSuccess: error == nil).toMap()
         BleEC.receiveData.event()?(bleCmdMap)
-        loggerD(msg: "cmd response（char）: \(peripheral.identifier.uuidString), chars = \(characteristic.uuid.uuidString), data = \(data.hexString())")
+        loggerD(msg: "cmd response(char): \(peripheral.identifier.uuidString), chars = \(characteristic.uuid.uuidString), data length = \(data.count)")
     }
     
 }

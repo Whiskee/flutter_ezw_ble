@@ -848,7 +848,7 @@ class BleManager private constructor() {
             mainScope.launch {
                 BleEC.RECEIVE_DATA.event?.success(bleCmdMap)
             }
-            sendLog(BleLoggerTag.d, "Receive cmd（old）: ${gatt.device.address}\n--type=${currentUuid.type}\n--length=${characteristic.value.size}\n--chartsType=${characteristic.writeType}\n--data=${characteristic.value.toHexString()}")
+            sendLog(BleLoggerTag.d, "Receive cmd(old): ${gatt.device.address}, type=${currentUuid.type}, length=${characteristic.value.size}, chartsType=${characteristic.writeType}")
         }
 
 //        //  发送数据后回调（新指令推送接口，有不兼容风险）
