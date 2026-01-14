@@ -33,6 +33,8 @@ enum BleMC: String {
     case connectDevice
     //  断连设备(uuid)
     case disconnectDevice
+    //  设置设备预连接
+    case devicePreConnected
     //  主动回复设备连接成功
     case deviceConnected
     //  发送指令
@@ -90,6 +92,10 @@ enum BleMC: String {
         case .deviceConnected:
             let uuid = arguments as? String ?? ""
             BleManager.shared.setConnected(uuid: uuid)
+            break
+        case .devicePreConnected:
+            let uuid = arguments as? String ?? ""
+            BleManager.shared.setPreConnected(uuid: uuid)
             break
         case .disconnectDevice:
             let jsonData = arguments as? [String:Any] ?? [:]

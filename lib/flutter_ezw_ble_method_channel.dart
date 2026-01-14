@@ -66,6 +66,10 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       });
 
   @override
+  Future<void> devicePreConnected(String uuid) async =>
+      methodChannel.invokeMethod("devicePreConnected", uuid);
+
+  @override
   Future<void> deviceConnected(String uuid) async =>
       methodChannel.invokeMethod("deviceConnected", uuid);
 

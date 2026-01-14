@@ -28,10 +28,12 @@ enum class BleMC {
     STOP_SCAN,
     //  连接设备(uuid)
     CONNECT_DEVICE,
-    //  断连设备(uuid)
-    DISCONNECT_DEVICE,
+    //  设置设备预连接
+    DEVICE_PRE_CONNECTED,
     //  主动回复设备连接成功
     DEVICE_CONNECTED,
+    //  断连设备(uuid)
+    DISCONNECT_DEVICE,
     //  发送指令
     SEND_CMD,
     //  进入升级模式
@@ -76,7 +78,9 @@ enum class BleMC {
                 val turnOnPureModel = jsonMap?.get("turnOnPureModel") as? Boolean ?: false
                 BleManager.instance.startScan(pureModel = turnOnPureModel)
             }
-            STOP_SCAN -> BleManager.instance.stopScan()
+            STOP_SCAN -> {
+                BleManager.instance.stopScan()
+            }
             CONNECT_DEVICE -> {
                 val jsonMap = arguments as Map<*, *>?
                 val belongConfig = jsonMap?.get("belongConfig") as String??: ""
@@ -87,6 +91,14 @@ enum class BleMC {
                 if (uuid.isNotEmpty() && sn.isNotEmpty()) {
                     BleManager.instance.connect(belongConfig, uuid, name, sn, afterUpgrade = afterUpgrade)
                 }
+            }
+            DEVICE_PRE_CONNECTED -> {
+                val uuid = arguments as String? ?: ""
+                BleManager.instance.setPreConnected(uuid)
+            }
+            DEVICE_CONNECTED -> {
+                val uuid = arguments as String? ?: ""
+                BleManager.instance.setConnected(uuid)
             }
             DISCONNECT_DEVICE -> {
                 val jsonMap = arguments as Map<*, *>?
@@ -108,10 +120,6 @@ enum class BleMC {
             QUITE_UPGRADE_STATE -> {
                 val uuid = arguments as String? ?: ""
                 BleManager.instance.quiteUpgradeState(uuid)
-            }
-            DEVICE_CONNECTED -> {
-                val uuid = arguments as String? ?: ""
-                BleManager.instance.setConnected(uuid)
             }
             CLEAN_CONNECT_CACHE -> {
                 BleManager.instance.cleanConnectCache()

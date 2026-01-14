@@ -37,6 +37,8 @@ class BleManager: NSObject {
     private lazy var connectingTimeoutTimers: [(String, String, Timer)] = []
     //  - 是否正在升级中
     private lazy var upgradeDevices: [String]? = nil
+    //  - 预连接设备集合（使用uuid作为key）
+    private lazy var preConnectedDevices: Set<String> = []
     //  =========== Get/Set
     //  - 当前蓝牙状态
     var currentBleState: Int {
@@ -114,6 +116,8 @@ extension BleManager {
             handleConnectState(uuid: easyConnect.uuid, name: easyConnect.name, state: .bleError)
             return
         }
+        //  1.5、清除预连接状态，避免脏数据影响新连接流程
+        preConnectedDevices.remove(easyConnect.uuid)
         //  2、非升级状态需要移除升级设备
         if !easyConnect.afterUpgrade {
             upgradeDevices?.removeAll(where: {$0 == easyConnect.uuid})
@@ -215,12 +219,24 @@ extension BleManager {
     }
     
     /**
+     *  设置设备预连接
+     */
+    func setPreConnected(uuid: String) {
+        guard !uuid.isEmpty else {
+            return
+        }
+        preConnectedDevices.insert(uuid)
+        loggerD(msg: "Set \(uuid) pre-connected")
+    }
+    /**
      *  设置连接成功
      */
     func setConnected(uuid: String) {
         guard checkIsFunctionCanBeCalled() else {
             return
         }
+        //  移除预连接状态
+        preConnectedDevices.remove(uuid)
         let connectedDevice = connectedDevices.first { device in
             device.peripheral.identifier.uuidString == uuid
         }
@@ -325,6 +341,7 @@ extension BleManager {
         }
         connectingTimeoutTimers.removeAll()
         upgradeDevices?.removeAll()
+        preConnectedDevices.removeAll()
         loggerD(msg: "Reset: success")
     }
     
@@ -562,12 +579,24 @@ extension BleManager {
         }
         //  2、创建连接超时倒计时定时器
         let timer = Timer.scheduledTimer(withTimeInterval: (currentConfig.connectTimeout + (afterUpgrade ? currentConfig.upgradeSwapTime : 0)) / 1000, repeats: false) { [weak self] timer in
-            guard self?.connectedDevices.first(where: { device in
+            guard let self = self else { return }
+            //  检查是否为预连接状态，如果是预连接则不执行超时逻辑，仅移除超时对象
+            if self.preConnectedDevices.contains(uuid) {
+                self.loggerD(msg: "connect-flow: \(uuid)-\(name), is pre-connected, skip timeout logic")
+                //  移除超时定时器
+                if let index = self.connectingTimeoutTimers.firstIndex(where: { info in
+                    info.0 == uuid || info.1 == name
+                }) {
+                    self.connectingTimeoutTimers.remove(at: index)
+                }
+                return
+            }
+            guard self.connectedDevices.first(where: { device in
                 device.peripheral.identifier.uuidString == uuid || device.peripheral.name == name
             })?.isConnected != true else {
                 return
             }
-            self?.handleConnectState(uuid: uuid, name: name, state: .timeout)
+            self.handleConnectState(uuid: uuid, name: name, state: .timeout)
         }
         connectingTimeoutTimers.append((uuid, name, timer))
         loggerD(msg: "connect-flow: \(uuid)-\(name), start connect time out timer")

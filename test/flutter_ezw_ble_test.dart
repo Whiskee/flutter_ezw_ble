@@ -52,6 +52,11 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
+  Future<void> devicePreConnected(String uuid) {
+    throw UnimplementedError();
+  }
+
+  @override
   Future<void> deviceConnected(String uuid) {
     throw UnimplementedError();
   }

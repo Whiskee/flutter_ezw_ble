@@ -77,6 +77,8 @@ class BleManager private constructor() {
     private val sendCmdQueue: ConcurrentLinkedQueue<BleCmd> = ConcurrentLinkedQueue()
     //  - 正在执行断连的设备
     private val disconnectingDevices: MutableList<Pair<String, BleConnectState>> = Collections.synchronizedList(mutableListOf())
+    //  - 预连接设备集合（使用uuid作为key）
+    private val preConnectedDevices: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
 
 
     /// =========== Private Variables
@@ -241,11 +243,13 @@ class BleManager private constructor() {
             sendLog(BleLoggerTag.e, "Start connect: $uuid, no config")
             return
         }
-        //  3、如果非升级模式下有升级状态的数据需要清除
+        //  3、清除预连接状态，避免脏数据影响新连接流程
+        preConnectedDevices.remove(uuid)
+        //  4、如果非升级模式下有升级状态的数据需要清除
         if (!afterUpgrade && upgradeDevices.contains(uuid)) {
             upgradeDevices.remove(uuid)
         }
-        //  4、获取新的连接对象
+        //  5、获取新的连接对象
         val remoteDevice = bluetoothAdapter.getRemoteDevice(uuid)
         //  - bondState = 12
         sendLog(BleLoggerTag.e, "Start connect: $uuid, remote device = ${remoteDevice.name}, state = ${remoteDevice.bondState}")
@@ -307,6 +311,12 @@ class BleManager private constructor() {
         val timeoutTimer = Timer()
         timeoutTimer.schedule(object : TimerTask() {
             override fun run() {
+                //  检查是否为预连接状态，如果是预连接则不执行超时逻辑，仅移除超时对象
+                if (preConnectedDevices.contains(uuid)) {
+                    sendLog(BleLoggerTag.d, "Start connect: $uuid, is pre-connected, skip timeout logic")
+                    waitingConnectDevices.firstOrNull { it.uuid == uuid }?.timeoutTimer = null
+                    return
+                }
                 sendLog(BleLoggerTag.e, "Start connect: $uuid, connect time out")
                 //  1、超时断连则记录断连状态，避免系统断连导致重复执行断连状态
                 disconnectingDevices.removeAll {
@@ -325,6 +335,31 @@ class BleManager private constructor() {
         sendLog(BleLoggerTag.d, "Start connect: $uuid connecting, belong config = ${bleDevice.belongConfig}, after upgrade = $afterUpgrade")
     }
 
+        /**
+     *  设置设备预连接
+     */
+    fun setPreConnected(uuid: String) {
+        if (uuid.isEmpty()) {
+            return
+        }
+        preConnectedDevices.add(uuid)
+        sendLog(BleLoggerTag.d, "Set $uuid pre-connected")
+    }
+
+    /**
+     *  主动设置连接成功
+     */
+    fun setConnected(uuid: String) {
+        if (!checkIsFunctionCanBeCalled() || uuid.isEmpty()) {
+            return
+        }
+        sendLog(BleLoggerTag.d, "Set $uuid connected")
+        //  移除预连接状态
+        preConnectedDevices.remove(uuid)
+        val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
+        handleConnectState(uuid, connectedDevice?.name ?: "", BleConnectState.CONNECTED)
+    }
+
     /**
      * 断连设备
      */
@@ -336,17 +371,7 @@ class BleManager private constructor() {
         handleConnectState(uuid, connectedDevice?.name ?: "", BleConnectState.DISCONNECT_BY_USER, removeBond)
     }
 
-    /**
-     *  主动设置连接成功
-     */
-    fun setConnected(uuid: String) {
-        if (!checkIsFunctionCanBeCalled() || uuid.isEmpty()) {
-            return
-        }
-        sendLog(BleLoggerTag.d, "Set $uuid connected")
-        val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
-        handleConnectState(uuid, connectedDevice?.name ?: "", BleConnectState.CONNECTED)
-    }
+
 
     /**
      *
@@ -426,6 +451,7 @@ class BleManager private constructor() {
         upgradeDevices.clear()
         sendCmdQueue.clear()
         disconnectingDevices.clear()
+        preConnectedDevices.clear()
         sendLog(BleLoggerTag.d, "Reset: success")
     }
 

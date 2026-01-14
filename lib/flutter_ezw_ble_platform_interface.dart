@@ -35,7 +35,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   }
 
   /// 获取蓝牙状态
-  /// 
+  ///
   /// - return 蓝牙状态
   ///
   Future<int> bleState() {
@@ -67,7 +67,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   }
 
   /// 连接设备
-  /// 
+  ///
   /// - param belongConfig 配置名称
   /// - param uuid 设备唯一标识
   /// - param name 设备名称
@@ -98,16 +98,26 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
         'disconnectDevice(uuid: $uuid, name: $name, removeBond: $removeBond) has not been implemented.');
   }
 
+  /// 设备预连接：告知原生设备即将连接，允许在连接成功前做一些准备工作，避免超时退出
+  ///
+  /// - param uuid 设备唯一标识
+  ///
+  Future<void> devicePreConnected(String uuid) {
+    throw UnimplementedError(
+        'devicePreConnected(uuid: $uuid) has not been implemented.');
+  }
+
   /// 设备连接成功
-  /// 
+  ///
   /// - param uuid 设备唯一标识
   ///
   Future<void> deviceConnected(String uuid) {
-    throw UnimplementedError('deviceConnected(uuid: $uuid) has not been implemented.');
+    throw UnimplementedError(
+        'deviceConnected(uuid: $uuid) has not been implemented.');
   }
 
   /// 发送指令
-  /// 
+  ///
   /// - param uuid 设备唯一标识
   /// - param data 指令数据
   /// - param psType 指令类型
@@ -121,7 +131,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   }
 
   /// 进入升级模式
-  /// 
+  ///
   /// - param uuid 设备唯一标识
   ///
   Future<void> enterUpgradeState(String uuid) {
@@ -129,7 +139,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   }
 
   /// 退出升级模式
-  /// 
+  ///
   /// - param uuid 设备唯一标识
   ///
   Future<void> quiteUpgradeState(String uuid) {
