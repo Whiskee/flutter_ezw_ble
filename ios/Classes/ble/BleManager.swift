@@ -235,11 +235,16 @@ extension BleManager {
         guard checkIsFunctionCanBeCalled() else {
             return
         }
+        if !preConnectedDevices.contains(uuid) {
+            loggerE(msg: "setConnected: \(uuid) connected failed, not pre-connected")
+            return
+        }
+        loggerD(msg: "setConnected: \(uuid) connected")
         //  移除预连接状态
         preConnectedDevices.remove(uuid)
-        let connectedDevice = connectedDevices.first { device in
+        let connectedDevice = connectedDevices.first(where: { device in
             device.peripheral.identifier.uuidString == uuid
-        }
+        })
         updateConnectedDevice(uuid: uuid, name: connectedDevice?.peripheral.name ?? "", isConnected: true)
     }
     
@@ -247,14 +252,17 @@ extension BleManager {
      *  断连
      */
     func disconnect(uuid: String, name: String) {
-        //  移除待连接设备
+        //  1、移除预连接状态
+        preConnectedDevices.remove(uuid)
+        //  2、移除待连接设备
         waitingConnectDevices.removeAll { easyConnect in
             easyConnect.uuid == uuid || easyConnect.name == name
         }
+        //  3、获取已连接设备
         let connectedDevice = connectedDevices.first { device in
             device.peripheral.identifier.uuidString == uuid || device.peripheral.name == name
         }
-        //  执行断连
+        //  4、执行断连
         updateConnectedDevice(uuid: uuid, name: connectedDevice?.peripheral.name ?? "", isConnected: false, updateByUser: true)
         loggerD(msg: "disconnect:\(uuid)-\(name), disconnect by user")
     }

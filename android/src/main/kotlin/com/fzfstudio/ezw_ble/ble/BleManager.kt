@@ -353,6 +353,10 @@ class BleManager private constructor() {
         if (!checkIsFunctionCanBeCalled() || uuid.isEmpty()) {
             return
         }
+        if (!preConnectedDevices.contains(uuid)) {
+            sendLog(BleLoggerTag.e, "Set $uuid connected failed, not pre-connected")
+            return
+        }
         sendLog(BleLoggerTag.d, "Set $uuid connected")
         //  移除预连接状态
         preConnectedDevices.remove(uuid)
@@ -365,13 +369,13 @@ class BleManager private constructor() {
      */
     fun disconnect(uuid: String, removeBond: Boolean = false) {
         sendLog(BleLoggerTag.d, "Star disconnect: $uuid by user")
-        //  1、获取已连接设备
+        //  1、移除预连接状态
+        preConnectedDevices.remove(uuid)
+        //  2、获取已连接设备
         val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
-        //  2、执行断连
+        //  3、执行断连
         handleConnectState(uuid, connectedDevice?.name ?: "", BleConnectState.DISCONNECT_BY_USER, removeBond)
     }
-
-
 
     /**
      *
