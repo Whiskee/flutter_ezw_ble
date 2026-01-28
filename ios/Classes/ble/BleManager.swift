@@ -166,11 +166,20 @@ extension BleManager {
         var oldPeripheral: CBPeripheral?
         //  - 6.3、查询已连接的设备
         //  -- 6.3.1、从已连接的设备连接获取设备
-        if let device = connectedDevices.first(where: { device in
+        if let index = connectedDevices.firstIndex(where: { device in
             device.peripheral.identifier.uuidString == easyConnect.uuid || device.peripheral.name == easyConnect.name
         }) {
             tag += "from connected device list"
-            oldPeripheral = device.peripheral
+            //  获取device设备信息
+            var device = connectedDevices[index]
+            //  重新拉取新的Peripherals确保任何情况下不会使用到就的peripheral
+            let id = device.peripheral.identifier
+            let list = centralManager.retrievePeripherals(withIdentifiers: [id])
+            oldPeripheral = list.first ?? device.peripheral
+            oldPeripheral?.delegate = self
+            //  关键：回写更新 connectedDevices 里的 peripheral
+            device.peripheral = oldPeripheral!
+            connectedDevices[index] = device
             guard !device.isConnected else {
                 waitingConnectDevices.removeAll { easyConnect in
                     device.peripheral.identifier.uuidString == easyConnect.uuid || device.peripheral.name == easyConnect.name
@@ -809,6 +818,10 @@ extension BleManager: CBCentralManagerDelegate {
                     handleConnectState(uuid: matchDevice.peripheral.identifier.uuidString, name: matchDevice.peripheral.name ?? "", state: .bleError)
                 }
             }
+            //  - 1.3、清除缓存
+            startConnectInfos.removeAll()
+            waitingConnectDevices.removeAll()
+            preConnectedDevices.removeAll()
         }
         loggerD(msg: "centralManagerDidUpdateState: State = \(central.state.label), code = \(central.state.rawValue)")
     }
