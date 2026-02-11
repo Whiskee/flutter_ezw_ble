@@ -148,6 +148,13 @@ extension BleManager {
             time: Date().timeIntervalSince1970,
         )
         newEasyConnect.bleConfig = bleConfig
+        //  - 4.2、目前只允许同时连接同一组设备，不同设备不能进入等待连接队列中
+        if let firstWaitingDevice = waitingConnectDevices.first {
+            if firstWaitingDevice.bleConfig?.name != bleConfig.name {
+                loggerD(msg: "connect-flow: \(easyConnect.uuid)-\(easyConnect.name), not start connect, ble config = \(bleConfig.name) not same with waiting config = \(firstWaitingDevice.bleConfig?.name ?? "")")
+                return
+            }
+        }
         //  - 4.2、如果不存在就缓存起来
         if !waitingConnectDevices.contains(where: { easyConnect in
             easyConnect.uuid == newEasyConnect.uuid || easyConnect.name == newEasyConnect.name

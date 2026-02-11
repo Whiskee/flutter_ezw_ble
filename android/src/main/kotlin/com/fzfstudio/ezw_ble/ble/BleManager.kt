@@ -269,13 +269,21 @@ class BleManager private constructor() {
             return
         }
         //  6、缓存连接对象，如果缓存中超过1个就等待考前的连接完成后再开始执行
+        //  - 6.1、目前只能同一个组合的设备能进入待连接，不是同一组设备不允许进入连接
+        val firstWaitingDevice = waitingConnectDevices.firstOrNull()
+        if (firstWaitingDevice != null && firstWaitingDevice.belongConfig.name != bleConfig.name) {
+            sendLog(BleLoggerTag.d, "Start connect: $uuid, not start connect, ble config = ${bleConfig.name} not same with waiting config = ${firstWaitingDevice.name}")
+            return
+        }
+        //  - 6.2、放入待连接池中
         if (!waitingConnectDevices.any { it.uuid == uuid }) {
             waitingConnectDevices.add(BleConnectTemp(bleConfig, uuid, name, sn, afterUpgrade))
         }
+        //  - 6.3、同一时刻只能连接一个设备
         if (waitingConnectDevices.size > 1) {
-            //  - 4.1、设置待连接设备进入连接状态，并等待上一个设备完成
+            //  - 6.3.1、设置待连接设备进入连接状态，并等待上一个设备完成
             handleConnectState(uuid, name, BleConnectState.CONNECTING)
-            //  - 4.2、打印上一个正在连接的设备
+            //  - 6.3.2、打印上一个正在连接的设备
             val lastDevice = waitingConnectDevices.firstOrNull { it.uuid != uuid }
             sendLog(BleLoggerTag.d, "Start connect: $uuid, waiting ${lastDevice?.uuid} finish connecting")
             return
@@ -400,6 +408,19 @@ class BleManager private constructor() {
             sendCmdQueue.poll()
             connectedDevices.firstOrNull { it.uuid == uuid }?.writeCharacteristic(data, psType)
         }
+    }
+    
+    /**
+     * 不等待写入结果的指令发送
+     * 
+     * - 注意，使用的是要尽量不要跟sendCmd一起使用，避免204响应导致数据丢失
+     */
+    fun sendCmdNoWait(uuid: String, data: ByteArray, psType: Int = 0) {
+        if (!checkIsFunctionCanBeCalled() || uuid.isEmpty()) {
+            return
+        }
+        connectedDevices.firstOrNull { it.uuid == uuid }?.writeCharacteristic(data, psType)
+        sendLog(BleLoggerTag.d, "Send cmd - no wait: $uuid, type=$psType, data length=${data.size}")
     }
 
     /**
