@@ -36,6 +36,8 @@ enum class BleMC {
     DISCONNECT_DEVICE,
     //  发送指令
     SEND_CMD,
+    //  发送指令(不等待写入结果)
+    SEND_CMD_NO_WAIT,
     //  进入升级模式
     ENTER_UPGRADE_STATE,
     //  退出升级模式
@@ -112,6 +114,13 @@ enum class BleMC {
                 val data = jsonMap?.get("data") as ByteArray? ?: byteArrayOf()
                 val psType = jsonMap?.get("psType") as Int? ?: 0
                 BleManager.instance.sendCmd(uuid, data, psType)
+            }
+            SEND_CMD_NO_WAIT -> {
+                val jsonMap = arguments as Map<*, *>?
+                val uuid = jsonMap?.get("uuid") as String? ?: ""
+                val data = jsonMap?.get("data") as ByteArray? ?: byteArrayOf()
+                val psType = jsonMap?.get("psType") as Int? ?: 0
+                BleManager.instance.sendCmdNoWait(uuid, data, psType)
             }
             ENTER_UPGRADE_STATE -> {
                 val uuid = arguments as String? ?: ""

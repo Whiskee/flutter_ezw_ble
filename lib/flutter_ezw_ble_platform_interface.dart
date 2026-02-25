@@ -130,6 +130,20 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     throw UnimplementedError('sendCmd() has not been implemented.');
   }
 
+  /// 发送指令(不等待写入结果)
+  ///
+  /// - param uuid 设备唯一标识
+  /// - param data 指令数据
+  /// - param psType 指令类型
+  ///
+  Future<void> sendCmdNoWait(
+    String uuid,
+    Uint8List data, {
+    int psType = 0,
+  }) {
+    throw UnimplementedError('sendCmdNoWait() has not been implemented.');
+  }
+
   /// 进入升级模式
   ///
   /// - param uuid 设备唯一标识

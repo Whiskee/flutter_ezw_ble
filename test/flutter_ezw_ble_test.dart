@@ -71,6 +71,15 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
+  Future<void> sendCmdNoWait(
+    String uuid,
+    Uint8List data, {
+    int psType = 0,
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
   Future<void> openAppSettings() {
     throw UnimplementedError();
   }
@@ -89,12 +98,12 @@ class MockFlutterEzwBlePlatform
   Future<void> quiteUpgradeState(String uuid) {
     throw UnimplementedError();
   }
-  
+
   @override
   Future<void> cleanConnectCache() {
     throw UnimplementedError();
   }
-  
+
   @override
   Future<void> resetBle() {
     throw UnimplementedError();

@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_ezw_ble/core/models/ble_config.dart';
@@ -84,6 +86,21 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
         "data": data,
         "psType": psType,
       });
+
+  /// 发送数据 - 原始数据 - 不等待响应(Android 平台使用)
+  @override
+  Future<void> sendCmdNoWait(
+    String uuid,
+    Uint8List data, {
+    int psType = 0,
+  }) async =>
+      Platform.isAndroid
+          ? methodChannel.invokeMethod<void>("sendCmdNoWait", {
+              "uuid": uuid,
+              "data": data,
+              "psType": psType,
+            })
+          : sendCmd(uuid, data, psType: psType);
 
   @override
   Future<void> enterUpgradeState(String uuid) =>
