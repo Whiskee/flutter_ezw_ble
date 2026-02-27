@@ -111,9 +111,7 @@ enum BleMC: String {
                 BleManager.shared.sendCmd(uuid: uuid, data: data.data, psType: psType)
             }
             //  由于iOS蓝牙发送数据没有系统回调是否发送成功，只能等待15ms保证数据是发送出去的
-            DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + .milliseconds(15)) {
-                result(nil)
-            }
+            result(nil)
             return
         case .enterUpgradeState:
             let uuid = arguments as? String ?? ""
