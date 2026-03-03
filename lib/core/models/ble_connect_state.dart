@@ -1,15 +1,17 @@
 enum BleConnectState {
-  //  步骤1：执行连接
+  //  步骤1.1：等待连接（Android专属，iOS没有等待连接的概念）
+  waitingConnect,
+  //  步骤1.2：执行连接
   connecting,
-  //  步骤2: 获取连接设备回复
+  //  步骤3: 获取连接设备回复
   contactDevice,
-  //  步骤3: 搜索设备服务特征
+  //  步骤4: 搜索设备服务特征
   searchService,
-  //  步骤4: 获取服务读写特征
+  //  步骤5: 获取服务读写特征
   searchChars,
-  //  步骤5: 发起绑定
+  //  步骤6: 发起绑定
   startBinding,
-  //  步骤5: 特征获取完毕，连接流程完成
+  //  步骤7: 特征获取完毕，连接流程完成
   connectFinish,
   //  错误码：
   //  - 主动断连
@@ -47,6 +49,8 @@ enum BleConnectState {
 extension BleConnectStateExt on BleConnectState {
   static BleConnectState label(String label) {
     switch (label) {
+      case "waitingConnect":
+        return BleConnectState.waitingConnect;
       case "connecting":
         return BleConnectState.connecting;
       case "contactDevice":
@@ -91,6 +95,7 @@ extension BleConnectStateExt on BleConnectState {
 
   //  连接流程：连接中
   bool get isConnecting =>
+      this == BleConnectState.waitingConnect ||
       this == BleConnectState.connecting ||
       this == BleConnectState.contactDevice ||
       this == BleConnectState.searchService ||

@@ -37,7 +37,6 @@ class BleDevice(
     val isConnected: Boolean
         get() = connectState == BleConnectState.CONNECTED
 
-
     /**
      * 添加Gatt及其读写配置
      */

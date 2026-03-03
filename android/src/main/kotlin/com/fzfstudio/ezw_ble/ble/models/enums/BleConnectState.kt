@@ -4,17 +4,19 @@ import com.google.gson.annotations.JsonAdapter
 
 @JsonAdapter(BleConnectStateAdapter::class)
 enum class BleConnectState {
-    //  步骤1：执行连接
+    //  步骤1: 等待连接
+    WAITING_CONNECT,
+    //  步骤2：执行连接
     CONNECTING,
-    //  步骤2: 获取连接设备回复
+    //  步骤3: 获取连接设备回复
     CONTACT_DEVICE,
-    //  步骤3: 搜索设备服务特征
+    //  步骤4: 搜索设备服务特征
     SEARCH_SERVICE,
-    //  步骤4: 获取服务读写特征
+    //  步骤5: 获取服务读写特征
     SEARCH_CHARS,
-    //  步骤5: 发起绑定
+    //  步骤6: 发起绑定
     START_BINDING,
-    //  步骤5: 特征获取完毕，连接流程完成
+    //  步骤7: 特征获取完毕，物理连接流程完成
     CONNECT_FINISH,
     //  错误码：
     //  - 主动断连
@@ -64,6 +66,13 @@ enum class BleConnectState {
                 this == SEARCH_CHARS ||
                 this == START_BINDING ||
                 this == CONNECT_FINISH
+
+    /**
+     *  是否正在执行流程连接中
+     */
+    val isFlowConnecting: Boolean
+        get() = this == WAITING_CONNECT || this.isConnecting
+
     /**
      *  已连接：真实连接和升级是属于连接状态
      */

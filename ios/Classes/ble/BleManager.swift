@@ -765,7 +765,7 @@ extension BleManager {
             }
             waitingConnectDevices.removeAll()
         }
-        //  - 4.3、没有成功也要连接下一个，避免一致下一次重连进不来
+        //  - 4.3、没有成功也要连接下一个，避免下一次重连进不来
         else if let newConnect = waitingConnectDevices.first {
             connect(easyConnect: newConnect)
         }

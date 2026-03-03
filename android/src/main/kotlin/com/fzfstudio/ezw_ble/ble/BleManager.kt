@@ -254,7 +254,7 @@ class BleManager private constructor() {
         //  - bondState = 12
         sendLog(BleLoggerTag.e, "Start connect: $uuid, remote device = ${remoteDevice.name}, state = ${remoteDevice.bondState}")
         if (retryWhenNoFoudDevice && (remoteDevice == null || remoteDevice.name == null)) {
-            handleConnectState(uuid, name, BleConnectState.CONNECTING)
+            handleConnectState(uuid, name, BleConnectState.WAITING_CONNECT)
             startScan()
             mainScope.launch {
                 delay(5000)
@@ -278,12 +278,12 @@ class BleManager private constructor() {
         //  - 6.2、放入待连接池中
         if (!waitingConnectDevices.any { it.uuid == uuid }) {
             waitingConnectDevices.add(BleConnectTemp(bleConfig, uuid, name, sn, afterUpgrade))
+            //  - 6.2.1、设置待连接设备进入连接状态，并等待上一个设备完成
+            handleConnectState(uuid, name, BleConnectState.WAITING_CONNECT)
         }
         //  - 6.3、同一时刻只能连接一个设备
         if (waitingConnectDevices.size > 1) {
-            //  - 6.3.1、设置待连接设备进入连接状态，并等待上一个设备完成
-            handleConnectState(uuid, name, BleConnectState.CONNECTING)
-            //  - 6.3.2、打印上一个正在连接的设备
+            //  - 6.3.1、打印上一个正在连接的设备
             val lastDevice = waitingConnectDevices.firstOrNull { it.uuid != uuid }
             sendLog(BleLoggerTag.d, "Start connect: $uuid, waiting ${lastDevice?.uuid} finish connecting")
             return
@@ -293,6 +293,9 @@ class BleManager private constructor() {
         if (bleDevice == null) {
             bleDevice = remoteDevice.toBleDevice(bleConfig, sn, 0)
             connectedDevices.add(bleDevice)
+        } else if (bleDevice.connectState.isConnecting) {
+            sendLog(BleLoggerTag.d, "Start connect: $uuid, device is connecting")
+            return
         } else if (bleDevice.isConnected) {
             waitingConnectDevices.removeAll {
                 if (it.uuid == bleDevice.uuid) {
@@ -335,11 +338,12 @@ class BleManager private constructor() {
                 handleConnectState(uuid, name, BleConnectState.TIMEOUT)
             }
         }, bleConfig.connectTimeout.toLong() + (if (afterUpgrade) bleConfig.upgradeSwapTime.toLong() else 0),)
-        waitingConnectDevices.firstOrNull { it.uuid == uuid }?.timeoutTimer = timeoutTimer
-        //  11、待连接中的设备已经处于连接中，不再发送
-        if (!isWaitingDevice) {
-            handleConnectState(uuid, name, BleConnectState.CONNECTING)
+        waitingConnectDevices.firstOrNull { it.uuid == uuid }?.let {
+            it.timeoutTimer?.cancel()
+            it.timeoutTimer = timeoutTimer
         }
+        //  11、待连接中的设备已经处于连接中，不再发送
+        handleConnectState(uuid, name, BleConnectState.CONNECTING)
         sendLog(BleLoggerTag.d, "Start connect: $uuid connecting, belong config = ${bleDevice.belongConfig}, after upgrade = $afterUpgrade")
     }
 
@@ -1057,7 +1061,7 @@ class BleManager private constructor() {
             }
         }
         //  2、处理正在连接
-        if (state.isConnecting) {
+        if (state.isFlowConnecting) {
             disconnectingDevices.removeAll {
                 it.first == uuid
             }
@@ -1066,11 +1070,11 @@ class BleManager private constructor() {
         else if (state.isDisconnected || state.isError) {
             disconnectDevice(uuid, state, removeBond)
         }
-        //  4、处理连接成功
+        //  4、处理连接成功（uuid 用 ignoreCase 比较：connect 与 setConnected 可能来自不同链路，MAC 大小写不一致会导致匹配不到，定时器无法清除）
         else if (state.isConnected) {
             // 安全移除等待连接的设备，并清理其定时器
             waitingConnectDevices.removeAll {
-                if (it.uuid == uuid) {
+                if (it.uuid.equals(uuid, ignoreCase = true)) {
                     it.timeoutTimer?.cancel()
                     it.timeoutTimer = null
                     true
@@ -1082,7 +1086,7 @@ class BleManager private constructor() {
             }
         }
         //  5、非连接流程，查询是否有待连接设备，如果有就开始连接
-        if (!state.isConnecting && !upgradeDevices.contains(uuid) && waitingConnectDevices.isNotEmpty()) {
+        if (!state.isFlowConnecting && !upgradeDevices.contains(uuid) && waitingConnectDevices.isNotEmpty()) {
             val waitingDevice = waitingConnectDevices.first()
             connect(waitingDevice.belongConfig.name, waitingDevice.uuid, waitingDevice.name, waitingDevice.sn, true, waitingDevice.afterUpgrade)
         }
