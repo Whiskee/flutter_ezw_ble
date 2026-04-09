@@ -251,16 +251,18 @@ class BleManager private constructor() {
         }
         //  5、获取新的连接对象
         val remoteDevice = bluetoothAdapter.getRemoteDevice(uuid)
-        //  - bondState = 12
-        sendLog(BleLoggerTag.e, "Start connect: $uuid, remote device = ${remoteDevice.name}, state = ${remoteDevice.bondState}")
-        if (retryWhenNoFoudDevice && (remoteDevice == null || remoteDevice.name == null)) {
+        sendLog(BleLoggerTag.e, "Start connect: $uuid, remote device = ${remoteDevice.name}, type = ${remoteDevice.type}, state = ${remoteDevice.bondState}")
+        //  - 首次尝试时先扫描2秒，确保BLE协议栈有最新的设备地址类型信息再执行connectGatt
+        //  - 原因：协议栈可能因断连/蓝牙重启丢失设备地址类型元数据，导致connectGatt静默失败（GATT 133）
+        if (retryWhenNoFoudDevice) {
             handleConnectState(uuid, name, BleConnectState.WAITING_CONNECT)
             startScan()
             mainScope.launch {
-                delay(5000)
+                delay(2000)
+                stopScan()
                 connect(belongConfig, uuid, name, sn, isWaitingDevice, afterUpgrade, false)
             }
-            sendLog(BleLoggerTag.e, "Start connect: $uuid, can not get device from remote, start scan device to retry")
+            sendLog(BleLoggerTag.d, "Start connect: $uuid, scan first to refresh BLE stack device info before connecting")
             return
         }
         if (remoteDevice == null || remoteDevice.name == null) {
@@ -281,11 +283,12 @@ class BleManager private constructor() {
             //  - 6.2.1、设置待连接设备进入连接状态，并等待上一个设备完成
             handleConnectState(uuid, name, BleConnectState.WAITING_CONNECT)
         }
-        //  - 6.3、同一时刻只能连接一个设备
-        if (waitingConnectDevices.size > 1) {
-            //  - 6.3.1、打印上一个正在连接的设备
-            val lastDevice = waitingConnectDevices.firstOrNull { it.uuid != uuid }
-            sendLog(BleLoggerTag.d, "Start connect: $uuid, waiting ${lastDevice?.uuid} finish connecting")
+        //  - 6.3、同一时刻只能连接一个设备：判断当前设备是否是队首
+        //  - 注意：不能用 size > 1，扫描后的二次进入（retryWhenNoFoudDevice=false）时队列中可能已有后续设备，
+        //  - 但当前设备仍是队首，必须允许它继续执行 connectGatt
+        val firstWaiting = waitingConnectDevices.firstOrNull()
+        if (firstWaiting != null && firstWaiting.uuid != uuid) {
+            sendLog(BleLoggerTag.d, "Start connect: $uuid, waiting ${firstWaiting.uuid} finish connecting")
             return
         }
         //  7、查询设备是否已经在连接缓存中，如果不在就创建；如果有且已经连接了就不再继续连接
