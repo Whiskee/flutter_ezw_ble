@@ -16,6 +16,8 @@ struct BleConnectedDevice {
     var readCharsDic: [Int: CBCharacteristic] = [:]
     var isConnected: Bool = false
     var readCharsNotify: Int = 0
+    /// BLE物理连接流程是否已完成（所有特征订阅确认后设置为true，断连/错误时重置为false）
+    var isBleFlowCompleted: Bool = false
     
     var isReadCharsNotifySuccess: Bool {
         get {

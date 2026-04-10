@@ -177,14 +177,11 @@ extension BleManager {
             device.peripheral.identifier.uuidString == easyConnect.uuid || device.peripheral.name == easyConnect.name
         }) {
             tag += "from connected device list"
-            //  获取device设备信息
             var device = connectedDevices[index]
-            //  重新拉取新的Peripherals确保任何情况下不会使用到就的peripheral
             let id = device.peripheral.identifier
             let list = centralManager.retrievePeripherals(withIdentifiers: [id])
             oldPeripheral = list.first ?? device.peripheral
             oldPeripheral?.delegate = self
-            //  关键：回写更新 connectedDevices 里的 peripheral
             device.peripheral = oldPeripheral!
             connectedDevices[index] = device
             guard !device.isConnected else {
@@ -193,6 +190,11 @@ extension BleManager {
                 }
                 loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), is already connected, \(tag)")
                 return
+            }
+            //  新的连接请求重置上一次的 BLE 流程标记，避免跨会话残留
+            if device.isBleFlowCompleted {
+                device.isBleFlowCompleted = false
+                connectedDevices[index] = device
             }
         }
         //  -- 6.3.2、在缓存中查找对应的设备
@@ -712,7 +714,7 @@ extension BleManager {
     }
     
     /**
-     *  连接状态打印
+     *  连接状态处理与队列管理
      */
     private func handleConnectState(uuid: String, name: String, state: BleConnectState, mtu: Int = 247, tag: String = "") {
         let fromTag = "\(tag.isNotEmpty ? " -- from: \(tag)" : "\"\"")"
@@ -730,42 +732,51 @@ extension BleManager {
         }
         //  2、设备连接状态为失败或断连就要设置连接设备连接状态为false
         if state.isError() || state.isDisconnected(), let index = connectedDevices.firstIndex(where: { $0.peripheral.identifier.uuidString == uuid || $0.peripheral.name == name }) {
-            //  - 2.1、获取待移除
             var device = connectedDevices[index]
-            //  - 2.2、设置为断连
             device.isConnected = false
-            //  - 2.3、移除所有订阅状态，确保都释放
+            device.isBleFlowCompleted = false
             for (_, readChar) in device.readCharsDic {
                 device.peripheral.setNotifyValue(false, for: readChar)
             }
-            //  - 2.4、清除已订阅的信息
             device.readCharsNotify = 0
             connectedDevices[index] = device
-            //  - 2.5、执行断连
             centralManager.cancelPeripheralConnection(device.peripheral)
             loggerD(msg: "connect-flow: \(uuid)-\(name), state = \(state), tag = \(fromTag)")
         }
         //  3、发送连接状态
         sendConnectStateToFlutter(uuid: uuid, name: name, state: state, mtu: mtu)
-        //  -- 如果设备正在连接就不处理
+        //  4、连接流程中的状态处理
         guard !state.isConnecting() else {
+            //  connectFinish 表示 BLE 物理连接流程完成，立即从队列中移除并推进下一个设备连接
+            //  超时定时器保留运行，作为协议层鉴权的安全兜底
+            if state == .connectFinish {
+                let wasInQueue = waitingConnectDevices.contains { $0.uuid == uuid || $0.name == name }
+                waitingConnectDevices.removeAll { $0.uuid == uuid || $0.name == name }
+                loggerD(msg: "connect-flow: \(uuid)-\(name), connectFinish, advance queue, remaining = \(waitingConnectDevices.count), tag = \(fromTag)")
+                if wasInQueue, let nextConnect = waitingConnectDevices.first {
+                    connect(easyConnect: nextConnect)
+                }
+            }
             return
         }
-        //  4、处理设备连接不成功
-        //  - 4.1、断连则移除当前待连接设备
+        //  5、非连接流程状态：队列管理
+        let wasInQueue = waitingConnectDevices.contains { $0.uuid == uuid || $0.name == name }
         waitingConnectDevices.removeAll { easyConnect in
             easyConnect.uuid == uuid || easyConnect.name == name
         }
-        loggerD(msg: "connect-flow: \(uuid)-\(name), remove from waiting connect device list, remaining count = \(waitingConnectDevices.count), tag = \(fromTag)")
-        //  - 4.2、如果连接失败(超时除外)，则移除所有等待连接设备
+        loggerD(msg: "connect-flow: \(uuid)-\(name), state = \(state), removed from queue (wasInQueue=\(wasInQueue)), remaining = \(waitingConnectDevices.count), tag = \(fromTag)")
+        //  如果设备不在队列中（已在 connectFinish 时移除），不再推进队列，避免重复触发
+        guard wasInQueue else {
+            return
+        }
+        //  - 5.1、连接失败(超时除外)，通知所有等待设备并清空队列
         if state.isError() && state != .timeout {
-            //  设置所有设备为连接失败
-            waitingConnectDevices.forEach { connect in
-                sendConnectStateToFlutter(uuid: uuid, name: name, state: state, mtu: mtu)
+            waitingConnectDevices.forEach { waitingDevice in
+                sendConnectStateToFlutter(uuid: waitingDevice.uuid, name: waitingDevice.name, state: state, mtu: mtu)
             }
             waitingConnectDevices.removeAll()
         }
-        //  - 4.3、没有成功也要连接下一个，避免下一次重连进不来
+        //  - 5.2、推进下一个设备
         else if let newConnect = waitingConnectDevices.first {
             connect(easyConnect: newConnect)
         }
@@ -841,7 +852,6 @@ extension BleManager: CBCentralManagerDelegate {
         guard peripheral.name?.isEmpty == false else {
             return
         }
-        loggerD(msg: "centralManagerDidDiscover: name = \(String(describing: peripheral.name)), uuid = \(peripheral.identifier.uuidString), rssi = \(RSSI)")
         //  2、发起连接处理：如果startConnectUuid不为空，说明本地查询不到设备，需要通过查询获取
         guard startConnectWithoutLocalStorage(peripheral: peripheral, rssi: RSSI.intValue) else {
             return
@@ -1101,12 +1111,12 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             return
         }
         loggerD(msg: "update notification state: \(peripheral.identifier.uuidString), chars = \(characteristic.uuid.uuidString)")
-        //  检查是否可以连接
         var connectedDevice = connectedDevices[connectedIndex]
         connectedDevice.readCharsNotify += 1
         connectedDevices[connectedIndex] = connectedDevice
         if connectedDevice.isReadCharsNotifySuccess, !connectedDevice.isConnected {
-            //  获取MTU
+            connectedDevice.isBleFlowCompleted = true
+            connectedDevices[connectedIndex] = connectedDevice
             let mtu = getDeviceMTU(peripheral: peripheral)
             handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .connectFinish, mtu: mtu, tag: tag)
             loggerD(msg: "update notification state: \(peripheral.identifier.uuidString), connect finish, writeCharsCount = \(connectedDevice.writeCharsDic.keys.count), ps = \(bleConfig.privateServices.count)")

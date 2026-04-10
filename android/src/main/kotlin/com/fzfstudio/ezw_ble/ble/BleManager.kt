@@ -1064,6 +1064,11 @@ class BleManager private constructor() {
             }
         }
         //  2、处理正在连接
+        //  注意：CONNECT_FINISH 不在此处推进队列。与 iOS 不同，Android 的定时器存储在
+        //  waitingConnectDevices 中的 BleConnectTemp.timeoutTimer 上，提前移除会导致定时器
+        //  引用丢失，setConnected 时无法取消，造成已连接设备被超时断开。
+        //  Android 的 connect() 已有 connectState.isConnecting 守卫（line 299），
+        //  可防止队列推进时对已完成设备的重复连接，因此不需要提前推进。
         if (state.isFlowConnecting) {
             disconnectingDevices.removeAll {
                 it.first == uuid
