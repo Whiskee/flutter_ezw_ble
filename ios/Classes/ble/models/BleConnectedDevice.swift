@@ -18,6 +18,8 @@ struct BleConnectedDevice {
     var readCharsNotify: Int = 0
     /// BLE物理连接流程是否已完成（所有特征订阅确认后设置为true，断连/错误时重置为false）
     var isBleFlowCompleted: Bool = false
+    /// 异常断连后需要先扫描再重连（disconnectFromSys时置true，重连时消费一次）
+    var needsScanBeforeReconnect: Bool = false
     
     var isReadCharsNotifySuccess: Bool {
         get {

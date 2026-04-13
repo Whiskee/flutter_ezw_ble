@@ -161,10 +161,19 @@ extension BleManager {
         }) {
             waitingConnectDevices.append(newEasyConnect)
         }
-        //  - 4.3、如果缓存对象只有一个，立马执行连接，如果没有就进入等待
+        //  - 4.3、默认只有队列头设备才能真正开始连接
+        //  -- 例外：scan 2s 后的重试会再次调用 connect(easyConnect:)
+        //  -- 此时当前设备仍在队列头，但 waitingConnectDevices.count 可能 > 1，
+        //  -- 不能再被整体数量拦住，否则会出现“队列头设备自己也一直等待自己完成”的死锁。
         if (waitingConnectDevices.count > 1) {
-            loggerD(msg: "connect-flow: \(easyConnect.uuid)-\(easyConnect.name), will start connect when last conect finish")
-            return
+            let isQueueHead =
+                waitingConnectDevices.first?.uuid == newEasyConnect.uuid ||
+                waitingConnectDevices.first?.name == newEasyConnect.name
+            if (!isQueueHead) {
+                loggerD(msg: "connect-flow: \(easyConnect.uuid)-\(easyConnect.name), will start connect when last conect finish")
+                return
+            }
+            loggerD(msg: "connect-flow: \(easyConnect.uuid)-\(easyConnect.name), queue head reconnect continues even with pending devices")
         }
         //  6、开始执行连接
         //  - 6.1、设置连接标志
@@ -189,6 +198,26 @@ extension BleManager {
                     device.peripheral.identifier.uuidString == easyConnect.uuid || device.peripheral.name == easyConnect.name
                 }
                 loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), is already connected, \(tag)")
+                return
+            }
+            //  异常断连后首次重连：先扫描2秒刷新 CoreBluetooth 内部缓存，再执行 connect
+            //  原因：CoreBT 缓存的 peripheral 元数据在异常断连后可能 stale，导致 connect 静默无反应
+            if device.needsScanBeforeReconnect {
+                device.needsScanBeforeReconnect = false
+                connectedDevices[index] = device
+                handleConnectState(uuid: newEasyConnect.uuid, name: easyConnect.name, state: .connecting)
+                startScan()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                    guard let self = self else { return }
+                    self.stopScan()
+                    //  扫描期间可能已超时/取消/蓝牙关闭，队列已清空则不再重连
+                    guard self.waitingConnectDevices.contains(where: { $0.uuid == newEasyConnect.uuid || $0.name == newEasyConnect.name }) else {
+                        self.loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), scan finished but device no longer in queue, skip reconnect")
+                        return
+                    }
+                    self.connect(easyConnect: easyConnect)
+                }
+                loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), scan 2s before reconnect to refresh CoreBT cache")
                 return
             }
             //  新的连接请求重置上一次的 BLE 流程标记，避免跨会话残留
@@ -735,6 +764,12 @@ extension BleManager {
             var device = connectedDevices[index]
             device.isConnected = false
             device.isBleFlowCompleted = false
+            //  异常断连标记：下次重连前需先扫描刷新 CoreBluetooth 缓存
+            //  - disconnectFromSys：系统异常断连，CoreBT peripheral 元数据可能 stale
+            //  - timeout：connect() 静默无反应，同样是 CoreBT 缓存问题的典型表现
+            if state == .disconnectFromSys || state == .timeout {
+                device.needsScanBeforeReconnect = true
+            }
             for (_, readChar) in device.readCharsDic {
                 device.peripheral.setNotifyValue(false, for: readChar)
             }

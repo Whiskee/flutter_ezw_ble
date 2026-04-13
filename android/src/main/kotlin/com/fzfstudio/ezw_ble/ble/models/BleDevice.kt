@@ -22,6 +22,8 @@ class BleDevice(
     val sn : String,
     var rssi: Int,
     var connectState: BleConnectState,
+    /// 异常断连/超时后需要先扫描再重连（DISCONNECT_FROM_SYS/TIMEOUT时置true，重连时消费一次）
+    var needsScanBeforeConnect: Boolean = false,
 ): GsonSerializable() {
 
     private val tag = "BleDevice"

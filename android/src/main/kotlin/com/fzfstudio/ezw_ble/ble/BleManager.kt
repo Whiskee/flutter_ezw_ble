@@ -226,7 +226,7 @@ class BleManager private constructor() {
      *  连接设备
      */
     @Synchronized
-    fun connect(belongConfig: String, uuid: String, name: String, sn: String, isWaitingDevice: Boolean = false, afterUpgrade: Boolean = false, retryWhenNoFoudDevice: Boolean = true) {
+    fun connect(belongConfig: String, uuid: String, name: String, sn: String, isWaitingDevice: Boolean = false, afterUpgrade: Boolean = false) {
         if (!checkIsFunctionCanBeCalled() ) {
             return
         }
@@ -252,25 +252,7 @@ class BleManager private constructor() {
         //  5、获取新的连接对象
         val remoteDevice = bluetoothAdapter.getRemoteDevice(uuid)
         sendLog(BleLoggerTag.e, "Start connect: $uuid, remote device = ${remoteDevice.name}, type = ${remoteDevice.type}, state = ${remoteDevice.bondState}")
-        //  - 首次尝试时先扫描2秒，确保BLE协议栈有最新的设备地址类型信息再执行connectGatt
-        //  - 原因：协议栈可能因断连/蓝牙重启丢失设备地址类型元数据，导致connectGatt静默失败（GATT 133）
-        if (retryWhenNoFoudDevice) {
-            handleConnectState(uuid, name, BleConnectState.WAITING_CONNECT)
-            startScan()
-            mainScope.launch {
-                delay(2000)
-                stopScan()
-                connect(belongConfig, uuid, name, sn, isWaitingDevice, afterUpgrade, false)
-            }
-            sendLog(BleLoggerTag.d, "Start connect: $uuid, scan first to refresh BLE stack device info before connecting")
-            return
-        }
-        if (remoteDevice == null || remoteDevice.name == null) {
-            handleConnectState(uuid, name, BleConnectState.NO_DEVICE_FOUND)
-            sendLog(BleLoggerTag.e, "Start connect: $uuid, no device found")
-            return
-        }
-        //  6、缓存连接对象，如果缓存中超过1个就等待考前的连接完成后再开始执行
+        //  6、缓存连接对象，如果缓存中超过1个就等待靠前的连接完成后再开始执行
         //  - 6.1、目前只能同一个组合的设备能进入待连接，不是同一组设备不允许进入连接
         val firstWaitingDevice = waitingConnectDevices.firstOrNull()
         if (firstWaitingDevice != null && firstWaitingDevice.belongConfig.name != bleConfig.name) {
@@ -284,11 +266,40 @@ class BleManager private constructor() {
             handleConnectState(uuid, name, BleConnectState.WAITING_CONNECT)
         }
         //  - 6.3、同一时刻只能连接一个设备：判断当前设备是否是队首
-        //  - 注意：不能用 size > 1，扫描后的二次进入（retryWhenNoFoudDevice=false）时队列中可能已有后续设备，
-        //  - 但当前设备仍是队首，必须允许它继续执行 connectGatt
         val firstWaiting = waitingConnectDevices.firstOrNull()
         if (firstWaiting != null && firstWaiting.uuid != uuid) {
             sendLog(BleLoggerTag.d, "Start connect: $uuid, waiting ${firstWaiting.uuid} finish connecting")
+            return
+        }
+        //  - 6.4、需要先扫描的情况：
+        //  - (1) 异常断连/超时后重连：协议栈可能丢失地址类型元数据，导致 connectGatt 静默失败（GATT 133）
+        //  - (2) 首次连接时设备不在系统 BT 缓存中（remoteDevice.name == null），需要扫描令协议栈缓存地址信息
+        val cachedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
+        val needsScanForCache = cachedDevice?.needsScanBeforeConnect == true
+        val needsScanForName = cachedDevice == null && remoteDevice.name == null
+        if (needsScanForCache || needsScanForName) {
+            cachedDevice?.needsScanBeforeConnect = false
+            if (needsScanForName) {
+                connectedDevices.add(BleDevice(bleConfig, name, uuid, sn, 0, BleConnectState.WAITING_CONNECT))
+            }
+            startScan()
+            mainScope.launch {
+                delay(2000)
+                stopScan()
+                if (waitingConnectDevices.any { it.uuid == uuid }) {
+                    connect(belongConfig, uuid, name, sn, isWaitingDevice, afterUpgrade)
+                } else {
+                    sendLog(BleLoggerTag.d, "Start connect: $uuid, scan finished but device no longer in queue, skip reconnect")
+                }
+            }
+            sendLog(BleLoggerTag.d, "Start connect: $uuid, scan 2s to refresh BLE stack device info before connecting")
+            return
+        }
+        //  - 6.5、扫描完成后仍然找不到设备（name == null 说明协议栈无缓存）
+        if (remoteDevice.name == null) {
+            connectedDevices.removeAll { it.uuid == uuid && it.myGatt == null }
+            handleConnectState(uuid, name, BleConnectState.NO_DEVICE_FOUND)
+            sendLog(BleLoggerTag.e, "Start connect: $uuid, no device found after scan")
             return
         }
         //  7、查询设备是否已经在连接缓存中，如果不在就创建；如果有且已经连接了就不再继续连接
@@ -1061,6 +1072,12 @@ class BleManager private constructor() {
         connectedDevices.forEach {
             if (it.uuid == uuid) {
                 it.connectState = state
+                //  异常断连/超时标记：下次重连前需先扫描刷新 BLE 协议栈缓存
+                //  - DISCONNECT_FROM_SYS：系统异常断连，协议栈可能丢失设备地址类型元数据
+                //  - TIMEOUT：connectGatt 静默无反应，同样是协议栈缓存问题的典型表现
+                if (state == BleConnectState.DISCONNECT_FROM_SYS || state == BleConnectState.TIMEOUT) {
+                    it.needsScanBeforeConnect = true
+                }
             }
         }
         //  2、处理正在连接
