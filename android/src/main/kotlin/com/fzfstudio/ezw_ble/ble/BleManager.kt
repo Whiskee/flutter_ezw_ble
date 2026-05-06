@@ -1065,6 +1065,88 @@ class BleManager private constructor() {
     }
 
     /**
+     * 判断是否是不需要继续连接同组其它 BLE 子设备的业务终态。
+     *
+     * G2 左右腿会被依次放入 waitingConnectDevices。boundFail/alreadyBound/noDeviceFound
+     * 已经能确定整机连接失败，继续推进另一条腿只会触发额外系统配对弹窗。
+     */
+    private fun isImmediateGroupFailure(state: BleConnectState): Boolean =
+        state == BleConnectState.BOUND_FAIL ||
+                state == BleConnectState.ALREADY_BOUND ||
+                state == BleConnectState.NO_DEVICE_FOUND
+
+    /**
+     * 取消同一设备组中其它正在等待或已经启动的连接，并同步同一个失败枚举给 Flutter。
+     *
+     * 这里按 belongConfig + sn 识别同一组设备；对于 G2，就是同一副眼镜的左右腿。
+     * 必须在 handleConnectState 推进 waitingConnectDevices 前执行，避免失败腿触发后
+     * native 队列继续连接另一条腿并弹出系统配对框。
+     */
+    private fun cancelPeerConnectionsForGroup(uuid: String, name: String, state: BleConnectState, mtu: Int) {
+        val sourceWaiting = waitingConnectDevices.firstOrNull {
+            it.uuid.equals(uuid, ignoreCase = true) || it.name == name
+        }
+        val sourceConnected = connectedDevices.firstOrNull {
+            it.uuid.equals(uuid, ignoreCase = true) || it.name == name
+        }
+        val targetConfigName = sourceWaiting?.belongConfig?.name
+            ?: sourceConnected?.belongConfig?.name
+            ?: return
+        val targetSn = sourceWaiting?.sn ?: sourceConnected?.sn ?: return
+
+        // 1、先处理还没真正开始 connectGatt 的等待项，防止后续队列推进。
+        val peerWaitingDevices = waitingConnectDevices.filter {
+            !it.uuid.equals(uuid, ignoreCase = true) &&
+                    it.belongConfig.name == targetConfigName &&
+                    it.sn == targetSn
+        }
+        waitingConnectDevices.removeAll { temp ->
+            val shouldRemove = temp.belongConfig.name == targetConfigName && temp.sn == targetSn
+            if (shouldRemove) {
+                temp.timeoutTimer?.cancel()
+                temp.timeoutTimer = null
+            }
+            shouldRemove
+        }
+        peerWaitingDevices.forEach { waitingDevice ->
+            sendLog(
+                BleLoggerTag.d,
+                "Connect group failed: ${waitingDevice.uuid}, ${waitingDevice.name}, state = $state, cancel waiting peer"
+            )
+            sendConnectState(waitingDevice.uuid, waitingDevice.name, state, mtu)
+        }
+
+        // 2、再清理同组里已经持有 GATT 的其它子设备，避免留下半连接状态。
+        val peerConnectedDevices = connectedDevices.filter {
+            !it.uuid.equals(uuid, ignoreCase = true) &&
+                    it.belongConfig.name == targetConfigName &&
+                    it.sn == targetSn
+        }
+        peerConnectedDevices.forEach { device ->
+            device.connectState = state
+            disconnectingDevices.removeAll { it.first == device.uuid }
+            disconnectingDevices.add(Pair(device.uuid, state))
+            device.releaseAndClear()
+            sendLog(
+                BleLoggerTag.d,
+                "Connect group failed: ${device.uuid}, ${device.name}, state = $state, clear peer gatt"
+            )
+            sendConnectState(device.uuid, device.name, state, mtu)
+        }
+        sendCmdQueue.clear()
+    }
+
+    /**
+     * 发送连接状态到 Flutter。
+     */
+    private fun sendConnectState(uuid: String, name: String, state: BleConnectState, mtu: Int = 247) {
+        mainScope.launch {
+            val connectModel = BleConnectModel(uuid, name, state, mtu)
+            BleEC.CONNECT_STATUS.event?.success(connectModel.toJson())
+        }
+    }
+
+    /**
      *  处理连接状态
      */
     private fun handleConnectState(uuid: String, name: String, state: BleConnectState, removeBond: Boolean = false, mtu: Int = 247) {
@@ -1093,6 +1175,9 @@ class BleManager private constructor() {
         }
         //  3、处理断连和错误连接
         else if (state.isDisconnected || state.isError) {
+            if (isImmediateGroupFailure(state)) {
+                cancelPeerConnectionsForGroup(uuid, name, state, mtu)
+            }
             disconnectDevice(uuid, state, removeBond)
         }
         //  4、处理连接成功（uuid 用 ignoreCase 比较：connect 与 setConnected 可能来自不同链路，MAC 大小写不一致会导致匹配不到，定时器无法清除）
@@ -1116,10 +1201,7 @@ class BleManager private constructor() {
             connect(waitingDevice.belongConfig.name, waitingDevice.uuid, waitingDevice.name, waitingDevice.sn, true, waitingDevice.afterUpgrade)
         }
         //  6、发送连接状态
-        mainScope.launch {
-            val connectModel = BleConnectModel(uuid,  name, state, mtu)
-            BleEC.CONNECT_STATUS.event?.success(connectModel.toJson())
-        }
+        sendConnectState(uuid, name, state, mtu)
     }
 
     /**
