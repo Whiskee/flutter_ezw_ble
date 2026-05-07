@@ -865,10 +865,19 @@ extension BleManager: CBCentralManagerDelegate {
         if central.state != .poweredOn {
             //  - 1.1、移除所有升级设备，避免退出OTA时，重置会连接状态的设备
             upgradeDevices?.removeAll()
-            //  - 1.2、断连所有设备：若设备已经断连了，就不再处理，避免状态重复断连
+            //  - 1.2、系统级蓝牙关闭：把已连接设备标记为 .disconnectFromSys（系统断连），
+            //         让 even_connect 的 EvenDeviceReconnectMixin 能在 BLE 恢复后自动接管重连。
+            //         ⚠️ 不能用 .bleError / .disconnectByUser：
+            //            - .bleError 落在 isError 但不在重连白名单 isConnectError 里
+            //            - .disconnectByUser 是用户主动断连语义
+            //            两者都不会触发重连，BLE 关再开后会有部分设备（典型如戒指）永远不重连。
             connectedDevices.forEach { matchDevice in
                 if matchDevice.isConnected {
-                    handleConnectState(uuid: matchDevice.peripheral.identifier.uuidString, name: matchDevice.peripheral.name ?? "", state: .bleError)
+                    handleConnectState(
+                        uuid: matchDevice.peripheral.identifier.uuidString,
+                        name: matchDevice.peripheral.name ?? "",
+                        state: .disconnectFromSys
+                    )
                 }
             }
             //  - 1.3、清除缓存

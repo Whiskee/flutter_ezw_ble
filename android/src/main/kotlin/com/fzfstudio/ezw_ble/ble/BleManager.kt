@@ -595,10 +595,17 @@ class BleManager private constructor() {
             if (bleState != 5) {
                 //  清除所有升级设备数据，避免执行OTA退出时出现状态回连问题
                 upgradeDevices.clear()
-                //  断连所有设备: 若设备已经断连了，就不再处理，避免状态重复断连
+                //  系统级蓝牙关闭：把所有已连接设备标记为 DISCONNECT_FROM_SYS（系统断连），
+                //  让 even_connect 的 EvenDeviceReconnectMixin 能在 BLE 恢复后自动接管重连。
+                //  ⚠️ 不能复用 disconnect()，它发的是 DISCONNECT_BY_USER（用户主动断），
+                //     重连白名单只包含 disconnectFromSys / serviceFail / charsFail / timeout，
+                //     用户主动断不会触发重连，会导致 BLE 关再开后只剩部分设备被业务层手动拉起、
+                //     其它设备（典型如戒指）永远不重连。
                 connectedDevices.forEach {
                     if (it.isConnected) {
-                        disconnect(it.uuid)
+                        //  与 disconnect() 一致：清理预连接标记，避免残留状态影响下次重连判定
+                        preConnectedDevices.remove(it.uuid)
+                        handleConnectState(it.uuid, it.name, BleConnectState.DISCONNECT_FROM_SYS)
                     }
                 }
             }
