@@ -1,5 +1,5 @@
 enum BleConnectState {
-  //  步骤1.1：等待连接（Android专属，iOS没有等待连接的概念）
+  //  步骤1.1：等待连接（兼容旧原生队列状态；新原生层不再主动上报）
   waitingConnect,
   //  步骤1.2：执行连接
   connecting,

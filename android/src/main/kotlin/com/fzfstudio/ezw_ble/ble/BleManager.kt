@@ -22,7 +22,6 @@ import com.fzfstudio.ezw_ble.ble.extension.toBleDevice
 import com.fzfstudio.ezw_ble.ble.models.BleCmd
 import com.fzfstudio.ezw_ble.ble.models.BleConfig
 import com.fzfstudio.ezw_ble.ble.models.BleConnectModel
-import com.fzfstudio.ezw_ble.ble.models.BleConnectTemp
 import com.fzfstudio.ezw_ble.ble.models.BleDevice
 import com.fzfstudio.ezw_ble.ble.models.BleMatchDevice
 import com.fzfstudio.ezw_ble.ble.models.BleSnRule
@@ -67,8 +66,6 @@ class BleManager private constructor() {
     private val connectedDevices: MutableList<BleDevice> = Collections.synchronizedList(mutableListOf())
     //  - 搜素结果临时缓存(DeviceInfo, 蓝牙对象)
     private val scanResultTemp: MutableList<BleDevice> = mutableListOf()
-    //  - 待连接设备缓存（UUID，SN）
-    private val waitingConnectDevices: MutableList<BleConnectTemp> = Collections.synchronizedList(mutableListOf())
     //  - 私有服务读写操作队列(私有服务类型，Descriptor)
     private val descriptorQueue: Queue<Pair<Int, BluetoothGattDescriptor>> = LinkedList()
     //  - 是否正在升级中
@@ -252,57 +249,32 @@ class BleManager private constructor() {
         //  5、获取新的连接对象
         val remoteDevice = bluetoothAdapter.getRemoteDevice(uuid)
         sendLog(BleLoggerTag.e, "Start connect: $uuid, remote device = ${remoteDevice.name}, type = ${remoteDevice.type}, state = ${remoteDevice.bondState}")
-        //  6、缓存连接对象，如果缓存中超过1个就等待靠前的连接完成后再开始执行
-        //  - 6.1、目前只能同一个组合的设备能进入待连接，不是同一组设备不允许进入连接
-        val firstWaitingDevice = waitingConnectDevices.firstOrNull()
-        if (firstWaitingDevice != null && firstWaitingDevice.belongConfig.name != bleConfig.name) {
-            sendLog(BleLoggerTag.d, "Start connect: $uuid, not start connect, ble config = ${bleConfig.name} not same with waiting config = ${firstWaitingDevice.name}")
-            return
-        }
-        //  - 6.2、放入待连接池中
-        if (!waitingConnectDevices.any { it.uuid == uuid }) {
-            waitingConnectDevices.add(BleConnectTemp(bleConfig, uuid, name, sn, afterUpgrade))
-            //  - 6.2.1、设置待连接设备进入连接状态，并等待上一个设备完成
-            handleConnectState(uuid, name, BleConnectState.WAITING_CONNECT)
-        }
-        //  - 6.3、同一时刻只能连接一个设备：判断当前设备是否是队首
-        val firstWaiting = waitingConnectDevices.firstOrNull()
-        if (firstWaiting != null && firstWaiting.uuid != uuid) {
-            sendLog(BleLoggerTag.d, "Start connect: $uuid, waiting ${firstWaiting.uuid} finish connecting")
-            return
-        }
-        //  - 6.4、需要先扫描的情况：
-        //  - (1) 异常断连/超时后重连：协议栈可能丢失地址类型元数据，导致 connectGatt 静默失败（GATT 133）
-        //  - (2) 首次连接时设备不在系统 BT 缓存中（remoteDevice.name == null），需要扫描令协议栈缓存地址信息
+        //  6、需要先扫描刷新协议栈缓存的情况
+        //  - 6.1、异常断连/超时后重连：协议栈可能丢失地址类型元数据，导致 connectGatt 静默失败（GATT 133）
+        //  - 6.2、首次连接时设备不在系统 BT 缓存中（remoteDevice.name == null），需要扫描令协议栈缓存地址信息
         val cachedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
         val needsScanForCache = cachedDevice?.needsScanBeforeConnect == true
-        val needsScanForName = cachedDevice == null && remoteDevice.name == null
+        val needsScanForName = !isWaitingDevice && cachedDevice == null && remoteDevice.name == null
         if (needsScanForCache || needsScanForName) {
             cachedDevice?.needsScanBeforeConnect = false
-            if (needsScanForName) {
-                connectedDevices.add(BleDevice(bleConfig, name, uuid, sn, 0, BleConnectState.WAITING_CONNECT))
-            }
             startScan()
             mainScope.launch {
                 delay(2000)
                 stopScan()
-                if (waitingConnectDevices.any { it.uuid == uuid }) {
-                    connect(belongConfig, uuid, name, sn, isWaitingDevice, afterUpgrade)
-                } else {
-                    sendLog(BleLoggerTag.d, "Start connect: $uuid, scan finished but device no longer in queue, skip reconnect")
-                }
+                //  - 6.3、扫描刷新后再次尝试连接当前 UUID。
+                connect(belongConfig, uuid, name, sn, true, afterUpgrade)
             }
             sendLog(BleLoggerTag.d, "Start connect: $uuid, scan 2s to refresh BLE stack device info before connecting")
             return
         }
-        //  - 6.5、扫描完成后仍然找不到设备（name == null 说明协议栈无缓存）
+        //  7、扫描完成后仍然找不到设备（name == null 说明协议栈无缓存）
         if (remoteDevice.name == null) {
             connectedDevices.removeAll { it.uuid == uuid && it.myGatt == null }
             handleConnectState(uuid, name, BleConnectState.NO_DEVICE_FOUND)
             sendLog(BleLoggerTag.e, "Start connect: $uuid, no device found after scan")
             return
         }
-        //  7、查询设备是否已经在连接缓存中，如果不在就创建；如果有且已经连接了就不再继续连接
+        //  8、查询设备是否已经在连接缓存中，如果不在就创建；如果有且已经连接了就不再继续连接
         var bleDevice = connectedDevices.firstOrNull { it.uuid == uuid }
         if (bleDevice == null) {
             bleDevice = remoteDevice.toBleDevice(bleConfig, sn, 0)
@@ -311,17 +283,12 @@ class BleManager private constructor() {
             sendLog(BleLoggerTag.d, "Start connect: $uuid, device is connecting")
             return
         } else if (bleDevice.isConnected) {
-            waitingConnectDevices.removeAll {
-                if (it.uuid == bleDevice.uuid) {
-                    it.timeoutTimer?.cancel()
-                    it.timeoutTimer = null
-                    true
-                } else false
-            }
+            bleDevice.timeoutTimer?.cancel()
+            bleDevice.timeoutTimer = null
             sendLog(BleLoggerTag.d, "Start connect: $uuid, device is already connected")
             return
         }
-        //  8、执行连接:默认获取基础私有服务的Gatt进行处理
+        //  9、执行连接:默认获取基础私有服务的Gatt进行处理
         val connectCallBack = createConnectCallBack()
         val gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             remoteDevice.connectGatt(weakContext?.get(), false, connectCallBack, BluetoothDevice.TRANSPORT_LE, BluetoothDevice.PHY_LE_2M)
@@ -330,16 +297,16 @@ class BleManager private constructor() {
         }
         //  - 缓存刷新的gatt
         bleDevice.update(gatt)
-        //  9、读取信号值
+        //  10、读取信号值
         gatt?.readRemoteRssi()
-        //  10、开启连接超时定时器
+        //  11、开启连接超时定时器
         val timeoutTimer = Timer()
         timeoutTimer.schedule(object : TimerTask() {
             override fun run() {
                 //  检查是否为预连接状态，如果是预连接则不执行超时逻辑，仅移除超时对象
                 if (preConnectedDevices.contains(uuid)) {
                     sendLog(BleLoggerTag.d, "Start connect: $uuid, is pre-connected, skip timeout logic")
-                    waitingConnectDevices.firstOrNull { it.uuid == uuid }?.timeoutTimer = null
+                    connectedDevices.firstOrNull { it.uuid == uuid }?.timeoutTimer = null
                     return
                 }
                 sendLog(BleLoggerTag.e, "Start connect: $uuid, connect time out")
@@ -352,11 +319,9 @@ class BleManager private constructor() {
                 handleConnectState(uuid, name, BleConnectState.TIMEOUT)
             }
         }, bleConfig.connectTimeout.toLong() + (if (afterUpgrade) bleConfig.upgradeSwapTime.toLong() else 0),)
-        waitingConnectDevices.firstOrNull { it.uuid == uuid }?.let {
-            it.timeoutTimer?.cancel()
-            it.timeoutTimer = timeoutTimer
-        }
-        //  11、待连接中的设备已经处于连接中，不再发送
+        bleDevice.timeoutTimer?.cancel()
+        bleDevice.timeoutTimer = timeoutTimer
+        //  12、当前设备已经处于连接中
         handleConnectState(uuid, name, BleConnectState.CONNECTING)
         sendLog(BleLoggerTag.d, "Start connect: $uuid connecting, belong config = ${bleDevice.belongConfig}, after upgrade = $afterUpgrade")
     }
@@ -471,10 +436,11 @@ class BleManager private constructor() {
      * 清除连接缓存
      */
     fun cleanConnectCache() {
-        waitingConnectDevices.forEach {
+        //  1、取消所有当前连接对象上的超时定时器。
+        connectedDevices.forEach {
             it.timeoutTimer?.cancel()
+            it.timeoutTimer = null
         }
-        waitingConnectDevices.clear()
     }
 
     /**
@@ -1059,88 +1025,8 @@ class BleManager private constructor() {
             }
             sendLog(BleLoggerTag.d, "${device.name} clear all gatt")
         }
-        //  3、安全移除等待连接的设备，并清理其定时器
-        waitingConnectDevices.removeAll { temp ->
-            if (temp.uuid == uuid) {
-                temp.timeoutTimer?.cancel()
-                temp.timeoutTimer = null
-                true
-            } else false
-        }
-        // 假设 sendCmdQueue 是 ConcurrentLinkedQueue
+        //  3、清空发送队列，避免断连后继续发送旧指令。
         sendCmdQueue.clear() // ConcurrentLinkedQueue.clear() 是线程安全的
-    }
-
-    /**
-     * 判断是否是不需要继续连接同组其它 BLE 子设备的业务终态。
-     *
-     * G2 左右腿会被依次放入 waitingConnectDevices。boundFail/alreadyBound/noDeviceFound
-     * 已经能确定整机连接失败，继续推进另一条腿只会触发额外系统配对弹窗。
-     */
-    private fun isImmediateGroupFailure(state: BleConnectState): Boolean =
-        state == BleConnectState.BOUND_FAIL ||
-                state == BleConnectState.ALREADY_BOUND ||
-                state == BleConnectState.NO_DEVICE_FOUND
-
-    /**
-     * 取消同一设备组中其它正在等待或已经启动的连接，并同步同一个失败枚举给 Flutter。
-     *
-     * 这里按 belongConfig + sn 识别同一组设备；对于 G2，就是同一副眼镜的左右腿。
-     * 必须在 handleConnectState 推进 waitingConnectDevices 前执行，避免失败腿触发后
-     * native 队列继续连接另一条腿并弹出系统配对框。
-     */
-    private fun cancelPeerConnectionsForGroup(uuid: String, name: String, state: BleConnectState, mtu: Int) {
-        val sourceWaiting = waitingConnectDevices.firstOrNull {
-            it.uuid.equals(uuid, ignoreCase = true) || it.name == name
-        }
-        val sourceConnected = connectedDevices.firstOrNull {
-            it.uuid.equals(uuid, ignoreCase = true) || it.name == name
-        }
-        val targetConfigName = sourceWaiting?.belongConfig?.name
-            ?: sourceConnected?.belongConfig?.name
-            ?: return
-        val targetSn = sourceWaiting?.sn ?: sourceConnected?.sn ?: return
-
-        // 1、先处理还没真正开始 connectGatt 的等待项，防止后续队列推进。
-        val peerWaitingDevices = waitingConnectDevices.filter {
-            !it.uuid.equals(uuid, ignoreCase = true) &&
-                    it.belongConfig.name == targetConfigName &&
-                    it.sn == targetSn
-        }
-        waitingConnectDevices.removeAll { temp ->
-            val shouldRemove = temp.belongConfig.name == targetConfigName && temp.sn == targetSn
-            if (shouldRemove) {
-                temp.timeoutTimer?.cancel()
-                temp.timeoutTimer = null
-            }
-            shouldRemove
-        }
-        peerWaitingDevices.forEach { waitingDevice ->
-            sendLog(
-                BleLoggerTag.d,
-                "Connect group failed: ${waitingDevice.uuid}, ${waitingDevice.name}, state = $state, cancel waiting peer"
-            )
-            sendConnectState(waitingDevice.uuid, waitingDevice.name, state, mtu)
-        }
-
-        // 2、再清理同组里已经持有 GATT 的其它子设备，避免留下半连接状态。
-        val peerConnectedDevices = connectedDevices.filter {
-            !it.uuid.equals(uuid, ignoreCase = true) &&
-                    it.belongConfig.name == targetConfigName &&
-                    it.sn == targetSn
-        }
-        peerConnectedDevices.forEach { device ->
-            device.connectState = state
-            disconnectingDevices.removeAll { it.first == device.uuid }
-            disconnectingDevices.add(Pair(device.uuid, state))
-            device.releaseAndClear()
-            sendLog(
-                BleLoggerTag.d,
-                "Connect group failed: ${device.uuid}, ${device.name}, state = $state, clear peer gatt"
-            )
-            sendConnectState(device.uuid, device.name, state, mtu)
-        }
-        sendCmdQueue.clear()
     }
 
     /**
@@ -1161,20 +1047,17 @@ class BleManager private constructor() {
         connectedDevices.forEach {
             if (it.uuid == uuid) {
                 it.connectState = state
-                //  异常断连/超时标记：下次重连前需先扫描刷新 BLE 协议栈缓存
-                //  - DISCONNECT_FROM_SYS：系统异常断连，协议栈可能丢失设备地址类型元数据
-                //  - TIMEOUT：connectGatt 静默无反应，同样是协议栈缓存问题的典型表现
+                // - 1.1、异常断连/超时标记：下次重连前需先扫描刷新 BLE 协议栈缓存。
+                // - 1.2、DISCONNECT_FROM_SYS 表示系统异常断连，协议栈可能丢失设备地址类型元数据。
+                // - 1.3、TIMEOUT 表示 connectGatt 静默无反应，同样是协议栈缓存问题的典型表现。
                 if (state == BleConnectState.DISCONNECT_FROM_SYS || state == BleConnectState.TIMEOUT) {
                     it.needsScanBeforeConnect = true
                 }
             }
         }
         //  2、处理正在连接
-        //  注意：CONNECT_FINISH 不在此处推进队列。与 iOS 不同，Android 的定时器存储在
-        //  waitingConnectDevices 中的 BleConnectTemp.timeoutTimer 上，提前移除会导致定时器
-        //  引用丢失，setConnected 时无法取消，造成已连接设备被超时断开。
-        //  Android 的 connect() 已有 connectState.isConnecting 守卫（line 299），
-        //  可防止队列推进时对已完成设备的重复连接，因此不需要提前推进。
+        //  注意：CONNECT_FINISH 只表示 BLE 服务/特征流程完成，真正的业务 connected
+        //  仍由上层鉴权后调用 deviceConnected 触发，所以这里不取消超时定时器。
         if (state.isFlowConnecting) {
             disconnectingDevices.removeAll {
                 it.first == uuid
@@ -1182,32 +1065,23 @@ class BleManager private constructor() {
         }
         //  3、处理断连和错误连接
         else if (state.isDisconnected || state.isError) {
-            if (isImmediateGroupFailure(state)) {
-                cancelPeerConnectionsForGroup(uuid, name, state, mtu)
-            }
             disconnectDevice(uuid, state, removeBond)
         }
         //  4、处理连接成功（uuid 用 ignoreCase 比较：connect 与 setConnected 可能来自不同链路，MAC 大小写不一致会导致匹配不到，定时器无法清除）
         else if (state.isConnected) {
-            // 安全移除等待连接的设备，并清理其定时器
-            waitingConnectDevices.removeAll {
-                if (it.uuid.equals(uuid, ignoreCase = true)) {
-                    it.timeoutTimer?.cancel()
-                    it.timeoutTimer = null
-                    true
-                } else false
+            // - 4.1、连接成功后清理当前设备上的超时定时器。
+            connectedDevices.firstOrNull {
+                it.uuid.equals(uuid, ignoreCase = true)
+            }?.let {
+                it.timeoutTimer?.cancel()
+                it.timeoutTimer = null
             }
-            //  从断连中设备列表中移除当前设备
+            // - 4.2、从断连中设备列表中移除当前设备。
             disconnectingDevices.removeAll {
                 it.first == uuid
             }
         }
-        //  5、非连接流程，查询是否有待连接设备，如果有就开始连接
-        if (!state.isFlowConnecting && !upgradeDevices.contains(uuid) && waitingConnectDevices.isNotEmpty()) {
-            val waitingDevice = waitingConnectDevices.first()
-            connect(waitingDevice.belongConfig.name, waitingDevice.uuid, waitingDevice.name, waitingDevice.sn, true, waitingDevice.afterUpgrade)
-        }
-        //  6、发送连接状态
+        //  5、发送连接状态
         sendConnectState(uuid, name, state, mtu)
     }
 

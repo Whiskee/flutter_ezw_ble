@@ -12,6 +12,7 @@ import com.fzfstudio.ezw_utils.gson.GsonSerializable
 import com.google.gson.annotations.JsonAdapter
 import kotlinx.coroutines.delay
 import java.util.Collections
+import java.util.Timer
 
 class BleDevice(
     //  序列化时只输出名称
@@ -31,6 +32,8 @@ class BleDevice(
     /// 缓存设备所含有的Gatt
     private var gatt: BluetoothGatt? = null
     private val writeAndReadList: MutableList<BleWriteAndRead> = Collections.synchronizedList(mutableListOf())
+    //  连接超时定时器
+    var timeoutTimer: Timer? = null
 
     ///========== Get
     val myGatt: BluetoothGatt?
@@ -63,11 +66,15 @@ class BleDevice(
      *  在这个函数的场景中，disconnect是不会执行onConnectionStateChange回调的，因为立马执行了close，主动做了释放
      */
     fun releaseAndClear() {
-        //  disconnect是用来断连设备但是不释放，便于重连，而且执行onConnectionStateChange的回调
+        //  1、取消连接超时定时器，避免释放 GATT 后仍触发 timeout。
+        timeoutTimer?.cancel()
+        timeoutTimer = null
+        //  2、disconnect是用来断连设备但是不释放，便于重连，而且执行onConnectionStateChange的回调
         gatt?.disconnect()
-        //  close是用来释放设备的，避免其他设备无法搜索以及连接
+        //  3、close是用来释放设备的，避免其他设备无法搜索以及连接
         gatt?.close()
         gatt = null
+        //  4、清空读写特征缓存
         writeAndReadList.clear()
     }
 

@@ -1,7 +1,6 @@
 import 'dart:io';
 
 import 'package:flutter_ezw_ble/core/models/ble_connect_state.dart';
-import 'package:flutter_ezw_ble/core/models/ble_device_hardware.dart';
 import 'package:flutter_ezw_ble/core/tools/connect_state_converter.dart';
 import 'package:json_annotation/json_annotation.dart';
 

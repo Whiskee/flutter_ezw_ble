@@ -28,8 +28,8 @@ class BleManager: NSObject {
     private lazy var scanPureModel: Bool = false
     //  - 搜素：获取结果临时缓存(DeviceInfo, 蓝牙对象)
     private lazy var scanResultTemp: [(BleDevice, CBPeripheral)] = []
-    //  - 待连接设备
-    private lazy var waitingConnectDevices: [BleEasyConnect] = []
+    //  - 当前连接请求缓存，用于原生回调反查 bleConfig
+    private lazy var activeConnectRequests: [BleEasyConnect] = []
     //  - 发起连接信息(所属蓝牙配置名称，UUID，设备名称, 发起时间， 是否是升级状态)
     //  -- 用于设备没能立马被发现时开启搜索，并从搜索中获取直接发起连接
     private lazy var startConnectInfos: [BleEasyConnect] = []
@@ -116,7 +116,7 @@ extension BleManager {
             handleConnectState(uuid: easyConnect.uuid, name: easyConnect.name, state: .bleError)
             return
         }
-        //  1.5、清除预连接状态，避免脏数据影响新连接流程
+        // - 1.1、清除预连接状态，避免脏数据影响新连接流程
         preConnectedDevices.remove(easyConnect.uuid)
         //  2、非升级状态需要移除升级设备
         if !easyConnect.afterUpgrade {
@@ -137,8 +137,8 @@ extension BleManager {
             handleConnectState(uuid: easyConnect.uuid, name: easyConnect.name, state: .emptyUuid)
             return
         }
-        //  4、缓存待连接数据
-        //  - 4.1、如果存在uuid为空，就创建一个UUID，避免空的uuid导致无法添加新的连接到waitingConnectDevices
+        //  4、缓存当前连接请求
+        //  - 4.1、如果存在uuid为空，就创建一个UUID，避免空 uuid 无法在回调中追踪请求
         let newUuid = easyConnect.uuid.isEmpty ? "temp-\(UUID().uuidString)" : easyConnect.uuid
         var newEasyConnect = BleEasyConnect(
             configName: bleConfig.name,
@@ -148,40 +148,15 @@ extension BleManager {
             time: Date().timeIntervalSince1970,
         )
         newEasyConnect.bleConfig = bleConfig
-        //  - 4.2、目前只允许同时连接同一组设备，不同设备不能进入等待连接队列中
-        if let firstWaitingDevice = waitingConnectDevices.first {
-            if firstWaitingDevice.bleConfig?.name != bleConfig.name {
-                loggerD(msg: "connect-flow: \(easyConnect.uuid)-\(easyConnect.name), not start connect, ble config = \(bleConfig.name) not same with waiting config = \(firstWaitingDevice.bleConfig?.name ?? "")")
-                return
-            }
-        }
-        //  - 4.2、如果不存在就缓存起来
-        if !waitingConnectDevices.contains(where: { easyConnect in
-            easyConnect.uuid == newEasyConnect.uuid || easyConnect.name == newEasyConnect.name
-        }) {
-            waitingConnectDevices.append(newEasyConnect)
-        }
-        //  - 4.3、默认只有队列头设备才能真正开始连接
-        //  -- 例外：scan 2s 后的重试会再次调用 connect(easyConnect:)
-        //  -- 此时当前设备仍在队列头，但 waitingConnectDevices.count 可能 > 1，
-        //  -- 不能再被整体数量拦住，否则会出现“队列头设备自己也一直等待自己完成”的死锁。
-        if (waitingConnectDevices.count > 1) {
-            let isQueueHead =
-                waitingConnectDevices.first?.uuid == newEasyConnect.uuid ||
-                waitingConnectDevices.first?.name == newEasyConnect.name
-            if (!isQueueHead) {
-                loggerD(msg: "connect-flow: \(easyConnect.uuid)-\(easyConnect.name), will start connect when last conect finish")
-                return
-            }
-            loggerD(msg: "connect-flow: \(easyConnect.uuid)-\(easyConnect.name), queue head reconnect continues even with pending devices")
-        }
+        //  - 4.2、写入当前请求缓存；是否串行由 Dart 业务层决定。
+        upsertActiveConnectRequest(newEasyConnect)
         //  6、开始执行连接
         //  - 6.1、设置连接标志
         var tag = "start connect: "
         //  - 6.2、获取带连接的设备
         var oldPeripheral: CBPeripheral?
         //  - 6.3、查询已连接的设备
-        //  -- 6.3.1、从已连接的设备连接获取设备
+        // - 6.3.1、从已连接的设备连接获取设备
         if let index = connectedDevices.firstIndex(where: { device in
             device.peripheral.identifier.uuidString == easyConnect.uuid || device.peripheral.name == easyConnect.name
         }) {
@@ -194,14 +169,12 @@ extension BleManager {
             device.peripheral = oldPeripheral!
             connectedDevices[index] = device
             guard !device.isConnected else {
-                waitingConnectDevices.removeAll { easyConnect in
-                    device.peripheral.identifier.uuidString == easyConnect.uuid || device.peripheral.name == easyConnect.name
-                }
+                removeActiveConnectRequest(uuid: newEasyConnect.uuid, name: newEasyConnect.name)
                 loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), is already connected, \(tag)")
                 return
             }
-            //  异常断连后首次重连：先扫描2秒刷新 CoreBluetooth 内部缓存，再执行 connect
-            //  原因：CoreBT 缓存的 peripheral 元数据在异常断连后可能 stale，导致 connect 静默无反应
+            // - 6.3.1.1、异常断连后首次重连：先扫描2秒刷新 CoreBluetooth 内部缓存，再执行 connect。
+            // - 6.3.1.2、CoreBT 缓存的 peripheral 元数据在异常断连后可能 stale，导致 connect 静默无反应。
             if device.needsScanBeforeReconnect {
                 device.needsScanBeforeReconnect = false
                 connectedDevices[index] = device
@@ -210,9 +183,9 @@ extension BleManager {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
                     guard let self = self else { return }
                     self.stopScan()
-                    //  扫描期间可能已超时/取消/蓝牙关闭，队列已清空则不再重连
-                    guard self.waitingConnectDevices.contains(where: { $0.uuid == newEasyConnect.uuid || $0.name == newEasyConnect.name }) else {
-                        self.loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), scan finished but device no longer in queue, skip reconnect")
+                    // - 6.3.1.3、扫描期间可能已超时、取消或蓝牙关闭，请求已清空则不再重连。
+                    guard self.findActiveConnectRequest(uuid: newEasyConnect.uuid, name: newEasyConnect.name) != nil else {
+                        self.loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), scan finished but request no longer active, skip reconnect")
                         return
                     }
                     self.connect(easyConnect: easyConnect)
@@ -220,20 +193,20 @@ extension BleManager {
                 loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), scan 2s before reconnect to refresh CoreBT cache")
                 return
             }
-            //  新的连接请求重置上一次的 BLE 流程标记，避免跨会话残留
+            // - 6.3.1.4、新的连接请求重置上一次的 BLE 流程标记，避免跨会话残留。
             if device.isBleFlowCompleted {
                 device.isBleFlowCompleted = false
                 connectedDevices[index] = device
             }
         }
-        //  -- 6.3.2、在缓存中查找对应的设备
+        // - 6.3.2、在缓存中查找对应的设备
         else if let temp = scanResultTemp.first(where: { info in
             return info.0.uuid == easyConnect.uuid || info.1.name == easyConnect.name
         }) {
             tag += "from scan result temp"
             oldPeripheral = temp.1
         }
-        //  -- 6.3.3、获取蓝牙设置页面中是否有符合的设备
+        // - 6.3.3、获取蓝牙设置页面中是否有符合的设备
         else if let device = findPeripheralFromConnected(uuid: easyConnect.uuid, name: easyConnect.name, psUUID: commonPs.serviceUUID) {
             tag += "from bluetooth setting"
             oldPeripheral = device
@@ -242,11 +215,11 @@ extension BleManager {
         //  - 6.4、查询是否获取到设备，如果没有就开启搜索
         guard let oldPeripheral = oldPeripheral else {
             tag += "no local device found, start scan device"
-            //  -- 展示连接中
+            // - 6.4.1、上报连接中状态。
             handleConnectState(uuid: newEasyConnect.uuid, name: easyConnect.name, state: .connecting)
-            //  -- 添加待连接的设备
+            // - 6.4.2、添加当前连接请求上下文，等待扫描命中后直连。
             startConnectInfos.append(newEasyConnect)
-            //  -- 根据服务特征查询设备
+            // - 6.4.3、根据服务特征查询设备。
             startScan()
             loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), \(tag)")
             return
@@ -301,10 +274,8 @@ extension BleManager {
     func disconnect(uuid: String, name: String) {
         //  1、移除预连接状态
         preConnectedDevices.remove(uuid)
-        //  2、移除待连接设备
-        waitingConnectDevices.removeAll { easyConnect in
-            easyConnect.uuid == uuid || easyConnect.name == name
-        }
+        //  2、移除当前连接请求
+        removeActiveConnectRequest(uuid: uuid, name: name)
         //  3、获取已连接设备
         let connectedDevice = connectedDevices.first { device in
             device.peripheral.identifier.uuidString == uuid || device.peripheral.name == name
@@ -372,8 +343,10 @@ extension BleManager {
      * 清除连接缓存
      */
     func cleanConnectCache() {
-        waitingConnectDevices.removeAll()
+        //  1、清理当前连接请求和搜索连接信息。
+        activeConnectRequests.removeAll()
         startConnectInfos.removeAll()
+        //  2、取消连接超时计时器。
         connectingTimeoutTimers.forEach { (uuid, name, timer) in
             timer.invalidate()
         }
@@ -389,7 +362,7 @@ extension BleManager {
             centralManager.cancelPeripheralConnection(device.peripheral)
         }
         connectedDevices.removeAll()
-        waitingConnectDevices.removeAll()
+        activeConnectRequests.removeAll()
         startConnectInfos.removeAll()
         connectingTimeoutTimers.forEach { (uuid, name, timer) in
             timer.invalidate()
@@ -528,6 +501,78 @@ extension BleManager {
     }
 
     /**
+     *  写入当前连接请求。
+     */
+    private func upsertActiveConnectRequest(_ request: BleEasyConnect) {
+        //  1、先移除同 UUID 或同名称的旧请求。
+        activeConnectRequests.removeAll { item in
+            item.uuid == request.uuid || item.name == request.name
+        }
+        //  2、写入最新连接请求，供 didConnect/服务发现/特征发现回调反查配置。
+        activeConnectRequests.append(request)
+    }
+
+    /**
+     *  根据外设查找当前连接请求。
+     */
+    private func findActiveConnectRequest(peripheral: CBPeripheral) -> BleEasyConnect? {
+        //  1、优先用 UUID 或名称匹配请求。
+        return findActiveConnectRequest(
+            uuid: peripheral.identifier.uuidString,
+            name: peripheral.name ?? ""
+        )
+    }
+
+    /**
+     *  根据 UUID 或名称查找当前连接请求。
+     */
+    private func findActiveConnectRequest(uuid: String, name: String) -> BleEasyConnect? {
+        //  1、UUID 或名称任一命中即可识别同一次连接请求。
+        return activeConnectRequests.first { request in
+            request.uuid == uuid || request.name == name
+        }
+    }
+
+    /**
+     *  更新当前连接请求的 UUID。
+     */
+    private func updateActiveConnectRequestUuid(uuid: String, name: String) {
+        //  1、通过 UUID 或名称找到需要补全 UUID 的请求。
+        guard let index = activeConnectRequests.firstIndex(where: { request in
+            request.uuid == uuid || request.name == name
+        }) else {
+            return
+        }
+        //  2、写回 CoreBluetooth 实际 UUID。
+        activeConnectRequests[index].uuid = uuid
+    }
+
+    /**
+     *  移除当前连接请求。
+     */
+    private func removeActiveConnectRequest(uuid: String, name: String) {
+        //  1、移除同 UUID 或同名称的请求。
+        activeConnectRequests.removeAll { request in
+            request.uuid == uuid || request.name == name
+        }
+    }
+
+    /**
+     *  查找指定外设所属 BLE 配置。
+     */
+    private func findBleConfig(uuid: String, name: String) -> BleConfig? {
+        //  1、优先从当前连接请求中获取配置。
+        if let config = findActiveConnectRequest(uuid: uuid, name: name)?.bleConfig {
+            return config
+        }
+        //  2、其次从已连接缓存中获取配置。
+        return connectedDevices.first { device in
+            device.peripheral.identifier.uuidString == uuid ||
+            device.peripheral.name == name
+        }?.belongConfig
+    }
+
+    /**
      *  处理已经连接的设备
      */
     private func handleAlreadyConnected(peripheral: CBPeripheral,  bleConfig: BleConfig, deviceName: String, tag: String = "") {
@@ -580,12 +625,11 @@ extension BleManager {
                 }) {
                     connectedDevices.append(BleConnectedDevice(belongConfig: bleConfig, peripheral: peripheral))
                 }
-                //  -- 1.3.3、检查待连接设备的uuid是否为空，如果为空就补全
-                if var easyConnect = waitingConnectDevices.first(where: { easyConnect in
-                    easyConnect.uuid == peripheral.identifier.uuidString || easyConnect.name == peripheral.name
-                }), easyConnect.uuid.isEmpty || easyConnect.uuid != peripheral.identifier.uuidString  {
-                    easyConnect.uuid = peripheral.identifier.uuidString
-                }
+                //  -- 1.3.3、检查当前连接请求的 uuid 是否为空，如果为空就补全
+                updateActiveConnectRequestUuid(
+                    uuid: peripheral.identifier.uuidString,
+                    name: peripheral.name ?? connectDevice.name
+                )
                 //  -- 1.3.4、再次更新连接状态
                 handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? connectDevice.name, state: .connecting, tag: "from search device")
                 self.centralManager.connect(peripheral)
@@ -782,39 +826,17 @@ extension BleManager {
         sendConnectStateToFlutter(uuid: uuid, name: name, state: state, mtu: mtu)
         //  4、连接流程中的状态处理
         guard !state.isConnecting() else {
-            //  connectFinish 表示 BLE 物理连接流程完成，立即从队列中移除并推进下一个设备连接
-            //  超时定时器保留运行，作为协议层鉴权的安全兜底
+            //  connectFinish 表示 BLE 物理连接流程完成，移除当前请求缓存。
+            //  超时定时器保留运行，作为协议层鉴权的安全兜底。
             if state == .connectFinish {
-                let wasInQueue = waitingConnectDevices.contains { $0.uuid == uuid || $0.name == name }
-                waitingConnectDevices.removeAll { $0.uuid == uuid || $0.name == name }
-                loggerD(msg: "connect-flow: \(uuid)-\(name), connectFinish, advance queue, remaining = \(waitingConnectDevices.count), tag = \(fromTag)")
-                if wasInQueue, let nextConnect = waitingConnectDevices.first {
-                    connect(easyConnect: nextConnect)
-                }
+                removeActiveConnectRequest(uuid: uuid, name: name)
+                loggerD(msg: "connect-flow: \(uuid)-\(name), connectFinish, remove active request, tag = \(fromTag)")
             }
             return
         }
-        //  5、非连接流程状态：队列管理
-        let wasInQueue = waitingConnectDevices.contains { $0.uuid == uuid || $0.name == name }
-        waitingConnectDevices.removeAll { easyConnect in
-            easyConnect.uuid == uuid || easyConnect.name == name
-        }
-        loggerD(msg: "connect-flow: \(uuid)-\(name), state = \(state), removed from queue (wasInQueue=\(wasInQueue)), remaining = \(waitingConnectDevices.count), tag = \(fromTag)")
-        //  如果设备不在队列中（已在 connectFinish 时移除），不再推进队列，避免重复触发
-        guard wasInQueue else {
-            return
-        }
-        //  - 5.1、连接失败(超时除外)，通知所有等待设备并清空队列
-        if state.isError() && state != .timeout {
-            waitingConnectDevices.forEach { waitingDevice in
-                sendConnectStateToFlutter(uuid: waitingDevice.uuid, name: waitingDevice.name, state: state, mtu: mtu)
-            }
-            waitingConnectDevices.removeAll()
-        }
-        //  - 5.2、推进下一个设备
-        else if let newConnect = waitingConnectDevices.first {
-            connect(easyConnect: newConnect)
-        }
+        //  5、非连接流程状态：移除当前请求缓存，不再由 native 推进其它设备。
+        removeActiveConnectRequest(uuid: uuid, name: name)
+        loggerD(msg: "connect-flow: \(uuid)-\(name), state = \(state), remove active request, tag = \(fromTag)")
     }
     
     /**
@@ -882,7 +904,7 @@ extension BleManager: CBCentralManagerDelegate {
             }
             //  - 1.3、清除缓存
             startConnectInfos.removeAll()
-            waitingConnectDevices.removeAll()
+            activeConnectRequests.removeAll()
             preConnectedDevices.removeAll()
         }
         loggerD(msg: "centralManagerDidUpdateState: State = \(central.state.label), code = \(central.state.rawValue)")
@@ -1004,15 +1026,14 @@ extension BleManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         let tag = "didConnect"
         //  1、检查是否获取到了蓝牙配置
-        guard let waitingConnectDevice = waitingConnectDevices.first(where: { easyConnect in
-            easyConnect.uuid == peripheral.identifier.uuidString || easyConnect.name == peripheral.name
-        }), let bleConfig = waitingConnectDevice.bleConfig else {
+        guard let connectRequest = findActiveConnectRequest(peripheral: peripheral),
+              let bleConfig = connectRequest.bleConfig else {
             handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .noBleConfigFound, tag: tag)
             return
         }
         //  2、发起服务发现
         loggerD(msg: "didConnect: \(peripheral.identifier.uuidString)")
-        handleAlreadyConnected(peripheral: peripheral, bleConfig: bleConfig, deviceName: waitingConnectDevice.name, tag: tag)
+        handleAlreadyConnected(peripheral: peripheral, bleConfig: bleConfig, deviceName: connectRequest.name, tag: tag)
     }
 
     /**
@@ -1056,9 +1077,7 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             return
         }
         //  - 1.2、没有查询到配置
-        guard let bleConfig = waitingConnectDevices.first(where: { easyConnect in
-            easyConnect.uuid == peripheral.identifier.uuidString || easyConnect.name == peripheral.name
-        })?.bleConfig else {
+        guard let bleConfig = findBleConfig(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "") else {
             handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .noBleConfigFound, tag: tag)
             return
         }
@@ -1093,9 +1112,7 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             return
         }
         //  2、获取设备所属蓝牙配置
-        guard let bleConfig = waitingConnectDevices.first(where: { easyConnect in
-            easyConnect.uuid == peripheral.identifier.uuidString || easyConnect.name == peripheral.name
-        })?.bleConfig else {
+        guard let bleConfig = findBleConfig(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "") else {
             handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .noBleConfigFound, tag: tag)
             return
         }
@@ -1137,9 +1154,7 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             return
         }
         //  2、获取设备所属蓝牙配置
-        guard let bleConfig = waitingConnectDevices.first(where: { easyConnect in
-            easyConnect.uuid == peripheral.identifier.uuidString || easyConnect.name == peripheral.name
-        })?.bleConfig else {
+        guard let bleConfig = findBleConfig(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "") else {
             handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .noBleConfigFound, tag: tag)
             return
         }
