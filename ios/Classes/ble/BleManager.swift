@@ -39,6 +39,9 @@ class BleManager: NSObject {
     private lazy var upgradeDevices: [String]? = nil
     //  - 预连接设备集合（使用uuid作为key）
     private lazy var preConnectedDevices: Set<String> = []
+    //  - OTA WriteWithoutResponse 写队列(key: peripheral.identifier.uuidString)
+    //  - 仅在 sendCmdNoWait + psType==1 路径上使用, 详见 IOS_OTA_NOWAIT_SPEC.md §4.2
+    private lazy var otaWriteQueues: [String: OtaWriteQueue] = [:]
     //  =========== Get/Set
     //  - 当前蓝牙状态
     var currentBleState: Int {
@@ -314,6 +317,62 @@ extension BleManager {
     }
 
     /**
+     *
+     *  发送数据 - 不等待响应(Android sendCmdNoWait 的 iOS 对应)
+     *
+     *  - psType == 1 (OTA): 走 WriteWithoutResponse + canSendWriteWithoutResponse 背压队列,
+     *    填满 packets-per-event, 与 Android WRITE_TYPE_NO_RESPONSE 对齐;
+     *  - 其它 psType: 退化到现有 WriteWithoutResponse 立即返回路径(行为不变);
+     *  - 设计与验收: 见 IOS_OTA_NOWAIT_SPEC.md.
+     */
+    func sendCmdNoWait(uuid: String, data: Data, psType: Int, result: @escaping FlutterResult) {
+        //  1、基础校验失败立即回调 nil, 避免 Dart 端 await 挂起
+        guard checkIsFunctionCanBeCalled() else {
+            result(nil)
+            return
+        }
+        //  2、升级中只放行 OTA 指令(与 sendCmd 保持一致)
+        guard upgradeDevices?.contains(where: { $0 == uuid }) != true || psType == 1 else {
+            loggerE(msg: "sendCmdNoWait: \(uuid), type=\(psType), cannot send non-OTA commands during upgrade")
+            result(nil)
+            return
+        }
+        //  3、设备/特征不存在视为查找不到设备
+        guard let device = connectedDevices.first(where: { device in
+            device.peripheral.identifier.uuidString == uuid
+        }), let writeChars = device.writeCharsDic[psType] else {
+            loggerE(msg: "sendCmdNoWait: \(uuid), type=\(psType), device not found")
+            result(nil)
+            return
+        }
+        //  4、分发: OTA 走背压队列, 其它走立即返回的 WriteWithoutResponse
+        let isOtaChannel = (psType == 1)
+        let supportsNoResponse = writeChars.properties.contains(.writeWithoutResponse)
+        if isOtaChannel && supportsNoResponse {
+            //  - 4.1、获取或惰性创建 OTA 写队列, 注入 loggerD 用于埋点
+            let queue = otaWriteQueues[uuid] ?? OtaWriteQueue(
+                peripheral: device.peripheral,
+                logger: { [weak self] msg in
+                    self?.loggerD(msg: msg)
+                }
+            )
+            otaWriteQueues[uuid] = queue
+            //  - 4.2、入队, result 由 pump 写完后回调; canSend 与 queueDepth 落点便于 tuning
+            loggerD(msg: "[ota] write uuid=\(uuid) bytes=\(data.count) canSend=\(device.peripheral.canSendWriteWithoutResponse) queueDepth=\(queue.queueDepth)")
+            queue.enqueue(data: data, characteristic: writeChars, result: result)
+        } else {
+            //  - 4.3、兜底: OTA 特征不声明 writeWithoutResponse 时打 warn 后回退
+            if isOtaChannel && !supportsNoResponse {
+                loggerE(msg: "[ezw_ble][warn] OTA characteristic missing writeWithoutResponse property, fallback to existing path uuid=\(uuid)")
+            }
+            //  - 4.4、保持现有 sendCmd 行为: WriteWithoutResponse 立即返回, 不做背压
+            device.peripheral.writeValue(data, for: writeChars, type: .withoutResponse)
+            loggerD(msg: "sendCmdNoWait: \(uuid), type=\(psType), writeChars=\(writeChars.uuid.uuidString), data length=\(data.count)")
+            result(nil)
+        }
+    }
+
+    /**
      *  进入升级模式
      */
     func enterUpgradeState(uuid: String) {
@@ -370,6 +429,9 @@ extension BleManager {
         connectingTimeoutTimers.removeAll()
         upgradeDevices?.removeAll()
         preConnectedDevices.removeAll()
+        //  清空所有 OTA 写队列, 通知 Dart 端 await 立即返回
+        otaWriteQueues.values.forEach { $0.cancelAll(reason: "reset") }
+        otaWriteQueues.removeAll()
         loggerD(msg: "Reset: success")
     }
     
@@ -820,6 +882,11 @@ extension BleManager {
             device.readCharsNotify = 0
             connectedDevices[index] = device
             centralManager.cancelPeripheralConnection(device.peripheral)
+            //  断连/错误状态: 取消该外设的 OTA 写队列, 避免 Dart 端 await 挂起
+            let queueKey = device.peripheral.identifier.uuidString
+            if let queue = otaWriteQueues.removeValue(forKey: queueKey) {
+                queue.cancelAll(reason: "device state=\(state.rawValue)")
+            }
             loggerD(msg: "connect-flow: \(uuid)-\(name), state = \(state), tag = \(fromTag)")
         }
         //  3、发送连接状态
@@ -1183,6 +1250,18 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
 
     }
     
+    /**
+     *  WriteWithoutResponse 背压解除回调
+     *  - CoreBluetooth 通知该外设可继续接收无应答写入, 把信号转发到对应的 OTA 写队列继续 pump.
+     */
+    func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        let uuid = peripheral.identifier.uuidString
+        guard let queue = otaWriteQueues[uuid] else {
+            return
+        }
+        queue.onPeripheralReadyToSendWriteWithoutResponse()
+    }
+
     /**
      *  获取设备下发指令数据
      */

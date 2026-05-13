@@ -1,5 +1,3 @@
-import 'dart:io';
-
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_ezw_ble/core/models/ble_config.dart';
@@ -87,20 +85,22 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
         "psType": psType,
       });
 
-  /// 发送数据 - 原始数据 - 不等待响应(Android 平台使用)
+  /// 发送数据 - 原始数据 - 不等待响应
+  /// - Android: 走 `WRITE_TYPE_NO_RESPONSE`;
+  /// - iOS: psType==1(OTA) 走 `WriteWithoutResponse` + `canSendWriteWithoutResponse` 背压队列,
+  ///   其它 psType 退化为现有 `WriteWithoutResponse` 立即返回;
+  /// - 详见 IOS_OTA_NOWAIT_SPEC.md.
   @override
   Future<void> sendCmdNoWait(
     String uuid,
     Uint8List data, {
     int psType = 0,
   }) async =>
-      Platform.isAndroid
-          ? methodChannel.invokeMethod<void>("sendCmdNoWait", {
-              "uuid": uuid,
-              "data": data,
-              "psType": psType,
-            })
-          : sendCmd(uuid, data, psType: psType);
+      methodChannel.invokeMethod<void>("sendCmdNoWait", {
+        "uuid": uuid,
+        "data": data,
+        "psType": psType,
+      });
 
   @override
   Future<void> enterUpgradeState(String uuid) =>

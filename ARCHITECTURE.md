@@ -18,7 +18,12 @@
 
 业务侧（如 `even_connect`）在这层之上注册多套 `BleConfig`（G1、G2、Ring1…），按"配置名（belongConfig）"来区分对接哪类设备。
 
-> **重要**：本仓库 `lib/` 下**只有 Dart 侧实现**。`android/`、`ios/` 目录在仓库内并不存在，原生侧 `FlutterEzwBlePlugin`（Kotlin / Swift）由独立工程提供，发布时由 `pubspec.yaml` 的 `plugin.platforms` 在主工程组装。改动 Dart API 前需要同步评估原生侧是否需要联动。
+> **重要**：本仓库 `lib/` 是 Dart 侧实现的主入口。原生侧 `FlutterEzwBlePlugin` 已纳入仓库 `android/` 与 `ios/` 子目录（Kotlin / Swift），与 Dart 侧同仓维护：
+>
+> - `ios/Classes/`：`FlutterEzwBlePlugin.swift` 注册 + `ble/BleManager.swift`（CoreBluetooth）+ `ble/BleChannel.swift`（MethodChannel 分发）+ `ble/OtaWriteQueue.swift`（OTA `WriteWithoutResponse` 背压队列，配套规范 `IOS_OTA_NOWAIT_SPEC.md`）；
+> - `android/src/main/kotlin/com/fzfstudio/ezw_ble/`：`FlutterEzwBlePlugin.kt` + `ble/BleManager.kt`。
+>
+> 改动 Dart API 时一并评估原生侧两端的联动；个别协议/性能改造（如 OTA 的 `sendCmdNoWait`）会有独立 spec 文档，落地时优先按 spec 走。
 
 ---
 
@@ -165,7 +170,7 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `devicePreConnected` | `Future<void> devicePreConnected(String uuid)` | "预连接"通知：业务确认要连这个设备前，让原生侧提前做准备（缓存、超时计时器复位），避免接下来的 `connectDevice` 超时。 |
 | `deviceConnected` | `Future<void> deviceConnected(String uuid)` | "真连上了"通知：业务侧（如收到设备配对回包后）告诉原生 "连接已业务就绪"，原生再 push `connectFinish` → `connected`。 |
 | `sendCmd` | `Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0})` | 写特征值，等待原生层 write 完成。`psType` 是"私有服务类型"，对应 `BlePrivateService.type`（0=基础，1=OTA，2+=自定义）。 |
-| `sendCmdNoWait` | `Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0})` | 不等 write callback，立刻返回。**iOS 上自动回退为 `sendCmd`**（见 method_channel 实现）。用于 OTA 这种连发场景。 |
+| `sendCmdNoWait` | `Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0})` | 不等 write callback，连发场景使用。Android：`WRITE_TYPE_NO_RESPONSE` 写入。iOS：`psType == 1`（OTA）走 `WriteWithoutResponse` + `canSendWriteWithoutResponse` 背压队列（见 `ios/Classes/ble/OtaWriteQueue.swift` 与 `IOS_OTA_NOWAIT_SPEC.md`），其它 `psType` 退化为 `WriteWithoutResponse` 立即返回路径。 |
 | `enterUpgradeState` | `Future<void> enterUpgradeState(String uuid)` | 标记此 uuid 进入 OTA。原生侧据此切到 OTA 私有服务、延长断连超时（与 `BleConfig.upgradeSwapTime` 配合）。 |
 | `quiteUpgradeState` | `Future<void> quiteUpgradeState(String uuid)` | 退出 OTA 状态。 |
 | `openBleSettings` | `Future<void> openBleSettings()` | 跳系统蓝牙开关页。 |
@@ -439,15 +444,21 @@ App 启动
 
 通信
   ├─ EzwBle.to.bleMC.sendCmd(uuid, bytes, psType: 0)   ▶ write，等 callback
-  ├─ EzwBle.to.bleMC.sendCmdNoWait(...)                ▶ Android：write 不等
+  ├─ EzwBle.to.bleMC.sendCmdNoWait(...)                ▶ Android：WRITE_TYPE_NO_RESPONSE
+  │                                                       iOS：psType==1 走 OtaWriteQueue 背压
+  │                                                       其它 psType 即时 WriteWithoutResponse
   └─ ◀ receiveDataEC: BleCmd(data, psType, isSuccess)
 
 OTA 流程
   ├─ EzwBle.to.bleMC.enterUpgradeState(uuid)
   ├─ ◀ connectStatusEC: upgrade
-  ├─ EzwBle.to.bleMC.sendCmd(..., psType=1)             ▶ 通过 OTA 私有服务发包
+  ├─ EzwBle.to.bleMC.sendCmdNoWait(..., psType=1)       ▶ 通过 OTA 私有服务连发
+  │                                                       Android: WRITE_TYPE_NO_RESPONSE
+  │                                                       iOS:     OtaWriteQueue + canSendWriteWithoutResponse 背压
+  │                                                       (与 Android packets-per-event 行为对齐, 详见 IOS_OTA_NOWAIT_SPEC.md)
   ├─ （固件烧录、设备重启 → 系统断连）
   ├─ ◀ connectStatusEC: disconnectFromSys
+  │      （iOS 侧 OtaWriteQueue 自动 cancelAll, 释放挂起的 await）
   ├─ （等 upgradeSwapTime ms 后重连）
   ├─ ◀ connectStatusEC: connecting ... connected
   └─ EzwBle.to.bleMC.quiteUpgradeState(uuid)
@@ -529,6 +540,19 @@ OTA 流程
 
 - 若改 matchCount 逻辑，**要保留"组合完成才上报"的约束**，否则会破坏业务侧"以整机为单位"的假设；
 - `BleMatchDevice.devices` 的顺序在 iOS / Android 上不保证一致，业务侧通过设备名里的 `_L_` / `_R_` 区分左右腿。
+
+### 11.6 iOS OTA `WriteWithoutResponse` 背压（`sendCmdNoWait` + `psType==1`）
+
+iOS 端 OTA 通道走单独的 per-peripheral 写队列 `OtaWriteQueue`，目标是把 packets-per-event 打满到 iOS 上限（4 包/事件），与 Android `WRITE_TYPE_NO_RESPONSE` 行为对齐。完整规范见 `IOS_OTA_NOWAIT_SPEC.md`。
+
+关键约束（改原生侧前必读）：
+
+- **触发条件**：仅 `sendCmdNoWait` + `psType == 1` 且特征声明 `.writeWithoutResponse` property 时启用；其它路径走原有 `WriteWithoutResponse` 即时返回，行为不变。
+- **背压机制**：`pump()` 写包前检查 `peripheral.canSendWriteWithoutResponse`，命中 `false` 即暂停，等 `peripheralIsReady(toSendWriteWithoutResponse:)` 回调驱动续写。
+- **软节流**：每 `softDrainEvery = 64` 包主动让出，等下一次 `peripheralIsReady`，防御老机型 `canSendWriteWithoutResponse` "报喜不报忧"。该阈值是配置常量，调参后回归测试。
+- **Dart 侧同步**：`MethodChannelEzwBle.sendCmdNoWait` 已统一走 `methodChannel.invokeMethod`，**不再 fall back 到 `sendCmd`**。改 Dart 入口前先确认原生 `sendCmdNoWait` handler 仍然处理所有 `psType` 分支（OTA + 兜底）。
+- **挂起 await 兜底**：断连/`reset()`/外设释放时 `OtaWriteQueue.cancelAll()` 会对所有 pending 写入回调 `result(nil)`，业务层依赖 CRC 校验决定是否 retry；改这条兜底必须保证**任何路径都不会让 Dart `await` 永远挂着**。
+- **范围外**：`psType == 3`（file）通道、iOS connection interval 协商、`psType == 0`（common）write type 切换均**不在本期范围**，改动前先评估对协议层应答匹配的影响。
 
 ---
 

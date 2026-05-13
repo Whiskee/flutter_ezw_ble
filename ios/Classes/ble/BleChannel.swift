@@ -39,6 +39,8 @@ enum BleMC: String {
     case deviceConnected
     //  发送指令
     case sendCmd
+    //  发送指令(不等待响应, 仅 OTA 通道走 WriteWithoutResponse + 背压队列)
+    case sendCmdNoWait
     //  进入升级模式
     case enterUpgradeState
     //  退出升级模式
@@ -112,6 +114,18 @@ enum BleMC: String {
             }
             //  由于iOS蓝牙发送数据没有系统回调是否发送成功，只能等待15ms保证数据是发送出去的
             result(nil)
+            return
+        case .sendCmdNoWait:
+            //  - psType==1 (OTA) 走 WriteWithoutResponse + 背压队列, result 由队列内部 pump 后回调;
+            //  - 其它 psType 退化为现有 sendCmd 行为(WriteWithoutResponse 立即返回).
+            let jsonData: [String:Any] = arguments as? [String:Any] ?? [:]
+            let uuid: String = jsonData["uuid"] as? String ?? ""
+            let psType: Int = jsonData["psType"] as? Int ?? 0
+            guard let data = jsonData["data"] as? FlutterStandardTypedData else {
+                result(nil)
+                return
+            }
+            BleManager.shared.sendCmdNoWait(uuid: uuid, data: data.data, psType: psType, result: result)
             return
         case .enterUpgradeState:
             let uuid = arguments as? String ?? ""
