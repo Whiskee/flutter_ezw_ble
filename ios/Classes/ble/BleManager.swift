@@ -296,20 +296,83 @@ extension BleManager {
     }
     
     /**
-     *  断连
+     *  断连 / 取消连接
+     *
+     *  - 既要支持"已连接设备的主动断连"，也要支持"connecting 中途用户点击取消"
+     *  - Dart 层在 scan-then-connect 阶段可能携带空 uuid（temp-UUID 不会回传到 Dart），
+     *    必须按 name 命中 in-flight 请求，否则会出现"点击取消无反应、要等扫描超时才结束"
+     *  - 在 connect(easyConnect:) 三个阶段都需要可取消：
+     *    a) startConnectInfos 中的 scan-then-connect 等待
+     *    b) connectedDevices 中已发起 centralManager.connect 但未 connectFinish 的 peripheral
+     *    c) 已完成连接流程的 peripheral
      */
     func disconnect(uuid: String, name: String) {
-        //  1、移除预连接状态
+        //  1、移除预连接状态（uuid 为空则为 no-op，但保留以兼容旧路径）
         preConnectedDevices.remove(uuid)
-        //  2、移除待连接设备
-        waitingConnectDevices.removeAll { easyConnect in
-            easyConnect.uuid == uuid || easyConnect.name == name
+
+        //  2、命中"in-flight scan-then-connect"请求：connect(easyConnect:) 在本地未找到 peripheral 时
+        //     生成 temp-UUID 并追加到 startConnectInfos；此时还没有 connectedDevices / CBPeripheral，
+        //     必须主动撤回 scan 触发器并通知 Dart 层。仅在字段非空时比较，避免空 uuid 误命中其他请求。
+        let inFlightInfos = startConnectInfos.filter { info in
+            (!uuid.isEmpty && info.uuid == uuid) || (!name.isEmpty && info.name == name)
         }
-        //  3、获取已连接设备
+        if !inFlightInfos.isEmpty {
+            //  - 2.1、移除 startConnectInfos，防止 didDiscover 找到设备后又触发连接
+            for info in inFlightInfos {
+                startConnectInfos.removeAll { $0.uuid == info.uuid || $0.name == info.name }
+            }
+            //  - 2.2、若已没有任何 scan-then-connect 请求挂起，停止扫描释放电量
+            if startConnectInfos.isEmpty {
+                stopScan()
+            }
+            //  - 2.3、提前移除 waitingConnectDevices 中匹配项，
+            //         避免 handleConnectState 末尾的"队列推进"分支再次触发 connect 闭环
+            waitingConnectDevices.removeAll { ec in
+                inFlightInfos.contains(where: { $0.uuid == ec.uuid || $0.name == ec.name })
+            }
+            //  - 2.4、emit .disconnectByUser：handleConnectState 内部会清定时器并通过
+            //         sendConnectStateToFlutter 发回 Dart；Dart 层按 (uuid OR name) 匹配，
+            //         name 命中即可正确落到对应 device，触发 UI 切换到已断开态
+            for info in inFlightInfos {
+                handleConnectState(uuid: info.uuid, name: info.name, state: .disconnectByUser, tag: "cancel in-flight by user")
+            }
+            loggerD(msg: "disconnect: cancelled in-flight scan/connect for \(uuid.isEmpty ? "(no-uuid)" : uuid)-\(name), removed \(inFlightInfos.count) item(s)")
+            return
+        }
+
+        //  3、命中"已加入 connectedDevices 但尚未 connectFinish"的 peripheral：
+        //     例如从蓝牙设置页/已绑定缓存 retrievePeripherals 命中后已 centralManager.connect(...)，
+        //     但 didConnect 回调尚未到达。此时 connectedDevices 存在条目但 isConnected=false。
+        //     直接走 handleConnectState(.disconnectByUser)：内部会调用 cancelPeripheralConnection
+        //     真正中断 in-progress 的 GATT 连接，避免连接挂起到系统超时
+        if let inProgressDevice = connectedDevices.first(where: { device in
+            ((!uuid.isEmpty && device.peripheral.identifier.uuidString == uuid)
+             || (!name.isEmpty && device.peripheral.name == name))
+            && !device.isConnected
+        }) {
+            let p = inProgressDevice.peripheral
+            let realUuid = p.identifier.uuidString
+            let realName = p.name ?? name
+            //  - 3.1、先移除 waitingConnectDevices，避免 handleConnectState 推进队列时重新连接
+            waitingConnectDevices.removeAll { ec in
+                ec.uuid == realUuid || ec.name == realName
+            }
+            //  - 3.2、emit .disconnectByUser；内部会清定时器、cancelPeripheralConnection、回调 Dart
+            handleConnectState(uuid: realUuid, name: realName, state: .disconnectByUser, tag: "cancel connecting by user")
+            loggerD(msg: "disconnect: cancelled connecting peripheral \(realUuid)-\(realName), by user")
+            return
+        }
+
+        //  4、原有"已连接设备主动断连"路径（设备已完成连接流程）
+        //  - 4.1、移除待连接设备（空字段时跳过对应比较，避免空 uuid 误删其他请求）
+        waitingConnectDevices.removeAll { easyConnect in
+            (!uuid.isEmpty && easyConnect.uuid == uuid) || (!name.isEmpty && easyConnect.name == name)
+        }
+        //  - 4.2、获取已连接设备
         let connectedDevice = connectedDevices.first { device in
             device.peripheral.identifier.uuidString == uuid || device.peripheral.name == name
         }
-        //  4、执行断连
+        //  - 4.3、执行断连
         updateConnectedDevice(uuid: uuid, name: connectedDevice?.peripheral.name ?? "", isConnected: false, updateByUser: true)
         loggerD(msg: "disconnect:\(uuid)-\(name), disconnect by user")
     }
