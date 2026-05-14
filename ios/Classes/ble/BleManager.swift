@@ -272,18 +272,66 @@ extension BleManager {
     }
     
     /**
-     *  断连
+     *  断连 / 取消连接
+     *
+     *  - 既要支持"已连接设备的主动断连"，也要支持"connecting 中途用户点击取消"
+     *  - Dart 层在 scan-then-connect 阶段可能携带空 uuid（temp-UUID 不会回传到 Dart），
+     *    必须按 name 命中 in-flight 请求，否则会出现"点击取消无反应、要等扫描超时才结束"
+     *  - 在 connect(easyConnect:) 三个阶段都需要可取消：
+     *    a) startConnectInfos 中的 scan-then-connect 等待
+     *    b) connectedDevices 中已发起 centralManager.connect 但未 connectFinish 的 peripheral
+     *    c) 已完成连接流程的 peripheral
      */
     func disconnect(uuid: String, name: String) {
-        //  1、移除预连接状态
+        //  1、移除预连接状态（uuid 为空则为 no-op，但保留以兼容旧路径）
         preConnectedDevices.remove(uuid)
-        //  2、移除当前连接请求
+        //  注意：不要在此处调用 removeActiveConnectRequest；需先按 uuid/name 命中 in-flight 或
+        // 未完成连接的外设（见 findUnfinishedConnectDevice），否则 Dart 空 uuid + 名称取消无法关联到 CB 外设。
+
+        //  2、命中"in-flight scan-then-connect"请求：connect(easyConnect:) 在本地未找到 peripheral 时
+        //     生成 temp-UUID 并追加到 startConnectInfos；此时还没有 connectedDevices / CBPeripheral，
+        //     必须主动撤回 scan 触发器并通知 Dart 层。仅在字段非空时比较，避免空 uuid 误命中其他请求。
+        let inFlightInfos = startConnectInfos.filter { info in
+            (!uuid.isEmpty && info.uuid == uuid) || (!name.isEmpty && info.name == name)
+        }
+        if !inFlightInfos.isEmpty {
+            //  - 2.1、移除 startConnectInfos，防止 didDiscover 找到设备后又触发连接
+            for info in inFlightInfos {
+                startConnectInfos.removeAll { $0.uuid == info.uuid || $0.name == info.name }
+            }
+            //  - 2.2、若已没有任何 scan-then-connect 请求挂起，停止扫描释放电量
+            if startConnectInfos.isEmpty {
+                stopScan()
+            }
+            //  - 2.3、emit .disconnectByUser：handleConnectState 内部会清定时器、移除 active 请求并通过
+            //         sendConnectStateToFlutter 发回 Dart；Dart 层按 (uuid OR name) 匹配，
+            //         name 命中即可正确落到对应 device，触发 UI 切换到已断开态
+            for info in inFlightInfos {
+                handleConnectState(uuid: info.uuid, name: info.name, state: .disconnectByUser, tag: "cancel in-flight by user")
+            }
+            loggerD(msg: "disconnect: cancelled in-flight scan/connect for \(uuid.isEmpty ? "(no-uuid)" : uuid)-\(name), removed \(inFlightInfos.count) item(s)")
+            return
+        }
+
+        //  3、命中"已加入 connectedDevices 但尚未 connectFinish"的 peripheral：
+        //     例如从蓝牙设置页/已绑定缓存 retrievePeripherals 命中后已 centralManager.connect(...)，
+        //     但 didConnect 回调尚未到达。此时 connectedDevices 存在条目但 isConnected=false。
+        //     直接走 handleConnectState(.disconnectByUser)：内部会调用 cancelPeripheralConnection
+        //     真正中断 in-progress 的 GATT 连接，避免连接挂起到系统超时
+        if let inProgressDevice = findUnfinishedConnectDevice(uuid: uuid, name: name) {
+            let p = inProgressDevice.peripheral
+            let realUuid = p.identifier.uuidString
+            let realName = p.name ?? name
+            handleConnectState(uuid: realUuid, name: realName, state: .disconnectByUser, tag: "cancel connecting by user")
+            loggerD(msg: "disconnect: cancelled connecting peripheral \(realUuid)-\(realName), by user")
+            return
+        }
+
+        //  4、已建立连接的设备（isConnected == true）：按 uuid / 广播名匹配
         removeActiveConnectRequest(uuid: uuid, name: name)
-        //  3、获取已连接设备
         let connectedDevice = connectedDevices.first { device in
             device.peripheral.identifier.uuidString == uuid || device.peripheral.name == name
         }
-        //  4、执行断连
         updateConnectedDevice(uuid: uuid, name: connectedDevice?.peripheral.name ?? "", isConnected: false, updateByUser: true)
         loggerD(msg: "disconnect:\(uuid)-\(name), disconnect by user")
     }
@@ -616,6 +664,53 @@ extension BleManager {
         //  1、移除同 UUID 或同名称的请求。
         activeConnectRequests.removeAll { request in
             request.uuid == uuid || request.name == name
+        }
+    }
+
+    /**
+     *  查找「协议层尚未 connectFinish」的缓存外设（`isConnected == false`），用于用户取消连接。
+     *
+     *  - Dart 常传空 uuid + 设备名；CoreBluetooth 在 GATT 连接过程中 `peripheral.name` 可能仍为 nil，
+     *    仅靠外设名称匹配会失败，需通过 `activeConnectRequests`（与 connect() 写入的 uuid/name 一致）桥接。
+     *  - 必须在移除 `activeConnectRequests` 之前调用，否则无法反查。
+     */
+    private func findUnfinishedConnectDevice(uuid: String, name: String) -> BleConnectedDevice? {
+        if let req = findActiveConnectRequest(uuid: uuid, name: name) {
+            if let matched = connectedDevices.first(where: { device in
+                guard !device.isConnected else { return false }
+                if !req.uuid.isEmpty, device.peripheral.identifier.uuidString == req.uuid {
+                    return true
+                }
+                if !req.name.isEmpty {
+                    let pname = device.peripheral.name ?? ""
+                    if pname == req.name { return true }
+                }
+                return false
+            }) {
+                return matched
+            }
+            //  请求仍为 temp-UUID 且尚未与 CB 标识对齐时，用未完成条目 + 名称收窄（避免仅靠 peripheral.name==nil 失配）
+            if req.uuid.hasPrefix("temp-") {
+                let unfinished = connectedDevices.filter { !$0.isConnected }
+                if unfinished.count == 1 {
+                    return unfinished.first
+                }
+                return unfinished.first { d in
+                    let pn = d.peripheral.name ?? ""
+                    if !req.name.isEmpty, pn == req.name { return true }
+                    if !name.isEmpty, pn == name { return true }
+                    return false
+                }
+            }
+            return nil
+        }
+        return connectedDevices.first { device in
+            guard !device.isConnected else { return false }
+            let pid = device.peripheral.identifier.uuidString
+            let pname = device.peripheral.name ?? ""
+            if !uuid.isEmpty, pid == uuid { return true }
+            if !name.isEmpty, !pname.isEmpty, pname == name { return true }
+            return false
         }
     }
 
