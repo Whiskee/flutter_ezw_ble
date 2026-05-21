@@ -90,8 +90,9 @@ enum class BleMC {
                 val name = jsonMap?.get("name") as String? ?: ""
                 val sn = jsonMap?.get("sn") as String? ?: ""
                 val afterUpgrade = jsonMap?.get("afterUpgrade") as Boolean? == true
+                val directConnect = jsonMap?.get("directConnect") as Boolean? == true
                 if (uuid.isNotEmpty() && sn.isNotEmpty()) {
-                    BleManager.instance.connect(belongConfig, uuid, name, sn, afterUpgrade = afterUpgrade)
+                    BleManager.instance.connect(belongConfig, uuid, name, sn, afterUpgrade = afterUpgrade, directConnect = directConnect)
                 }
             }
             DEVICE_PRE_CONNECTED -> {

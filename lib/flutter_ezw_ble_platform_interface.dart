@@ -73,6 +73,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// - param name 设备名称
   /// - param sn only for Android
   /// - param afterUpgrade 是否在升级模式下连接
+  /// - param directConnect 为 true 时不走任何扫描，仅使用已有缓存/peripheral 直连
   ///
   Future<void> connectDevice(
     String belongConfig,
@@ -80,6 +81,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     String name, {
     String? sn,
     bool? afterUpgrade,
+    bool directConnect = false,
   }) {
     throw UnimplementedError('connectDevice() has not been implemented.');
   }

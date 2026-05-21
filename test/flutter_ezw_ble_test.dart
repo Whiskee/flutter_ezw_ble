@@ -41,6 +41,7 @@ class MockFlutterEzwBlePlatform
     String name, {
     String? sn,
     bool? afterUpgrade,
+    bool directConnect = false,
   }) {
     throw UnimplementedError();
   }

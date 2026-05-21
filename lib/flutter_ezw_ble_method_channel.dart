@@ -37,6 +37,7 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
   /// 连接设备
   /// - name 仅在 iOS 平台有效
   /// - sn 仅在 Android 平台有效
+  /// - directConnect 为 true 时不走任何扫描，仅使用已有缓存/peripheral 直连
   @override
   Future<void> connectDevice(
     String belongConfig,
@@ -44,13 +45,15 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
     String name, {
     String? sn,
     bool? afterUpgrade,
+    bool directConnect = false,
   }) async =>
       methodChannel.invokeMethod("connectDevice", {
         "belongConfig": belongConfig,
         "uuid": uuid,
         "name": name,
         "sn": sn,
-        "afterUpgrade": afterUpgrade
+        "afterUpgrade": afterUpgrade,
+        "directConnect": directConnect,
       });
 
   @override

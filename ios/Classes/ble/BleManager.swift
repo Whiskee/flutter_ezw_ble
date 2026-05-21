@@ -148,16 +148,23 @@ extension BleManager {
             uuid: newUuid,
             name: easyConnect.name,
             afterUpgrade: easyConnect.afterUpgrade,
+            directConnect: easyConnect.directConnect,
             time: Date().timeIntervalSince1970,
         )
         newEasyConnect.bleConfig = bleConfig
         //  - 4.2、写入当前请求缓存；是否串行由 Dart 业务层决定。
         upsertActiveConnectRequest(newEasyConnect)
+        // - 5.1、非 directConnect 时丢弃陈旧 scanResultTemp，避免屏蔽箱/离线设备 blind GATT → timeout。
+        if !easyConnect.directConnect {
+            purgeStaleScanCache(uuid: easyConnect.uuid, name: easyConnect.name)
+        }
         //  6、开始执行连接
         //  - 6.1、设置连接标志
         var tag = "start connect: "
         //  - 6.2、获取带连接的设备
         var oldPeripheral: CBPeripheral?
+        //  - 6.2.1、仅 scanResultTemp 命中时才要求本轮扫描可见；其它来源允许 retrieve/connect 直连。
+        var requireScanVisibility = false
         //  - 6.3、查询已连接的设备
         // - 6.3.1、从已连接的设备连接获取设备
         if let index = connectedDevices.firstIndex(where: { device in
@@ -171,14 +178,22 @@ extension BleManager {
             oldPeripheral?.delegate = self
             device.peripheral = oldPeripheral!
             connectedDevices[index] = device
-            guard !device.isConnected else {
+            // - 6.3.1.0、已在 CoreBluetooth 连接态的外设可直接恢复服务发现；断开态缓存必须重新扫描确认可见。
+            requireScanVisibility = !easyConnect.directConnect && oldPeripheral?.state != .connected
+            // - 6.3.1.1、协议已完成则同步 Dart；未完成则继续走服务发现/重连。
+            if device.isConnected && device.isBleFlowCompleted {
                 removeActiveConnectRequest(uuid: newEasyConnect.uuid, name: newEasyConnect.name)
-                loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), is already connected, \(tag)")
+                if let peripheral = oldPeripheral {
+                    handleAlreadyConnected(peripheral: peripheral, bleConfig: bleConfig, deviceName: easyConnect.name, tag: tag)
+                }
+                loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), already connected, resync flow, \(tag)")
                 return
+            } else if device.isConnected {
+                tag += ", resume incomplete connected flow"
             }
             // - 6.3.1.1、异常断连后首次重连：先扫描2秒刷新 CoreBluetooth 内部缓存，再执行 connect。
             // - 6.3.1.2、CoreBT 缓存的 peripheral 元数据在异常断连后可能 stale，导致 connect 静默无反应。
-            if device.needsScanBeforeReconnect {
+            if device.needsScanBeforeReconnect && !easyConnect.directConnect {
                 device.needsScanBeforeReconnect = false
                 connectedDevices[index] = device
                 handleConnectState(uuid: newEasyConnect.uuid, name: easyConnect.name, state: .connecting)
@@ -195,6 +210,9 @@ extension BleManager {
                 }
                 loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), scan 2s before reconnect to refresh CoreBT cache")
                 return
+            } else if device.needsScanBeforeReconnect && easyConnect.directConnect {
+                device.needsScanBeforeReconnect = false
+                connectedDevices[index] = device
             }
             // - 6.3.1.4、新的连接请求重置上一次的 BLE 流程标记，避免跨会话残留。
             if device.isBleFlowCompleted {
@@ -208,6 +226,7 @@ extension BleManager {
         }) {
             tag += "from scan result temp"
             oldPeripheral = temp.1
+            requireScanVisibility = !easyConnect.directConnect
         }
         // - 6.3.3、获取蓝牙设置页面中是否有符合的设备
         else if let device = findPeripheralFromConnected(uuid: easyConnect.uuid, name: easyConnect.name, psUUID: commonPs.serviceUUID) {
@@ -215,8 +234,25 @@ extension BleManager {
             oldPeripheral = device
             connectedDevices.append(BleConnectedDevice(belongConfig: bleConfig, peripheral: device))
         }
+        // - 6.3.4、directConnect 专用：发现页 scanResultTemp 可能被其它 startScan 清空，
+        //   但 CoreBluetooth 仍保留本会话见过的 peripheral；屏蔽箱场景应 blind GATT → timeout，而非 630。
+        if oldPeripheral == nil, easyConnect.directConnect, !easyConnect.uuid.isEmpty,
+           let cbUuid = UUID(uuidString: easyConnect.uuid) {
+            let retrieved = centralManager.retrievePeripherals(withIdentifiers: [cbUuid])
+            if let peripheral = retrieved.first {
+                tag += "from retrievePeripherals cache"
+                oldPeripheral = peripheral
+            }
+        }
         //  - 6.4、查询是否获取到设备，如果没有就开启搜索
         guard let oldPeripheral = oldPeripheral else {
+            if easyConnect.directConnect {
+                //  本会话从未见过该 UUID（例如进程重启后无缓存），directConnect 才 fast-fail 630。
+                removeActiveConnectRequest(uuid: newEasyConnect.uuid, name: newEasyConnect.name)
+                handleConnectState(uuid: newEasyConnect.uuid, name: easyConnect.name, state: .noDeviceFound)
+                loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), directConnect: no peripheral in CoreBluetooth cache")
+                return
+            }
             tag += "no local device found, start scan device"
             // - 6.4.1、上报连接中状态。
             handleConnectState(uuid: newEasyConnect.uuid, name: easyConnect.name, state: .connecting)
@@ -227,9 +263,23 @@ extension BleManager {
             loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), \(tag)")
             return
         }
+        // - 6.4.1、scanResultTemp 和断开态缓存都要求扫描可见；系统已连接/retrieve 允许直连。
+        if requireScanVisibility && !isTargetVisibleInScan(uuid: easyConnect.uuid, name: easyConnect.name) {
+            tag += ", target not visible in current scan, start scan device"
+            handleConnectState(uuid: newEasyConnect.uuid, name: easyConnect.name, state: .connecting)
+            startConnectInfos.append(newEasyConnect)
+            startScan()
+            loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), \(tag)")
+            return
+        }
         //  - 6.5、检查是否是否已经处于连接状态，如果是就直接发起服务发现, 不是就发起连接
         tag += ", afterUpdate: \(newEasyConnect.afterUpgrade)"
         loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), \(tag)")
+        // - 6.5.1、in-flight 外设写入 connectedDevices，便于用户 cancel 时 cancelPeripheralConnection。
+        if !connectedDevices.contains(where: { $0.peripheral.identifier == oldPeripheral.identifier }) {
+            connectedDevices.append(BleConnectedDevice(belongConfig: bleConfig, peripheral: oldPeripheral))
+        }
+        oldPeripheral.delegate = self
         if oldPeripheral.state == .connected {
             handleAlreadyConnected(peripheral: oldPeripheral, bleConfig: bleConfig, deviceName: easyConnect.name, tag: "start connect")
         } else {
@@ -311,6 +361,22 @@ extension BleManager {
             }
             loggerD(msg: "disconnect: cancelled in-flight scan/connect for \(uuid.isEmpty ? "(no-uuid)" : uuid)-\(name), removed \(inFlightInfos.count) item(s)")
             return
+        }
+
+        //  2.5、命中 activeConnectRequest + 连接超时定时器，但尚未写入 connectedDevices 的 in-flight GATT connect。
+        if let request = findActiveConnectRequest(uuid: uuid, name: name) {
+            let hasTimer = connectingTimeoutTimers.contains { $0.0 == request.uuid || $0.1 == request.name }
+            if hasTimer, findUnfinishedConnectDevice(uuid: uuid, name: name) == nil {
+                if let match = scanResultTemp.first(where: { info in
+                    (!request.uuid.isEmpty && !request.uuid.hasPrefix("temp-") && info.0.uuid == request.uuid) ||
+                    (!request.name.isEmpty && (info.0.name == request.name || info.1.name == request.name))
+                }) {
+                    centralManager.cancelPeripheralConnection(match.1)
+                }
+                handleConnectState(uuid: request.uuid, name: request.name, state: .disconnectByUser, tag: "cancel active connect by user")
+                loggerD(msg: "disconnect: cancelled active connect for \(request.uuid)-\(request.name), by user")
+                return
+            }
         }
 
         //  3、命中"已加入 connectedDevices 但尚未 connectFinish"的 peripheral：
@@ -714,6 +780,27 @@ extension BleManager {
         }
     }
 
+
+    /**
+     *  非 directConnect 连接前清除目标在 scanResultTemp 中的陈旧条目，避免离线/屏蔽箱设备仍被 blind GATT connect 拖成 timeout。
+     */
+    private func purgeStaleScanCache(uuid: String, name: String) {
+        scanResultTemp.removeAll { info in
+            (!uuid.isEmpty && info.0.uuid == uuid) ||
+            (!name.isEmpty && (info.0.name == name || info.1.name == name))
+        }
+    }
+
+    /**
+     *  判断目标是否出现在当前扫描窗口缓存中（与 Android isTargetVisibleInScan 对齐）。
+     */
+    private func isTargetVisibleInScan(uuid: String, name: String) -> Bool {
+        scanResultTemp.contains { info in
+            (!uuid.isEmpty && info.0.uuid == uuid) ||
+            (!name.isEmpty && (info.0.name == name || info.1.name == name))
+        }
+    }
+
     /**
      *  查找指定外设所属 BLE 配置。
      */
@@ -902,9 +989,16 @@ extension BleManager {
                                        isConnected: Bool? = nil,
                                        updateByUser: Bool = false) {
         //  1、没有缓存就不更新
-        guard uuid.isNotEmpty, connectedDevices.isNotEmpty else {
+        guard uuid.isNotEmpty else {
+            loggerE(msg: "updateConnectedDevice: \(uuid), empty uuid")
+            return
+        }
+        guard connectedDevices.isNotEmpty else {
+            if updateByUser {
+                handleConnectState(uuid: uuid, name: name, state: .disconnectByUser, tag: "cancel with empty connectedDevices cache")
+            }
             loggerE(msg: "updateConnectedDevice: \(uuid), not found device")
-            return;
+            return
         }
 
         //  2、获取缓存设备

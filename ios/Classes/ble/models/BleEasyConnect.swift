@@ -11,16 +11,18 @@ struct BleEasyConnect: Codable {
     var uuid: String
     var name: String
     var afterUpgrade: Bool = false
+    var directConnect: Bool = false
     var time: TimeInterval?
     
     /// 非JSON数据
     var bleConfig: BleConfig?
     
-    init(configName: String, uuid: String, name: String, afterUpgrade: Bool = false, time: TimeInterval? = nil) {
+    init(configName: String, uuid: String, name: String, afterUpgrade: Bool = false, directConnect: Bool = false, time: TimeInterval? = nil) {
         self.belongConfig = configName
         self.uuid = uuid
         self.name = name
         self.afterUpgrade = afterUpgrade
+        self.directConnect = directConnect
         self.time = time
     }
 }

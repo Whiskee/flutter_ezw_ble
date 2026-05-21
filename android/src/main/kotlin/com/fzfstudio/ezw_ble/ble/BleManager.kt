@@ -24,6 +24,7 @@ import com.fzfstudio.ezw_ble.ble.models.BleConfig
 import com.fzfstudio.ezw_ble.ble.models.BleConnectModel
 import com.fzfstudio.ezw_ble.ble.models.BleDevice
 import com.fzfstudio.ezw_ble.ble.models.BleMatchDevice
+import com.fzfstudio.ezw_ble.ble.models.BlePendingScanConnect
 import com.fzfstudio.ezw_ble.ble.models.BleSnRule
 import com.fzfstudio.ezw_ble.ble.models.BluetoothGattStatus
 import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
@@ -76,6 +77,10 @@ class BleManager private constructor() {
     private val disconnectingDevices: MutableList<Pair<String, BleConnectState>> = Collections.synchronizedList(mutableListOf())
     //  - 预连接设备集合（使用uuid作为key）
     private val preConnectedDevices: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
+
+    //  - 扫描命中后再连接的待处理请求（非 directConnect 且目标未出现在 scanResultTemp 时入队）
+    private val pendingScanConnects: MutableList<BlePendingScanConnect> =
+        Collections.synchronizedList(mutableListOf())
 
 
     /// =========== Private Variables
@@ -223,7 +228,7 @@ class BleManager private constructor() {
      *  连接设备
      */
     @Synchronized
-    fun connect(belongConfig: String, uuid: String, name: String, sn: String, isWaitingDevice: Boolean = false, afterUpgrade: Boolean = false) {
+    fun connect(belongConfig: String, uuid: String, name: String, sn: String, isWaitingDevice: Boolean = false, afterUpgrade: Boolean = false, directConnect: Boolean = false) {
         if (!checkIsFunctionCanBeCalled() ) {
             return
         }
@@ -255,23 +260,63 @@ class BleManager private constructor() {
         val cachedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
         val needsScanForCache = cachedDevice?.needsScanBeforeConnect == true
         val needsScanForName = !isWaitingDevice && cachedDevice == null && remoteDevice.name == null
-        if (needsScanForCache || needsScanForName) {
+        if (!directConnect && (needsScanForCache || needsScanForName)) {
             cachedDevice?.needsScanBeforeConnect = false
+            // 首次缓存缺失路径先同步 connecting；缓存重连路径已在前序失败回调中进入连接态，避免递归回来被 isConnecting guard 挡住。
+            if (needsScanForName) {
+                handleConnectState(uuid, name, BleConnectState.CONNECTING)
+            }
             startScan()
             mainScope.launch {
-                delay(2000)
+                delay(3000)
                 stopScan()
-                //  - 6.3、扫描刷新后再次尝试连接当前 UUID。
-                connect(belongConfig, uuid, name, sn, true, afterUpgrade)
+                //  - 6.3、刷新扫描后仍看不到目标则 fast-fail，避免盲连 GATT 超时。
+                if (!isTargetVisibleInScan(uuid, name, sn)) {
+                    connectedDevices.removeAll { it.uuid == uuid && it.myGatt == null }
+                    handleConnectState(uuid, name, BleConnectState.NO_DEVICE_FOUND)
+                    sendLog(BleLoggerTag.e, "Start connect: $uuid, no device found after refresh scan")
+                    return@launch
+                }
+                connect(belongConfig, uuid, name, sn, true, afterUpgrade, directConnect)
             }
-            sendLog(BleLoggerTag.d, "Start connect: $uuid, scan 2s to refresh BLE stack device info before connecting")
+            sendLog(BleLoggerTag.d, "Start connect: $uuid, scan 3s to refresh BLE stack device info before connecting")
             return
         }
         //  7、扫描完成后仍然找不到设备（name == null 说明协议栈无缓存）
-        if (remoteDevice.name == null) {
+        if (!directConnect && remoteDevice.name == null) {
             connectedDevices.removeAll { it.uuid == uuid && it.myGatt == null }
             handleConnectState(uuid, name, BleConnectState.NO_DEVICE_FOUND)
             sendLog(BleLoggerTag.e, "Start connect: $uuid, no device found after scan")
+            return
+        }
+        //  7.1、非 directConnect 且当前扫描窗口未看到目标时，先扫描命中再连接。
+        if (!directConnect && !isWaitingDevice && !isTargetVisibleInScan(uuid, name, sn)) {
+            val alreadyPending = pendingScanConnects.any { it.uuid.equals(uuid, ignoreCase = true) }
+            if (!alreadyPending) {
+                handleConnectState(uuid, name, BleConnectState.CONNECTING)
+                pendingScanConnects.add(
+                    BlePendingScanConnect(
+                        belongConfig = belongConfig,
+                        uuid = uuid,
+                        name = name,
+                        sn = sn,
+                        afterUpgrade = afterUpgrade,
+                        directConnect = directConnect,
+                    ),
+                )
+                if (!isScanning) {
+                    startScan()
+                }
+                //  无扫描结果时也要在 connectTimeout 后 fast-fail。
+                mainScope.launch {
+                    delay(bleConfig.connectTimeout.toLong())
+                    expirePendingScanConnects()
+                }
+                sendLog(
+                    BleLoggerTag.d,
+                    "Start connect: $uuid, scan-then-connect because target not seen in scan",
+                )
+            }
             return
         }
         //  8、查询设备是否已经在连接缓存中，如果不在就创建；如果有且已经连接了就不再继续连接
@@ -623,6 +668,66 @@ class BleManager private constructor() {
         }
     }
 
+    /// 当前扫描缓存中是否已出现目标设备。
+    private fun isTargetVisibleInScan(uuid: String, name: String, sn: String): Boolean {
+        return scanResultTemp.any { device ->
+            device.uuid.equals(uuid, ignoreCase = true) ||
+                (name.isNotEmpty() && device.name == name) ||
+                (sn.isNotEmpty() && device.sn == sn)
+        }
+    }
+
+    /// 待扫描连接请求是否与扫描结果匹配。
+    private fun matchesPendingScan(device: BleDevice, pending: BlePendingScanConnect): Boolean {
+        return pending.uuid.equals(device.uuid, ignoreCase = true) ||
+            (pending.name.isNotEmpty() && pending.name == device.name) ||
+            (pending.sn.isNotEmpty() && pending.sn == device.sn)
+    }
+
+    /// 扫描窗口超时后，将仍未命中的待连接请求按 noDeviceFound 结束。
+    private fun expirePendingScanConnects() {
+        if (pendingScanConnects.isEmpty()) {
+            return
+        }
+        val now = System.currentTimeMillis()
+        val expired = pendingScanConnects.filter { pending ->
+            val config = bleConfigs.firstOrNull { it.name == pending.belongConfig } ?: return@filter false
+            now - pending.startTimeMs > config.connectTimeout
+        }
+        for (pending in expired) {
+            pendingScanConnects.removeAll { it.uuid.equals(pending.uuid, ignoreCase = true) }
+            if (pendingScanConnects.isEmpty()) {
+                stopScan()
+            }
+            connectedDevices.removeAll { it.uuid == pending.uuid && it.myGatt == null }
+            handleConnectState(pending.uuid, pending.name, BleConnectState.NO_DEVICE_FOUND)
+            sendLog(BleLoggerTag.d, "Start connect: ${pending.uuid}, scan-then-connect timeout")
+        }
+    }
+
+    /// 扫描命中待连接目标后，带着 isWaitingDevice 继续走 connectGatt。
+    private fun tryConnectFromPendingScan(foundDevice: BleDevice) {
+        if (pendingScanConnects.isEmpty()) {
+            return
+        }
+        val matched = pendingScanConnects.filter { matchesPendingScan(foundDevice, it) }
+        for (pending in matched) {
+            pendingScanConnects.removeAll { it.uuid.equals(pending.uuid, ignoreCase = true) }
+            if (pendingScanConnects.isEmpty()) {
+                stopScan()
+            }
+            connect(
+                pending.belongConfig,
+                pending.uuid,
+                pending.name,
+                pending.sn,
+                isWaitingDevice = true,
+                afterUpgrade = pending.afterUpgrade,
+                directConnect = pending.directConnect,
+            )
+        }
+    }
+
     /// 创建蓝牙搜索回调
     private fun createScanCallBack(): ScanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
@@ -651,6 +756,8 @@ class BleManager private constructor() {
                     //  - 4.1、创建设备自定义模型对象,并缓存
                     val bleDevice = device.toBleDevice(bleConfig, deviceSn, result.rssi)
                     scanResultTemp.add(bleDevice)
+                    expirePendingScanConnects()
+                    tryConnectFromPendingScan(bleDevice)
                     //  - 4.2、判断是否需要根据SN组合设备，不需要就直接提交
                     sendMatchDevices(deviceSn, listOf(bleDevice))
                     return
@@ -673,6 +780,8 @@ class BleManager private constructor() {
                 //  - 6.1、创建设备自定义模型对象,并缓存
                 val bleDevice = device.toBleDevice(bleConfig, deviceSn, result.rssi)
                 scanResultTemp.add(bleDevice)
+                expirePendingScanConnects()
+                tryConnectFromPendingScan(bleDevice)
                 //  - 6.2、判断是否需要根据SN组合设备，不需要就直接提交
                 if (bleConfig.scan.matchCount < 2) {
                     sendMatchDevices(deviceSn, listOf(bleDevice))

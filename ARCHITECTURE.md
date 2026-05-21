@@ -137,7 +137,13 @@ EzwBle.to.receiveDataEC.listen((cmd) => print(cmd.data));
 
 // 3. 主动调用
 await EzwBle.to.bleMC.startScan();
-await EzwBle.to.bleMC.connectDevice('g2_glasses', uuid, name, sn: sn);
+await EzwBle.to.bleMC.connectDevice(
+  'g2_glasses',
+  uuid,
+  name,
+  sn: sn,
+  directConnect: false,
+);
 await EzwBle.to.bleMC.sendCmd(uuid, Uint8List.fromList([0xAA, ...]));
 ```
 
@@ -165,7 +171,7 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `initConfigs` | `Future<void> initConfigs(List<BleConfig> configs)` | **必须最先调用**。把多份配置一次性下发给原生层；下发参数是 `configs.map((c) => c.customToJson())`（保证嵌套 model 也序列化）。 |
 | `startScan` | `Future<void> startScan({bool turnOnPureModel = false})` | 启动扫描。`turnOnPureModel = true` 时跳过 SN/MAC 规则、回原始广播（用于排障）。 |
 | `stopScan` | `Future<void> stopScan()` | 显式停止扫描。 |
-| `connectDevice` | `Future<void> connectDevice(String belongConfig, String uuid, String name, {String? sn, bool? afterUpgrade})` | 发起连接。`belongConfig` 必须命中 `initConfigs` 注册过的配置名；`name` 在 iOS 端定位，`sn` 仅 Android 用；`afterUpgrade=true` 时走 OTA 后的特殊重连路径。 |
+| `connectDevice` | `Future<void> connectDevice(String belongConfig, String uuid, String name, {String? sn, bool? afterUpgrade, bool directConnect = false})` | 发起连接。`belongConfig` 必须命中 `initConfigs` 注册过的配置名；`name` 在 iOS 端定位，`sn` 仅 Android 用；`afterUpgrade=true` 时走 OTA 后的特殊重连路径；`directConnect=true` 时不做 scan-first 可见性校验，只使用本地/系统缓存直连。 |
 | `disconnectDevice` | `Future<void> disconnectDevice(String uuid, String name, {bool removeBond = false})` | 主动断连。`removeBond=true`（仅 Android）会一并移除系统配对。 |
 | `devicePreConnected` | `Future<void> devicePreConnected(String uuid)` | "预连接"通知：业务确认要连这个设备前，让原生侧提前做准备（缓存、超时计时器复位），避免接下来的 `connectDevice` 超时。 |
 | `deviceConnected` | `Future<void> deviceConnected(String uuid)` | "真连上了"通知：业务侧（如收到设备配对回包后）告诉原生 "连接已业务就绪"，原生再 push `connectFinish` → `connected`。 |
@@ -408,6 +414,20 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 
 改这类聚合规则时要注意：**判定边界往哪偏，会直接影响业务侧自动重连/排障弹窗触发条件**。
 
+### 8.4 连接前扫描策略：`directConnect` vs scan-first
+
+`connectDevice(..., directConnect: false)` 是默认路径，适用于缓存设备、手动重连和自动重连。原生层会避免直接使用陈旧扫描缓存 blind GATT：
+
+- Android：如果 `BluetoothDevice.name == null` 或缓存设备标记 `needsScanBeforeConnect`，先刷新扫描 3s；首次缓存缺失路径会先上报 `connecting`，让 UI 不停留在 `none`。刷新扫描后仍未看到目标则上报 `noDeviceFound`。
+- Android：如果本轮 `scanResultTemp` 没有目标，先把请求放入 `pendingScanConnects`，扫描命中后再 `connectGatt`；超出 `connectTimeout` 仍未命中则上报 `noDeviceFound`。
+- iOS：非 directConnect 会先清理目标在 `scanResultTemp` 中的陈旧条目；若来源是 `scanResultTemp` 或断开态 `connectedDevices` 缓存，必须在当前扫描窗口重新看到目标，否则走 scan-then-connect，扫描超时上报 `noDeviceFound`。
+- iOS：系统蓝牙已连接的 peripheral（`CBPeripheral.state == .connected`）不要求扫描可见，直接恢复服务发现；已完成协议流程的缓存会通过 `handleAlreadyConnected` 重新同步 Dart 状态。
+
+`directConnect: true` 是发现页/临时 service 使用的路径。它表示业务已经从本轮发现结果拿到了目标，不应再用 scan-first 可见性把连接改成 `noDeviceFound`：
+
+- iOS：若 `scanResultTemp` 被后续 `startScan()` 清空，会尝试 `retrievePeripherals(withIdentifiers:)` 取 CoreBluetooth 缓存；缓存存在时 blind GATT，屏蔽箱场景按 `timeout` 结束；进程重启等完全无缓存时才 fast-fail 为 `noDeviceFound`。
+- Android：跳过 `remoteDevice.name == null` 和 scan-first 可见性 fast-fail，直接走系统缓存/GATT 路径。
+
 ---
 
 ## 9. BLE 通信生命周期（完整时序）
@@ -430,8 +450,9 @@ App 启动
 发起连接
   │
   ├─ EzwBle.to.bleMC.devicePreConnected(uuid)    （可选；提前告知）
-  ├─ EzwBle.to.bleMC.connectDevice(belongConfig, uuid, name, sn: sn)
+  ├─ EzwBle.to.bleMC.connectDevice(belongConfig, uuid, name, sn: sn, directConnect: false)
   │
+  ├─ （默认 scan-first：缓存不可见时先扫描，未命中 → noDeviceFound）
   ├─ ◀ connectStatusEC: connecting
   ├─ ◀ connectStatusEC: contactDevice
   ├─ ◀ connectStatusEC: searchService
