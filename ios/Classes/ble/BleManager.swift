@@ -913,7 +913,7 @@ extension BleManager {
     /**
      *  开始连接后，执行连接超时倒计时
      */
-    private func startConnectingCountdown(currentConfig: BleConfig, uuid: String, name: String, afterUpgrade: Bool) {
+    private func startConnectingCountdown(currentConfig: BleConfig, uuid: String, name: String, afterUpgrade: Bool, isAuthGrace: Bool = false) {
         //  1、检查是否存在相同的
         guard !connectingTimeoutTimers.contains(where: { info in
             info.0 == uuid || info.1 == name
@@ -923,26 +923,31 @@ extension BleManager {
         //  2、创建连接超时倒计时定时器
         let timer = Timer.scheduledTimer(withTimeInterval: (currentConfig.connectTimeout + (afterUpgrade ? currentConfig.upgradeSwapTime : 0)) / 1000, repeats: false) { [weak self] timer in
             guard let self = self else { return }
-            //  检查是否为预连接状态，如果是预连接则不执行超时逻辑，仅移除超时对象
-            if self.preConnectedDevices.contains(uuid) {
-                self.loggerD(msg: "connect-flow: \(uuid)-\(name), is pre-connected, skip timeout logic")
-                //  移除超时定时器
-                if let index = self.connectingTimeoutTimers.firstIndex(where: { info in
-                    info.0 == uuid || info.1 == name
-                }) {
-                    self.connectingTimeoutTimers.remove(at: index)
-                }
-                return
+            //  先移除当前(一次性)超时定时器记录
+            if let index = self.connectingTimeoutTimers.firstIndex(where: { info in
+                info.0 == uuid || info.1 == name
+            }) {
+                self.connectingTimeoutTimers.remove(at: index)
             }
+            //  已连接：无需任何处理
             guard self.connectedDevices.first(where: { device in
                 device.peripheral.identifier.uuidString == uuid || device.peripheral.name == name
             })?.isConnected != true else {
                 return
             }
+            //  预连接(协议层鉴权进行中)：给一次有界宽限期，而不是永久豁免。
+            //  永久豁免会导致 Dart 端鉴权流程异常/挂起(deviceConnected 永不到达)时，
+            //  设备永久停在 connectFinish，App UI 一直显示"连接中"且无法自愈。
+            if self.preConnectedDevices.contains(uuid) && !isAuthGrace {
+                self.loggerD(msg: "connect-flow: \(uuid)-\(name), pre-connected, start bounded auth grace")
+                self.startConnectingCountdown(currentConfig: currentConfig, uuid: uuid, name: name, afterUpgrade: false, isAuthGrace: true)
+                return
+            }
+            //  宽限期到期仍未连接(或本就不是预连接) → 强制超时，避免永久卡在 connecting。
             self.handleConnectState(uuid: uuid, name: name, state: .timeout)
         }
         connectingTimeoutTimers.append((uuid, name, timer))
-        loggerD(msg: "connect-flow: \(uuid)-\(name), start connect time out timer")
+        loggerD(msg: "connect-flow: \(uuid)-\(name), start connect time out timer\(isAuthGrace ? " (auth grace)" : "")")
     }
     
     /**

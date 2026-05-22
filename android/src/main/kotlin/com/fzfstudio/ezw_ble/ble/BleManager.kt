@@ -345,16 +345,43 @@ class BleManager private constructor() {
         //  10、读取信号值
         gatt?.readRemoteRssi()
         //  11、开启连接超时定时器
+        startConnectTimeout(bleConfig, uuid, name, afterUpgrade)
+        //  12、当前设备已经处于连接中
+        handleConnectState(uuid, name, BleConnectState.CONNECTING)
+        sendLog(BleLoggerTag.d, "Start connect: $uuid connecting, belong config = ${bleDevice.belongConfig}, after upgrade = $afterUpgrade")
+    }
+
+    /**
+     *  开启/续期连接超时定时器。
+     *
+     *  预连接(协议层鉴权进行中)时给一次有界宽限期(isAuthGrace=true)，而不是永久豁免：
+     *  永久豁免会让 Dart 端鉴权异常/挂起(deviceConnected 永不到达)的设备永久停在
+     *  connectFinish，App UI 一直显示"连接中"且无法自愈。
+     */
+    private fun startConnectTimeout(
+        bleConfig: BleConfig,
+        uuid: String,
+        name: String,
+        afterUpgrade: Boolean,
+        isAuthGrace: Boolean = false,
+    ) {
         val timeoutTimer = Timer()
         timeoutTimer.schedule(object : TimerTask() {
             override fun run() {
-                //  检查是否为预连接状态，如果是预连接则不执行超时逻辑，仅移除超时对象
-                if (preConnectedDevices.contains(uuid)) {
-                    sendLog(BleLoggerTag.d, "Start connect: $uuid, is pre-connected, skip timeout logic")
-                    connectedDevices.firstOrNull { it.uuid == uuid }?.timeoutTimer = null
+                //  已连接：仅清理定时器
+                val device = connectedDevices.firstOrNull { it.uuid == uuid }
+                if (device?.isConnected == true) {
+                    device.timeoutTimer = null
                     return
                 }
-                sendLog(BleLoggerTag.e, "Start connect: $uuid, connect time out")
+                //  预连接(鉴权进行中)：续一次有界宽限期，而非永久豁免。
+                if (preConnectedDevices.contains(uuid) && !isAuthGrace) {
+                    sendLog(BleLoggerTag.d, "Start connect: $uuid, pre-connected, start bounded auth grace")
+                    startConnectTimeout(bleConfig, uuid, name, afterUpgrade = false, isAuthGrace = true)
+                    return
+                }
+                //  宽限到期仍未连接(或本就不是预连接) → 强制超时，避免永久卡在 connecting。
+                sendLog(BleLoggerTag.e, "Start connect: $uuid, connect time out${if (isAuthGrace) " (auth grace expired)" else ""}")
                 //  1、超时断连则记录断连状态，避免系统断连导致重复执行断连状态
                 disconnectingDevices.removeAll {
                     it.first == uuid
@@ -363,12 +390,11 @@ class BleManager private constructor() {
                 //  2、执行超时断连
                 handleConnectState(uuid, name, BleConnectState.TIMEOUT)
             }
-        }, bleConfig.connectTimeout.toLong() + (if (afterUpgrade) bleConfig.upgradeSwapTime.toLong() else 0),)
-        bleDevice.timeoutTimer?.cancel()
-        bleDevice.timeoutTimer = timeoutTimer
-        //  12、当前设备已经处于连接中
-        handleConnectState(uuid, name, BleConnectState.CONNECTING)
-        sendLog(BleLoggerTag.d, "Start connect: $uuid connecting, belong config = ${bleDevice.belongConfig}, after upgrade = $afterUpgrade")
+        }, bleConfig.connectTimeout.toLong() + (if (afterUpgrade) bleConfig.upgradeSwapTime.toLong() else 0))
+        //  把定时器挂到设备上，连接成功(handleConnectState .CONNECTED)时会被 cancel 清理。
+        val bleDevice = connectedDevices.firstOrNull { it.uuid == uuid }
+        bleDevice?.timeoutTimer?.cancel()
+        bleDevice?.timeoutTimer = timeoutTimer
     }
 
         /**
