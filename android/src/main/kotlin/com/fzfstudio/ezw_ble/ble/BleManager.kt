@@ -324,7 +324,12 @@ class BleManager private constructor() {
         if (bleDevice == null) {
             bleDevice = remoteDevice.toBleDevice(bleConfig, sn, 0)
             connectedDevices.add(bleDevice)
-        } else if (bleDevice.connectState.isConnecting) {
+        } else if (bleDevice.connectState.isConnecting && !isWaitingDevice) {
+            //  isWaitingDevice == true 表示这是 scan-then-connect / 扫描刷新 命中目标后的
+            //  二次进入：扫描阶段自身已把状态置为 connecting（见上方 §7.1），此处必须放行去
+            //  connectGatt，否则会被"自己设的 connecting 状态"挡住返回，而 pendingScanConnects
+            //  此时已被移除 → expirePendingScanConnects 也不再触发 → 设备永久卡在 connecting。
+            //  典型复现：DFU 后戒指重启，首连 scan-then-connect，重启完成被扫描命中却连不上。
             sendLog(BleLoggerTag.d, "Start connect: $uuid, device is connecting")
             return
         } else if (bleDevice.isConnected) {

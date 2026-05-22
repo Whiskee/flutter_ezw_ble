@@ -419,7 +419,8 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 `connectDevice(..., directConnect: false)` 是默认路径，适用于缓存设备、手动重连和自动重连。原生层会避免直接使用陈旧扫描缓存 blind GATT：
 
 - Android：如果 `BluetoothDevice.name == null` 或缓存设备标记 `needsScanBeforeConnect`，先刷新扫描 3s；首次缓存缺失路径会先上报 `connecting`，让 UI 不停留在 `none`。刷新扫描后仍未看到目标则上报 `noDeviceFound`。
-- Android：如果本轮 `scanResultTemp` 没有目标，先把请求放入 `pendingScanConnects`，扫描命中后再 `connectGatt`；超出 `connectTimeout` 仍未命中则上报 `noDeviceFound`。
+- Android：如果本轮 `scanResultTemp` 没有目标，先把请求放入 `pendingScanConnects`，扫描命中后由 `tryConnectFromPendingScan` 移除 pending 并以 `isWaitingDevice=true` 重入 `connect()` 真正 `connectGatt`；超出 `connectTimeout` 仍未命中则 `expirePendingScanConnects` 上报 `noDeviceFound`。
+  - **自锁规避（重点）**：scan-then-connect / 3s 扫描刷新阶段会先把状态置为 `connecting`，因此命中后重入的 `connect()` 必须用 `isWaitingDevice` 跳过 `connectState.isConnecting` 守卫——否则会被"自己设的 `connecting` 状态"挡住 return，而 pending 此时已被移除、`expirePendingScanConnects` 也不再触发 → 设备**永久卡 `connecting`**。典型复现：DFU 后戒指重启，首连走 scan-then-connect，重启完成被扫描命中却连不上。
 - iOS：非 directConnect 会先清理目标在 `scanResultTemp` 中的陈旧条目；若来源是 `scanResultTemp` 或**未被系统连接的**断开态 `connectedDevices` 缓存，必须在当前扫描窗口重新看到目标，否则走 scan-then-connect，扫描超时上报 `noDeviceFound`。
 - iOS（ANCS / 系统级连接的根治，重点）：外设若因 ANCS（Apple Notification Center Service）或系统级配对被 iPhone 自动连接，会**停止广播**，`scanForPeripherals` 永远扫不到，"先扫再连"必然超时报 `noDeviceFound`——典型现象是"系统蓝牙里明明显示已连，App 却连不上、一直 630"。因此连接前用 `findPeripheralFromConnected()`（即 `retrieveConnectedPeripherals(withServices:)`，查询范围 = 配置全部私有服务 **+ Apple ANCS 服务 UUID `7905F431-B5CE-4E99-A40F-4B1E122D00D0`**）做"是否系统已连"的**权威判定**。
   - **不能只看 `CBPeripheral.state == .connected`**：系统级连接不归 App 自己的 central 持有，`retrievePeripherals(withIdentifiers:)` 返回的 peripheral `state` 往往仍是 `.disconnected`，只有 `retrieveConnectedPeripherals` 能可靠识别。
