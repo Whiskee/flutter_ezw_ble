@@ -420,13 +420,25 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 
 - Android：如果 `BluetoothDevice.name == null` 或缓存设备标记 `needsScanBeforeConnect`，先刷新扫描 3s；首次缓存缺失路径会先上报 `connecting`，让 UI 不停留在 `none`。刷新扫描后仍未看到目标则上报 `noDeviceFound`。
 - Android：如果本轮 `scanResultTemp` 没有目标，先把请求放入 `pendingScanConnects`，扫描命中后再 `connectGatt`；超出 `connectTimeout` 仍未命中则上报 `noDeviceFound`。
-- iOS：非 directConnect 会先清理目标在 `scanResultTemp` 中的陈旧条目；若来源是 `scanResultTemp` 或断开态 `connectedDevices` 缓存，必须在当前扫描窗口重新看到目标，否则走 scan-then-connect，扫描超时上报 `noDeviceFound`。
-- iOS：系统蓝牙已连接的 peripheral（`CBPeripheral.state == .connected`）不要求扫描可见，直接恢复服务发现；已完成协议流程的缓存会通过 `handleAlreadyConnected` 重新同步 Dart 状态。
+- iOS：非 directConnect 会先清理目标在 `scanResultTemp` 中的陈旧条目；若来源是 `scanResultTemp` 或**未被系统连接的**断开态 `connectedDevices` 缓存，必须在当前扫描窗口重新看到目标，否则走 scan-then-connect，扫描超时上报 `noDeviceFound`。
+- iOS（ANCS / 系统级连接的根治，重点）：外设若因 ANCS（Apple Notification Center Service）或系统级配对被 iPhone 自动连接，会**停止广播**，`scanForPeripherals` 永远扫不到，"先扫再连"必然超时报 `noDeviceFound`——典型现象是"系统蓝牙里明明显示已连，App 却连不上、一直 630"。因此连接前用 `findPeripheralFromConnected()`（即 `retrieveConnectedPeripherals(withServices:)`，查询范围 = 配置全部私有服务 **+ Apple ANCS 服务 UUID `7905F431-B5CE-4E99-A40F-4B1E122D00D0`**）做"是否系统已连"的**权威判定**。
+  - **不能只看 `CBPeripheral.state == .connected`**：系统级连接不归 App 自己的 central 持有，`retrievePeripherals(withIdentifiers:)` 返回的 peripheral `state` 往往仍是 `.disconnected`，只有 `retrieveConnectedPeripherals` 能可靠识别。
+  - 命中系统已连：跳过 scan-then-connect 与"异常断连后扫 2s 刷新 CoreBT 缓存"（`needsScanBeforeReconnect`），直接 `centralManager.connect(peripheral)`（对系统已连外设会立即 `didConnect`）→ 服务发现 → `connectFinish`；已完成协议流程的缓存仍走 `handleAlreadyConnected` 重新同步 Dart 状态。
+  - 三条取设备路径都做该判定：①缓存命中 `connectedDevices`（含 `needsScanBeforeReconnect`，命中时打 `system-connected (ANCS), skip scan` 日志）；②蓝牙设置页/系统已连 `findPeripheralFromConnected`；③按 UUID 取回 `retrievePeripherals`。
+  - **离线设备**：retrieve 查不到、state 也非 connected → 维持 scan-first，扫不到仍快速 `noDeviceFound`，不回归。
 
 `directConnect: true` 是发现页/临时 service 使用的路径。它表示业务已经从本轮发现结果拿到了目标，不应再用 scan-first 可见性把连接改成 `noDeviceFound`：
 
 - iOS：若 `scanResultTemp` 被后续 `startScan()` 清空，会尝试 `retrievePeripherals(withIdentifiers:)` 取 CoreBluetooth 缓存；缓存存在时 blind GATT，屏蔽箱场景按 `timeout` 结束；进程重启等完全无缓存时才 fast-fail 为 `noDeviceFound`。
 - Android：跳过 `remoteDevice.name == null` 和 scan-first 可见性 fast-fail，直接走系统缓存/GATT 路径。
+
+### 8.5 连接超时与鉴权宽限（`startConnectingCountdown`）
+
+连接发起即启动一个 `connectTimeout`（默认 15s，OTA 后追加 `upgradeSwapTime`）的一次性超时定时器：
+
+- 任一非"连接中"终态（connected / 断开 / 错误）到达 → `handleConnectState` 清除该定时器。
+- `connectFinish`（BLE 物理连接完成、但应用层鉴权尚未完成）**不清除**定时器，作为鉴权阶段的安全兜底。
+- **鉴权宽限（重点）**：业务层收到 `connectFinish` 后会发鉴权/通道指令，期间调用 `devicePreConnected(uuid)`（iOS `setPreConnected` / Android `preConnectedDevices`）告知原生"即将连上"。历史实现是 pre-connected 后**永久豁免**超时——一旦 Dart 端鉴权流程异常/挂起（`deviceConnected` 永不到达），设备会永久停在 `connectFinish`（属 `isConnecting`），App UI 一直"连接中"且无法自愈。现改为**有界宽限**（`isAuthGrace`）：定时器触发时若已 pre-connected 但仍未 `connected`，再续一次（连接成功仍由 `handleConnectState` 清除）；二次到期仍未连接则强制上报 `timeout`，杜绝永久卡死。iOS/Android 行为对齐。
 
 ---
 

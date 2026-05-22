@@ -135,7 +135,7 @@ extension BleManager {
         //  - 3.2、获取基础的私有服务
         let commonPs = bleConfig.privateServices.first { $0.type == 0 }
         //  - 3.3、检查uuid和commonPs不能为空
-        guard easyConnect.uuid.isNotEmpty || easyConnect.name.isNotEmpty, let commonPs = commonPs else {
+        guard easyConnect.uuid.isNotEmpty || easyConnect.name.isNotEmpty, commonPs != nil else {
             loggerE(msg: "connect-flow: \(easyConnect.uuid) can not find")
             handleConnectState(uuid: easyConnect.uuid, name: easyConnect.name, state: .emptyUuid)
             return
@@ -178,8 +178,19 @@ extension BleManager {
             oldPeripheral?.delegate = self
             device.peripheral = oldPeripheral!
             connectedDevices[index] = device
-            // - 6.3.1.0、已在 CoreBluetooth 连接态的外设可直接恢复服务发现；断开态缓存必须重新扫描确认可见。
-            requireScanVisibility = !easyConnect.directConnect && oldPeripheral?.state != .connected
+            // - 6.3.1.0、系统已连接(典型 ANCS)判定：另一个 central/系统持有连接时，
+            //   我们自己的 central 看到的 peripheral.state 往往不是 .connected，必须用
+            //   retrieveConnectedPeripherals(私有服务 + ANCS) 权威判定，否则会把不广播的
+            //   ANCS 设备误判为"需要扫描确认可见" → 扫不到 → 报 630（UI 一直连不上）。
+            let cachedServiceUUIDs = bleConfig.privateServices.map { $0.serviceUUID }
+            let systemConnected = oldPeripheral?.state == .connected
+                || findPeripheralFromConnected(uuid: easyConnect.uuid, name: easyConnect.name, serviceUUIDs: cachedServiceUUIDs) != nil
+            if systemConnected {
+                loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(easyConnect.name), cached device is system-connected (ANCS), skip scan, connect directly")
+            }
+            // - 6.3.1.0、已在系统/CoreBluetooth 连接态的外设可直接 connect 恢复服务发现；
+            //   仅真正断开态缓存才需要扫描确认可见。
+            requireScanVisibility = !easyConnect.directConnect && !systemConnected && oldPeripheral?.state != .connected
             // - 6.3.1.1、协议已完成则同步 Dart；未完成则继续走服务发现/重连。
             if device.isConnected && device.isBleFlowCompleted {
                 removeActiveConnectRequest(uuid: newEasyConnect.uuid, name: newEasyConnect.name)
@@ -193,7 +204,8 @@ extension BleManager {
             }
             // - 6.3.1.1、异常断连后首次重连：先扫描2秒刷新 CoreBluetooth 内部缓存，再执行 connect。
             // - 6.3.1.2、CoreBT 缓存的 peripheral 元数据在异常断连后可能 stale，导致 connect 静默无反应。
-            if device.needsScanBeforeReconnect && !easyConnect.directConnect {
+            //   但系统已连接(ANCS)的外设不广播，扫描必然失败 → 必须跳过这段扫描刷新，直接 connect。
+            if device.needsScanBeforeReconnect && !easyConnect.directConnect && !systemConnected {
                 device.needsScanBeforeReconnect = false
                 connectedDevices[index] = device
                 handleConnectState(uuid: newEasyConnect.uuid, name: easyConnect.name, state: .connecting)
@@ -210,7 +222,8 @@ extension BleManager {
                 }
                 loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), scan 2s before reconnect to refresh CoreBT cache")
                 return
-            } else if device.needsScanBeforeReconnect && easyConnect.directConnect {
+            } else if device.needsScanBeforeReconnect {
+                // directConnect 或系统已连接(ANCS)：无需扫描刷新，清掉标记后直接 connect。
                 device.needsScanBeforeReconnect = false
                 connectedDevices[index] = device
             }
@@ -229,17 +242,27 @@ extension BleManager {
             requireScanVisibility = !easyConnect.directConnect
         }
         // - 6.3.3、获取蓝牙设置页面中是否有符合的设备
-        else if let device = findPeripheralFromConnected(uuid: easyConnect.uuid, name: easyConnect.name, psUUID: commonPs.serviceUUID) {
+        else if let device = findPeripheralFromConnected(uuid: easyConnect.uuid, name: easyConnect.name, serviceUUIDs: bleConfig.privateServices.map { $0.serviceUUID }) {
             tag += "from bluetooth setting"
             oldPeripheral = device
             connectedDevices.append(BleConnectedDevice(belongConfig: bleConfig, peripheral: device))
         }
-        // - 6.3.4、directConnect 专用：发现页 scanResultTemp 可能被其它 startScan 清空，
-        //   但 CoreBluetooth 仍保留本会话见过的 peripheral；屏蔽箱场景应 blind GATT → timeout，而非 630。
-        if oldPeripheral == nil, easyConnect.directConnect, !easyConnect.uuid.isEmpty,
-           let cbUuid = UUID(uuidString: easyConnect.uuid) {
-            let retrieved = centralManager.retrievePeripherals(withIdentifiers: [cbUuid])
-            if let peripheral = retrieved.first {
+        // - 6.3.4、按 UUID 取回外设：根治"系统已连接(ANCS)但不广播 → 扫描必失败报 630"。
+        //   scanForPeripherals 只能发现正在广播的外设；外设一旦因 ANCS/系统级配对被
+        //   系统自动连接就会停止广播，"先扫再连"永远扫不到。这里在进扫描兜底前，先用
+        //   retrievePeripherals(byId) 取回外设，按其 state 决定直连还是扫描：
+        //   - state == .connected：系统已连接(典型 ANCS) → 必须直连，跳过扫描可见性校验。
+        //   - directConnect：保持 blind connect 语义(不依赖扫描可见)。
+        //   - 其余(非直连且非已连接)：不在此直连，落到 6.4 扫描，保留对离线/屏蔽箱设备的
+        //     fast-fail(630) 行为。
+        if oldPeripheral == nil, !easyConnect.uuid.isEmpty,
+           let cbUuid = UUID(uuidString: easyConnect.uuid),
+           let peripheral = centralManager.retrievePeripherals(withIdentifiers: [cbUuid]).first {
+            if peripheral.state == .connected {
+                tag += "from retrievePeripherals (system-connected)"
+                oldPeripheral = peripheral
+                requireScanVisibility = false
+            } else if easyConnect.directConnect {
                 tag += "from retrievePeripherals cache"
                 oldPeripheral = peripheral
             }
@@ -598,11 +621,23 @@ extension BleManager {
         return currentConfig
     }
     
+    /// Apple ANCS 服务 UUID。外设若因 ANCS 被系统自动连接会停止广播，扫描无法发现，
+    /// 必须靠 retrieveConnectedPeripherals/retrievePeripherals 取回后直连。
+    private static let ancsServiceUUID = CBUUID(string: "7905F431-B5CE-4E99-A40F-4B1E122D00D0")
+
     /**
-     *  通过uuid获取蓝牙设置页面已经匹配过的设备
+     *  获取"系统已连接"的目标外设(覆盖蓝牙设置页/ANCS 等系统级连接)。
+     *
+     *  用配置全部私有服务 + ANCS 服务一起查询：ANCS-only 连接时私有服务可能尚未被
+     *  CoreBluetooth 缓存，只查单个私有服务会漏掉，导致目标掉进扫描而报 630。
      */
-    private func findPeripheralFromConnected(uuid: String, name: String, psUUID: CBUUID)-> CBPeripheral? {
-        let connectedPeripherals = centralManager.retrieveConnectedPeripherals(withServices: [psUUID])
+    private func findPeripheralFromConnected(uuid: String, name: String, serviceUUIDs: [CBUUID])-> CBPeripheral? {
+        var queryServices = serviceUUIDs
+        if !queryServices.contains(BleManager.ancsServiceUUID) {
+            queryServices.append(BleManager.ancsServiceUUID)
+        }
+        guard !queryServices.isEmpty else { return nil }
+        let connectedPeripherals = centralManager.retrieveConnectedPeripherals(withServices: queryServices)
         return connectedPeripherals.first { device in
             device.name == name || device.identifier.uuidString == uuid
         }
