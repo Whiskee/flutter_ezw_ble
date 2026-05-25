@@ -268,7 +268,7 @@ class BleManager private constructor() {
             }
             startScan()
             mainScope.launch {
-                delay(3000)
+                delay(5000)
                 stopScan()
                 //  - 6.3、刷新扫描后仍看不到目标则 fast-fail，避免盲连 GATT 超时。
                 if (!isTargetVisibleInScan(uuid, name, sn)) {

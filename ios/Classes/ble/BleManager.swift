@@ -35,6 +35,8 @@ class BleManager: NSObject {
     private lazy var startConnectInfos: [BleEasyConnect] = []
     //  - 连接超时定时器集合(UUID, Name, 倒计时定时器)
     private lazy var connectingTimeoutTimers: [(String, String, Timer)] = []
+    //  - 扫描后再连接阶段的超时定时器集合(UUID, Name, 倒计时定时器)
+    private lazy var scanConnectTimeoutTimers: [(String, String, Timer)] = []
     //  - 是否正在升级中
     private lazy var upgradeDevices: [String]? = nil
     //  - 预连接设备集合（使用uuid作为key）
@@ -210,7 +212,7 @@ extension BleManager {
                 connectedDevices[index] = device
                 handleConnectState(uuid: newEasyConnect.uuid, name: easyConnect.name, state: .connecting)
                 startScan()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
                     guard let self = self else { return }
                     self.stopScan()
                     // - 6.3.1.3、扫描期间可能已超时、取消或蓝牙关闭，请求已清空则不再重连。
@@ -220,7 +222,7 @@ extension BleManager {
                     }
                     self.connect(easyConnect: easyConnect)
                 }
-                loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), scan 2s before reconnect to refresh CoreBT cache")
+                loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), scan 5s before reconnect to refresh CoreBT cache")
                 return
             } else if device.needsScanBeforeReconnect {
                 // directConnect 或系统已连接(ANCS)：无需扫描刷新，清掉标记后直接 connect。
@@ -281,6 +283,7 @@ extension BleManager {
             handleConnectState(uuid: newEasyConnect.uuid, name: easyConnect.name, state: .connecting)
             // - 6.4.2、添加当前连接请求上下文，等待扫描命中后直连。
             startConnectInfos.append(newEasyConnect)
+            startScanConnectTimeout(currentConfig: bleConfig, uuid: newEasyConnect.uuid, name: newEasyConnect.name, afterUpgrade: easyConnect.afterUpgrade)
             // - 6.4.3、根据服务特征查询设备。
             startScan()
             loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), \(tag)")
@@ -291,6 +294,7 @@ extension BleManager {
             tag += ", target not visible in current scan, start scan device"
             handleConnectState(uuid: newEasyConnect.uuid, name: easyConnect.name, state: .connecting)
             startConnectInfos.append(newEasyConnect)
+            startScanConnectTimeout(currentConfig: bleConfig, uuid: newEasyConnect.uuid, name: newEasyConnect.name, afterUpgrade: easyConnect.afterUpgrade)
             startScan()
             loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), \(tag)")
             return
@@ -547,6 +551,10 @@ extension BleManager {
             timer.invalidate()
         }
         connectingTimeoutTimers.removeAll()
+        scanConnectTimeoutTimers.forEach { (uuid, name, timer) in
+            timer.invalidate()
+        }
+        scanConnectTimeoutTimers.removeAll()
     }
     
     /**
@@ -564,6 +572,10 @@ extension BleManager {
             timer.invalidate()
         }
         connectingTimeoutTimers.removeAll()
+        scanConnectTimeoutTimers.forEach { (uuid, name, timer) in
+            timer.invalidate()
+        }
+        scanConnectTimeoutTimers.removeAll()
         upgradeDevices?.removeAll()
         preConnectedDevices.removeAll()
         //  清空所有 OTA 写队列, 通知 Dart 端 await 立即返回
@@ -837,6 +849,14 @@ extension BleManager {
     }
 
     /**
+     *  判断两个连接目标是否指向同一 BLE 设备。
+     */
+    private func isSameConnectTarget(storedUuid: String, storedName: String, uuid: String, name: String) -> Bool {
+        return (!storedUuid.isEmpty && !uuid.isEmpty && storedUuid == uuid) ||
+            (!storedName.isEmpty && !name.isEmpty && storedName == name)
+    }
+
+    /**
      *  查找指定外设所属 BLE 配置。
      */
     private func findBleConfig(uuid: String, name: String) -> BleConfig? {
@@ -879,8 +899,13 @@ extension BleManager {
         //  1、遍历执行设备连接
         for connectDevice in startConnectInfos {
             guard let bleConfig = connectDevice.bleConfig else {
-                startConnectInfos.removeAll()
-                stopScan()
+                cancelScanConnectTimeout(uuid: connectDevice.uuid, name: connectDevice.name)
+                startConnectInfos.removeAll { info in
+                    info.uuid == connectDevice.uuid || info.name == connectDevice.name
+                }
+                if startConnectInfos.isEmpty {
+                    stopScan()
+                }
                 handleConnectState(uuid: connectDevice.uuid, name: connectDevice.name, state: .noBleConfigFound)
                 loggerE(msg: "centralManager - search: \(connectDevice.uuid)-\(connectDevice.name), no config found")
                 return false
@@ -889,28 +914,30 @@ extension BleManager {
             //  -- 1.1.2、是否可以移除
             var canRemove: Bool = false
             //  - 1.2、设置搜索超时（时间戳获取到的余数为秒）
-            if Date().timeIntervalSince1970 - connectDevice.time! > bleConfig.connectTimeout / 1000 {
-                loggerD(msg: "centralManager - search: \(connectDevice.uuid)-\(connectDevice.name), no device found")
-                handleConnectState(uuid: connectDevice.uuid, name: connectDevice.name, state: .noDeviceFound)
+            if let startTime = connectDevice.time, Date().timeIntervalSince1970 - startTime > bleConfig.connectTimeout / 1000 {
+                loggerD(msg: "centralManager - search: \(connectDevice.uuid)-\(connectDevice.name), scan timestamp fallback")
+                handleConnectState(uuid: connectDevice.uuid, name: connectDevice.name, state: .noDeviceFound, tag: "scan timestamp fallback")
                 canRemove = true
             }
             //  - 1.3、如果找到对应的UUID就执行连接
-            else if connectDevice.uuid == peripheral.identifier.uuidString || connectDevice.name == peripheral.name! {
+            else if connectDevice.uuid == peripheral.identifier.uuidString || connectDevice.name == (peripheral.name ?? "") {
+                let peripheralName = peripheral.name ?? connectDevice.name
+                cancelScanConnectTimeout(uuid: connectDevice.uuid, name: connectDevice.name)
                 //  -- 1.3.2、开始新的倒计时
-                startConnectingCountdown(currentConfig: bleConfig, uuid: peripheral.identifier.uuidString, name: peripheral.name!, afterUpgrade: connectDevice.afterUpgrade)
+                startConnectingCountdown(currentConfig: bleConfig, uuid: peripheral.identifier.uuidString, name: peripheralName, afterUpgrade: connectDevice.afterUpgrade)
                 //  -- 默认添加到缓存中
                 if !connectedDevices.contains(where: { device in
-                    device.peripheral.identifier.uuidString == peripheral.identifier.uuidString || device.peripheral.name == peripheral.name!
+                    device.peripheral.identifier.uuidString == peripheral.identifier.uuidString || device.peripheral.name == peripheralName
                 }) {
                     connectedDevices.append(BleConnectedDevice(belongConfig: bleConfig, peripheral: peripheral))
                 }
                 //  -- 1.3.3、检查当前连接请求的 uuid 是否为空，如果为空就补全
                 updateActiveConnectRequestUuid(
                     uuid: peripheral.identifier.uuidString,
-                    name: peripheral.name ?? connectDevice.name
+                    name: peripheralName
                 )
                 //  -- 1.3.4、再次更新连接状态
-                handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? connectDevice.name, state: .connecting, tag: "from search device")
+                handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheralName, state: .connecting, tag: "from search device")
                 self.centralManager.connect(peripheral)
                 canRemove = true
                 loggerD(msg: "centralManager - search: \(connectDevice.uuid)-\(connectDevice.name), device has been found, start connecting, after upgrade \(connectDevice.afterUpgrade)")
@@ -975,7 +1002,7 @@ extension BleManager {
             //  设备永久停在 connectFinish，App UI 一直显示"连接中"且无法自愈。
             if self.preConnectedDevices.contains(uuid) && !isAuthGrace {
                 self.loggerD(msg: "connect-flow: \(uuid)-\(name), pre-connected, start bounded auth grace")
-                self.startConnectingCountdown(currentConfig: currentConfig, uuid: uuid, name: name, afterUpgrade: false, isAuthGrace: true)
+                self.startConnectingCountdown(currentConfig: currentConfig, uuid: uuid, name: name, afterUpgrade: afterUpgrade, isAuthGrace: true)
                 return
             }
             //  宽限期到期仍未连接(或本就不是预连接) → 强制超时，避免永久卡在 connecting。
@@ -983,6 +1010,54 @@ extension BleManager {
         }
         connectingTimeoutTimers.append((uuid, name, timer))
         loggerD(msg: "connect-flow: \(uuid)-\(name), start connect time out timer\(isAuthGrace ? " (auth grace)" : "")")
+    }
+
+    /**
+     *  开始扫描后再连接阶段的超时倒计时。
+     *
+     *  iOS 后台扫描可能长时间没有 didDiscover 回调，不能只依赖扫描回调里的时间差检查。
+     *  这里仍保持 scan 阶段“找不到设备”的 noDeviceFound 语义，避免把没电/拉距误报成 GATT timeout。
+     */
+    private func startScanConnectTimeout(currentConfig: BleConfig, uuid: String, name: String, afterUpgrade: Bool) {
+        cancelScanConnectTimeout(uuid: uuid, name: name)
+        let timeout = (currentConfig.connectTimeout + (afterUpgrade ? currentConfig.upgradeSwapTime : 0)) / 1000
+        let timer = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            self.scanConnectTimeoutTimers.removeAll { info in
+                self.isSameConnectTarget(storedUuid: info.0, storedName: info.1, uuid: uuid, name: name)
+            }
+            guard self.findActiveConnectRequest(uuid: uuid, name: name) != nil else {
+                return
+            }
+            guard self.startConnectInfos.contains(where: { info in
+                self.isSameConnectTarget(storedUuid: info.uuid, storedName: info.name, uuid: uuid, name: name)
+            }) else {
+                return
+            }
+            self.startConnectInfos.removeAll { info in
+                self.isSameConnectTarget(storedUuid: info.uuid, storedName: info.name, uuid: uuid, name: name)
+            }
+            if self.startConnectInfos.isEmpty {
+                self.stopScan()
+            }
+            self.handleConnectState(uuid: uuid, name: name, state: .noDeviceFound, tag: "scan connect timeout")
+            self.loggerD(msg: "connect-flow: \(uuid)-\(name), scan connect timeout")
+        }
+        scanConnectTimeoutTimers.append((uuid, name, timer))
+        loggerD(msg: "connect-flow: \(uuid)-\(name), start scan connect timeout timer")
+    }
+
+    /**
+     *  取消扫描后再连接阶段的超时倒计时。
+     */
+    private func cancelScanConnectTimeout(uuid: String, name: String) {
+        scanConnectTimeoutTimers = scanConnectTimeoutTimers.filter { info in
+            let shouldCancel = isSameConnectTarget(storedUuid: info.0, storedName: info.1, uuid: uuid, name: name)
+            if shouldCancel {
+                info.2.invalidate()
+            }
+            return !shouldCancel
+        }
     }
     
     /**
@@ -1094,6 +1169,9 @@ extension BleManager {
             connectingTimeoutTimers.remove(at: index)
             loggerD(msg: "connect-flow: \(uuid)-\(name), state = \(state.rawValue), stop connect timer, tag = \(fromTag)")
         }
+        if !state.isConnecting() {
+            cancelScanConnectTimeout(uuid: uuid, name: name)
+        }
         //  2、设备连接状态为失败或断连就要设置连接设备连接状态为false
         if state.isError() || state.isDisconnected(), let index = connectedDevices.firstIndex(where: { $0.peripheral.identifier.uuidString == uuid || $0.peripheral.name == name }) {
             var device = connectedDevices[index]
@@ -1202,6 +1280,14 @@ extension BleManager: CBCentralManagerDelegate {
             startConnectInfos.removeAll()
             activeConnectRequests.removeAll()
             preConnectedDevices.removeAll()
+            connectingTimeoutTimers.forEach { (uuid, name, timer) in
+                timer.invalidate()
+            }
+            connectingTimeoutTimers.removeAll()
+            scanConnectTimeoutTimers.forEach { (uuid, name, timer) in
+                timer.invalidate()
+            }
+            scanConnectTimeoutTimers.removeAll()
         }
         loggerD(msg: "centralManagerDidUpdateState: State = \(central.state.label), code = \(central.state.rawValue)")
     }

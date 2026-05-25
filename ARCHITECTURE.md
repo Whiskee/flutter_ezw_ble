@@ -56,7 +56,7 @@
                        └────────────┬─────────────────────────────┘
                                     │ Pigeon / MethodChannel
                        ┌────────────▼─────────────────────────────┐
-                       │          原生 BLE 实现（外部仓库）        │
+                       │          原生 BLE 实现（同仓 Kotlin/Swift） │
                        │   iOS: CoreBluetooth                     │
                        │   Android: BluetoothGatt + 配对/绑定逻辑 │
                        └──────────────────────────────────────────┘
@@ -171,7 +171,7 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `initConfigs` | `Future<void> initConfigs(List<BleConfig> configs)` | **必须最先调用**。把多份配置一次性下发给原生层；下发参数是 `configs.map((c) => c.customToJson())`（保证嵌套 model 也序列化）。 |
 | `startScan` | `Future<void> startScan({bool turnOnPureModel = false})` | 启动扫描。`turnOnPureModel = true` 时跳过 SN/MAC 规则、回原始广播（用于排障）。 |
 | `stopScan` | `Future<void> stopScan()` | 显式停止扫描。 |
-| `connectDevice` | `Future<void> connectDevice(String belongConfig, String uuid, String name, {String? sn, bool? afterUpgrade, bool directConnect = false})` | 发起连接。`belongConfig` 必须命中 `initConfigs` 注册过的配置名；`name` 在 iOS 端定位，`sn` 仅 Android 用；`afterUpgrade=true` 时走 OTA 后的特殊重连路径；`directConnect=true` 时不做 scan-first 可见性校验，只使用本地/系统缓存直连。 |
+| `connectDevice` | `Future<void> connectDevice(String belongConfig, String uuid, String name, {String? sn, bool? afterUpgrade, bool directConnect = false})` | 发起连接。`belongConfig` 必须命中 `initConfigs` 注册过的配置名；`name` 在 iOS 端定位，`sn` 仅 Android 用；`afterUpgrade=true` 时走 OTA 后的特殊重连路径；`directConnect=true` 表示调用方明确接受本地/系统缓存直连，不再要求当前扫描窗口可见；默认 `false` 仍保持 scan-first。 |
 | `disconnectDevice` | `Future<void> disconnectDevice(String uuid, String name, {bool removeBond = false})` | 主动断连。`removeBond=true`（仅 Android）会一并移除系统配对。 |
 | `devicePreConnected` | `Future<void> devicePreConnected(String uuid)` | "预连接"通知：业务确认要连这个设备前，让原生侧提前做准备（缓存、超时计时器复位），避免接下来的 `connectDevice` 超时。 |
 | `deviceConnected` | `Future<void> deviceConnected(String uuid)` | "真连上了"通知：业务侧（如收到设备配对回包后）告诉原生 "连接已业务就绪"，原生再 push `connectFinish` → `connected`。 |
@@ -416,7 +416,7 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 
 ### 8.4 连接前扫描策略：`directConnect` vs scan-first
 
-`connectDevice(..., directConnect: false)` 是默认路径，适用于缓存设备、手动重连和自动重连。原生层会避免直接使用陈旧扫描缓存 blind GATT：
+`connectDevice(..., directConnect: false)` 是默认路径，适用于前台主服务连接、手动重连和自动重连。原生层会避免直接使用陈旧扫描缓存 blind GATT：
 
 - Android：如果 `BluetoothDevice.name == null` 或缓存设备标记 `needsScanBeforeConnect`，先刷新扫描 3s；首次缓存缺失路径会先上报 `connecting`，让 UI 不停留在 `none`。刷新扫描后仍未看到目标则上报 `noDeviceFound`。
 - Android：如果本轮 `scanResultTemp` 没有目标，先把请求放入 `pendingScanConnects`，扫描命中后由 `tryConnectFromPendingScan` 移除 pending 并以 `isWaitingDevice=true` 重入 `connect()` 真正 `connectGatt`；超出 `connectTimeout` 仍未命中则 `expirePendingScanConnects` 上报 `noDeviceFound`。
@@ -428,10 +428,12 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
   - 三条取设备路径都做该判定：①缓存命中 `connectedDevices`（含 `needsScanBeforeReconnect`，命中时打 `system-connected (ANCS), skip scan` 日志）；②蓝牙设置页/系统已连 `findPeripheralFromConnected`；③按 UUID 取回 `retrievePeripherals`。
   - **离线设备**：retrieve 查不到、state 也非 connected → 维持 scan-first，扫不到仍快速 `noDeviceFound`，不回归。
 
-`directConnect: true` 是发现页/临时 service 使用的路径。它表示业务已经从本轮发现结果拿到了目标，不应再用 scan-first 可见性把连接改成 `noDeviceFound`：
+`directConnect: true` 是调用方显式选择的缓存/peripheral 直连路径，当前由 `even_connect` 在发现页 temp service 和后台重连场景传入。它表示业务已经拿到明确目标，或后台扫描不可作为可靠前置条件，不应再用 scan-first 可见性把连接改成 `noDeviceFound`：
 
 - iOS：若 `scanResultTemp` 被后续 `startScan()` 清空，会尝试 `retrievePeripherals(withIdentifiers:)` 取 CoreBluetooth 缓存；缓存存在时 blind GATT，屏蔽箱场景按 `timeout` 结束；进程重启等完全无缓存时才 fast-fail 为 `noDeviceFound`。
 - Android：跳过 `remoteDevice.name == null` 和 scan-first 可见性 fast-fail，直接走系统缓存/GATT 路径。
+
+原生层不自行判断“缓存设备是否应该后台直连”。这个决策属于上层业务：前台保留 scan-first 刷新协议栈缓存，后台由 `even_connect` 传 `directConnect: true` 避免 iOS/Android 后台扫描不可见导致回连被误判为 `noDeviceFound`。
 
 ### 8.5 连接超时与鉴权宽限（`startConnectingCountdown`）
 
@@ -534,25 +536,167 @@ OTA 流程
 
 ---
 
-## 11. 改造指引
+## 11. 原生层架构与状态映射
+
+`flutter_ezw_ble` 的 Dart 层只是 API 与模型边界，真正决定连接行为的是同仓的 Android/iOS 原生实现。修改连接、扫描、绑定、超时、OTA 写入时，必须同时检查 Dart 模型、Kotlin、Swift 三处是否保持同一语义。
+
+### 11.1 原生文件职责
+
+| 文件 | 平台 | 职责 |
+| --- | --- | --- |
+| `android/src/main/kotlin/.../BleManager.kt` | Android | 扫描、scan-then-connect、GATT 连接、服务/特征发现、MTU、descriptor notify、系统 bond 回调、发送队列、OTA 状态 |
+| `android/src/main/kotlin/.../BleChannel.kt` | Android | MethodChannel 分发，把 Dart 调用路由到 `BleManager` |
+| `android/src/main/kotlin/.../models/BleDevice.kt` | Android | 原生侧连接缓存模型，含 `connectState`、`myGatt`、`timeoutTimer`、`needsScanBeforeConnect` |
+| `ios/Classes/ble/BleManager.swift` | iOS | CoreBluetooth 扫描、retrieve 系统已连接外设、连接倒计时、服务/特征发现、状态推流 |
+| `ios/Classes/ble/BleChannel.swift` | iOS | MethodChannel 分发 |
+| `ios/Classes/ble/models/BleConnectedDevice.swift` | iOS | 已连接外设缓存，含 `isConnected`、`isBleFlowCompleted`、`needsScanBeforeReconnect` |
+| `ios/Classes/ble/OtaWriteQueue.swift` | iOS | `sendCmdNoWait + psType=1` 的 WriteWithoutResponse 背压队列 |
+
+### 11.2 Android 连接主流程
+
+```
+connect(belongConfig, uuid, name, sn, directConnect=false)
+  ├─ 校验权限 / uuid / BleConfig
+  ├─ 清除 preConnectedDevices[uuid]
+  ├─ directConnect=true
+  │    └─ 跳过 name/scan-visible 前置校验，直接走系统缓存/GATT
+  ├─ directConnect=false 且 remoteDevice.name == null 或 needsScanBeforeConnect
+  │    └─ 先扫描刷新 BLE stack 缓存，扫不到 → noDeviceFound
+  ├─ directConnect=false 且当前扫描窗口没看到目标
+  │    └─ pendingScanConnects += request，扫描命中后 isWaitingDevice=true 重入 connect
+  ├─ connectedDevices 查找/创建 BleDevice
+  ├─ connectState.isConnecting 且不是 isWaitingDevice → 跳过防重入
+  ├─ isConnected → 取消 timeoutTimer 并返回
+  ├─ remoteDevice.connectGatt(... TRANSPORT_LE, PHY_LE_2M)
+  ├─ startConnectTimeout(connectTimeout + afterUpgrade ? upgradeSwapTime : 0)
+  └─ handleConnectState(CONNECTING)
+
+BluetoothGattCallback
+  ├─ STATE_CONNECTED → discoverServices() → SEARCH_SERVICE
+  ├─ onServicesDiscovered → 找 privateServices
+  ├─ 写 CCCD descriptor → 全部 readChars notify enabled
+  ├─ requestMtu(config.mtu)
+  └─ connectFinish 或 createBond/startBinding
+```
+
+Android 的防重入重点是 `isWaitingDevice`：scan-then-connect 阶段已经先把设备置为 `CONNECTING`，扫描命中后必须允许二次进入真正 `connectGatt`，否则会被自己设置的 `isConnecting` 挡住。
+
+### 11.3 Android 超时与鉴权宽限
+
+`startConnectTimeout()` 挂在 `BleDevice.timeoutTimer` 上：
+
+1. 正常连接中超时 → `handleConnectState(TIMEOUT)`。
+2. 已 `devicePreConnected(uuid)` 但未 `deviceConnected(uuid)` → 只续一次有界鉴权宽限。
+3. 宽限二次到期仍未 connected → 强制 `TIMEOUT`，防止永久卡 `connectFinish`。
+4. `handleConnectState(CONNECTED)` 会清理 timer；`disconnect/reset` 会清理 `preConnectedDevices`。
+
+`devicePreConnected` 与 `deviceConnected` 是业务层鉴权的桥：
+
+```
+connectFinish 上报给 Dart
+  → even_connect 发 AUTH/pairAuth
+  → 业务确认成功
+  → devicePreConnected(uuid)
+  → 业务收尾（G2 右腿 selectPipeChannel/timeSync）
+  → deviceConnected(uuid)
+  → handleConnectState(CONNECTED)
+```
+
+### 11.4 Android bond 状态映射边界
+
+`onDeviceBondStateChanged(device, isBonded)` 是 `alreadyBound/boundFail` 的主要来源，风险最大。它必须遵守阶段语义：
+
+- `isBonded == true` 且 `belongConfig.initiateBinding == true`：可以推进 `CONNECT_FINISH`。
+- 当前处于 `START_BINDING` 或主动绑定流程中失败：可以上报 `BOUND_FAIL`。
+- 当前已经 `CONNECTED/UPGRADE`：迟到的 bond 失败不应覆盖连接成功态。
+- 当前已经 `TIMEOUT/DISCONNECT_FROM_SYS`：bond 失败通常是后续副作用，应避免再次把语义改成 `BOUND_FAIL`，否则上层会把可重试链路误判成 777 终态。
+
+G2 当前配置 `initiateBinding=false`，它的应用层安全握手由 `even_connect` 发送 `AUTHENTICATION(4)` 完成，不应依赖 Android 系统 bond 成功来判断业务连接成功。
+
+### 11.5 `GATT_CONN_LMP_TIMEOUT` 的处理原则
+
+Android `onConnectionStateChange(... STATE_DISCONNECTED)` 会打印 HCI/GATT 状态，例如 `GATT_CONN_LMP_TIMEOUT`。这类状态必须和当前连接阶段一起判断：
+
+| 当前阶段 | 建议语义 | 原因 |
+| --- | --- | --- |
+| `CONNECTING/SEARCH_SERVICE/SEARCH_CHARS` | `TIMEOUT` 或 `DISCONNECT_FROM_SYS`，由上层 retry | 物理链路尚未完成，属于可重试连接失败 |
+| `CONNECT_FINISH` 且尚未 `deviceConnected` | `TIMEOUT`，保留 retry | 应用层鉴权尚未确认成功 |
+| 已 `CONNECTED/UPGRADE` | 优先 `DISCONNECT_FROM_SYS` 或忽略迟到 bond 失败 | 不应把系统 bond 回调降级成 777 |
+| 用户主动断连中 | `DISCONNECT_BY_USER` | 由 `disconnectingDevices` 指定目标语义 |
+
+不要把 `GATT_CONN_LMP_TIMEOUT` 和 `BOUND_FAIL` 直接绑定。`BOUND_FAIL` 只应描述绑定流程失败，不应描述普通链路超时。
+
+### 11.6 iOS 连接主流程
+
+```
+connect(easyConnect)
+  ├─ 校验蓝牙状态 / BleConfig / common private service
+  ├─ 写 activeConnectRequests
+  ├─ 非 directConnect 清理陈旧 scanResultTemp
+  ├─ connectedDevices 命中
+  │    ├─ retrievePeripherals(withIdentifiers)
+  │    ├─ retrieveConnectedPeripherals(privateServices + ANCS) 判断系统已连接
+  │    ├─ isConnected && isBleFlowCompleted → handleAlreadyConnected 重放状态
+  │    ├─ directConnect → 使用缓存 peripheral 直接 connect
+  │    └─ needsScanBeforeReconnect 且非系统已连接 → scan 5s 刷新 CoreBT 缓存
+  ├─ scanResultTemp 命中 → 可按本轮扫描结果连接
+  ├─ findPeripheralFromConnected 命中 → 系统/蓝牙设置页已连接，直接 connect
+  ├─ retrievePeripherals(uuid) 命中
+  │    ├─ state == connected → 直接 connect
+  │    └─ directConnect → blind connect
+  ├─ 否则 scan-then-connect，超时 noDeviceFound
+  ├─ centralManager.connect 或 handleAlreadyConnected
+  ├─ startConnectingCountdown
+  └─ handleConnectState(connecting)
+```
+
+iOS 的关键差异：系统级 ANCS 连接会让外设停止广播，`scanForPeripherals` 不会再看到它。必须通过 `retrieveConnectedPeripherals(withServices:)` 做权威判定，否则会误报 `noDeviceFound`。
+
+### 11.7 iOS `isBleFlowCompleted` 与状态重放
+
+`BleConnectedDevice.isBleFlowCompleted` 表示服务发现 + 特征订阅流程已经完成：
+
+- true：所有 read characteristics 的 notify 都开启成功。
+- false：新连接开始、断连、错误、跨会话重连时重置。
+- 已 `isConnected && isBleFlowCompleted`：可以通过 `handleAlreadyConnected` 重放 `connectFinish/connected` 状态，避免系统已连但 Dart 侧丢状态。
+
+这个标记只描述 CoreBluetooth/GATT 流程，不代表 G2 应用层 AUTH 已成功；G2/Ring1 的最终成功仍由业务层调用 `deviceConnected`。
+
+### 11.8 状态映射回归清单
+
+改任何原生状态映射时，至少验证：
+
+1. 首连绑定失败仍上报 `boundFail/alreadyBound`，App 能展示正确错误码。
+2. 已 `connected` 后的迟到 bond/GATT 回调不会把状态降级成 `boundFail`。
+3. `GATT_CONN_LMP_TIMEOUT` 在连接中阶段能触发 retry，而不是永久卡 `connecting`。
+4. scan-then-connect 命中后不会被 `isConnecting` 防重入拦截。
+5. iOS ANCS/system-connected 设备不依赖广播扫描，仍能直接恢复服务发现。
+6. `directConnect=true` 只绕过 scan-visible 前置条件，不绕过真实 GATT 连接、服务发现、特征订阅和连接超时。
+7. `directConnect=false` 的前台路径仍应在离线设备上快速 `noDeviceFound`，不能因为后台优化退化成长期 blind timeout。
+8. `devicePreConnected` 后如果业务层异常未调用 `deviceConnected`，有界鉴权宽限会最终超时自愈。
+9. 主动断连不会被后续系统断连回调改写成系统失败。
+
+---
+
+## 12. 改造指引
 
 下面这部分**不是规范，是踩坑笔记**，按改动维度列出注意事项。
 
-### 11.1 新增一个 MethodChannel 方法
+### 12.1 新增一个 MethodChannel 方法
 
 1. `flutter_ezw_ble_platform_interface.dart`：抽象签名 + `UnimplementedError`，写 dartdoc 注明参数语义；
 2. `flutter_ezw_ble_method_channel.dart`：`@override`，用 `methodChannel.invokeMethod`；
-3. 原生侧（外部仓库）：两端 `onMethodCall` 分支；
+3. 原生侧（同仓 Android/iOS）：两端 `onMethodCall` 分支；
 4. 如果新参数涉及业务模型，记得在该模型加 `customToJson()`（避免嵌套 model 走默认 toJson 导致字段缺失）。
 
-### 11.2 新增一路 EventChannel
+### 12.2 新增一路 EventChannel
 
 1. 在 `BleEventChannel` 枚举里加新值；
 2. 在 `EzwBle` 单例里加一个 `Stream<XX>` 字段，包好类型转换；
 3. 原生侧用相同 tag 拼接（`ezwBleTag + "_" + enum.name`）注册 StreamHandler；
 4. 注意 `BleEventChannelExt._bleECs` 是 list 缓存，跨热重载可能保留旧引用——开发时 hot restart 比 hot reload 更稳。
 
-### 11.3 改连接状态机
+### 12.3 改连接状态机
 
 每加/删一个 `BleConnectState`：
 
@@ -562,20 +706,20 @@ OTA 流程
 4. 检查 `BleMatchDevice` 上的聚合 getter 是否需要同步（往往要）；
 5. 原生侧 push 该状态名的字符串要和 `enum.name` 完全一致。
 
-### 11.4 改 SN / MAC 解析
+### 12.4 改 SN / MAC 解析
 
 - `BleSnRule.byteLength` 改成不同值时必须满足 assert，否则 `BleConfig` 构造直接抛异常；
 - `BleMacRule` 只在 iOS 起作用，Android 改了等于没改；
 - 替换 SN 正则时记得测控制字符的边界（默认 `[\x00-\x1F\x7F]`）。
 
-### 11.5 关于"双腿设备"的特殊性
+### 12.5 关于"双腿设备"的特殊性
 
 `BleConfig.scan.matchCount >= 2` 表示一个 SN 对应多个 BLE 端点。原生层会等到所有腿都扫描到才推 `scanResultEC`，期间业务侧不会看到"半成品"的 `BleMatchDevice`。这意味着：
 
 - 若改 matchCount 逻辑，**要保留"组合完成才上报"的约束**，否则会破坏业务侧"以整机为单位"的假设；
 - `BleMatchDevice.devices` 的顺序在 iOS / Android 上不保证一致，业务侧通过设备名里的 `_L_` / `_R_` 区分左右腿。
 
-### 11.6 iOS OTA `WriteWithoutResponse` 背压（`sendCmdNoWait` + `psType==1`）
+### 12.6 iOS OTA `WriteWithoutResponse` 背压（`sendCmdNoWait` + `psType==1`）
 
 iOS 端 OTA 通道走单独的 per-peripheral 写队列 `OtaWriteQueue`，目标是把 packets-per-event 打满到 iOS 上限（4 包/事件），与 Android `WRITE_TYPE_NO_RESPONSE` 行为对齐。完整规范见 `IOS_OTA_NOWAIT_SPEC.md`。
 
@@ -590,10 +734,10 @@ iOS 端 OTA 通道走单独的 per-peripheral 写队列 `OtaWriteQueue`，目标
 
 ---
 
-## 12. 现状与已知不足
+## 13. 现状与已知不足
 
 - `pubspec.yaml` 仍写 `version: 0.0.1`，`CHANGELOG.md` 只占位。后续每次改动都应更新版本号和 changelog（语义化版本）。
-- 原生侧实现不在此仓库，文档无法覆盖具体 BLE 行为（重试次数、扫描间隔等），改原生需另起一份对应文档。
+- 原生侧实现已在本仓 `android/` 与 `ios/` 子目录维护；改连接、绑定、扫描、超时、OTA 写入时必须同步更新本架构文档的 Dart/Kotlin/Swift 三层说明。
 - `receiveDataEC` 的 `data` 是 Base64 字符串，跨大数据（OTA）有 ~33% 体积放大，未来可考虑切到 `StandardMethodCodec` 的 `Uint8List` 通路，但会破坏当前 Dart API 的兼容性。
 - `BleDeviceHardware.fromByte` 中 `isMaster = isMaster;` 是**自赋值 bug**（构造形参覆盖了字段），导致 `isMaster` 永远是字段默认值 `false`。改时记得同步更新 §7.8 的字段说明。
 - `BleConnectStateExt.label` 没有覆盖 `disconnectFromSys`、`bleError`、`systemError` 三个分支，反序列化时会回落到 `BleConnectState.none`——若原生侧真的会推这些字符串，需要补全 switch。
