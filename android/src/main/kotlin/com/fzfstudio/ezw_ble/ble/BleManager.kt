@@ -262,8 +262,11 @@ class BleManager private constructor() {
         val needsScanForName = !isWaitingDevice && cachedDevice == null && remoteDevice.name == null
         if (!directConnect && (needsScanForCache || needsScanForName)) {
             cachedDevice?.needsScanBeforeConnect = false
-            // 首次缓存缺失路径先同步 connecting；缓存重连路径已在前序失败回调中进入连接态，避免递归回来被 isConnecting guard 挡住。
-            if (needsScanForName) {
+            //  刷新扫描前统一置 connecting：蓝牙开关后整机重连会先被编排器重置为 none 再连，
+            //  此时不属于"前序失败回调已进入连接态"的情况；若不在扫描前置位，UI 会卡在待连接
+            //  约 5s（扫描结束才显示连接中）。扫描命中后重入时 isWaitingDevice=true，不会被
+            //  §8 的 isConnecting guard 挡住；扫描失败仍走 NO_DEVICE_FOUND，状态机自洽。
+            if (needsScanForCache || needsScanForName) {
                 handleConnectState(uuid, name, BleConnectState.CONNECTING)
             }
             startScan()
