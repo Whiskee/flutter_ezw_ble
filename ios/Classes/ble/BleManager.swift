@@ -212,7 +212,7 @@ extension BleManager {
                 connectedDevices[index] = device
                 handleConnectState(uuid: newEasyConnect.uuid, name: easyConnect.name, state: .connecting)
                 startScan()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) { [weak self] in
                     guard let self = self else { return }
                     self.stopScan()
                     // - 6.3.1.3、扫描期间可能已超时、取消或蓝牙关闭，请求已清空则不再重连。
