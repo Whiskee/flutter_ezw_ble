@@ -272,10 +272,22 @@ extension BleManager {
         //  - 6.4、查询是否获取到设备，如果没有就开启搜索
         guard let oldPeripheral = oldPeripheral else {
             if easyConnect.directConnect {
-                //  本会话从未见过该 UUID（例如进程重启后无缓存），directConnect 才 fast-fail 630。
+                //  directConnect 只表示“优先复用 CoreBluetooth 缓存”。搜索后连接或
+                //  API 恢复设备时 iOS 可能只有稳定 name、没有 UUID/peripheral 缓存；
+                //  此时不能直接报 630，否则设备仍在广播也会被快失败。
+                if !easyConnect.name.isEmpty {
+                    tag += "directConnect no cache, fallback scan by name"
+                    handleConnectState(uuid: newEasyConnect.uuid, name: easyConnect.name, state: .connecting)
+                    startConnectInfos.append(newEasyConnect)
+                    startScanConnectTimeout(currentConfig: bleConfig, uuid: newEasyConnect.uuid, name: newEasyConnect.name, afterUpgrade: easyConnect.afterUpgrade)
+                    startScan()
+                    loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), \(tag)")
+                    return
+                }
+                //  本会话从未见过该 UUID 且没有稳定 name 可扫描，directConnect 才 fast-fail 630。
                 removeActiveConnectRequest(uuid: newEasyConnect.uuid, name: newEasyConnect.name)
                 handleConnectState(uuid: newEasyConnect.uuid, name: easyConnect.name, state: .noDeviceFound)
-                loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), directConnect: no peripheral in CoreBluetooth cache")
+                loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), directConnect: no peripheral in CoreBluetooth cache and no name fallback")
                 return
             }
             tag += "no local device found, start scan device"

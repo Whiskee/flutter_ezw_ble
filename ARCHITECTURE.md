@@ -21,7 +21,7 @@
 > **重要**：本仓库 `lib/` 是 Dart 侧实现的主入口。原生侧 `FlutterEzwBlePlugin` 已纳入仓库 `android/` 与 `ios/` 子目录（Kotlin / Swift），与 Dart 侧同仓维护：
 >
 > - `ios/Classes/`：`FlutterEzwBlePlugin.swift` 注册 + `ble/BleManager.swift`（CoreBluetooth）+ `ble/BleChannel.swift`（MethodChannel 分发）+ `ble/OtaWriteQueue.swift`（OTA `WriteWithoutResponse` 背压队列，配套规范 `IOS_OTA_NOWAIT_SPEC.md`）；
-> - `android/src/main/kotlin/com/fzfstudio/ezw_ble/`：`FlutterEzwBlePlugin.kt` + `ble/BleManager.kt`。
+> - `android/src/main/kotlin/com/fzfstudio/ezw_ble/`：`FlutterEzwBlePlugin.kt` + `ble/BleManager.kt`，其中 `ble/extension/BluetoothDeviceExt.kt` 承载 Android 设备名解析与 `BleDevice` 转换。
 >
 > 改动 Dart API 时一并评估原生侧两端的联动；个别协议/性能改造（如 OTA 的 `sendCmdNoWait`）会有独立 spec 文档，落地时优先按 spec 走。
 
@@ -418,9 +418,9 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 
 `connectDevice(..., directConnect: false)` 是默认路径，适用于前台主服务连接、手动重连和自动重连。原生层会避免直接使用陈旧扫描缓存 blind GATT：
 
-- Android：如果 `BluetoothDevice.name == null` 或缓存设备标记 `needsScanBeforeConnect`，先刷新扫描 3s；首次缓存缺失路径会先上报 `connecting`，让 UI 不停留在 `none`。刷新扫描后仍未看到目标则上报 `noDeviceFound`。
+- Android：连接前先解析稳定设备名，优先级为 `BluetoothDevice.name` → `connectDevice` 入参 `name` → 本轮扫描缓存名 / 连接缓存名。这样可以覆盖 `getRemoteDevice(address).name` 为空、但业务仍持有稳定广播名的场景。若非 `directConnect` 且仍没有稳定 name，先刷新扫描 10s；刷新后仍未看到目标则上报 `noDeviceFound`。如果最终仍没有稳定 name（包含 `directConnect` 路径），按 `boundFail` 结束，不能用 MAC address 伪装 name，否则会污染 G2/R1 的 name/SN 匹配语义。
 - Android：如果本轮 `scanResultTemp` 没有目标，先把请求放入 `pendingScanConnects`，扫描命中后由 `tryConnectFromPendingScan` 移除 pending 并以 `isWaitingDevice=true` 重入 `connect()` 真正 `connectGatt`；超出 `connectTimeout` 仍未命中则 `expirePendingScanConnects` 上报 `noDeviceFound`。
-  - **自锁规避（重点）**：scan-then-connect / 3s 扫描刷新阶段会先把状态置为 `connecting`，因此命中后重入的 `connect()` 必须用 `isWaitingDevice` 跳过 `connectState.isConnecting` 守卫——否则会被"自己设的 `connecting` 状态"挡住 return，而 pending 此时已被移除、`expirePendingScanConnects` 也不再触发 → 设备**永久卡 `connecting`**。典型复现：DFU 后戒指重启，首连走 scan-then-connect，重启完成被扫描命中却连不上。
+  - **自锁规避（重点）**：scan-then-connect / 扫描刷新阶段会先把状态置为 `connecting`，因此命中后重入的 `connect()` 必须用 `isWaitingDevice` 跳过 `connectState.isConnecting` 守卫——否则会被"自己设的 `connecting` 状态"挡住 return，而 pending 此时已被移除、`expirePendingScanConnects` 也不再触发 → 设备**永久卡 `connecting`**。典型复现：DFU 后戒指重启，首连走 scan-then-connect，重启完成被扫描命中却连不上。
 - iOS：非 directConnect 会先清理目标在 `scanResultTemp` 中的陈旧条目；若来源是 `scanResultTemp` 或**未被系统连接的**断开态 `connectedDevices` 缓存，必须在当前扫描窗口重新看到目标，否则走 scan-then-connect，扫描超时上报 `noDeviceFound`。
 - iOS（ANCS / 系统级连接的根治，重点）：外设若因 ANCS（Apple Notification Center Service）或系统级配对被 iPhone 自动连接，会**停止广播**，`scanForPeripherals` 永远扫不到，"先扫再连"必然超时报 `noDeviceFound`——典型现象是"系统蓝牙里明明显示已连，App 却连不上、一直 630"。因此连接前用 `findPeripheralFromConnected()`（即 `retrieveConnectedPeripherals(withServices:)`，查询范围 = 配置全部私有服务 **+ Apple ANCS 服务 UUID `7905F431-B5CE-4E99-A40F-4B1E122D00D0`**）做"是否系统已连"的**权威判定**。
   - **不能只看 `CBPeripheral.state == .connected`**：系统级连接不归 App 自己的 central 持有，`retrievePeripherals(withIdentifiers:)` 返回的 peripheral `state` 往往仍是 `.disconnected`，只有 `retrieveConnectedPeripherals` 能可靠识别。
@@ -430,8 +430,8 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 
 `directConnect: true` 是调用方显式选择的缓存/peripheral 直连路径，当前由 `even_connect` 在发现页 temp service 和后台重连场景传入。它表示业务已经拿到明确目标，或后台扫描不可作为可靠前置条件，不应再用 scan-first 可见性把连接改成 `noDeviceFound`：
 
-- iOS：若 `scanResultTemp` 被后续 `startScan()` 清空，会尝试 `retrievePeripherals(withIdentifiers:)` 取 CoreBluetooth 缓存；缓存存在时 blind GATT，屏蔽箱场景按 `timeout` 结束；进程重启等完全无缓存时才 fast-fail 为 `noDeviceFound`。
-- Android：跳过 `remoteDevice.name == null` 和 scan-first 可见性 fast-fail，直接走系统缓存/GATT 路径。
+- iOS：若 `scanResultTemp` 被后续 `startScan()` 清空，会尝试 `retrievePeripherals(withIdentifiers:)` 取 CoreBluetooth 缓存；缓存存在时 blind GATT，屏蔽箱场景按 `timeout` 结束。若 `directConnect` 没有 UUID/peripheral 缓存但仍有稳定 `name`，回退到 scan-by-name 并用 scan connect timeout 结束；只有 UUID/peripheral 缓存和 name 都缺失时才 fast-fail 为 `noDeviceFound`。
+- Android：跳过 `remoteDevice.name == null` 的扫描刷新前置条件和 scan-first 可见性 fast-fail；只要能从 connect 入参或缓存解析出稳定 name，就直接走系统缓存/GATT 路径。
 
 原生层不自行判断“缓存设备是否应该后台直连”。这个决策属于上层业务：前台保留 scan-first 刷新协议栈缓存，后台由 `even_connect` 传 `directConnect: true` 避免 iOS/Android 后台扫描不可见导致回连被误判为 `noDeviceFound`。
 
@@ -546,6 +546,7 @@ OTA 流程
 | --- | --- | --- |
 | `android/src/main/kotlin/.../BleManager.kt` | Android | 扫描、scan-then-connect、GATT 连接、服务/特征发现、MTU、descriptor notify、系统 bond 回调、发送队列、OTA 状态 |
 | `android/src/main/kotlin/.../BleChannel.kt` | Android | MethodChannel 分发，把 Dart 调用路由到 `BleManager` |
+| `android/src/main/kotlin/.../extension/BluetoothDeviceExt.kt` | Android | `resolveBleDeviceName()` 稳定名称解析与 `BluetoothDevice.toBleDevice()` 转换；配套单测覆盖 name 优先级 |
 | `android/src/main/kotlin/.../models/BleDevice.kt` | Android | 原生侧连接缓存模型，含 `connectState`、`myGatt`、`timeoutTimer`、`needsScanBeforeConnect` |
 | `ios/Classes/ble/BleManager.swift` | iOS | CoreBluetooth 扫描、retrieve 系统已连接外设、连接倒计时、服务/特征发现、状态推流 |
 | `ios/Classes/ble/BleChannel.swift` | iOS | MethodChannel 分发 |
@@ -558,10 +559,13 @@ OTA 流程
 connect(belongConfig, uuid, name, sn, directConnect=false)
   ├─ 校验权限 / uuid / BleConfig
   ├─ 清除 preConnectedDevices[uuid]
+  ├─ 解析稳定设备名: remoteDevice.name → connect 参数 name → scan/connected 缓存 name
   ├─ directConnect=true
-  │    └─ 跳过 name/scan-visible 前置校验，直接走系统缓存/GATT
-  ├─ directConnect=false 且 remoteDevice.name == null 或 needsScanBeforeConnect
-  │    └─ 先扫描刷新 BLE stack 缓存，扫不到 → noDeviceFound
+  │    └─ 跳过扫描刷新与 scan-visible 前置校验，稳定 name 存在时直接走系统缓存/GATT
+  ├─ directConnect=false 且稳定 name 缺失或 needsScanBeforeConnect
+  │    └─ 先扫描 10s 刷新 BLE stack 缓存，扫不到 → noDeviceFound
+  ├─ 最终稳定 name 仍缺失
+  │    └─ boundFail（不使用 MAC 伪造 name）
   ├─ directConnect=false 且当前扫描窗口没看到目标
   │    └─ pendingScanConnects += request，扫描命中后 isWaitingDevice=true 重入 connect
   ├─ connectedDevices 查找/创建 BleDevice
@@ -579,7 +583,7 @@ BluetoothGattCallback
   └─ connectFinish 或 createBond/startBinding
 ```
 
-Android 的防重入重点是 `isWaitingDevice`：scan-then-connect 阶段已经先把设备置为 `CONNECTING`，扫描命中后必须允许二次进入真正 `connectGatt`，否则会被自己设置的 `isConnecting` 挡住。
+Android 的防重入重点是 `isWaitingDevice`：scan-then-connect 阶段已经先把设备置为 `CONNECTING`，扫描命中后必须允许二次进入真正 `connectGatt`，否则会被自己设置的 `isConnecting` 挡住。连接状态上报也应尽量使用解析后的稳定 name，而不是回读可能为空的 `BluetoothDevice.name`。
 
 ### 11.3 Android 超时与鉴权宽限
 
@@ -644,6 +648,8 @@ connect(easyConnect)
   ├─ retrievePeripherals(uuid) 命中
   │    ├─ state == connected → 直接 connect
   │    └─ directConnect → blind connect
+  ├─ directConnect 但无 UUID/peripheral 缓存且 name 非空
+  │    └─ 回退 scan-by-name + scan connect timeout
   ├─ 否则 scan-then-connect，超时 noDeviceFound
   ├─ centralManager.connect 或 handleAlreadyConnected
   ├─ startConnectingCountdown
@@ -675,6 +681,8 @@ iOS 的关键差异：系统级 ANCS 连接会让外设停止广播，`scanForPe
 7. `directConnect=false` 的前台路径仍应在离线设备上快速 `noDeviceFound`，不能因为后台优化退化成长期 blind timeout。
 8. `devicePreConnected` 后如果业务层异常未调用 `deviceConnected`，有界鉴权宽限会最终超时自愈。
 9. 主动断连不会被后续系统断连回调改写成系统失败。
+10. Android `BluetoothDevice.name` 为空时仍能用 connect 参数或扫描缓存名继续连接；三者都缺失时应失败为 `boundFail`，不能把 MAC address 写进 name。
+11. iOS `directConnect` 缺 UUID/peripheral 缓存但有稳定 name 时应回退扫描，而不是立即 `noDeviceFound`。
 
 ---
 

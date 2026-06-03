@@ -791,7 +791,7 @@ class BleManager private constructor() {
                 }
                 //  2、过滤已经缓存过的对象
                 //  -- 由于已经过滤了重复项，所以不用担心会重复发送已经发送过的对象
-                if (scanResultTemp.firstOrNull { it.uuid == device.address } != null) {
+                if (synchronized(scanResultTemp) { scanResultTemp.any { it.uuid == device.address } }) {
                     return
                 }
                 //  3、通过蓝牙配置文件中的scan获取目标设备
