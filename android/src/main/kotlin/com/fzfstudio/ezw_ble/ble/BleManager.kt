@@ -263,7 +263,21 @@ class BleManager private constructor() {
         //  - 6.2、首次连接时设备不在系统 BT 缓存中（remoteDevice.name == null），需要扫描令协议栈缓存地址信息
         val needsScanForCache = cachedDevice?.needsScanBeforeConnect == true
         val needsScanForName = !isWaitingDevice && cachedDevice == null && resolvedName == null
-        if (!directConnect && (needsScanForCache || needsScanForName)) {
+        //  - 6.0、目标当前已被系统 GATT 连着（典型：OTA 升级完那条腿重启后被系统自动回连+绑定）。
+        //    已被系统连上的外设不再广播 adv，scan-then-connect 永远扫不到 → 误判 NO_DEVICE_FOUND，
+        //    表现为「系统蓝牙显示已连接，App 却一直 noDeviceFound / 连接失败」。此时设备就在系统连接
+        //    列表里、协议栈也已有地址类型元数据，可直接 connectGatt by MAC，故跳过扫描直连。
+        //    仅在系统确实连着时才跳过；out-of-range / 普通失败（不在系统连接列表）仍走原扫描路径，
+        //    NO_DEVICE_FOUND / 超时等终态语义不变。
+        val isOsConnected = runCatching {
+            bluetoothManager.getConnectedDevices(BluetoothProfile.GATT)
+                .any { it.address.equals(uuid, ignoreCase = true) }
+        }.getOrDefault(false)
+        if (isOsConnected) {
+            cachedDevice?.needsScanBeforeConnect = false
+            sendLog(BleLoggerTag.d, "Start connect: $uuid, already connected at system GATT, direct connect without scan")
+        }
+        if (!directConnect && !isOsConnected && (needsScanForCache || needsScanForName)) {
             cachedDevice?.needsScanBeforeConnect = false
             //  刷新扫描前统一置 connecting：蓝牙开关后整机重连会先被编排器重置为 none 再连，
             //  此时不属于"前序失败回调已进入连接态"的情况；若不在扫描前置位，UI 会卡在待连接
@@ -297,7 +311,8 @@ class BleManager private constructor() {
             return
         }
         //  7.1、非 directConnect 且当前扫描窗口未看到目标时，先扫描命中再连接。
-        if (!directConnect && !isWaitingDevice && !isTargetVisibleInScan(uuid, name, sn)) {
+        //  isOsConnected 时跳过（系统已连着的设备不广播，扫不到属正常，应直连）。
+        if (!directConnect && !isWaitingDevice && !isOsConnected && !isTargetVisibleInScan(uuid, name, sn)) {
             val alreadyPending = pendingScanConnects.any { it.uuid.equals(uuid, ignoreCase = true) }
             if (!alreadyPending) {
                 handleConnectState(uuid, name, BleConnectState.CONNECTING)
@@ -339,11 +354,20 @@ class BleManager private constructor() {
             //  典型复现：DFU 后戒指重启，首连 scan-then-connect，重启完成被扫描命中却连不上。
             sendLog(BleLoggerTag.d, "Start connect: $uuid, device is connecting")
             return
-        } else if (bleDevice.isConnected) {
+        } else if (bleDevice.isConnected && bleDevice.myGatt != null) {
             bleDevice.timeoutTimer?.cancel()
             bleDevice.timeoutTimer = null
             sendLog(BleLoggerTag.d, "Start connect: $uuid, device is already connected")
             return
+        } else if (bleDevice.isConnected && bleDevice.myGatt == null) {
+            //  僵尸「已连接」：connectState 仍是 CONNECTED，但 GATT 已被 releaseAndClear 置空。
+            //  成因：teardown 主动断连与系统断连回调竞态时，系统断连回调走「正在主动断连，忽略」
+            //  分支提前 return，没把状态落成 disconnected。若此处直接 return「already connected」，
+            //  会白白浪费一个 recover 周期（日志：device is already connected → 整轮重连超时）。
+            //  这里清掉超时定时器、不再 return，继续往下走 §9 重新 connectGatt。
+            bleDevice.timeoutTimer?.cancel()
+            bleDevice.timeoutTimer = null
+            sendLog(BleLoggerTag.e, "Start connect: $uuid, stale connected with no gatt, force reconnect")
         }
         //  9、执行连接:默认获取基础私有服务的Gatt进行处理
         val connectCallBack = createConnectCallBack()
@@ -650,8 +674,13 @@ class BleManager private constructor() {
                 //     重连白名单只包含 disconnectFromSys / serviceFail / charsFail / timeout，
                 //     用户主动断不会触发重连，会导致 BLE 关再开后只剩部分设备被业务层手动拉起、
                 //     其它设备（典型如戒指）永远不重连。
+                //  ⚠️ 这里必须用 connectState.isConnected（含 CONNECTED + UPGRADE），
+                //     不能用 BleDevice.isConnected（只判 CONNECTED）。
+                //     OTA 升级中的设备 connectState = UPGRADE，若用后者会被漏掉，
+                //     导致蓝牙关闭时不释放其 GATT。蓝牙重开后该 GATT 的 binder 已死，
+                //     业务层仍以为"已连接"继续发指令 → android.os.DeadObjectException 刷屏。
                 connectedDevices.forEach {
-                    if (it.isConnected) {
+                    if (it.connectState.isConnected) {
                         //  与 disconnect() 一致：清理预连接标记，避免残留状态影响下次重连判定
                         preConnectedDevices.remove(it.uuid)
                         handleConnectState(it.uuid, it.name, BleConnectState.DISCONNECT_FROM_SYS)
