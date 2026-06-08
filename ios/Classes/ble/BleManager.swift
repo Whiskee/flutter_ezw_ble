@@ -60,6 +60,18 @@ class BleManager: NSObject {
 
 }
 
+private extension Optional where Wrapped == Data {
+    func toBleDebugHex() -> String {
+        guard let data = self else {
+            return "null"
+        }
+        guard !data.isEmpty else {
+            return ""
+        }
+        return data.map { String(format: "%02X", $0) }.joined(separator: " ")
+    }
+}
+
 // MARK: - Public Methods
 extension BleManager {
 
@@ -704,8 +716,9 @@ extension BleManager {
         //  根据SnRule截取manufacture中的数据
         if var manufactureData = manufactureData, let snRule = snRule {
             var startIndex = snRule.startSubIndex
-            if startIndex > manufactureData.count {
-                startIndex = 0
+            if startIndex >= manufactureData.count ||
+                (snRule.byteLength > 0 && manufactureData.count < snRule.byteLength) {
+                return sn
             }
             var endIndex = manufactureData.endIndex
             if snRule.byteLength > 0, manufactureData.count > snRule.byteLength {
@@ -716,6 +729,54 @@ extension BleManager {
             sn = String(data: manufactureData, encoding: .utf8) ?? ""
         }
         return replaceControlCharacters(in: sn, snRule: snRule)
+    }
+    
+    /**
+     *  定向排查 R1 SN 广播：
+     *  - manufactureDataHex: iOS 收到的 kCBAdvDataManufacturerData
+     *  - currentSliceHex/currentSliceText: 按当前 snRule 实际截出的片段
+     *  - parsedSn: 正式 parser 输出
+     */
+    private func logRingSnAdvertisementDebug(
+        name: String,
+        manufactureData: Data?,
+        snRule: BleSnRule,
+        parsedSn: String
+    ) {
+        guard name == "EVEN R1_1AF5A7" else {
+            return
+        }
+        let slice = extractSnRuleSlice(data: manufactureData, snRule: snRule)
+        let sliceText = slice.flatMap { String(data: $0, encoding: .utf8) } ?? "null"
+        let parts = [
+            "Start scan: R1 SN ADV debug, name=\(name)",
+            "manufactureSize=\(manufactureData?.count ?? 0)",
+            "snRule(start=\(snRule.startSubIndex), byteLength=\(snRule.byteLength))",
+            "parsedSn=\(parsedSn)",
+            "currentSliceHex=\(slice.toBleDebugHex())",
+            "currentSliceText=\(sliceText)",
+            "manufactureDataHex=\(manufactureData.toBleDebugHex())"
+        ]
+        loggerD(msg: parts.joined(separator: ", "))
+    }
+    
+    private func extractSnRuleSlice(data: Data?, snRule: BleSnRule) -> Data? {
+        guard let data = data else {
+            return nil
+        }
+        let startIndex = snRule.startSubIndex
+        if startIndex >= data.count ||
+            (snRule.byteLength > 0 && data.count < snRule.byteLength) {
+            return Data()
+        }
+        var endIndex = data.endIndex
+        if snRule.byteLength > 0, data.count > snRule.byteLength {
+            endIndex = snRule.byteLength
+        }
+        if endIndex <= startIndex {
+            return Data()
+        }
+        return data.subdata(in: startIndex..<endIndex)
     }
     
     /**
@@ -1359,7 +1420,19 @@ extension BleManager: CBCentralManagerDelegate {
         var deviceSn = peripheral.name ?? ""
         let snRule = bleConfig.scan.snRule
         if let snRule = snRule {
-            deviceSn = parseDataToObtainSn(manufactureData: manufactureData, snRule: snRule)
+            let parsedSn = parseDataToObtainSn(manufactureData: manufactureData, snRule: snRule)
+            logRingSnAdvertisementDebug(
+                name: peripheral.name ?? "",
+                manufactureData: manufactureData,
+                snRule: snRule,
+                parsedSn: parsedSn
+            )
+            if parsedSn.isNotEmpty,
+               (snRule.filters.isEmpty || snRule.filters.contains(where: { mark in
+                   return parsedSn.contains(mark)
+               })) {
+                deviceSn = parsedSn
+            }
             //  - 5.2.1、阻断发送到Flutter
             //  -- a、SN无法被解析的
             //  -- b、不包含标识的设备
@@ -1368,6 +1441,13 @@ extension BleManager: CBCentralManagerDelegate {
                !snRule.filters.contains(where: { mark in
                    return deviceSn.contains(mark)
                }) {
+                let peripheralName = peripheral.name ?? ""
+                if peripheralName.contains("EVEN R1") ||
+                    peripheralName.contains("B210") ||
+                    peripheralName.contains("B290") ||
+                    peripheralName.contains("DfuTarg") {
+                    loggerE(msg: "Start scan: drop by snRule, name=\(peripheralName), parsedSn=\(parsedSn), finalSn=\(deviceSn), filters=\(snRule.filters)")
+                }
                 return
             }
         }

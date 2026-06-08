@@ -818,17 +818,56 @@ class BleManager private constructor() {
                 if (advertisedName.isNullOrEmpty()) {
                     return
                 }
-                //  2、过滤已经缓存过的对象
-                //  -- 由于已经过滤了重复项，所以不用担心会重复发送已经发送过的对象
-                if (synchronized(scanResultTemp) { scanResultTemp.any { it.uuid == device.address } }) {
-                    return
-                }
-                //  3、通过蓝牙配置文件中的scan获取目标设备
+                //  2、通过蓝牙配置文件中的scan获取目标设备
                 val bleConfig = bleConfigs.firstOrNull { config -> config.scan.nameFilters.firstOrNull { filter ->
                     advertisedName.contains(filter)
                 }  != null
                 }
                 if (bleConfig == null) {
+                    return
+                }
+                //  3、过滤已经缓存过的对象。
+                //
+                //  R1 的 SN 在 scan response 中，Android 可能先回调不带 SN 的主广播包，
+                //  再回调带 SN 的 scan response。这里不能对同 address 直接早退，否则会把
+                //  "EVEN R1_..." 兜底值永久缓存，后续真实 B210/B290 SN 没机会覆盖。
+                val cachedScanDevice = synchronized(scanResultTemp) {
+                    scanResultTemp.firstOrNull { it.uuid == device.address }
+                }
+                if (cachedScanDevice != null) {
+                    if (!scanPureMode && cachedScanDevice.sn == cachedScanDevice.name) {
+                        val snRule = bleConfig.scan.snRule
+                        if (snRule != null) {
+                            val parsedSn = parseDataToObtainSn(result.scanRecord?.bytes, snRule)
+                            logRingSnAdvertisementDebug(
+                                name = advertisedName,
+                                scanRecordBytes = result.scanRecord?.bytes,
+                                snRule = snRule,
+                                parsedSn = parsedSn,
+                            )
+                            val hasValidSn = parsedSn.isNotEmpty() &&
+                                (snRule.filters.isEmpty() || snRule.filters.any { parsedSn.contains(it) })
+                            if (hasValidSn && parsedSn != cachedScanDevice.sn) {
+                                val bleDevice = device.toBleDevice(bleConfig, advertisedName, parsedSn, result.rssi)
+                                synchronized(scanResultTemp) {
+                                    scanResultTemp.removeAll { it.uuid == device.address }
+                                    scanResultTemp.add(bleDevice)
+                                }
+                                expirePendingScanConnects()
+                                tryConnectFromPendingScan(bleDevice)
+                                if (bleConfig.scan.matchCount < 2) {
+                                    sendMatchDevices(parsedSn, listOf(bleDevice))
+                                    return
+                                }
+                                val matchDevices = synchronized(scanResultTemp) {
+                                    scanResultTemp.filter { it.sn == bleDevice.sn }
+                                }
+                                if (matchDevices.size == bleConfig.scan.matchCount) {
+                                    sendMatchDevices(parsedSn, matchDevices)
+                                }
+                            }
+                        }
+                    }
                     return
                 }
                 //  4、检查是否是纯净模式
@@ -848,12 +887,31 @@ class BleManager private constructor() {
                 //  - 5.1、获取SN数据
                 val snRule = bleConfig.scan.snRule
                 if (snRule != null) {
-                    deviceSn = parseDataToObtainSn(result.scanRecord?.bytes, snRule)
+                    val parsedSn = parseDataToObtainSn(result.scanRecord?.bytes, snRule)
+                    logRingSnAdvertisementDebug(
+                        name = advertisedName,
+                        scanRecordBytes = result.scanRecord?.bytes,
+                        snRule = snRule,
+                        parsedSn = parsedSn,
+                    )
+                    if (parsedSn.isNotEmpty() &&
+                        (snRule.filters.isEmpty() || snRule.filters.any { parsedSn.contains(it) })) {
+                        deviceSn = parsedSn
+                    }
                     //  - 5.2、阻断发送到Flutter
                     //  -- a、SN无法被解析的
                     //  -- b、不包含标识的设备
                     if (deviceSn.isEmpty() ||
                         (snRule.filters.isNotEmpty() && !snRule.filters.any { deviceSn.contains(it) })) {
+                        if (advertisedName.contains("EVEN R1") ||
+                            advertisedName.contains("B210") ||
+                            advertisedName.contains("B290") ||
+                            advertisedName.contains("DfuTarg")) {
+                            sendLog(
+                                BleLoggerTag.e,
+                                "Start scan: drop by snRule, name=$advertisedName, parsedSn=$parsedSn, finalSn=$deviceSn, filters=${snRule.filters}"
+                            )
+                        }
                         return
                     }
                 }
@@ -895,8 +953,9 @@ class BleManager private constructor() {
             return sn
         }
         var startIndex = snRule.startSubIndex
-        if (startIndex > bytes.size) {
-            startIndex = 0
+        if (startIndex >= bytes.size ||
+            (snRule.byteLength > 0 && bytes.size < snRule.byteLength)) {
+            return sn
         }
         var endIndex = bytes.size
         if (snRule.byteLength > 0 && endIndex > (snRule.byteLength - startIndex)) {
@@ -904,6 +963,79 @@ class BleManager private constructor() {
         }
         sn = String(bytes.copyOfRange(startIndex, endIndex), Charsets.UTF_8)
         return replaceControlCharacters(sn, snRule)
+    }
+
+    /**
+     *  定向排查 R1 SN 广播：
+     *  - scanRecordHex: Android 收到的完整 ScanRecord bytes
+     *  - currentSliceHex/currentSliceText: 按当前 snRule 实际截出的片段
+     *  - parsedSn: 正式 parser 输出
+     */
+    private fun logRingSnAdvertisementDebug(
+        name: String,
+        scanRecordBytes: ByteArray?,
+        snRule: BleSnRule,
+        parsedSn: String,
+    ) {
+        if (name != "EVEN R1_1AF5A7") {
+            return
+        }
+        val slice = extractSnRuleSlice(scanRecordBytes, snRule)
+        val sliceText = slice.toBleDebugText()
+        sendLog(
+            BleLoggerTag.d,
+            "Start scan: R1 SN ADV debug, name=$name, " +
+                "recordSize=${scanRecordBytes?.size ?: 0}, " +
+                "snRule(start=${snRule.startSubIndex}, byteLength=${snRule.byteLength}), " +
+                "parsedSn=$parsedSn, " +
+                "currentSliceHex=${slice.toBleDebugHex()}, " +
+                "currentSliceText=$sliceText, " +
+                "scanRecordHex=${scanRecordBytes.toBleDebugHex()}"
+        )
+    }
+
+    private fun extractSnRuleSlice(bytes: ByteArray?, snRule: BleSnRule): ByteArray? {
+        if (bytes == null) {
+            return null
+        }
+        val startIndex = snRule.startSubIndex
+        if (startIndex >= bytes.size ||
+            (snRule.byteLength > 0 && bytes.size < snRule.byteLength)) {
+            return ByteArray(0)
+        }
+        var endIndex = bytes.size
+        if (snRule.byteLength > 0 && endIndex > (snRule.byteLength - startIndex)) {
+            endIndex = snRule.byteLength
+        }
+        if (endIndex <= startIndex) {
+            return ByteArray(0)
+        }
+        return bytes.copyOfRange(startIndex, endIndex)
+    }
+
+    private fun ByteArray?.toBleDebugHex(): String {
+        if (this == null) {
+            return "null"
+        }
+        if (isEmpty()) {
+            return ""
+        }
+        return joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
+    }
+
+    private fun ByteArray?.toBleDebugText(): String {
+        if (this == null) {
+            return "null"
+        }
+        return toString(Charsets.UTF_8)
+            .map { char ->
+                if (Character.isISOControl(char)) {
+                    '.'
+                } else {
+                    char
+                }
+            }
+            .joinToString("")
     }
 
     /**
