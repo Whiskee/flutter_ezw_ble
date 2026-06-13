@@ -11,6 +11,7 @@
 //
 
 import CoreBluetooth
+import Foundation
 import Flutter
 
 /// 单个 OTA 写入条目
@@ -30,6 +31,13 @@ final class OtaWriteQueue {
     //  - 软节流阈值: 每写入 N 包主动让出, 等待 peripheralIsReady 后再继续
     //  - 可后续按机型实测调整
     private static let softDrainEvery: Int = 64
+    //  - CoreBluetooth 偶发不再回调 peripheralIsReady 时, 定期重查 canSend,
+    //    避免 Dart 侧 await 永久挂起并把后续 retry 堆进同一个 native queue.
+    private static let backpressureRetryInterval: TimeInterval = 0.1
+    //  - 软节流本身用于防突发丢包, 兜底重查要更保守, 避免绕过节流保护。
+    private static let softThrottleRetryInterval: TimeInterval = 0.5
+    //  - 上层 OTA 等待响应 5s 超时; 原生侧提前释放 pending, 让业务层走 CRC/timeout retry。
+    private static let backpressureStallTimeout: TimeInterval = 4.0
 
     //  =========== Variables
     //  - 关联外设(弱引用避免循环持有)
@@ -38,6 +46,10 @@ final class OtaWriteQueue {
     private var pending: [OtaWriteItem] = []
     //  - 自上一次软节流以来已成功写入的包数
     private var sinceLastDrainSync: Int = 0
+    //  - 进入 canSend=false / 软节流等待的时间
+    private var backpressureStartedAt: Date?
+    //  - 兜底重查任务; 只允许一个 pending work item
+    private var backpressureRetryWorkItem: DispatchWorkItem?
     //  - 日志回调(由 BleManager 注入, 复用其 loggerD)
     private let logger: ((String) -> Void)?
 
@@ -77,6 +89,7 @@ extension OtaWriteQueue {
      */
     func onPeripheralReadyToSendWriteWithoutResponse() {
         logger?("[ezw_ble][ota] peripheralIsReady → resume pump (pending=\(pending.count))")
+        clearBackpressureWait()
         pump()
     }
 
@@ -93,6 +106,7 @@ extension OtaWriteQueue {
         let snapshot = pending
         pending.removeAll()
         sinceLastDrainSync = 0
+        clearBackpressureWait()
         snapshot.forEach { item in
             item.result(nil)
         }
@@ -118,9 +132,14 @@ extension OtaWriteQueue {
         while !pending.isEmpty {
             //  - 2.1、CoreBluetooth 暂时不能再吞包, 等下一次 peripheralIsReady 回调
             guard peripheral.canSendWriteWithoutResponse else {
+                if shouldCancelStalledBackpressure(reason: "canSend=false") {
+                    return
+                }
                 logger?("[ezw_ble][ota] pump pause canSend=false, wait peripheralIsReady (pending=\(pending.count))")
+                scheduleBackpressureRetry(after: Self.backpressureRetryInterval)
                 return
             }
+            clearBackpressureWait()
             //  - 2.2、出队并写入
             let head = pending.removeFirst()
             peripheral.writeValue(
@@ -137,8 +156,62 @@ extension OtaWriteQueue {
             if sinceLastDrainSync >= Self.softDrainEvery {
                 logger?("[ezw_ble][ota] pump throttle (sinceLastDrainSync=\(sinceLastDrainSync)), wait peripheralIsReady")
                 sinceLastDrainSync = 0
+                markBackpressureWaitStarted()
+                scheduleBackpressureRetry(after: Self.softThrottleRetryInterval)
                 return
             }
         }
+        clearBackpressureWait()
+    }
+}
+
+// MARK: - Backpressure Watchdog
+private extension OtaWriteQueue {
+
+    func markBackpressureWaitStarted() {
+        if backpressureStartedAt == nil {
+            backpressureStartedAt = Date()
+        }
+    }
+
+    func clearBackpressureWait() {
+        backpressureStartedAt = nil
+        backpressureRetryWorkItem?.cancel()
+        backpressureRetryWorkItem = nil
+    }
+
+    func scheduleBackpressureRetry(after interval: TimeInterval) {
+        markBackpressureWaitStarted()
+        guard backpressureRetryWorkItem == nil else {
+            return
+        }
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self = self else {
+                return
+            }
+            self.backpressureRetryWorkItem = nil
+            guard !self.pending.isEmpty else {
+                return
+            }
+            self.pump()
+        }
+        backpressureRetryWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + interval,
+            execute: workItem
+        )
+    }
+
+    func shouldCancelStalledBackpressure(reason: String) -> Bool {
+        markBackpressureWaitStarted()
+        guard let startedAt = backpressureStartedAt else {
+            return false
+        }
+        let waitSeconds = Date().timeIntervalSince(startedAt)
+        guard waitSeconds >= Self.backpressureStallTimeout else {
+            return false
+        }
+        cancelAll(reason: "\(reason) stalled \(String(format: "%.1f", waitSeconds))s")
+        return true
     }
 }

@@ -734,8 +734,8 @@ iOS 端 OTA 通道走单独的 per-peripheral 写队列 `OtaWriteQueue`，目标
 关键约束（改原生侧前必读）：
 
 - **触发条件**：仅 `sendCmdNoWait` + `psType == 1` 且特征声明 `.writeWithoutResponse` property 时启用；其它路径走原有 `WriteWithoutResponse` 即时返回，行为不变。
-- **背压机制**：`pump()` 写包前检查 `peripheral.canSendWriteWithoutResponse`，命中 `false` 即暂停，等 `peripheralIsReady(toSendWriteWithoutResponse:)` 回调驱动续写。
-- **软节流**：每 `softDrainEvery = 64` 包主动让出，等下一次 `peripheralIsReady`，防御老机型 `canSendWriteWithoutResponse` "报喜不报忧"。该阈值是配置常量，调参后回归测试。
+- **背压机制**：`pump()` 写包前检查 `peripheral.canSendWriteWithoutResponse`，命中 `false` 即暂停，优先等 `peripheralIsReady(toSendWriteWithoutResponse:)` 回调驱动续写；同时有 watchdog 短周期重查 `canSend`，避免回调缺失时 Dart await 永久挂起。
+- **软节流**：每 `softDrainEvery = 64` 包主动让出，等下一次 `peripheralIsReady` 或更保守的 watchdog 重查，防御老机型 `canSendWriteWithoutResponse` "报喜不报忧"。该阈值是配置常量，调参后回归测试。
 - **Dart 侧同步**：`MethodChannelEzwBle.sendCmdNoWait` 已统一走 `methodChannel.invokeMethod`，**不再 fall back 到 `sendCmd`**。改 Dart 入口前先确认原生 `sendCmdNoWait` handler 仍然处理所有 `psType` 分支（OTA + 兜底）。
 - **挂起 await 兜底**：断连/`reset()`/外设释放时 `OtaWriteQueue.cancelAll()` 会对所有 pending 写入回调 `result(nil)`，业务层依赖 CRC 校验决定是否 retry；改这条兜底必须保证**任何路径都不会让 Dart `await` 永远挂着**。
 - **范围外**：`psType == 3`（file）通道、iOS connection interval 协商、`psType == 0`（common）write type 切换均**不在本期范围**，改动前先评估对协议层应答匹配的影响。

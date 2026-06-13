@@ -113,6 +113,11 @@ final class OtaWriteQueue {
     private var sinceLastDrainSync = 0
     // 每 64 包做一次软节流(等 peripheralIsReady 回调)
     private static let softDrainEvery = 64
+    // peripheralIsReady 偶发缺失时,短周期重查 canSend;软节流用更保守间隔,
+    // 卡住超过 4s 则释放 pending,让上层 5s OTA 响应超时前进入 CRC/timeout retry。
+    private static let backpressureRetryInterval: TimeInterval = 0.1
+    private static let softThrottleRetryInterval: TimeInterval = 0.5
+    private static let backpressureStallTimeout: TimeInterval = 4.0
 
     func enqueue(data: Data, characteristic: CBCharacteristic, result: FlutterResult) {
         pending.append((data, characteristic, result))
@@ -122,7 +127,7 @@ final class OtaWriteQueue {
     private func pump() {
         while !pending.isEmpty {
             guard peripheral.canSendWriteWithoutResponse else {
-                // 等下一次 peripheralIsReady 回调
+                // 等下一次 peripheralIsReady 回调;同时启动 watchdog 定期重查 canSend
                 return
             }
             let head = pending.removeFirst()
@@ -139,7 +144,7 @@ final class OtaWriteQueue {
             // 突发塞包导致底层丢包(老机型上观察到)
             if sinceLastDrainSync >= Self.softDrainEvery {
                 sinceLastDrainSync = 0
-                return // 主动暂停,等下一次 peripheralIsReady
+                return // 主动暂停,等下一次 peripheralIsReady 或 watchdog 重查
             }
         }
     }
@@ -153,6 +158,13 @@ final class OtaWriteQueue {
 
 `CBPeripheralDelegate.peripheralIsReady(toSendWriteWithoutResponse:)` 必须接入到
 `OtaWriteQueue.onPeripheralReadyToSendWriteWithoutResponse()`。
+
+watchdog 只在 OTA 队列已经 pending 且 `canSendWriteWithoutResponse == false`
+或软节流等待时启动。正常情况下由 `peripheralIsReady` 立即恢复；如果
+CoreBluetooth 没有回调但 `canSend` 后续变回 `true`，watchdog 会继续
+pump。硬背压用 0.1s 重查，软节流用 0.5s 保守重查，避免绕过老机型
+丢包防线；如果超过 4s 仍不可写，队列 `cancelAll` 并对 pending 的
+`FlutterResult` 返回 `nil`，由 G2 OTA 上层 5s 响应超时/CRC retry 接管。
 
 ### 4.3 兜底路径
 
@@ -181,6 +193,7 @@ if !supportsNoResponse {
 [ezw_ble][ota] write uuid=<uuid> bytes=<len> canSend=<bool> queueDepth=<n>
 [ezw_ble][ota] pump throttle (sinceLastDrainSync=64), wait peripheralIsReady
 [ezw_ble][ota] peripheralIsReady → resume pump (pending=<n>)
+[ezw_ble][ota] cancelAll reason=canSend=false stalled <seconds>s, discard pending=<n>
 ```
 
 日志经现有 `logger` EventChannel 上报到 Dart 端 `blePrintEC`(参考 §6 命名约定)。
