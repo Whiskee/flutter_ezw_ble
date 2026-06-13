@@ -22,17 +22,21 @@ class BleDevice(
     val uuid: String,
     val sn : String,
     var rssi: Int,
+    @Volatile
     var connectState: BleConnectState,
     /// 异常断连/超时后需要先扫描再重连（DISCONNECT_FROM_SYS/TIMEOUT时置true，重连时消费一次）
+    @Volatile
     var needsScanBeforeConnect: Boolean = false,
 ): GsonSerializable() {
 
     private val tag = "BleDevice"
 
     /// 缓存设备所含有的Gatt
+    @Volatile
     private var gatt: BluetoothGatt? = null
     private val writeAndReadList: MutableList<BleWriteAndRead> = Collections.synchronizedList(mutableListOf())
     //  连接超时定时器
+    @Volatile
     var timeoutTimer: Timer? = null
 
     ///========== Get

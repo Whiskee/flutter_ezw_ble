@@ -1094,9 +1094,17 @@ class BleManager private constructor() {
                     sendLog(BleLoggerTag.e, "Connect call back: ${gatt.device.address} not my connected device, state = STATE_DISCONNECTED(code:$status)")
                     return
                 }
-                //  如果断连发生时已经在连接中了，就不要断连
-                if (myDevice.connectState.isConnecting) {
-                    sendLog(BleLoggerTag.e, "Connect call back: ${gatt.device.address} is start new connecting, stop disconnect flow, keep connecting")
+                //  如果断连来自旧 GATT，且新 GATT 已在连接中，就忽略旧回调；
+                //  当前 GATT 自己断开必须继续走失败处理，否则 Dart 层收不到终态。
+                if (decideDisconnectDuringConnect(
+                        isConnecting = myDevice.connectState.isConnecting,
+                        isCurrentGatt = myDevice.myGatt === gatt,
+                    ) == DisconnectDuringConnectDecision.IGNORE_STALE_DISCONNECT
+                ) {
+                    sendLog(BleLoggerTag.e, "Connect call back: ${gatt.device.address} is stale disconnect during new connecting, keep connecting")
+                    runCatching { gatt.close() }.onFailure { closeError ->
+                        sendLog(BleLoggerTag.e, "Connect call back: ${gatt.device.address} close stale gatt exception: ${closeError.message}")
+                    }
                     return
                 }
                 //  - 执行断开连接，确保被释放
@@ -1118,8 +1126,10 @@ class BleManager private constructor() {
                 }
                 //  -- 打印
                 sendLog(BleLoggerTag.e, "Connect call back: ${gatt.device.address} state = STATE_DISCONNECTED(code:${BluetoothGattStatus.getStatusDescription(status)})")
-                //  -- GATT_CONN_LMP_TIMEOUT, 移除配对导致的出现的GATT_CONN_LMP_TIMEOUT，就不执行操作
-                if (status == 22) {
+                //  -- GATT_CONN_LMP_TIMEOUT，非连接流程中的迟到回调沿用历史忽略；
+                //  当前连接流程里发生的 LMP timeout 必须给 Dart 一个终态。
+                if (status == BluetoothGattStatus.GATT_CONN_LMP_TIMEOUT &&
+                    shouldIgnoreGattConnLmpTimeout(myDevice.connectState.isConnecting)) {
                     return
                 }
                 //  -- 执行连接状态处理

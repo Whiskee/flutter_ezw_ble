@@ -3,6 +3,8 @@ package com.fzfstudio.ezw_ble.ble.models
 // 在 BleManager.kt 文件顶部或者一个合适的位置
 
 object BluetoothGattStatus {
+    const val GATT_CONN_LMP_TIMEOUT = 22
+
     val statusMessages: Map<Int, String> = mapOf(
         0 to "GATT_SUCCESS",
         1 to "GATT_INVALID_HANDLE", // HCI_ERR_INVALID_CONN_HANDLE
@@ -23,7 +25,7 @@ object BluetoothGattStatus {
         16 to "GATT_UNSUPPORTED_GROUP_TYPE", // HCI_ERR_UNSUPPORTED_GRP_TYPE
         17 to "GATT_INSUFFICIENT_RESOURCES", // HCI_ERR_INSUFFICIENT_RESOURCES
         19 to "GATT_CONN_TERMINATE_PEER_USER", // Connection terminated by peer user
-        22 to "GATT_CONN_LMP_TIMEOUT", // Connection failed to be established due to LMP response timeout
+        GATT_CONN_LMP_TIMEOUT to "GATT_CONN_LMP_TIMEOUT", // Connection failed to be established due to LMP response timeout
         34 to "GATT_CONN_FAIL_ESTABLISHMENT", // Connection fail to establish
         62 to "GATT_CONN_TERMINATE_LOCAL_HOST", // Connection terminated by local host
         133 to "GATT_ERROR", // Generic error. This is a very common one for various unspecified issues.
