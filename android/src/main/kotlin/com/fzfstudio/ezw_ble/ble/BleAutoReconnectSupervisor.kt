@@ -243,15 +243,19 @@ internal class BleAutoReconnectSupervisor(
             return
         }
 
-        // 2. 已连接/正在连接/已有 passive GATT 时不重复打开新 GATT。
+        // 2. 当前 timer 已触发，先清掉 task 里的 timer 引用；否则 passive refresh
+        // 会被自己的 schedule timer 误判为“仍有等待任务”而无法重建 GATT。
+        task.timer?.cancel()
+        task.timer = null
+
+        // 3. 已连接/正在连接/已有 passive GATT 时不重复打开新 GATT。
         // passive watchdog 会关闭僵死 GATT，但 UI 仍保持 CONNECTING；此时允许
         // TIMEOUT 原因进入下一轮，重建底层 passive handle。
         val currentDevice = connectedDevices.firstOrNull { it.uuid.equals(uuid, ignoreCase = true) }
         val isPassiveRefresh =
             previousState == BleConnectState.TIMEOUT &&
                 currentDevice?.connectState?.isFlowConnecting == true &&
-                task.passiveGatt == null &&
-                task.timer == null
+                task.passiveGatt == null
         if (
             (currentDevice?.connectState?.isFlowConnecting == true && !isPassiveRefresh) ||
             currentDevice?.connectState?.isConnected == true ||
@@ -264,21 +268,19 @@ internal class BleAutoReconnectSupervisor(
             return
         }
 
-        // 3. 蓝牙关闭期间暂停，不把这次 timer 计为失败。
+        // 4. 蓝牙关闭期间暂停，不把这次 timer 计为失败。
         if (!isBluetoothEnabled() || bleState() != BLE_STATE_ON) {
             task.pausedByBluetoothOff = true
             return
         }
 
-        // 4. 递增 attempt，并清理上一轮 passive GATT。attempt 只参与退避计算和日志诊断，
+        // 5. 递增 attempt，并清理上一轮 passive GATT。attempt 只参与退避计算和日志诊断，
         //    不再决定是否停止回连，避免设备离开较久后 native 主动放弃。
         task.attempt = nextAttemptCount(task.attempt)
-        task.timer?.cancel()
-        task.timer = null
         task.passiveGatt?.close()
         task.passiveGatt = null
 
-        // 5. 系统断连/扫描找不到/多次失败后使用 passive autoConnect。
+        // 6. 系统断连/扫描找不到/多次失败后使用 passive autoConnect。
         //
         // autoReconnect 已经拥有稳定 address，不应该再显式 startScan；系统断连场景交给
         // Android `connectGatt(autoConnect=true)` 持有底层 rendezvous point。
@@ -291,7 +293,7 @@ internal class BleAutoReconnectSupervisor(
             return
         }
 
-        // 6. 主动回连复用 manager 的完整连接路由和 GATT readiness。
+        // 7. 主动回连复用 manager 的完整连接路由和 GATT readiness。
         sendLog(BleLoggerTag.d, "Auto reconnect: $uuid, active attempt ${task.attempt}")
         activeConnect(task)
     }

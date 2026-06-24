@@ -154,6 +154,10 @@ The Android watchdog is a zombie-GATT refresh mechanism, not a stop condition or
 visible connection failure.
 If the device remains away for a long time, the supervisor keeps recreating or
 rescheduling the reconnect attempt until the task is explicitly cancelled.
+The scheduled refresh attempt must clear the fired timer before duplicate
+connection guards run; otherwise the supervisor can reject its own refresh while
+the device is still visibly `CONNECTING` and `passiveGatt` has already been
+closed.
 
 ## iOS Strategy
 

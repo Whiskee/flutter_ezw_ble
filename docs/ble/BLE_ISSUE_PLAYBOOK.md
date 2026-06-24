@@ -932,6 +932,9 @@ Symptoms:
 - Logs may show repeated `timeout`, `noDeviceFound`, passive watchdog refresh,
   or an old `max attempts reached` / `skip attempt` message before reconnect
   activity stops.
+- Android R1 may log `passive watchdog refresh`, then `schedule attempt 2`,
+  followed by `ignored because state=CONNECTING passiveGatt=false`; after that
+  the UI stays connecting forever and no new passive GATT is created.
 
 Root cause:
 
@@ -942,6 +945,10 @@ Root cause:
   a previously connected device can return later.
 - Android passive `autoConnect=true` may need periodic zombie-GATT refreshes,
   but the watchdog must only recreate the pending handle, never delete the task.
+- A passive refresh timer is itself stored on the reconnect task. If
+  `beginAttempt` checks `task.timer == null` before clearing the fired timer,
+  the refresh attempt is rejected by its own timer while the visible device
+  state is intentionally still `CONNECTING`.
 - iOS CoreBluetooth pending connect is the system wake/reconnect point; app
   timers or attempt counters must not cancel it while waiting for the peripheral
   to return.
@@ -955,6 +962,9 @@ Fix:
   for compatibility/backoff diagnostics.
 - On Android, let passive watchdog close the stale GATT and schedule the next
   attempt without emitting a Dart/UI `timeout`; visible state stays connecting.
+- When the scheduled passive refresh attempt fires, clear `task.timer` before
+  duplicate-connection guards, and allow `previousState=TIMEOUT +
+  state=CONNECTING + passiveGatt=null` to rebuild the passive GATT.
 - On iOS, keep native passive reconnect as a CoreBluetooth pending connect. The
   watchdog may log pending status, but it must not emit Dart/UI `timeout`;
   start short timeouts only after `didConnect` enters GATT readiness.

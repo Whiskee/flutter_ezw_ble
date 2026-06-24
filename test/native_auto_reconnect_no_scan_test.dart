@@ -77,6 +77,14 @@ void main() {
     );
     expect(
       androidReconnect,
+      contains('误判为“仍有等待任务”而无法重建 GATT'),
+    );
+    expect(
+      androidReconnect,
+      isNot(contains('task.timer == null')),
+    );
+    expect(
+      androidReconnect,
       isNot(
         contains(
             'handleConnectState(task.uuid, task.name, BleConnectState.TIMEOUT)'),
