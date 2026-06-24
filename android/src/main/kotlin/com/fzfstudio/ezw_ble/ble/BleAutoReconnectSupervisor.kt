@@ -191,7 +191,7 @@ internal class BleAutoReconnectSupervisor(
      *
      * 非系统/链路/GATT readiness 失败不会触发回连，避免用户主动断开后又被 native 拉起。
      */
-    fun schedule(uuid: String, state: BleConnectState) {
+    fun schedule(uuid: String, state: BleConnectState, overrideDelayMs: Long? = null) {
         // 1. 非回连状态直接忽略。
         if (!shouldScheduleReconnect(state)) {
             return
@@ -217,7 +217,7 @@ internal class BleAutoReconnectSupervisor(
         //    自动回连的停止源只能是用户/业务主动取消、配置关闭、reset/release 或进程死亡。
         task.timer?.cancel()
         val nextAttempt = nextAttemptCount(task.attempt)
-        val delayMs = calculateDelay(config, nextAttempt)
+        val delayMs = overrideDelayMs ?: calculateDelay(config, nextAttempt)
         val timer = Timer()
         task.timer = timer
         timer.schedule(object : TimerTask() {
@@ -361,10 +361,11 @@ internal class BleAutoReconnectSupervisor(
         val timer = Timer()
         task.timer = timer
 
-        // 2. watchdog 至少覆盖一次 connectTimeout。
-        val watchdogMs = config.autoReconnectMaxDelayMs
-            .coerceAtLeast(config.connectTimeout.toInt())
-            .toLong()
+        // 2. passive pending 不是前台连接超时；它的目标是持续刷新底层 autoConnect 句柄。
+        // 这里使用短周期，避免设备回到手机附近后还卡在 30s attempt 退避窗口。
+        val watchdogMs = PASSIVE_REFRESH_WATCHDOG_MS
+            .coerceAtLeast(config.autoReconnectBaseDelayMs.toLong())
+            .coerceAtMost(config.autoReconnectMaxDelayMs.toLong())
         timer.schedule(object : TimerTask() {
             override fun run() {
                 mainScope().launch {
@@ -389,7 +390,7 @@ internal class BleAutoReconnectSupervisor(
                     // 6. watchdog 只刷新底层 passive handle，不向 Dart/UI 推 TIMEOUT。
                     // autoReconnect 的可见语义保持为“持续连接中”，直到用户取消或真实连接成功。
                     sendLog(BleLoggerTag.d, "Auto reconnect: ${task.uuid}, passive watchdog refresh")
-                    schedule(task.uuid, BleConnectState.TIMEOUT)
+                    schedule(task.uuid, BleConnectState.TIMEOUT, PASSIVE_REFRESH_RETRY_DELAY_MS)
                 }
             }
         }, watchdogMs)
@@ -420,6 +421,12 @@ internal class BleAutoReconnectSupervisor(
     private companion object {
         /** Even 插件内部的蓝牙开启状态值。 */
         private const val BLE_STATE_ON = 5
+
+        /** passive autoConnect 僵住时的刷新周期；短周期保证设备回到附近后能快速重建 GATT。 */
+        private const val PASSIVE_REFRESH_WATCHDOG_MS = 5000L
+
+        /** watchdog 关闭旧 passive GATT 后的重试延迟，和指数退避解耦。 */
+        private const val PASSIVE_REFRESH_RETRY_DELAY_MS = 1000L
 
         /** 统一 uuid key，规避 MAC 大小写差异。 */
         private fun reconnectKey(uuid: String): String = uuid.lowercase()

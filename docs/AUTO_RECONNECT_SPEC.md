@@ -115,6 +115,12 @@ Native reconnect is a persistent intent after `deviceConnected(uuid)`. Reaching
 refresh a native passive handle. A successful business `connected` resets the
 attempt counter.
 
+Android passive refresh is intentionally decoupled from the exponential backoff.
+Once the supervisor owns an `autoConnect=true` GATT, the watchdog closes stale
+pending handles on a short fixed cadence and schedules the replacement handle
+with a short retry delay. This keeps a device that returns after several minutes
+from waiting behind a maxed-out `autoReconnectMaxDelayMs` attempt window.
+
 Backoff is not the primary wakeup mechanism on iOS. When a known iOS peripheral supports native passive reconnect, the reconnect attempt should immediately create a CoreBluetooth pending connect and let the OS hold it while the app is backgrounded, suspended, or later restored. App timers are allowed only as foreground/manual-connect watchdogs or Android vendor-stack cleanup; they must not be the thing that waits for an iOS device to return.
 
 ## GATT Restoration Gate
@@ -148,12 +154,14 @@ Android uses the existing active `connect(...)` path first. This preserves:
 - System GATT connected detection.
 - Scan-then-connect pending queue and self-lock prevention.
 
-When active reconnect cannot see the target and `autoReconnectUseNativePassive == true`, Android may use `BluetoothDevice.connectGatt(..., autoConnect = true, ...)` as a passive reconnect handle. The supervisor must still keep a watchdog; when the watchdog expires, it closes the pending GATT, applies backoff, and creates a fresh passive handle without emitting a Dart/UI timeout. This avoids vendor Bluetooth stacks leaving a zombie pending connection forever while the visible app state remains connecting.
+When active reconnect cannot see the target and `autoReconnectUseNativePassive == true`, Android may use `BluetoothDevice.connectGatt(..., autoConnect = true, ...)` as a passive reconnect handle. The supervisor must still keep a watchdog; when the watchdog expires, it closes the pending GATT and creates a fresh passive handle without emitting a Dart/UI timeout. This avoids vendor Bluetooth stacks leaving a zombie pending connection forever while the visible app state remains connecting.
 
 The Android watchdog is a zombie-GATT refresh mechanism, not a stop condition or
 visible connection failure.
 If the device remains away for a long time, the supervisor keeps recreating or
 rescheduling the reconnect attempt until the task is explicitly cancelled.
+The refresh cadence must stay short and bounded separately from attempt backoff;
+attempt count is diagnostic in this path, not the delay source.
 The scheduled refresh attempt must clear the fired timer before duplicate
 connection guards run; otherwise the supervisor can reject its own refresh while
 the device is still visibly `CONNECTING` and `passiveGatt` has already been

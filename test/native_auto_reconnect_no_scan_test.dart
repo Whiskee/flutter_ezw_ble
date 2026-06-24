@@ -77,6 +77,23 @@ void main() {
     );
     expect(
       androidReconnect,
+      contains('PASSIVE_REFRESH_WATCHDOG_MS = 5000L'),
+    );
+    expect(
+      androidReconnect,
+      contains('PASSIVE_REFRESH_RETRY_DELAY_MS = 1000L'),
+    );
+    expect(
+      androidReconnect,
+      contains(
+          'schedule(task.uuid, BleConnectState.TIMEOUT, PASSIVE_REFRESH_RETRY_DELAY_MS)'),
+    );
+    expect(
+      androidReconnect,
+      contains('overrideDelayMs ?: calculateDelay(config, nextAttempt)'),
+    );
+    expect(
+      androidReconnect,
       contains('误判为“仍有等待任务”而无法重建 GATT'),
     );
     expect(
