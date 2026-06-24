@@ -935,10 +935,11 @@ Symptoms:
 - Android R1 may log `passive watchdog refresh`, then `schedule attempt 2`,
   followed by `ignored because state=CONNECTING passiveGatt=false`; after that
   the UI stays connecting forever and no new passive GATT is created.
-- After about 5 minutes away from the phone, Android may log
-  `passive watchdog refresh` followed by `schedule attempt 11 after 30000ms`;
-  multiple devices then take minutes to recover because each passive handle waits
-  behind the max backoff window.
+- A bad acceleration attempt may log `passive watchdog refresh` followed by
+  `schedule attempt N after 1000ms`, with repeated Android
+  `cancelOpen/close/unregisterApp/registerApp` for G2 left, G2 right, and R1.
+  This means the app is destroying the native pending autoConnect handle before
+  Android has a stable chance to reconnect.
 
 Root cause:
 
@@ -953,10 +954,9 @@ Root cause:
   `beginAttempt` checks `task.timer == null` before clearing the fired timer,
   the refresh attempt is rejected by its own timer while the visible device
   state is intentionally still `CONNECTING`.
-- Reusing exponential attempt backoff for Android passive refresh makes the
-  refresh cadence slower the longer the device is away. That is too conservative
-  for `autoConnect=true`, whose job is to keep a fresh native rendezvous point
-  ready for the device return.
+- `autoConnect=true` is itself the native rendezvous point. Treating it like a
+  scan loop and recreating it every few seconds resets that rendezvous point and
+  can be worse than waiting behind backoff.
 - iOS CoreBluetooth pending connect is the system wake/reconnect point; app
   timers or attempt counters must not cancel it while waiting for the peripheral
   to return.
@@ -968,11 +968,13 @@ Fix:
   process actually dies.
 - Do not use `autoReconnectMaxAttempts` as a stop condition. Keep the field only
   for compatibility/backoff diagnostics.
-- On Android, let passive watchdog close the stale GATT and schedule the next
-  attempt without emitting a Dart/UI `timeout`; visible state stays connecting.
-- Decouple Android passive refresh from ordinary attempt backoff: use a short
-  fixed watchdog cadence and a short retry delay after closing the stale pending
-  GATT. Attempt count remains diagnostic only in this path.
+- On Android, keep a live pending passive GATT registered and let the watchdog
+  observe/re-arm without emitting a Dart/UI `timeout`; visible state stays
+  connecting.
+- Do not decouple Android passive refresh by adding a short close/recreate loop.
+  A live pending passive GATT should stay registered; the watchdog may observe
+  and re-arm itself, and should rebuild only if the passive handle is already
+  missing.
 - When the scheduled passive refresh attempt fires, clear `task.timer` before
   duplicate-connection guards, and allow `previousState=TIMEOUT +
   state=CONNECTING + passiveGatt=null` to rebuild the passive GATT.

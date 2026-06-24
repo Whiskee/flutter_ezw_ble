@@ -73,24 +73,19 @@ void main() {
     );
     expect(
       androidReconnect,
-      contains('passive watchdog refresh'),
+      contains('passive watchdog observed pending connect'),
     );
     expect(
       androidReconnect,
-      contains('PASSIVE_REFRESH_WATCHDOG_MS = 5000L'),
+      contains('passive watchdog rebuild missing handle'),
     );
     expect(
       androidReconnect,
-      contains('PASSIVE_REFRESH_RETRY_DELAY_MS = 1000L'),
+      contains('频繁关闭 pending GATT 会不断 unregister/register'),
     );
     expect(
       androidReconnect,
-      contains(
-          'schedule(task.uuid, BleConnectState.TIMEOUT, PASSIVE_REFRESH_RETRY_DELAY_MS)'),
-    );
-    expect(
-      androidReconnect,
-      contains('overrideDelayMs ?: calculateDelay(config, nextAttempt)'),
+      isNot(contains('PASSIVE_REFRESH_RETRY_DELAY_MS')),
     );
     expect(
       androidReconnect,
