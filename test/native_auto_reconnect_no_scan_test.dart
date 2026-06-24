@@ -62,12 +62,25 @@ void main() {
     expect(
       iosManager,
       contains(
-          'native passive watchdog emitted timeout without cancelling pending connect'),
+          'native passive watchdog observed pending connect, keep connecting'),
     );
     expect(
       iosManager,
-      contains(
-          'sendConnectStateToFlutter(uuid: uuid, name: name, state: .timeout'),
+      isNot(
+        contains(
+            'sendConnectStateToFlutter(uuid: uuid, name: name, state: .timeout'),
+      ),
+    );
+    expect(
+      androidReconnect,
+      contains('passive watchdog refresh'),
+    );
+    expect(
+      androidReconnect,
+      isNot(
+        contains(
+            'handleConnectState(task.uuid, task.name, BleConnectState.TIMEOUT)'),
+      ),
     );
   });
 }

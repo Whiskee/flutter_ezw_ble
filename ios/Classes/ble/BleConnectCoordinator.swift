@@ -250,7 +250,7 @@ extension BleManager {
         }
         if nativePassiveReconnect && oldPeripheral.state != .connected {
             // 被动回连必须让 CoreBluetooth 长时间持有 pending connect，短 timer 会破坏 State Restoration 唤醒点。
-            // 这里改用观察 watchdog：超时只通知 Dart/UI 退出普通 connecting，不取消 pending connect。
+            // 这里的 watchdog 只记录 pending 是否仍被系统持有，UI 继续保持 connecting。
             startNativePassiveReconnectWatchdog(
                 currentConfig: bleConfig,
                 uuid: newEasyConnect.uuid,

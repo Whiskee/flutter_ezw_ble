@@ -946,12 +946,12 @@ extension BleManager {
     /**
      *  启动 iOS native passive reconnect 观察 watchdog。
      *
-     *  该 watchdog 只负责解除 Dart/UI 的普通 `connecting` 卡死，不取消
-     *  CoreBluetooth pending connect，也不移除 active request；否则设备稍后真正
-     *  didConnect 时会丢失 bleConfig，State Restoration 的系统唤醒点也会被破坏。
+     *  该 watchdog 只观测 pending connect 是否仍被系统持有，不再把等待态改成
+     *  timeout。autoReconnect 的产品语义是“用户未主动取消前持续连接中”，因此
+     *  CoreBluetooth pending connect 和 Dart/UI 的 connecting 必须保持一致。
      */
     func startNativePassiveReconnectWatchdog(currentConfig: BleConfig, uuid: String, name: String) {
-        // 1、同一 endpoint 只保留一个观察 timer，避免重复向 Dart 推 timeout。
+        // 1、同一 endpoint 只保留一个观察 timer，避免重复记录 pending 状态。
         cancelNativePassiveReconnectWatchdog(uuid: uuid, name: name)
         let timeout = TimeInterval(
             max(currentConfig.autoReconnectMaxDelayMs, Int(currentConfig.connectTimeout))
@@ -971,9 +971,9 @@ extension BleManager {
             })?.isConnected != true else {
                 return
             }
-            // 4、只给 Dart 一个可恢复终态，native pending connect 继续留给 CoreBluetooth 持有。
-            self.sendConnectStateToFlutter(uuid: uuid, name: name, state: .timeout, mtu: 247)
-            self.loggerD(msg: "autoReconnect: \(uuid)-\(name), native passive watchdog emitted timeout without cancelling pending connect")
+            // 4、pending connect 仍有效时保持 Dart/UI 的 connecting 状态；真正退出只由
+            // 用户取消、蓝牙关闭/reset、真实连接成功或后续 CoreBluetooth 终态驱动。
+            self.loggerD(msg: "autoReconnect: \(uuid)-\(name), native passive watchdog observed pending connect, keep connecting")
         }
         passiveReconnectWatchdogTimers.append((uuid, name, timer))
         loggerD(msg: "autoReconnect: \(uuid)-\(name), start native passive watchdog \(Int(timeout * 1000))ms")
@@ -1152,7 +1152,7 @@ extension BleManager {
             cancelScanConnectTimeout(uuid: uuid, name: name)
         }
         if state != .connecting {
-            // native passive watchdog 只覆盖「pending connect 无任何 CoreBluetooth 回调」窗口；
+            // native passive watchdog 只观察「pending connect 无任何 CoreBluetooth 回调」窗口；
             // 一旦进入 didConnect/GATT/终态路径，后续交给普通连接超时和状态机处理。
             cancelNativePassiveReconnectWatchdog(uuid: uuid, name: name)
         }

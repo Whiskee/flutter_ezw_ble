@@ -929,7 +929,7 @@ Symptoms:
 - A device was business connected, auto reconnect was enabled, and then the
   device stayed away for many minutes.
 - When the device comes back, no new native reconnect attempt appears.
-- Logs may show repeated `timeout`, `noDeviceFound`, passive watchdog timeout,
+- Logs may show repeated `timeout`, `noDeviceFound`, passive watchdog refresh,
   or an old `max attempts reached` / `skip attempt` message before reconnect
   activity stops.
 
@@ -953,9 +953,10 @@ Fix:
   process actually dies.
 - Do not use `autoReconnectMaxAttempts` as a stop condition. Keep the field only
   for compatibility/backoff diagnostics.
-- On Android, let passive watchdog timeout close the stale GATT and schedule the
-  next attempt.
-- On iOS, keep native passive reconnect as a CoreBluetooth pending connect and
+- On Android, let passive watchdog close the stale GATT and schedule the next
+  attempt without emitting a Dart/UI `timeout`; visible state stays connecting.
+- On iOS, keep native passive reconnect as a CoreBluetooth pending connect. The
+  watchdog may log pending status, but it must not emit Dart/UI `timeout`;
   start short timeouts only after `didConnect` enters GATT readiness.
 
 Owner:

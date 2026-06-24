@@ -148,9 +148,10 @@ Android uses the existing active `connect(...)` path first. This preserves:
 - System GATT connected detection.
 - Scan-then-connect pending queue and self-lock prevention.
 
-When active reconnect cannot see the target and `autoReconnectUseNativePassive == true`, Android may use `BluetoothDevice.connectGatt(..., autoConnect = true, ...)` as a passive reconnect handle. The supervisor must still keep a watchdog; when the watchdog expires, it closes the pending GATT, applies backoff, and creates a fresh passive handle. This avoids vendor Bluetooth stacks leaving a zombie pending connection forever.
+When active reconnect cannot see the target and `autoReconnectUseNativePassive == true`, Android may use `BluetoothDevice.connectGatt(..., autoConnect = true, ...)` as a passive reconnect handle. The supervisor must still keep a watchdog; when the watchdog expires, it closes the pending GATT, applies backoff, and creates a fresh passive handle without emitting a Dart/UI timeout. This avoids vendor Bluetooth stacks leaving a zombie pending connection forever while the visible app state remains connecting.
 
-The Android watchdog is a zombie-GATT refresh mechanism, not a stop condition.
+The Android watchdog is a zombie-GATT refresh mechanism, not a stop condition or
+visible connection failure.
 If the device remains away for a long time, the supervisor keeps recreating or
 rescheduling the reconnect attempt until the task is explicitly cancelled.
 
@@ -176,8 +177,8 @@ still work while State Restoration background relaunch is disabled.
 Do not start the short connect timeout while the reconnect is only pending in CoreBluetooth; otherwise the app can cancel the preserved connect before the peripheral returns. Start the normal timeout after `didConnect`, then require service discovery, characteristic discovery, CCCD writes, `connectFinish`, G2 AUTH, and final `deviceConnected`.
 
 CoreBluetooth pending connect is the iOS long-wait mechanism. App timers may
-update diagnostics or foreground UI, but must not cancel the pending connect
-just because the peripheral stayed away for minutes or hours.
+update diagnostics, but must not cancel the pending connect or emit a Dart/UI
+timeout just because the peripheral stayed away for minutes or hours.
 
 ## even_connect Integration
 

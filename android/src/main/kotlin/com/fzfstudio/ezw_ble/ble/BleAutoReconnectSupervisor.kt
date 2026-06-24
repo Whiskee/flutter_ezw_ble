@@ -244,9 +244,16 @@ internal class BleAutoReconnectSupervisor(
         }
 
         // 2. 已连接/正在连接/已有 passive GATT 时不重复打开新 GATT。
+        // passive watchdog 会关闭僵死 GATT，但 UI 仍保持 CONNECTING；此时允许
+        // TIMEOUT 原因进入下一轮，重建底层 passive handle。
         val currentDevice = connectedDevices.firstOrNull { it.uuid.equals(uuid, ignoreCase = true) }
+        val isPassiveRefresh =
+            previousState == BleConnectState.TIMEOUT &&
+                currentDevice?.connectState?.isFlowConnecting == true &&
+                task.passiveGatt == null &&
+                task.timer == null
         if (
-            currentDevice?.connectState?.isFlowConnecting == true ||
+            (currentDevice?.connectState?.isFlowConnecting == true && !isPassiveRefresh) ||
             currentDevice?.connectState?.isConnected == true ||
             task.passiveGatt != null
         ) {
@@ -328,9 +335,9 @@ internal class BleAutoReconnectSupervisor(
         // 6. 系统未创建 GATT session 时，按 timeout 进入下一轮调度。
         if (gatt == null) {
             sendLog(BleLoggerTag.e, "Auto reconnect: ${task.uuid}, passive connectGatt returned null")
-            // CONNECTING 已经发给 Dart，必须通过统一状态机落到终态；直接 schedule 会
-            // 留下 FlowConnecting 状态，下一轮 beginAttempt 会被自己挡住。
-            handleConnectState(task.uuid, resolvedName, BleConnectState.TIMEOUT)
+            // CONNECTING 已经发给 Dart；autoReconnect 未取消前 UI 继续保持连接中，
+            // 下一轮由 beginAttempt 的 passive refresh 分支重建底层 handle。
+            schedule(task.uuid, BleConnectState.TIMEOUT)
             return
         }
 
@@ -375,10 +382,12 @@ internal class BleAutoReconnectSupervisor(
                     } catch (_: Exception) {
                     }
                     current.passiveGatt = null
+                    current.timer = null
 
-                    // 6. 以 TIMEOUT 回到统一状态机，由 schedule 决定是否继续。
-                    handleConnectState(task.uuid, task.name, BleConnectState.TIMEOUT)
-                    sendLog(BleLoggerTag.e, "Auto reconnect: ${task.uuid}, passive watchdog timeout")
+                    // 6. watchdog 只刷新底层 passive handle，不向 Dart/UI 推 TIMEOUT。
+                    // autoReconnect 的可见语义保持为“持续连接中”，直到用户取消或真实连接成功。
+                    sendLog(BleLoggerTag.d, "Auto reconnect: ${task.uuid}, passive watchdog refresh")
+                    schedule(task.uuid, BleConnectState.TIMEOUT)
                 }
             }
         }, watchdogMs)
