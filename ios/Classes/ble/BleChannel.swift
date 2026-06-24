@@ -11,154 +11,7 @@ typealias EvenConnectStreamHandler = NSObject & FlutterStreamHandler
 
 /// Event Channel 事件存储
 private var bleEvents: Dictionary<String, FlutterEventSink> = [:]
-
-/// Method Channel
-enum BleMC: String {
-    case getPlatformVersion
-    //  当前蓝牙状态
-    //  - unknown = 0
-    //  - resetting = 1
-    //  - unsupported = 2
-    //  - unauthorized = 3
-    //  - poweredOff = 4
-    //  - poweredOn = 5
-    case bleState
-    //  设置蓝牙配置
-    case initConfigs
-    //  开始扫描设备
-    case startScan
-    //  停止扫描设备
-    case stopScan
-    //  连接设备(uuid)
-    case connectDevice
-    //  断连设备(uuid)
-    case disconnectDevice
-    //  设置设备预连接
-    case devicePreConnected
-    //  主动回复设备连接成功
-    case deviceConnected
-    //  发送指令
-    case sendCmd
-    //  发送指令(不等待响应, 仅 OTA 通道走 WriteWithoutResponse + 背压队列)
-    case sendCmdNoWait
-    //  进入升级模式
-    case enterUpgradeState
-    //  退出升级模式
-    case quiteUpgradeState
-    //  打开蓝牙设置页面
-    case openBleSettings
-    //  打开App设置页面
-    case openAppSettings
-    //  清除连接缓存
-    case cleanConnectCache
-    //  重置
-    case resetBle
-    //  未知
-    case unknown
-    
-    /**
-     *  处理回调结果
-     */
-    func handle(arguments: Any?,  result: @escaping FlutterResult) {
-        switch self {
-        case .getPlatformVersion:
-            result("iOS " + UIDevice.current.systemVersion)
-            return
-        case .bleState:
-            result(BleManager.shared.currentBleState)
-            return
-        case .initConfigs:
-            let jsonArray: Array<[String:Any]> = arguments as? Array<[String:Any]> ?? []
-            let configs: Array<BleConfig?> = jsonArray
-                .map { jsonData in
-                    jsonData.decodeTo()
-                }
-                .filter { $0 != nil }
-            BleManager.shared.initConfigs(configs: configs.map { $0! })
-            break
-        case .startScan:
-            let jsonData: [String:Any] = arguments as? [String:Any] ?? [:]
-            let turnOnPureModel = jsonData["turnOnPureModel"] as? Bool ?? false
-            BleManager.shared.startScan(pureModel: turnOnPureModel)
-            break
-        case .stopScan:
-            BleManager.shared.stopScan()
-            break
-        case .connectDevice:
-            let jsonData: [String:Any] = arguments as? [String:Any] ?? [:]
-            let easyConnect: BleEasyConnect? = jsonData.decodeTo()
-            if let easyConnect: BleEasyConnect = jsonData.decodeTo() {
-                BleManager.shared.connect(easyConnect: easyConnect)
-            }
-            break
-        case .deviceConnected:
-            let uuid = arguments as? String ?? ""
-            BleManager.shared.setConnected(uuid: uuid)
-            break
-        case .devicePreConnected:
-            let uuid = arguments as? String ?? ""
-            BleManager.shared.setPreConnected(uuid: uuid)
-            break
-        case .disconnectDevice:
-            let jsonData = arguments as? [String:Any] ?? [:]
-            let uuid: String = jsonData["uuid"] as? String ?? ""
-            let name: String = jsonData["name"] as? String ?? ""
-            BleManager.shared.disconnect(uuid: uuid,name: name)
-            break
-        case .sendCmd:
-            let jsonData: [String:Any] = arguments as? [String:Any] ?? [:]
-            let uuid: String = jsonData["uuid"] as? String ?? ""
-            let psType: Int = jsonData["psType"] as? Int ?? 0
-            if let data = jsonData["data"] as? FlutterStandardTypedData {
-                BleManager.shared.sendCmd(uuid: uuid, data: data.data, psType: psType)
-            }
-            //  由于iOS蓝牙发送数据没有系统回调是否发送成功，只能等待15ms保证数据是发送出去的
-            result(nil)
-            return
-        case .sendCmdNoWait:
-            //  - psType==1 (OTA) 走 WriteWithoutResponse + 背压队列, result 由队列内部 pump 后回调;
-            //  - 其它 psType 退化为现有 sendCmd 行为(WriteWithoutResponse 立即返回).
-            let jsonData: [String:Any] = arguments as? [String:Any] ?? [:]
-            let uuid: String = jsonData["uuid"] as? String ?? ""
-            let psType: Int = jsonData["psType"] as? Int ?? 0
-            guard let data = jsonData["data"] as? FlutterStandardTypedData else {
-                result(nil)
-                return
-            }
-            BleManager.shared.sendCmdNoWait(uuid: uuid, data: data.data, psType: psType, result: result)
-            return
-        case .enterUpgradeState:
-            let uuid = arguments as? String ?? ""
-            BleManager.shared.enterUpgradeState(uuid: uuid)
-            break
-        case .quiteUpgradeState:
-            let uuid = arguments as? String ?? ""
-            BleManager.shared.quiteUpgradeState(uuid: uuid)
-            break
-        case .cleanConnectCache:
-            BleManager.shared.cleanConnectCache()
-            break
-        case .resetBle:
-            BleManager.shared.reset()
-            break
-        case .openBleSettings:
-            if let url = URL(string: "App-Prefs:root=Bluetooth"), UIApplication.shared.canOpenURL(url) {
-                UIApplication.shared.open(url, options: [:], completionHandler: nil)
-            }
-            break
-        case .openAppSettings:
-            if let settingsURL = URL(string: UIApplication.openSettingsURLString),
-               UIApplication.shared.canOpenURL(settingsURL) {
-                UIApplication.shared.open(settingsURL, options: [:], completionHandler: nil)
-            }
-            break
-        default:
-            break
-        }
-        result(nil)
-    }
-}
-
+private var pendingBleEvents: Dictionary<String, [Any]> = [:]
 
 /// Event Channel
 enum BleEC: String, CaseIterable {
@@ -199,6 +52,19 @@ enum BleEC: String, CaseIterable {
         }
         return bleEvents[eventLabel]
     }
+
+    func emit(_ value: Any) {
+        if let event = event() {
+            event(value)
+            return
+        }
+        var pending = pendingBleEvents[eventLabel] ?? []
+        pending.append(value)
+        if pending.count > 120 {
+            pending.removeFirst(pending.count - 120)
+        }
+        pendingBleEvents[eventLabel] = pending
+    }
 }
 
 
@@ -213,6 +79,11 @@ extension FlutterEzwBlePlugin: FlutterStreamHandler {
             return nil
         }
         bleEvents[eventName] = events
+        if let pending = pendingBleEvents.removeValue(forKey: eventName) {
+            pending.forEach { value in
+                events(value)
+            }
+        }
         return nil
     }
     

@@ -4,7 +4,13 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   test('iOS scan-then-connect paths are guarded by a timeout', () {
-    final source = File('ios/Classes/ble/BleManager.swift').readAsStringSync();
+    final managerSource =
+        File('ios/Classes/ble/BleManager.swift').readAsStringSync();
+    final connectSource =
+        File('ios/Classes/ble/BleConnectCoordinator.swift').readAsStringSync();
+    final scanSource =
+        File('ios/Classes/ble/BleScanPipeline.swift').readAsStringSync();
+    final source = '$managerSource\n$connectSource\n$scanSource';
 
     expect(source, contains('scanConnectTimeoutTimers'));
     expect(source, contains('startScanConnectTimeout'));
@@ -21,7 +27,8 @@ void main() {
     );
     expect(
       source,
-      contains('let cachedServiceUUIDs = bleConfig.privateServices.map { \$0.serviceUUID }'),
+      contains(
+          'let cachedServiceUUIDs = bleConfig.privateServices.map { \$0.serviceUUID }'),
     );
     expect(
       source,
@@ -29,7 +36,8 @@ void main() {
     );
     expect(
       source,
-      contains('cached device is system-connected (ANCS), skip scan, connect directly'),
+      contains(
+          'cached device is system-connected (ANCS), skip scan, connect directly'),
     );
     expect(
       source,
@@ -49,7 +57,10 @@ void main() {
     );
     expect(source, isNot(contains('peripheral.name!')));
     expect(source, contains('afterUpgrade: afterUpgrade, isAuthGrace: true'));
-    expect(source, contains('cancelScanConnectTimeout(uuid: connectDevice.uuid, name: connectDevice.name)'));
+    expect(
+        source,
+        contains(
+            'cancelScanConnectTimeout(uuid: request.uuid, name: request.name)'));
     expect(source, contains('scanConnectTimeoutTimers.forEach'));
     expect(source, contains('connectingTimeoutTimers.forEach'));
   });

@@ -5,18 +5,17 @@ PODS:
     - flutter_ezw_utils
   - flutter_ezw_utils (0.0.1):
     - Flutter
-  - integration_test (0.0.1):
+  - flutter_keyboard_visibility (0.0.1):
     - Flutter
-  - shared_preferences_foundation (0.0.1):
+  - permission_handler_apple (9.3.0):
     - Flutter
-    - FlutterMacOS
 
 DEPENDENCIES:
   - Flutter (from `Flutter`)
   - flutter_ezw_ble (from `.symlinks/plugins/flutter_ezw_ble/ios`)
   - flutter_ezw_utils (from `.symlinks/plugins/flutter_ezw_utils/ios`)
-  - integration_test (from `.symlinks/plugins/integration_test/ios`)
-  - shared_preferences_foundation (from `.symlinks/plugins/shared_preferences_foundation/darwin`)
+  - flutter_keyboard_visibility (from `.symlinks/plugins/flutter_keyboard_visibility/ios`)
+  - permission_handler_apple (from `.symlinks/plugins/permission_handler_apple/ios`)
 
 EXTERNAL SOURCES:
   Flutter:
@@ -25,18 +24,18 @@ EXTERNAL SOURCES:
     :path: ".symlinks/plugins/flutter_ezw_ble/ios"
   flutter_ezw_utils:
     :path: ".symlinks/plugins/flutter_ezw_utils/ios"
-  integration_test:
-    :path: ".symlinks/plugins/integration_test/ios"
-  shared_preferences_foundation:
-    :path: ".symlinks/plugins/shared_preferences_foundation/darwin"
+  flutter_keyboard_visibility:
+    :path: ".symlinks/plugins/flutter_keyboard_visibility/ios"
+  permission_handler_apple:
+    :path: ".symlinks/plugins/permission_handler_apple/ios"
 
 SPEC CHECKSUMS:
   Flutter: e0871f40cf51350855a761d2e70bf5af5b9b5de7
   flutter_ezw_ble: 684455e64acc3989dc94ffdce397da3ab10d4179
   flutter_ezw_utils: 02f8ed48d61b2f9b7643407e97047dba1455abf4
-  integration_test: 4a889634ef21a45d28d50d622cf412dc6d9f586e
-  shared_preferences_foundation: 9e1978ff2562383bd5676f64ec4e9aa8fa06a6f7
+  flutter_keyboard_visibility: 4625131e43015dbbe759d9b20daaf77e0e3f6619
+  permission_handler_apple: 4ed2196e43d0651e8ff7ca3483a069d469701f2d
 
-PODFILE CHECKSUM: 4305caec6b40dde0ae97be1573c53de1882a07e5
+PODFILE CHECKSUM: 3a480e0b2e5c980d37f251b32d231e4aabb64da0
 
 COCOAPODS: 1.16.2

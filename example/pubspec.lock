@@ -2,12 +2,13 @@
 # See https://dart.dev/tools/pub/glossary#lockfile
 packages:
   app_settings:
-    dependency: transitive
+    dependency: "direct overridden"
     description:
-      name: app_settings
-      sha256: "3e46c561441e5820d3a25339bf8b51b9e45a5f686873851a20c257a530917795"
-      url: "https://pub.dev"
-    source: hosted
+      path: "."
+      ref: "30f3d52314e24c934cafaf383e68c8085c8cda41"
+      resolved-ref: "30f3d52314e24c934cafaf383e68c8085c8cda41"
+      url: "https://github.com/rhbrunetto/app_settings.git"
+    source: git
     version: "6.1.1"
   archive:
     dependency: transitive
@@ -400,7 +401,7 @@ packages:
     source: hosted
     version: "2.3.0"
   permission_handler:
-    dependency: transitive
+    dependency: "direct main"
     description:
       name: permission_handler
       sha256: bc917da36261b00137bbc8896bf1482169cd76f866282368948f032c8c1caae1
@@ -504,7 +505,7 @@ packages:
     source: hosted
     version: "1.26.1"
   shared_preferences:
-    dependency: transitive
+    dependency: "direct main"
     description:
       name: shared_preferences
       sha256: "6e8bf70b7fef813df4e9a36f658ac46d107db4b4cfe1048b477d4e453a8159f5"

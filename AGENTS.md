@@ -9,7 +9,10 @@
 优先阅读：
 
 - `ARCHITECTURE.md`：插件契约、MethodChannel/EventChannel API、模型、原生职责和扩展规则。
-- `IOS_OTA_NOWAIT_SPEC.md`：改 iOS OTA `WriteWithoutResponse` 行为前必须阅读。
+- `docs/AUTO_RECONNECT_SPEC.md`：改自动回连、长期 reconnect intent、GATT readiness gate 前必须阅读。
+- `docs/IOS_STATE_RESTORATION_SPEC.md`：改 iOS CoreBluetooth State Preservation / Restoration 前必须阅读。
+- `docs/IOS_OTA_NOWAIT_SPEC.md`：改 iOS OTA `WriteWithoutResponse` 行为前必须阅读。
+- `docs/ble/BLE_ISSUE_PLAYBOOK.md`：排查扫描、连接、重连、State Restoration 和 example 启动问题时优先查看。
 - `README.md`：排障说明和 HCI 错误码参考。
 
 ## 关键边界
@@ -21,16 +24,21 @@
 - `lib/core/models/**` 是 JSON 序列化的 BLE 配置、设备、扫描、连接、状态和命令模型。
 - `android/src/main/kotlin/com/fzfstudio/ezw_ble/**` 是 Android BluetoothGatt 实现。
 - `ios/Classes/**` 是 iOS CoreBluetooth 实现，包含 `BleManager`、`BleChannel` 和 `OtaWriteQueue`。
+- 原生自动回连只在业务调用 `deviceConnected(uuid)` 后启用；`connectFinish` 只表示 GATT ready，不表示业务 connected。
+- `timeout`、`noDeviceFound`、`serviceFail`、`charsFail` 是单次尝试失败，不是长期回连停止条件；只有用户/业务主动断连、移除、reset、清缓存、配置关闭或插件释放才能取消 reconnect intent。
+- iOS State Restoration 只能恢复进程内 BLE 工作和 CoreBluetooth peripheral；私有服务、notify/CCCD、业务认证指令必须重新执行，不承诺把 App UI 拉到前台。
 
 ## 修改规则
 
+- 默认注释策略：任何代码改动都必须同步补充必要注释。新增/重构的类、状态字段、函数、跨异步流程和平台桥接逻辑必须写清楚“为什么这样做”和“关键流程顺序”；不要等用户再次提醒才补注释。
 - 新增 MethodChannel 方法时，同步更新 platform interface、Dart method-channel 实现、Android 分发/实现、iOS 分发/实现和测试。
 - 新增 EventChannel 时，同步更新枚举、Dart stream 映射和两个平台的事件源。
 - `ezwBleTag` 和 channel name 拼接规则必须与原生常量保持一致。
 - `initConfigs` 必须使用 `customToJson` 序列化嵌套模型，不要改成浅层 JSON。
 - 不要手工编辑 `*.g.dart`。修改源模型后运行 build_runner。
 - `receiveData` 的二进制 payload 跨 Method/EventChannel 时保持 Base64 约定。
-- iOS OTA 中 `psType == 1` 的 `sendCmdNoWait` 必须与 `OtaWriteQueue`、`canSendWriteWithoutResponse` 和 `IOS_OTA_NOWAIT_SPEC.md` 对齐。
+- iOS OTA 中 `psType == 1` 的 `sendCmdNoWait` 必须与 `OtaWriteQueue`、`canSendWriteWithoutResponse` 和 `docs/IOS_OTA_NOWAIT_SPEC.md` 对齐。
+- 改 auto reconnect 或 iOS State Restoration 时，同步更新 `docs/AUTO_RECONNECT_SPEC.md`、`docs/IOS_STATE_RESTORATION_SPEC.md`、`ARCHITECTURE.md` 和相关测试/排障记录。
 - BLE 行为变化通常需要同时审视 Dart 和原生两端，不要假设 Android 与 iOS 可以共享实现细节。
 
 ## 常用命令
@@ -41,4 +49,3 @@
 - `dart run build_runner build --delete-conflicting-outputs`：重新生成 JSON 模型输出。
 
 使用仓库指定的 Flutter/FVM 版本。声明 channel、模型或原生 BLE 改动完成前运行最窄的相关测试；涉及共享 BLE 行为时运行 `flutter test`。
-

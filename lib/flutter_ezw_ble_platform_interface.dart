@@ -181,4 +181,13 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   Future<void> cleanConnectCache() {
     throw UnimplementedError('cleanConnectCache() has not been implemented.');
   }
+
+  /// 读取并清空原生自动回连/后台恢复期间持久化的事件。
+  ///
+  /// 用于 iOS State Restoration 或 Android 原生回连先于 Dart 监听器发生时，
+  /// 让业务层在启动后补齐 native 侧证据并决定是否继续业务鉴权流程。
+  Future<List<Map<String, dynamic>>> drainAutoReconnectEvents() {
+    throw UnimplementedError(
+        'drainAutoReconnectEvents() has not been implemented.');
+  }
 }

@@ -12,6 +12,10 @@
 	<string>This app requires access to Bluetooth to connect with nearby devices and enhance your user experience.</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>Allow Bluetooth to be turned on in order to use the Bluetooth function</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>bluetooth-central</string>
+	</array>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>

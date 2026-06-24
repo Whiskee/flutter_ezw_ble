@@ -29,7 +29,7 @@ android {
         namespace = "com.fzfstudio.ezw_ble"
     }
 
-    compileSdk = 34
+    compileSdk = 36
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
