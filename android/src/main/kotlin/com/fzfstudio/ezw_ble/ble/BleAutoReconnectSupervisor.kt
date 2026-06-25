@@ -18,7 +18,7 @@ import java.util.TimerTask
 /**
  * Android native 自动回连监督器。
  *
- * 该类拥有回连 task、backoff、passive `autoConnect=true` 和 watchdog。`BleManager` 只告诉它
+ * 该类拥有回连 task、passive `autoConnect=true` 和 watchdog。`BleManager` 只告诉它
  * “某设备已允许回连/需要取消/蓝牙关闭/连接失败”，不再关心具体调度细节。
  */
 internal class BleAutoReconnectSupervisor(
@@ -211,9 +211,21 @@ internal class BleAutoReconnectSupervisor(
             return
         }
 
-        // 5. 新失败原因覆盖旧 timer。自动回连不再做指数退避：首轮立即开始；
-        //    后续重建旧 passive GATT 时使用 5s 固定防抖，降低 register/unregister 过频风险。
+        // 5. 新失败原因覆盖旧 timer。若失败回调来自上一轮 passive GATT，先关闭旧句柄；
+        //    否则 beginAttempt 会因 passiveGatt 仍存在而跳过下一轮重建。
         task.timer?.cancel()
+        if (task.passiveGatt != null) {
+            try {
+                task.passiveGatt?.disconnect()
+                task.passiveGatt?.close()
+            } catch (error: Exception) {
+                sendLog(BleLoggerTag.e, "Auto reconnect: $uuid, close stale passive gatt error = ${error.message}")
+            }
+            task.passiveGatt = null
+        }
+
+        // 6. 自动回连不再做指数退避：首轮立即开始；后续重建旧 passive GATT
+        //    时使用 5s 固定防抖，降低 register/unregister 过频风险。
         val delayMs =
             if (task.attempt == 0 && task.passiveGatt == null) 0L
             else PASSIVE_RECONNECT_DEBOUNCE_MS
@@ -410,7 +422,7 @@ internal class BleAutoReconnectSupervisor(
         /**
          * 计算下一次尝试序号。
          *
-         * 自动回连可能持续很久，序号只用于日志和指数退避；达到 Int 上限后保持饱和，
+         * 自动回连可能持续很久，序号只用于日志；达到 Int 上限后保持饱和，
          * 避免极端长期运行时溢出成负数并破坏 Timer 延迟。
          */
         private fun nextAttemptCount(current: Int): Int =
