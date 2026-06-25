@@ -1557,22 +1557,18 @@ class BleManager private constructor() {
     /**
      * 恢复 Android 返回 GATT_INSUFFICIENT_AUTHORIZATION 后的授权状态。
      *
-     * status=8 通常表示系统当前保存的 GATT cache 或 bond key 已经不能再访问外设服务。
-     * 只继续 passive autoConnect 会反复等满 connectTimeout；这里先刷新 cache，并在系统明确
-     * 显示已 bonded 时清掉 stale bond，让下一轮 autoReconnect 重新建立可用授权。
+     * status=8 只能说明当前 GATT session 被系统拒绝访问，不能等价为系统配对已损坏。
+     * 自动重连场景必须保留用户的系统 bond，否则 G2/R1 会反复弹系统配对框。清 bond 只允许走
+     * 用户明确移除设备时传入的 removeBond=true 路径。
      */
     private fun recoverInsufficientAuthorization(gatt: BluetoothGatt, device: BleDevice) {
         val refreshed = refreshDeviceCache(gatt)
         device.needsScanBeforeConnect = true
         val bondState = gatt.device.bondState
-        val shouldRemoveStaleBond = bondState == BluetoothDevice.BOND_BONDED
         sendLog(
             BleLoggerTag.d,
-            "${device.uuid}, authorization recovery: refresh=$refreshed, bond=${bondState.toBondStateName()}, removeStaleBond=$shouldRemoveStaleBond",
+            "${device.uuid}, authorization recovery: refresh=$refreshed, bond=${bondState.toBondStateName()}, keepBond=true",
         )
-        if (shouldRemoveStaleBond) {
-            removeBond(device.uuid)
-        }
     }
 
     /**
