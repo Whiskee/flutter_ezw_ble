@@ -22,10 +22,6 @@ struct BleConfig: Codable {
     let autoReconnect: Bool
     //  自动回连退避计数兼容字段；当前实现不把次数作为停止条件
     let autoReconnectMaxAttempts: Int
-    //  自动回连初始退避时间(ms)
-    let autoReconnectBaseDelayMs: Int
-    //  自动回连最大退避时间(ms)
-    let autoReconnectMaxDelayMs: Int
     //  是否允许平台被动回连能力
     let autoReconnectUseNativePassive: Bool
     
@@ -38,8 +34,6 @@ struct BleConfig: Codable {
         upgradeSwapTime: TimeInterval = 60000,
         autoReconnect: Bool = false,
         autoReconnectMaxAttempts: Int = 0,
-        autoReconnectBaseDelayMs: Int = 1000,
-        autoReconnectMaxDelayMs: Int = 30000,
         autoReconnectUseNativePassive: Bool = true
     ) {
         self.name = name
@@ -51,8 +45,6 @@ struct BleConfig: Codable {
         self.upgradeSwapTime = upgradeSwapTime
         self.autoReconnect = autoReconnect
         self.autoReconnectMaxAttempts = autoReconnectMaxAttempts
-        self.autoReconnectBaseDelayMs = autoReconnectBaseDelayMs
-        self.autoReconnectMaxDelayMs = autoReconnectMaxDelayMs
         self.autoReconnectUseNativePassive = autoReconnectUseNativePassive
         assert(connectTimeout > 10000, "The timeout period must be greater than 10000ms")
     }
@@ -66,8 +58,6 @@ struct BleConfig: Codable {
         case upgradeSwapTime
         case autoReconnect
         case autoReconnectMaxAttempts
-        case autoReconnectBaseDelayMs
-        case autoReconnectMaxDelayMs
         case autoReconnectUseNativePassive
     }
 
@@ -82,8 +72,6 @@ struct BleConfig: Codable {
             upgradeSwapTime: try container.decodeIfPresent(TimeInterval.self, forKey: .upgradeSwapTime) ?? 60000,
             autoReconnect: try container.decodeIfPresent(Bool.self, forKey: .autoReconnect) ?? false,
             autoReconnectMaxAttempts: try container.decodeIfPresent(Int.self, forKey: .autoReconnectMaxAttempts) ?? 0,
-            autoReconnectBaseDelayMs: try container.decodeIfPresent(Int.self, forKey: .autoReconnectBaseDelayMs) ?? 1000,
-            autoReconnectMaxDelayMs: try container.decodeIfPresent(Int.self, forKey: .autoReconnectMaxDelayMs) ?? 30000,
             autoReconnectUseNativePassive: try container.decodeIfPresent(Bool.self, forKey: .autoReconnectUseNativePassive) ?? true
         )
     }

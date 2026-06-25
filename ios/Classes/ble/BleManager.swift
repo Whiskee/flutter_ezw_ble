@@ -953,9 +953,7 @@ extension BleManager {
     func startNativePassiveReconnectWatchdog(currentConfig: BleConfig, uuid: String, name: String) {
         // 1、同一 endpoint 只保留一个观察 timer，避免重复记录 pending 状态。
         cancelNativePassiveReconnectWatchdog(uuid: uuid, name: name)
-        let timeout = TimeInterval(
-            max(currentConfig.autoReconnectMaxDelayMs, Int(currentConfig.connectTimeout))
-        ) / 1000
+        let timeout = currentConfig.connectTimeout / 1000
         let timer = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { [weak self] _ in
             guard let self = self else { return }
             // 2、timer 触发后先移除自身记录；这是一次性 UI 观测，不做循环重试。

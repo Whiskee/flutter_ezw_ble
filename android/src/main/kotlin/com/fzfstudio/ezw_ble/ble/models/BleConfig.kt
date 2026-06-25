@@ -27,10 +27,6 @@ data class BleConfig(
     val autoReconnect: Boolean = false,
     /** 自动回连退避计数兼容字段；当前实现不把次数作为停止条件。 */
     val autoReconnectMaxAttempts: Int = 0,
-    /** 自动回连初始退避时间，单位毫秒。 */
-    val autoReconnectBaseDelayMs: Int = 1000,
-    /** 自动回连最大退避时间，单位毫秒。 */
-    val autoReconnectMaxDelayMs: Int = 30000,
     /** 是否允许平台 passive autoConnect 能力。 */
     val autoReconnectUseNativePassive: Boolean = true,
 ): GsonSerializable() {

@@ -44,8 +44,6 @@ internal class BleAutoReconnectSupervisor(
     private val persistReconnectTarget: (BleDevice) -> Unit,
     /** 推进连接状态，由 manager 统一清理 GATT/队列/事件。 */
     private val handleConnectState: (String, String, BleConnectState) -> Unit,
-    /** 主动回连时复用 manager 的前台 connect 路由。 */
-    private val activeConnect: (BleReconnectTask) -> Unit,
     /** 统一日志出口。 */
     private val sendLog: (BleLoggerTag, String) -> Unit,
 ) {
@@ -164,8 +162,8 @@ internal class BleAutoReconnectSupervisor(
     /**
      * 蓝牙恢复后重启被暂停的回连任务。
      *
-     * 所有任务都回到 `schedule`，统一遵守 backoff，而不是立即并发连接。
-     * maxAttempts 不能作为停止条件；自动回连是业务 connected 后建立的持续意图。
+     * 所有任务都回到 passive `connectGatt(true)`，不再使用指数退避；自动回连是业务
+     * connected 后建立的持续意图，停止源只能是用户/业务主动取消、配置关闭或 reset/release。
      */
     fun resumeAfterBluetoothOn() {
         // 1. 只恢复因蓝牙关闭暂停的任务。
@@ -213,29 +211,30 @@ internal class BleAutoReconnectSupervisor(
             return
         }
 
-        // 5. 新失败原因覆盖旧 timer。即使尝试次数已经超过历史 maxAttempts，也不能停止；
-        //    自动回连的停止源只能是用户/业务主动取消、配置关闭、reset/release 或进程死亡。
+        // 5. 新失败原因覆盖旧 timer。自动回连不再做指数退避：首轮立即开始；
+        //    后续重建旧 passive GATT 时使用 5s 固定防抖，降低 register/unregister 过频风险。
         task.timer?.cancel()
-        val nextAttempt = nextAttemptCount(task.attempt)
-        val delayMs = calculateDelay(config, nextAttempt)
+        val delayMs =
+            if (task.attempt == 0 && task.passiveGatt == null) 0L
+            else PASSIVE_RECONNECT_DEBOUNCE_MS
         val timer = Timer()
         task.timer = timer
         timer.schedule(object : TimerTask() {
             override fun run() {
                 mainScope().launch {
-                    beginAttempt(task.uuid, state)
+                    beginAttempt(task.uuid)
                 }
             }
         }, delayMs)
-        sendLog(BleLoggerTag.d, "Auto reconnect: $uuid, schedule attempt $nextAttempt after ${delayMs}ms, reason=$state")
+        sendLog(BleLoggerTag.d, "Auto reconnect: $uuid, schedule passive retry after ${delayMs}ms, reason=$state")
     }
 
     /**
      * 执行一次自动回连尝试。
      *
-     * 主动尝试复用 manager 的 connect；passive 尝试使用 Android `autoConnect=true`。
+     * 每次尝试都使用 Android passive `connectGatt(true)`。
      */
-    private fun beginAttempt(uuid: String, previousState: BleConnectState) {
+    private fun beginAttempt(uuid: String) {
         // 1. timer 触发时 task/config 可能已取消或变化，必须重新读取。
         val task = reconnectTasks[reconnectKey(uuid)] ?: return
         val config = bleConfigs().firstOrNull { it.name == task.belongConfig } ?: return
@@ -248,16 +247,10 @@ internal class BleAutoReconnectSupervisor(
         task.timer?.cancel()
         task.timer = null
 
-        // 3. 已连接/正在连接/已有 passive GATT 时不重复打开新 GATT。
-        // passive GATT 活着时必须交给 Android 系统持有，不能被 watchdog 频繁关闭。
-        // 只有没有 passive handle 的 TIMEOUT 才允许重建底层 pending 连接。
+        // 3. 已连接/已有 passive GATT 时不重复打开新 GATT。
+        // passive GATT 的刷新由 watchdog 按 connectTimeout 统一关闭和重建。
         val currentDevice = connectedDevices.firstOrNull { it.uuid.equals(uuid, ignoreCase = true) }
-        val isPassiveRefresh =
-            previousState == BleConnectState.TIMEOUT &&
-                currentDevice?.connectState?.isFlowConnecting == true &&
-                task.passiveGatt == null
         if (
-            (currentDevice?.connectState?.isFlowConnecting == true && !isPassiveRefresh) ||
             currentDevice?.connectState?.isConnected == true ||
             task.passiveGatt != null
         ) {
@@ -274,28 +267,18 @@ internal class BleAutoReconnectSupervisor(
             return
         }
 
-        // 5. 递增 attempt，并清理上一轮 passive GATT。attempt 只参与退避计算和日志诊断，
+        // 5. 递增 attempt，并清理上一轮 passive GATT。attempt 只参与日志诊断，
         //    不再决定是否停止回连，避免设备离开较久后 native 主动放弃。
         task.attempt = nextAttemptCount(task.attempt)
         task.passiveGatt?.close()
         task.passiveGatt = null
 
-        // 6. 系统断连/扫描找不到/多次失败后使用 passive autoConnect。
-        //
-        // autoReconnect 已经拥有稳定 address，不应该再显式 startScan；系统断连场景交给
-        // Android `connectGatt(autoConnect=true)` 持有底层 rendezvous point。
-        val usePassive = config.autoReconnectUseNativePassive &&
-            (previousState == BleConnectState.DISCONNECT_FROM_SYS ||
-                previousState == BleConnectState.NO_DEVICE_FOUND ||
-                task.attempt > 1)
-        if (usePassive) {
-            beginPassiveReconnect(task, config)
+        // 6. autoReconnect 全程使用 passive autoConnect，不切换到 connectGatt(false)。
+        if (!config.autoReconnectUseNativePassive) {
+            sendLog(BleLoggerTag.d, "Auto reconnect: $uuid, native passive disabled by config")
             return
         }
-
-        // 7. 主动回连复用 manager 的完整连接路由和 GATT readiness。
-        sendLog(BleLoggerTag.d, "Auto reconnect: $uuid, active attempt ${task.attempt}")
-        activeConnect(task)
+        beginPassiveReconnect(task, config)
     }
 
     /**
@@ -337,8 +320,7 @@ internal class BleAutoReconnectSupervisor(
         // 6. 系统未创建 GATT session 时，按 timeout 进入下一轮调度。
         if (gatt == null) {
             sendLog(BleLoggerTag.e, "Auto reconnect: ${task.uuid}, passive connectGatt returned null")
-            // CONNECTING 已经发给 Dart；autoReconnect 未取消前 UI 继续保持连接中，
-            // 下一轮由 beginAttempt 的 passive refresh 分支重建底层 handle。
+            // CONNECTING 已经发给 Dart；autoReconnect 未取消前 UI 继续保持连接中。
             schedule(task.uuid, BleConnectState.TIMEOUT)
             return
         }
@@ -353,8 +335,9 @@ internal class BleAutoReconnectSupervisor(
     /**
      * 为 passive autoConnect 建立 watchdog。
      *
-     * Android `autoConnect=true` 可能长期 pending 且不回调；watchdog 只观察 pending 状态。
-     * 频繁关闭 pending GATT 会不断 unregister/register，反而破坏系统等待设备回来的机会。
+     * Android `autoConnect=true` 可能长期 pending 且不回调；这里用 connectTimeout 作为
+     * 一轮 passive session 的 deadline。到期仍未 connected 时关闭旧 GATT，5s 后重建，
+     * 既避免无限躺在系统 pending 队列，也避免过高频率 register/unregister。
      */
     private fun startPassiveWatchdog(task: BleReconnectTask, config: BleConfig) {
         // 1. 同一 task 只保留一个 watchdog。
@@ -362,10 +345,8 @@ internal class BleAutoReconnectSupervisor(
         val timer = Timer()
         task.timer = timer
 
-        // 2. watchdog 只用于诊断/兜底观察，不把 pending autoConnect 当作轮询连接杀掉重建。
-        val watchdogMs = config.autoReconnectMaxDelayMs
-            .coerceAtLeast(config.connectTimeout.toInt())
-            .toLong()
+        // 2. 每轮 passive autoConnect 最多等待 connectTimeout。
+        val watchdogMs = config.connectTimeout.toLong().coerceAtLeast(1000L)
         timer.schedule(object : TimerTask() {
             override fun run() {
                 mainScope().launch {
@@ -378,14 +359,21 @@ internal class BleAutoReconnectSupervisor(
                         return@launch
                     }
 
-                    // 5. pending passive GATT 存在时继续交给 Android 持有；这里仅重挂观察 timer。
+                    // 5. pending passive GATT 存在但 deadline 已到，关闭并在固定防抖后重建。
                     if (current.passiveGatt != null) {
+                        try {
+                            current.passiveGatt?.disconnect()
+                            current.passiveGatt?.close()
+                        } catch (error: Exception) {
+                            sendLog(BleLoggerTag.e, "Auto reconnect: ${task.uuid}, close expired passive gatt error = ${error.message}")
+                        }
+                        current.passiveGatt = null
                         current.timer = null
                         sendLog(
                             BleLoggerTag.d,
-                            "Auto reconnect: ${task.uuid}, passive watchdog observed pending connect",
+                            "Auto reconnect: ${task.uuid}, passive deadline reached, rebuild after ${PASSIVE_RECONNECT_DEBOUNCE_MS}ms",
                         )
-                        startPassiveWatchdog(current, config)
+                        schedule(task.uuid, BleConnectState.TIMEOUT)
                         return@launch
                     }
 
@@ -409,21 +397,12 @@ internal class BleAutoReconnectSupervisor(
             state == BleConnectState.CHARS_FAIL ||
             state == BleConnectState.NO_DEVICE_FOUND
 
-    /**
-     * 计算 backoff 延迟。
-     */
-    private fun calculateDelay(config: BleConfig, attempt: Int): Long {
-        // 1. 策略下沉到独立 policy，便于测试和替换。
-        return BleAutoReconnectDelayPolicy.calculate(
-            baseMs = config.autoReconnectBaseDelayMs,
-            maxMs = config.autoReconnectMaxDelayMs,
-            attempt = attempt,
-        )
-    }
-
     private companion object {
         /** Even 插件内部的蓝牙开启状态值。 */
         private const val BLE_STATE_ON = 5
+
+        /** passive GATT 到期后固定防抖，降低 Android register/unregister 过频风险。 */
+        private const val PASSIVE_RECONNECT_DEBOUNCE_MS = 5000L
 
         /** 统一 uuid key，规避 MAC 大小写差异。 */
         private fun reconnectKey(uuid: String): String = uuid.lowercase()

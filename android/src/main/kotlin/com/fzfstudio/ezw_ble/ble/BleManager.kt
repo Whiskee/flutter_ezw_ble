@@ -86,7 +86,7 @@ class BleManager private constructor() {
     private var scanRefreshGenerationCounter: Long = 0
     //  - 自动回连持久化仓库，只负责配置快照、回连目标和事件缓冲
     private val reconnectStore = BleReconnectStore()
-    //  - 自动回连监督器，只负责 task/backoff/passive autoConnect/watchdog
+    //  - 自动回连监督器，只负责 task/passive autoConnect/watchdog
     private val autoReconnectSupervisor by lazy {
         BleAutoReconnectSupervisor(
             connectedDevices = connectedDevices,
@@ -100,18 +100,6 @@ class BleManager private constructor() {
             createConnectCallback = { expectedUuid -> createConnectCallBack(expectedUuid) },
             persistReconnectTarget = { device -> persistReconnectTarget(device) },
             handleConnectState = { uuid, name, state -> handleConnectState(uuid, name, state) },
-            activeConnect = { task ->
-                // autoReconnect 已经由业务 connected 后 arm，持有稳定 address/name。
-                // 即使走主动 GATT 尝试，也不应再进入前台 scan-refresh/scan-then-connect。
-                connect(
-                    task.belongConfig,
-                    task.uuid,
-                    task.name,
-                    task.sn,
-                    afterUpgrade = false,
-                    directConnect = true,
-                )
-            },
             sendLog = { tag, message -> sendLog(tag, message) },
         )
     }

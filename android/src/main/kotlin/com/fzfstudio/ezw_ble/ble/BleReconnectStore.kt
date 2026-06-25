@@ -260,8 +260,6 @@ internal class BleReconnectStore {
             put("mtu", mtu)
             put("autoReconnect", autoReconnect)
             put("autoReconnectMaxAttempts", autoReconnectMaxAttempts)
-            put("autoReconnectBaseDelayMs", autoReconnectBaseDelayMs)
-            put("autoReconnectMaxDelayMs", autoReconnectMaxDelayMs)
             put("autoReconnectUseNativePassive", autoReconnectUseNativePassive)
         }
     }
@@ -341,8 +339,6 @@ internal class BleReconnectStore {
             mtu = optInt("mtu", 247),
             autoReconnect = optBoolean("autoReconnect", false),
             autoReconnectMaxAttempts = optInt("autoReconnectMaxAttempts", 0),
-            autoReconnectBaseDelayMs = optInt("autoReconnectBaseDelayMs", 1000),
-            autoReconnectMaxDelayMs = optInt("autoReconnectMaxDelayMs", 30000),
             autoReconnectUseNativePassive = optBoolean("autoReconnectUseNativePassive", true),
         )
     }

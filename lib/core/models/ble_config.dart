@@ -25,10 +25,6 @@ class BleConfig {
   final bool autoReconnect;
   //  自动回连退避计数兼容字段；当前实现不把次数作为停止条件
   final int autoReconnectMaxAttempts;
-  //  自动回连初始退避时间(ms)
-  final int autoReconnectBaseDelayMs;
-  //  自动回连最大退避时间(ms)
-  final int autoReconnectMaxDelayMs;
   //  是否允许平台被动回连能力
   final bool autoReconnectUseNativePassive;
 
@@ -42,8 +38,6 @@ class BleConfig {
     this.mtu = 247,
     this.autoReconnect = false,
     this.autoReconnectMaxAttempts = 0,
-    this.autoReconnectBaseDelayMs = 1000,
-    this.autoReconnectMaxDelayMs = 30000,
     this.autoReconnectUseNativePassive = true,
   });
 

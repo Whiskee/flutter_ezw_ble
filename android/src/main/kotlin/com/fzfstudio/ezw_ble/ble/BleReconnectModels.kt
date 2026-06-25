@@ -53,32 +53,3 @@ internal data class BlePersistedReconnectTarget(
     /** Business serial number for upper-layer diagnostics. */
     val sn: String,
 )
-
-/**
- * Exponential backoff policy for Android active reconnect.
- *
- * Passive autoConnect still needs watchdog/backoff because Android GATT can get
- * stuck without a useful callback; this policy keeps retry cadence bounded
- * without ever cancelling the long-lived reconnect intent by itself.
- */
-internal object BleAutoReconnectDelayPolicy {
-    /**
-     * Calculates bounded reconnect delay in milliseconds.
-     *
-     * Negative config values are coerced to safe lower bounds so malformed JSON
-     * cannot create immediate busy loops or negative timer delays.
-     */
-    fun calculate(baseMs: Int, maxMs: Int, attempt: Int): Long {
-        val base = baseMs.coerceAtLeast(0).toLong()
-        val max = maxMs.coerceAtLeast(baseMs).toLong()
-        if (attempt <= 1) {
-            return base.coerceAtMost(max)
-        }
-        var delay = base
-        // Cap doubling count to avoid overflow while still giving enough spread for repeated failures.
-        repeat((attempt - 1).coerceAtMost(12)) {
-            delay = (delay * 2).coerceAtMost(max)
-        }
-        return delay.coerceAtMost(max)
-    }
-}

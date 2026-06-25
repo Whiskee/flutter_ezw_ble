@@ -19,10 +19,6 @@ BleConfig _$BleConfigFromJson(Map<String, dynamic> json) => BleConfig(
       autoReconnect: json['autoReconnect'] as bool? ?? false,
       autoReconnectMaxAttempts:
           (json['autoReconnectMaxAttempts'] as num?)?.toInt() ?? 0,
-      autoReconnectBaseDelayMs:
-          (json['autoReconnectBaseDelayMs'] as num?)?.toInt() ?? 1000,
-      autoReconnectMaxDelayMs:
-          (json['autoReconnectMaxDelayMs'] as num?)?.toInt() ?? 30000,
       autoReconnectUseNativePassive:
           json['autoReconnectUseNativePassive'] as bool? ?? true,
     );
@@ -37,7 +33,5 @@ Map<String, dynamic> _$BleConfigToJson(BleConfig instance) => <String, dynamic>{
       'mtu': instance.mtu,
       'autoReconnect': instance.autoReconnect,
       'autoReconnectMaxAttempts': instance.autoReconnectMaxAttempts,
-      'autoReconnectBaseDelayMs': instance.autoReconnectBaseDelayMs,
-      'autoReconnectMaxDelayMs': instance.autoReconnectMaxDelayMs,
       'autoReconnectUseNativePassive': instance.autoReconnectUseNativePassive,
     };

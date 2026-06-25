@@ -234,8 +234,6 @@ class BleConfig {
   final int    mtu;               // 仅 Android 用，默认 247
   final bool   autoReconnect;     // 是否启用原生自动回连，默认 false
   final int    autoReconnectMaxAttempts;      // 兼容/日志字段，不再作为停止条件
-  final int    autoReconnectBaseDelayMs;      // 初始退避时间(ms)，默认 1000
-  final int    autoReconnectMaxDelayMs;       // 最大退避时间(ms)，默认 30000
   final bool   autoReconnectUseNativePassive; // 是否允许平台被动回连，默认 true
 }
 ```
@@ -477,7 +475,7 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 - 单次 `charsFail`
 - 蓝牙关闭
 
-蓝牙关闭只暂停任务；蓝牙重新开启后恢复任务。`autoReconnectBaseDelayMs` 和 `autoReconnectMaxDelayMs` 控制退避节奏；`autoReconnectMaxAttempts` 仅保留兼容和日志意义，**不再作为停止条件**。也就是说，设备离开 30 分钟再回来，只要用户/业务没有主动取消，原生层仍应继续持有或重建回连任务。
+蓝牙关闭只暂停任务；蓝牙重新开启后恢复任务。自动回连不再使用指数退避；`connectTimeout` 是单轮 passive reconnect 的最长等待时间，超时后关闭旧 GATT，并在固定 5s 防抖后重建 `connectGatt(true)`。`autoReconnectMaxAttempts` 仅保留兼容和日志意义，**不再作为停止条件**。也就是说，设备离开 30 分钟再回来，只要用户/业务没有主动取消，原生层仍应继续持有或重建回连任务。
 
 回连成功的门槛不是 GATT 物理连接成功，而是全部 `BleConfig.privateServices` 都重新恢复：
 

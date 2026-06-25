@@ -17,6 +17,8 @@ import Foundation
  *  但把任务调度/退避/持久化这些策略从 BleManager 主文件中隔离出来。
  */
 extension BleManager {
+    private var passiveReconnectDebounceMs: TimeInterval { 5000 }
+
     /**
      *  判断两个连接目标是否指向同一 BLE 设备。
      */
@@ -292,35 +294,17 @@ extension BleManager {
             return
         }
         // noDeviceFound 通常表示没有可用于 CoreBluetooth pending connect 的 peripheral
-        // cache。此时不再启动显式扫描，也不能立刻递归重试；按 backoff 等下一轮系统恢复机会。
+        // cache。此时不再启动显式扫描，也不能立刻递归重试；按固定防抖等下一轮系统恢复机会。
         task.timer?.invalidate()
-        // nextAttempt 只决定退避档位，不决定是否停止。持续回连只能被用户/业务取消、
+        // nextAttempt 只用于日志，不决定是否停止。持续回连只能被用户/业务取消、
         // 配置关闭、reset/release 或进程死亡终止。
         let nextAttempt = nextReconnectAttemptCount(task.attempt)
-        let delay = calculateReconnectDelay(config: config, attempt: nextAttempt) / 1000
+        let delay = passiveReconnectDebounceMs / 1000
         task.timer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
             self?.beginReconnectAttempt(uuid: task.uuid)
         }
         reconnectTasks[reconnectKey(uuid: task.uuid)] = task
         loggerD(msg: "autoReconnect: \(task.uuid), schedule attempt \(nextAttempt) after \(Int(delay * 1000))ms, reason=\(state.rawValue)")
-    }
-
-    /**
-     *  计算自动回连退避时间。
-     *
-     *  指数退避限制在 12 次倍增内，防止 Int 溢出，同时尊重配置的最大延迟。
-     */
-    func calculateReconnectDelay(config: BleConfig, attempt: Int) -> TimeInterval {
-        let base = max(config.autoReconnectBaseDelayMs, 0)
-        let maxDelay = max(config.autoReconnectMaxDelayMs, base)
-        guard attempt > 1 else {
-            return TimeInterval(min(base, maxDelay))
-        }
-        var delay = base
-        for _ in 0..<min(attempt - 1, 12) {
-            delay = min(delay * 2, maxDelay)
-        }
-        return TimeInterval(min(delay, maxDelay))
     }
 
     /**

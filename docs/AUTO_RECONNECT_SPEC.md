@@ -25,8 +25,6 @@ Add these fields to `BleConfig`:
 | --- | --- | --- |
 | `autoReconnect` | `false` | Enables native auto reconnect for devices using this config. |
 | `autoReconnectMaxAttempts` | `0` | Legacy/backoff compatibility field. Native reconnect no longer stops because this count is reached. |
-| `autoReconnectBaseDelayMs` | `1000` | Initial reconnect delay. |
-| `autoReconnectMaxDelayMs` | `30000` | Maximum exponential backoff delay. |
 | `autoReconnectUseNativePassive` | `true` | Allows platform passive reconnect paths when active reconnect cannot see the device. |
 
 The default behavior remains unchanged. Existing callers must explicitly opt in.
@@ -101,18 +99,21 @@ Do not schedule reconnect for:
 - `systemError`
 - Devices currently in `upgrade`
 
-## Backoff And Passive Handles
-
-Delay is exponential:
-
-```text
-delay = min(autoReconnectMaxDelayMs, autoReconnectBaseDelayMs * 2^(attempt - 1))
-```
+## Passive Session Deadline
 
 Native reconnect is a persistent intent after `deviceConnected(uuid)`. Reaching
 `autoReconnectMaxAttempts`, `timeout`, `noDeviceFound`, `serviceFail`, or
-`charsFail` must not delete the task. Those states only advance the backoff or
-refresh a native passive handle. A successful business `connected` resets the
+`charsFail` must not delete the task.
+
+```text
+connectGatt(true)
+  -> wait connectTimeout
+  -> close stale passive GATT if still not connected
+  -> debounce 5s
+  -> recreate connectGatt(true)
+```
+
+Those states only refresh a native passive handle. A successful business `connected` resets the
 attempt counter.
 
 Android passive reconnect must preserve the pending `autoConnect=true` GATT.

@@ -235,8 +235,6 @@ private fun Map<*, *>.toBleConfig(): BleConfig? {
         mtu = get("mtu").toIntOrDefault(247),
         autoReconnect = get("autoReconnect") as? Boolean ?: false,
         autoReconnectMaxAttempts = get("autoReconnectMaxAttempts").toIntOrDefault(0),
-        autoReconnectBaseDelayMs = get("autoReconnectBaseDelayMs").toIntOrDefault(1000),
-        autoReconnectMaxDelayMs = get("autoReconnectMaxDelayMs").toIntOrDefault(30000),
         autoReconnectUseNativePassive = get("autoReconnectUseNativePassive") as? Boolean ?: true,
     )
 }
