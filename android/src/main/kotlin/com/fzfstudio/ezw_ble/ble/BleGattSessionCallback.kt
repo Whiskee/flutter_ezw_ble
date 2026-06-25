@@ -92,12 +92,15 @@ internal class BleGattSessionCallback(
         isPrivateServiceReady = false
         val device = currentExpectedDeviceForGatt(gatt, "connection disconnected") ?: return
 
-        // 6. 新连接已开始时忽略旧断连回调，避免 stale callback 把新 session 拉成断连。
+        // 6. 当前 active GATT 在 connecting 阶段收到断连，说明本轮 connectGatt 已经失败。
+        //    不能继续静默 keep connecting：G2 第二条腿会等满 timeout，甚至在部分机型上丢失终态。
+        //    stale GATT 已在 currentExpectedDeviceForGatt 里过滤，这里可以安全落本轮 timeout。
         if (device.connectState.isConnecting) {
             sendLog(
                 BleLoggerTag.e,
-                "Connect call back: $address is start new connecting, stop disconnect flow, keep connecting",
+                "Connect call back: $address disconnected while connecting, fail active connect as timeout, code=${BluetoothGattStatus.getStatusDescription(status)}",
             )
+            handleConnectState(address, device.name, BleConnectState.TIMEOUT, DEFAULT_MTU)
             return
         }
 
