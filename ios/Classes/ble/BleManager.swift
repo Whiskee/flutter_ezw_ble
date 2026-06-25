@@ -1014,14 +1014,26 @@ extension BleManager {
             loggerE(msg: "\(logHead) \(peripheral.identifier.uuidString), not my connected device")
             return
         }
-        //  3、如果error为空，说明为用户主动操作断连
+        //  3、error 为空不一定是用户主动断连。蓝牙关闭 / 系统回收 CoreBluetooth
+        //     pending 连接时也可能给 nil error；只要当前是系统蓝牙不可用，或该设备仍有
+        //     autoReconnect 任务，就必须按系统断连处理，避免误清长期回连意图。
         guard let error = error as? NSError else {
             //  不执行断连
             //  - 已经断连就不再处理
             //  - 没有退出升级状态的不用处理
             if myDevice.isConnected {
-                handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .disconnectByUser, tag: tag)
-                loggerE(msg: "\(logHead) \(peripheral.identifier.uuidString), No error when disconnect by user")
+                let shouldKeepReconnect = centralManager.state != .poweredOn ||
+                    reconnectTasks.values.contains { task in
+                        isSameConnectTarget(
+                            storedUuid: task.uuid,
+                            storedName: task.name,
+                            uuid: peripheral.identifier.uuidString,
+                            name: peripheral.name ?? ""
+                        )
+                    }
+                let state: BleConnectState = shouldKeepReconnect ? .disconnectFromSys : .disconnectByUser
+                handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: state, tag: tag)
+                loggerE(msg: "\(logHead) \(peripheral.identifier.uuidString), nil error disconnect mapped to \(state.rawValue), bluetooth=\(centralManager.state.label)")
             }
             return
         }
