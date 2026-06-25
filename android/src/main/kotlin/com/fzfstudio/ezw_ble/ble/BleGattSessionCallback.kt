@@ -32,8 +32,8 @@ internal class BleGattSessionCallback(
     private val handleConnectState: (String, String, BleConnectState, Int) -> Unit,
     /** 查询系统蓝牙是否仍可用；蓝牙关闭时断连由系统状态监听统一处理。 */
     private val isBluetoothEnabled: () -> Boolean,
-    /** 刷新 Android 隐藏 GATT cache，仅在授权/服务缓存异常路径使用。 */
-    private val refreshDeviceCache: (BluetoothGatt?) -> Boolean,
+    /** 处理 Android 授权失败，必要时由 manager 清理 stale bond / 标记扫描刷新。 */
+    private val recoverInsufficientAuthorization: (BluetoothGatt, BleDevice) -> Unit,
     /** 查询一个 uuid 是否正处于 manager 主动断连流程。 */
     private val consumeDisconnectingState: (String) -> BleConnectState?,
     /** 通知 manager 单条写入完成，让发送队列继续推进下一条命令。 */
@@ -91,8 +91,15 @@ internal class BleGattSessionCallback(
         // 5. 断连会使本 session 的 GATT readiness 失效。
         isPrivateServiceReady = false
         val device = currentExpectedDeviceForGatt(gatt, "connection disconnected") ?: return
+        val isInsufficientAuthorization = status == BluetoothGatt.GATT_INSUFFICIENT_AUTHORIZATION
 
-        // 6. 当前 active GATT 在 connecting 阶段收到断连，说明本轮 connectGatt 已经失败。
+        // 6. 授权失败意味着 Android 当前 GATT/bond 视图已拒绝这个 peripheral。
+        //    即使本轮还处在 connecting，也必须先做恢复，否则下一轮 passive autoConnect 仍会等在同一条坏链路上。
+        if (isInsufficientAuthorization) {
+            recoverInsufficientAuthorization(gatt, device)
+        }
+
+        // 7. 当前 active GATT 在 connecting 阶段收到断连，说明本轮 connectGatt 已经失败。
         //    不能继续静默 keep connecting：G2 第二条腿会等满 timeout，甚至在部分机型上丢失终态。
         //    stale GATT 已在 currentExpectedDeviceForGatt 里过滤，这里可以安全落本轮 timeout。
         if (device.connectState.isConnecting) {
@@ -104,16 +111,11 @@ internal class BleGattSessionCallback(
             return
         }
 
-        // 7. 释放 native GATT 资源；不 close 会让后续连接占住旧 binder session。
+        // 8. 释放 native GATT 资源；不 close 会让后续连接占住旧 binder session。
         try {
             gatt.close()
         } catch (closeError: Exception) {
             sendLog(BleLoggerTag.e, "Connect call back: $address close gatt exception: ${closeError.message}")
-        }
-
-        // 8. 授权失败常伴随 Android GATT cache 脏数据，刷新后下一轮连接重新 discover。
-        if (status == BluetoothGatt.GATT_INSUFFICIENT_AUTHORIZATION) {
-            refreshDeviceCache(gatt)
         }
 
         // 9. 用户/超时主动断连已经有明确状态，不再二次上报系统断连。

@@ -1361,9 +1361,9 @@ class BleManager private constructor() {
                 // 3. 蓝牙关闭时断连由系统监听批量处理，callback 只需要查询当前状态。
                 isBluetoothEnabled()
             },
-            refreshDeviceCache = { gatt ->
-                // 4. 授权/cache 异常仍复用 manager 的反射 refresh 实现。
-                refreshDeviceCache(gatt)
+            recoverInsufficientAuthorization = { gatt, device ->
+                // 4. 授权失败需要由 manager 统一恢复 cache/bond 状态，callback 不直接操作全局列表。
+                recoverInsufficientAuthorization(gatt, device)
             },
             consumeDisconnectingState = { uuid ->
                 // 5. 主动断连/超时断连已带有明确状态，消费后不再上报系统断连。
@@ -1552,6 +1552,37 @@ class BleManager private constructor() {
             }
         }
         return false
+    }
+
+    /**
+     * 恢复 Android 返回 GATT_INSUFFICIENT_AUTHORIZATION 后的授权状态。
+     *
+     * status=8 通常表示系统当前保存的 GATT cache 或 bond key 已经不能再访问外设服务。
+     * 只继续 passive autoConnect 会反复等满 connectTimeout；这里先刷新 cache，并在系统明确
+     * 显示已 bonded 时清掉 stale bond，让下一轮 autoReconnect 重新建立可用授权。
+     */
+    private fun recoverInsufficientAuthorization(gatt: BluetoothGatt, device: BleDevice) {
+        val refreshed = refreshDeviceCache(gatt)
+        device.needsScanBeforeConnect = true
+        val bondState = gatt.device.bondState
+        val shouldRemoveStaleBond = bondState == BluetoothDevice.BOND_BONDED
+        sendLog(
+            BleLoggerTag.d,
+            "${device.uuid}, authorization recovery: refresh=$refreshed, bond=${bondState.toBondStateName()}, removeStaleBond=$shouldRemoveStaleBond",
+        )
+        if (shouldRemoveStaleBond) {
+            removeBond(device.uuid)
+        }
+    }
+
+    /**
+     * 仅用于授权恢复日志，避免后续排障还要人工记 Android bondState 数字。
+     */
+    private fun Int.toBondStateName(): String = when (this) {
+        BluetoothDevice.BOND_NONE -> "BOND_NONE"
+        BluetoothDevice.BOND_BONDING -> "BOND_BONDING"
+        BluetoothDevice.BOND_BONDED -> "BOND_BONDED"
+        else -> "UNKNOWN($this)"
     }
 
     /**
