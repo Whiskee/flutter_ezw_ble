@@ -109,7 +109,7 @@ Native reconnect is a persistent intent after `deviceConnected(uuid)`. Reaching
 connectGatt(true)
   -> wait connectTimeout
   -> close stale passive GATT if still not connected
-  -> debounce 5s
+  -> debounce 1.5s
   -> recreate connectGatt(true)
 ```
 

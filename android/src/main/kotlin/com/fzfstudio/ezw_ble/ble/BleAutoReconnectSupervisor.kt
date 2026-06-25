@@ -225,7 +225,7 @@ internal class BleAutoReconnectSupervisor(
         }
 
         // 6. 自动回连不再做指数退避：首轮立即开始；后续重建旧 passive GATT
-        //    时使用 5s 固定防抖，降低 register/unregister 过频风险。
+        //    时使用 1.5s 固定防抖，兼顾回连速度和 register/unregister 过频风险。
         val delayMs =
             if (task.attempt == 0 && task.passiveGatt == null) 0L
             else PASSIVE_RECONNECT_DEBOUNCE_MS
@@ -348,7 +348,7 @@ internal class BleAutoReconnectSupervisor(
      * 为 passive autoConnect 建立 watchdog。
      *
      * Android `autoConnect=true` 可能长期 pending 且不回调；这里用 connectTimeout 作为
-     * 一轮 passive session 的 deadline。到期仍未 connected 时关闭旧 GATT，5s 后重建，
+     * 一轮 passive session 的 deadline。到期仍未 connected 时关闭旧 GATT，1.5s 后重建，
      * 既避免无限躺在系统 pending 队列，也避免过高频率 register/unregister。
      */
     private fun startPassiveWatchdog(task: BleReconnectTask, config: BleConfig) {
@@ -414,7 +414,7 @@ internal class BleAutoReconnectSupervisor(
         private const val BLE_STATE_ON = 5
 
         /** passive GATT 到期后固定防抖，降低 Android register/unregister 过频风险。 */
-        private const val PASSIVE_RECONNECT_DEBOUNCE_MS = 5000L
+        private const val PASSIVE_RECONNECT_DEBOUNCE_MS = 1500L
 
         /** 统一 uuid key，规避 MAC 大小写差异。 */
         private fun reconnectKey(uuid: String): String = uuid.lowercase()

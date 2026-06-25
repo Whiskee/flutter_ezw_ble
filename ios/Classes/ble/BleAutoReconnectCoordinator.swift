@@ -17,7 +17,7 @@ import Foundation
  *  但把任务调度/退避/持久化这些策略从 BleManager 主文件中隔离出来。
  */
 extension BleManager {
-    private var passiveReconnectDebounceMs: TimeInterval { 5000 }
+    private var passiveReconnectDebounceMs: TimeInterval { 1500 }
 
     /**
      *  判断两个连接目标是否指向同一 BLE 设备。
