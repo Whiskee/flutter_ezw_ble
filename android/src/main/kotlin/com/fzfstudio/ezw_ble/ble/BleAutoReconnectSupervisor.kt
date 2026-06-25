@@ -1,6 +1,5 @@
 package com.fzfstudio.ezw_ble.ble
 
-import BleLoggerTag
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.os.Build
@@ -9,6 +8,7 @@ import com.fzfstudio.ezw_ble.ble.extension.toBleDevice
 import com.fzfstudio.ezw_ble.ble.models.BleConfig
 import com.fzfstudio.ezw_ble.ble.models.BleDevice
 import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
+import com.fzfstudio.ezw_ble.ble.models.enums.BleLoggerTag
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import java.util.Collections

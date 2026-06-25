@@ -1,6 +1,5 @@
 package com.fzfstudio.ezw_ble.ble
 
-import BleLoggerTag
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
@@ -13,6 +12,7 @@ import com.fzfstudio.ezw_ble.ble.models.BleCmd
 import com.fzfstudio.ezw_ble.ble.models.BleDevice
 import com.fzfstudio.ezw_ble.ble.models.BluetoothGattStatus
 import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
+import com.fzfstudio.ezw_ble.ble.models.enums.BleLoggerTag
 import java.util.LinkedList
 import java.util.Queue
 

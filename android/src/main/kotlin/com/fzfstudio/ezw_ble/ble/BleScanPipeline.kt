@@ -1,12 +1,12 @@
 package com.fzfstudio.ezw_ble.ble
 
-import BleLoggerTag
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import com.fzfstudio.ezw_ble.ble.extension.toBleDevice
 import com.fzfstudio.ezw_ble.ble.models.BleConfig
 import com.fzfstudio.ezw_ble.ble.models.BleDevice
 import com.fzfstudio.ezw_ble.ble.models.BleSnRule
+import com.fzfstudio.ezw_ble.ble.models.enums.BleLoggerTag
 import java.util.UUID
 import java.util.regex.Pattern
 

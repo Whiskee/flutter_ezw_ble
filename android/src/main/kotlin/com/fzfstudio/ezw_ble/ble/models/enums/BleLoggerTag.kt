@@ -1,3 +1,5 @@
+package com.fzfstudio.ezw_ble.ble.models.enums
+
 enum class BleLoggerTag {
     //  信息
     d,
