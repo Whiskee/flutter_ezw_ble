@@ -103,9 +103,10 @@ internal class BleAutoReconnectSupervisor(
     /**
      * 取消单个设备自动回连。
      *
-     * 用户主动断开/remove 时必须调用，确保 pending timer/passive GATT 不再恢复连接。
+     * 用户主动断开/remove 或前台连接接管同 UUID 时调用，确保 pending timer/passive
+     * GATT 不再与新的 owner 竞争。
      */
-    fun cancel(uuid: String) {
+    fun cancel(uuid: String, reason: String = "unspecified") {
         // 1. task 不存在时保持幂等。
         val task = reconnectTasks.remove(reconnectKey(uuid)) ?: return
 
@@ -119,7 +120,7 @@ internal class BleAutoReconnectSupervisor(
             sendLog(BleLoggerTag.e, "Auto reconnect: $uuid, close passive gatt error = ${error.message}")
         }
         task.passiveGatt = null
-        sendLog(BleLoggerTag.d, "Auto reconnect: $uuid, task cancelled")
+        sendLog(BleLoggerTag.d, "Auto reconnect: $uuid, task cancelled, reason=$reason")
     }
 
     /**
@@ -127,10 +128,10 @@ internal class BleAutoReconnectSupervisor(
      *
      * reset/release 场景使用，防止 manager 已释放但 timer 或 passive GATT 仍回调。
      */
-    fun cancelAll() {
+    fun cancelAll(reason: String = "unspecified") {
         // 1. 复制 key 列表后逐个取消，避免遍历时修改 map。
         reconnectTasks.keys.toList().forEach { key ->
-            reconnectTasks[key]?.uuid?.let { cancel(it) }
+            reconnectTasks[key]?.uuid?.let { cancel(it, reason = reason) }
         }
     }
 

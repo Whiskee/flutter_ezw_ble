@@ -316,6 +316,8 @@ class BleManager private constructor() {
         val bleConfig = guardForegroundConnectRequest(request) ?: return
 
         // 3. 每次主动连接都清理上一轮预连接/升级脏状态，避免旧业务态污染新连接。
+        //    同时只接管当前 UUID 的 passive autoReconnect task，不能全局 cancelAll，
+        //    否则 G2/R1 多设备长期回连会互相取消。
         clearForegroundConnectMarkers(request)
 
         // 4. 解析 Android 连接路由：设备句柄、缓存设备、扫描名、系统 GATT connected 状态。
@@ -391,7 +393,11 @@ class BleManager private constructor() {
         // 1. 新连接开始时，上一轮业务认证中的 preConnected 不再可信。
         preConnectedDevices.remove(request.uuid)
 
-        // 2. 非升级连接需要退出升级态，避免普通连接继承 OTA 的断连/等待策略。
+        // 2. 前台连接开始后，该 UUID 由本轮 connectGatt(false) 接管；只取消同 UUID
+        // 的 passive GATT，保留其它逻辑设备的 native autoReconnect owner。
+        autoReconnectSupervisor.cancel(request.uuid, reason = "foreground connect ${request.belongConfig}")
+
+        // 3. 非升级连接需要退出升级态，避免普通连接继承 OTA 的断连/等待策略。
         if (!request.afterUpgrade && upgradeDevices.contains(request.uuid)) {
             upgradeDevices.remove(request.uuid)
         }
@@ -798,7 +804,7 @@ class BleManager private constructor() {
         sendLog(BleLoggerTag.d, "Star disconnect: $uuid by user")
         // 用户主动断开就是取消长期回连意图；removeBond 只额外清系统绑定。
         removePersistedReconnectTarget(uuid)
-        autoReconnectSupervisor.cancel(uuid)
+        autoReconnectSupervisor.cancel(uuid, reason = "user disconnect")
         // 用户主动断开必须取消“扫描刷新后重入 connect”的本地延迟任务。
         cancelScanRefresh(uuid)
         cancelPendingScanConnect(uuid)
@@ -886,7 +892,7 @@ class BleManager private constructor() {
         }
         cancelAllScanRefresh()
         pendingScanConnects.clear()
-        autoReconnectSupervisor.cancelAll()
+        autoReconnectSupervisor.cancelAll(reason = "cleanConnectCache")
         // clean cache 是显式清理入口，必须同时清磁盘目标，避免下次进程恢复又自动回连。
         clearPersistedReconnectTargets()
     }
@@ -910,7 +916,7 @@ class BleManager private constructor() {
         preConnectedDevices.clear()
         // cleanConnectCache 已经清理持久化回连目标；这里保持 reset 流程单一出口，
         // 避免未来有人在两处加入不同副作用导致 reset 语义分叉。
-        autoReconnectSupervisor.cancelAll()
+        autoReconnectSupervisor.cancelAll(reason = "reset")
         sendLog(BleLoggerTag.d, "Reset: success")
     }
 
@@ -1493,7 +1499,7 @@ class BleManager private constructor() {
             }
         }
         if (state == BleConnectState.DISCONNECT_BY_USER) {
-            autoReconnectSupervisor.cancel(uuid)
+            autoReconnectSupervisor.cancel(uuid, reason = "disconnectByUser state")
         }
         //  2、处理正在连接
         //  注意：CONNECT_FINISH 只表示 BLE 服务/特征流程完成，真正的业务 connected
