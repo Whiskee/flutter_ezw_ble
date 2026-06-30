@@ -29,6 +29,8 @@ enum BleMC: String {
     case startScan
     //  停止扫描设备
     case stopScan
+    //  检查目标外设是否已被系统/CoreBluetooth 持有连接（含 ANCS）
+    case isSystemConnectedPeripheral
     //  连接设备(uuid)
     case connectDevice
     //  断连设备(uuid)
@@ -84,6 +86,17 @@ enum BleMC: String {
         case .stopScan:
             BleManager.shared.stopScan()
             break
+        case .isSystemConnectedPeripheral:
+            let jsonData: [String:Any] = arguments as? [String:Any] ?? [:]
+            let belongConfig: String = jsonData["belongConfig"] as? String ?? ""
+            let uuid: String = jsonData["uuid"] as? String ?? ""
+            let name: String = jsonData["name"] as? String ?? ""
+            result(BleManager.shared.isSystemConnectedPeripheral(
+                belongConfig: belongConfig,
+                uuid: uuid,
+                name: name
+            ))
+            return
         case .connectDevice:
             let jsonData: [String:Any] = arguments as? [String:Any] ?? [:]
             let easyConnect: BleEasyConnect? = jsonData.decodeTo()

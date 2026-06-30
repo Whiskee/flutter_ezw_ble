@@ -121,6 +121,40 @@ extension BleManager {
         centralManager.stopScan()
         loggerD(msg: "\(isStartScan ? "checking if scan is already running, stopping it first if necessary" : "stop scan")")
     }
+
+    /**
+     *  目标外设是否已被系统/CoreBluetooth 持有连接。
+     *
+     *  G2 右腿申请 ANCS 后可能停止广播，scanForPeripherals 不会再发现它；
+     *  Dart 层 scan-first 流程可用该方法把“系统已连接”也视为一种发现结果。
+     */
+    func isSystemConnectedPeripheral(belongConfig: String, uuid: String, name: String) -> Bool {
+        guard checkIsFunctionCanBeCalled(),
+              let bleConfig = bleConfigs.first(where: { config in
+                config.name == belongConfig
+              }) else {
+            loggerD(msg: "system-connected probe: \(uuid)-\(name), no config for \(belongConfig)")
+            return false
+        }
+        let serviceUUIDs = bleConfig.privateServices.map { $0.serviceUUID }
+        if findPeripheralFromConnected(
+            uuid: uuid,
+            name: name,
+            serviceUUIDs: serviceUUIDs
+        ) != nil {
+            loggerD(msg: "system-connected probe: \(uuid)-\(name), hit retrieveConnectedPeripherals")
+            return true
+        }
+        if !uuid.isEmpty,
+           let cbUuid = UUID(uuidString: uuid),
+           let peripheral = centralManager.retrievePeripherals(withIdentifiers: [cbUuid]).first,
+           peripheral.state == .connected {
+            loggerD(msg: "system-connected probe: \(uuid)-\(name), hit retrievePeripherals")
+            return true
+        }
+        loggerD(msg: "system-connected probe: \(uuid)-\(name), miss")
+        return false
+    }
     
     /**
      *  连接设备

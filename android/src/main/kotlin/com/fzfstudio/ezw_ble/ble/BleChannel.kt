@@ -26,6 +26,8 @@ enum class BleMC {
     START_SCAN,
     //  停止扫描设备
     STOP_SCAN,
+    //  检查目标外设是否已被系统持有连接（Android 无 ANCS 语义，固定 false）
+    IS_SYSTEM_CONNECTED_PERIPHERAL,
     //  连接设备(uuid)
     CONNECT_DEVICE,
     //  设置设备预连接
@@ -82,6 +84,9 @@ enum class BleMC {
             }
             STOP_SCAN -> {
                 BleManager.instance.stopScan()
+            }
+            IS_SYSTEM_CONNECTED_PERIPHERAL -> {
+                return result.success(false)
             }
             CONNECT_DEVICE -> {
                 val jsonMap = arguments as Map<*, *>?
