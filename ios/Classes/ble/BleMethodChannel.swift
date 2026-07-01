@@ -21,6 +21,8 @@ enum BleMC: String {
     case startScan
     /// Stop active scan unless a scan-then-connect request is pending.
     case stopScan
+    /// Check whether CoreBluetooth already owns a connected peripheral.
+    case isSystemConnectedPeripheral
     /// Start one foreground connect request.
     case connectDevice
     /// Disconnect or cancel an in-flight connect request.
@@ -86,6 +88,17 @@ enum BleMC: String {
         case .stopScan:
             BleManager.shared.stopScan()
             break
+        case .isSystemConnectedPeripheral:
+            let jsonData: [String: Any] = arguments as? [String: Any] ?? [:]
+            let belongConfig: String = jsonData["belongConfig"] as? String ?? ""
+            let uuid: String = jsonData["uuid"] as? String ?? ""
+            let name: String = jsonData["name"] as? String ?? ""
+            result(BleManager.shared.isSystemConnectedPeripheral(
+                belongConfig: belongConfig,
+                uuid: uuid,
+                name: name
+            ))
+            return
         case .connectDevice:
             var jsonData: [String: Any] = arguments as? [String: Any] ?? [:]
             // Dart older versions may omit nullable flags. Normalize them before decoding
