@@ -2,6 +2,7 @@ import 'dart:typed_data';
 
 import 'package:flutter_ezw_ble/core/models/ble_config.dart';
 import 'package:flutter_ezw_ble/core/models/ble_cmd.dart';
+import 'package:flutter_ezw_ble/core/models/ble_device.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_method_channel.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_platform_interface.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -36,6 +37,15 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
+  Future<bool> isSystemConnectedPeripheral(
+    String belongConfig,
+    String uuid,
+    String name,
+  ) {
+    throw UnimplementedError();
+  }
+
+  @override
   Future<void> connectDevice(
     String belongConfig,
     String uuid,
@@ -60,6 +70,11 @@ class MockFlutterEzwBlePlatform
 
   @override
   Future<void> deviceConnected(String uuid) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> armAutoReconnectTargets(List<BleDevice> devices) {
     throw UnimplementedError();
   }
 

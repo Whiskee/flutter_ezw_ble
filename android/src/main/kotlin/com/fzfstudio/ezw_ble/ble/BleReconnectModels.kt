@@ -38,6 +38,24 @@ internal data class BleReconnectTask(
 )
 
 /**
+ * Dart 从绑定缓存补种的 native 自动回连目标。
+ *
+ * 它只表达“用户仍允许该端点长期回连”，不代表当前已经存在 live GATT。
+ */
+internal data class BleReconnectSeed(
+    /** Dart BleConfig name used to resolve current native config. */
+    val belongConfig: String,
+    /** Android BluetoothDevice address or plugin UUID surrogate. */
+    val uuid: String,
+    /** Last known Bluetooth name for diagnostics and fallback matching. */
+    val name: String,
+    /** Business serial number for multi-endpoint diagnosis. */
+    val sn: String,
+    /** Cached RSSI, only used for constructing the lightweight BleDevice. */
+    val rssi: Int,
+)
+
+/**
  * Persisted reconnect identity.
  *
  * Only identity/config data is persisted because BluetoothGatt and service

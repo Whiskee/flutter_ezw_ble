@@ -253,6 +253,42 @@ class BleManager private constructor() {
     }
 
     /**
+     * 从 Dart 绑定缓存补种 native 自动回连目标。
+     *
+     * 该入口只建立长期回连 owner：不发起前台连接、不清其它设备 task、不修改系统 bond。
+     * 用于旧缓存/进程恢复时当前 native 进程尚未经历 `deviceConnected` 的场景。
+     */
+    fun armAutoReconnectTargets(targets: List<BleReconnectSeed>) {
+        if (targets.isEmpty()) {
+            return
+        }
+        restorePersistedConfigsIfNeeded()
+        targets.forEach { target ->
+            val config = bleConfigs.firstOrNull { it.name == target.belongConfig }
+            if (config == null) {
+                sendLog(
+                    BleLoggerTag.e,
+                    "Auto reconnect: ${target.uuid}, seed ignored, config not found: ${target.belongConfig}",
+                )
+                return@forEach
+            }
+            if (!config.autoReconnect || target.uuid.isBlank()) {
+                return@forEach
+            }
+            val seedDevice = BleDevice(
+                belongConfig = config,
+                name = target.name,
+                uuid = target.uuid,
+                sn = target.sn,
+                rssi = target.rssi,
+                connectState = BleConnectState.NONE,
+            )
+            autoReconnectSupervisor.arm(seedDevice)
+            sendLog(BleLoggerTag.d, "Auto reconnect: ${target.uuid}, seeded native reconnect target")
+        }
+    }
+
+    /**
      *  开启扫描
      */
     fun startScan(pureModel: Boolean = false) {

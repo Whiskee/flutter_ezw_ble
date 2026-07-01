@@ -34,6 +34,8 @@ enum class BleMC {
     DEVICE_PRE_CONNECTED,
     /** 标记设备业务鉴权成功并启用自动回连。 */
     DEVICE_CONNECTED,
+    /** 补种 native 自动回连目标，不发起前台连接。 */
+    ARM_AUTO_RECONNECT_TARGETS,
     /** 断开设备连接，可选移除系统绑定。 */
     DISCONNECT_DEVICE,
     /** 发送普通 GATT 指令。 */
@@ -141,6 +143,13 @@ enum class BleMC {
                 val uuid = arguments as? String ?: ""
                 BleManager.instance.setConnected(uuid)
             }
+            ARM_AUTO_RECONNECT_TARGETS -> {
+                // 1. 旧缓存/进程恢复时，Dart 只补种长期回连意图，不打开 GATT。
+                val jsonArray = arguments as List<*>?
+                val targets = jsonArray?.mapNotNull { (it as? Map<*, *>)?.toReconnectSeed() }
+                    ?: emptyList()
+                BleManager.instance.armAutoReconnectTargets(targets)
+            }
             DISCONNECT_DEVICE -> {
                 // 1. 主动断连必须透传 removeBond，移除设备时需要清理系统绑定。
                 val jsonMap = arguments as Map<*, *>?
@@ -236,6 +245,29 @@ private fun Map<*, *>.toBleConfig(): BleConfig? {
         autoReconnect = get("autoReconnect") as? Boolean ?: false,
         autoReconnectMaxAttempts = get("autoReconnectMaxAttempts").toIntOrDefault(0),
         autoReconnectUseNativePassive = get("autoReconnectUseNativePassive") as? Boolean ?: true,
+    )
+}
+
+/**
+ * 将 Dart `BleDevice` JSON 转成 native 自动回连 seed。
+ *
+ * 该结构只用于建立长期回连意图，不代表当前 GATT 已连接。
+ */
+private fun Map<*, *>.toReconnectSeed(): BleReconnectSeed? {
+    val belongConfig = get("belongConfig") as? String ?: return null
+    val uuid = get("uuid") as? String ?: return null
+    val name = get("name") as? String ?: ""
+    val sn = get("sn") as? String ?: ""
+    val rssi = get("rssi").toIntOrDefault(0)
+    if (belongConfig.isEmpty() || uuid.isEmpty()) {
+        return null
+    }
+    return BleReconnectSeed(
+        belongConfig = belongConfig,
+        uuid = uuid,
+        name = name,
+        sn = sn,
+        rssi = rssi,
     )
 }
 

@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_ezw_ble/core/models/ble_config.dart';
+import 'package:flutter_ezw_ble/core/models/ble_device.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble.dart';
 
 import 'flutter_ezw_ble_platform_interface.dart';
@@ -88,6 +89,13 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
   @override
   Future<void> deviceConnected(String uuid) async =>
       methodChannel.invokeMethod("deviceConnected", uuid);
+
+  @override
+  Future<void> armAutoReconnectTargets(List<BleDevice> devices) async =>
+      methodChannel.invokeMethod(
+        "armAutoReconnectTargets",
+        devices.map((device) => device.toJson()).toList(),
+      );
 
   @override
   Future<void> sendCmd(

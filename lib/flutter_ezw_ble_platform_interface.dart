@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:flutter_ezw_ble/core/models/ble_config.dart';
+import 'package:flutter_ezw_ble/core/models/ble_device.dart';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
 import 'flutter_ezw_ble_method_channel.dart';
@@ -129,6 +130,15 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   Future<void> deviceConnected(String uuid) {
     throw UnimplementedError(
         'deviceConnected(uuid: $uuid) has not been implemented.');
+  }
+
+  /// 只补种 native 自动回连目标，不发起前台连接。
+  ///
+  /// 用于旧缓存/进程恢复场景：Dart 已知道用户允许 autoReconnect，但 native
+  /// 当前进程尚未经历 `deviceConnected`，需要先建立长期回连 owner。
+  Future<void> armAutoReconnectTargets(List<BleDevice> devices) {
+    throw UnimplementedError(
+        'armAutoReconnectTargets(devices: $devices) has not been implemented.');
   }
 
   /// 发送指令

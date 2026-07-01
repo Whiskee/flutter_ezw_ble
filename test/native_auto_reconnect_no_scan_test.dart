@@ -20,15 +20,15 @@ void main() {
 
     expect(
       androidReconnect,
-      contains('previousState == BleConnectState.DISCONNECT_FROM_SYS'),
+      contains('private fun shouldScheduleReconnect(state: BleConnectState)'),
     );
     expect(
       androidManager,
-      contains('autoReconnect 已经由业务 connected 后 arm，持有稳定 address/name。'),
+      contains('该入口只建立长期回连 owner：不发起前台连接'),
     );
     expect(
       androidManager,
-      contains('directConnect = true'),
+      contains('direct connect without scan'),
     );
 
     expect(
@@ -45,7 +45,7 @@ void main() {
     );
     expect(
       iosReconnect,
-      contains('按 backoff 等下一轮系统恢复机会'),
+      contains('按固定防抖等下一轮系统恢复机会'),
     );
     expect(
       iosReconnect,
@@ -73,7 +73,7 @@ void main() {
     );
     expect(
       androidReconnect,
-      contains('passive watchdog observed pending connect'),
+      contains('passive deadline reached, rebuild after'),
     );
     expect(
       androidReconnect,
@@ -81,7 +81,7 @@ void main() {
     );
     expect(
       androidReconnect,
-      contains('频繁关闭 pending GATT 会不断 unregister/register'),
+      contains('过高频率 register/unregister'),
     );
     expect(
       androidReconnect,
