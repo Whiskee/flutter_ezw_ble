@@ -34,6 +34,19 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
   @override
   Future<void> stopScan() async => methodChannel.invokeMethod("stopScan");
 
+  @override
+  Future<bool> isSystemConnectedPeripheral(
+    String belongConfig,
+    String uuid,
+    String name,
+  ) async =>
+      await methodChannel.invokeMethod<bool>("isSystemConnectedPeripheral", {
+        "belongConfig": belongConfig,
+        "uuid": uuid,
+        "name": name,
+      }) ??
+      false;
+
   /// 连接设备
   /// - name 仅在 iOS 平台有效
   /// - sn 仅在 Android 平台有效

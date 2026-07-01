@@ -66,6 +66,19 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     throw UnimplementedError('stopScan() has not been implemented.');
   }
 
+  /// 检查目标外设是否已被系统/CoreBluetooth 持有连接。
+  ///
+  /// iOS G2 右腿申请 ANCS 后可能停止广播，普通扫描无法发现；此方法用于
+  /// scan-first 流程中的目标化探测，不能替代真正的 connectDevice。
+  Future<bool> isSystemConnectedPeripheral(
+    String belongConfig,
+    String uuid,
+    String name,
+  ) {
+    throw UnimplementedError(
+        'isSystemConnectedPeripheral() has not been implemented.');
+  }
+
   /// 连接设备
   ///
   /// - param belongConfig 配置名称
