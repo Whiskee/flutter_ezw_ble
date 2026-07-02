@@ -258,7 +258,7 @@ class BleManager private constructor() {
      * 该入口只建立长期回连 owner：不发起前台连接、不清其它设备 task、不修改系统 bond。
      * 用于旧缓存/进程恢复时当前 native 进程尚未经历 `deviceConnected` 的场景。
      */
-    fun armAutoReconnectTargets(targets: List<BleReconnectSeed>) {
+    internal fun armAutoReconnectTargets(targets: List<BleReconnectSeed>) {
         if (targets.isEmpty()) {
             return
         }
