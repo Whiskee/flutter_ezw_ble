@@ -1072,7 +1072,21 @@ extension BleManager {
             return
         }
         //  4、错误处理
-        //  - 4.1、已被绑定或密钥有异常
+        //  - 4.1、iOS error 14 表示 pairing 信息失配；autoReconnect 模式下这是可恢复的
+        //        系统断连错误，不能进入 alreadyBound 终态，否则会停止持续回连。
+        let hasAutoReconnectTask = reconnectTasks.values.contains { task in
+            isSameConnectTarget(
+                storedUuid: task.uuid,
+                storedName: task.name,
+                uuid: peripheral.identifier.uuidString,
+                name: peripheral.name ?? ""
+            )
+        }
+        if error.code == 14, hasAutoReconnectTask {
+            handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .disconnectFromSys, tag: tag)
+            loggerE(msg: "\(logHead) \(peripheral.identifier.uuidString), error code = \(error.code), msg = \(error.localizedDescription), mapped to disconnectFromSys for autoReconnect")
+            return
+        }
         if error.code == 14 {
             handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .alreadyBound, tag: tag)
         } else {
