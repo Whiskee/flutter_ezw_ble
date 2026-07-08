@@ -5,7 +5,7 @@
 //  Created by Whiskee on 2026/5/12.
 //
 //  iOS OTA WriteWithoutResponse 写队列与背压控制
-//  - 配套规范: /Users/whiskee/Workspace/OpenSource/flutter_ezw_ble/IOS_OTA_NOWAIT_SPEC.md
+//  - 配套规范: docs/IOS_OTA_NOWAIT_SPEC.md
 //  - 通过 canSendWriteWithoutResponse + peripheralIsReadyToSendWriteWithoutResponse: 做流控,
 //    把 iOS OTA 通道的每包等回调改成填满 packets-per-event,与 Android WRITE_TYPE_NO_RESPONSE 对齐.
 //

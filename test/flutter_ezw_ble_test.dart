@@ -1,6 +1,8 @@
 import 'dart:typed_data';
 
 import 'package:flutter_ezw_ble/core/models/ble_config.dart';
+import 'package:flutter_ezw_ble/core/models/ble_cmd.dart';
+import 'package:flutter_ezw_ble/core/models/ble_device.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_method_channel.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_platform_interface.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -35,6 +37,15 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
+  Future<bool> isSystemConnectedPeripheral(
+    String belongConfig,
+    String uuid,
+    String name,
+  ) {
+    throw UnimplementedError();
+  }
+
+  @override
   Future<void> connectDevice(
     String belongConfig,
     String uuid,
@@ -59,6 +70,11 @@ class MockFlutterEzwBlePlatform
 
   @override
   Future<void> deviceConnected(String uuid) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> armAutoReconnectTargets(List<BleDevice> devices) {
     throw UnimplementedError();
   }
 
@@ -109,6 +125,11 @@ class MockFlutterEzwBlePlatform
   Future<void> resetBle() {
     throw UnimplementedError();
   }
+
+  @override
+  Future<List<Map<String, dynamic>>> drainAutoReconnectEvents() {
+    throw UnimplementedError();
+  }
 }
 
 void main() {
@@ -116,6 +137,30 @@ void main() {
 
   test('$MethodChannelEzwBle is the default instance', () {
     expect(initialPlatform, isInstanceOf<MethodChannelEzwBle>());
+  });
+
+  test('BleCmd.receiveMap decodes stable receiveData payloads', () {
+    final cmd = BleCmd.receiveMap({
+      'uuid': 'device-1',
+      'psType': 2,
+      'data': 'AQID',
+      'isSuccess': true,
+    });
+
+    expect(cmd.uuid, 'device-1');
+    expect(cmd.psType, 2);
+    expect(cmd.data, [1, 2, 3]);
+    expect(cmd.isSuccess, isTrue);
+  });
+
+  test('BleCmd.receiveMap does not throw on malformed receiveData payloads',
+      () {
+    final cmd = BleCmd.receiveMap({'unexpected': null});
+
+    expect(cmd.uuid, isEmpty);
+    expect(cmd.psType, 0);
+    expect(cmd.data, isNull);
+    expect(cmd.isSuccess, isFalse);
   });
 
   // test('getPlatformVersion', () async {

@@ -67,6 +67,8 @@ extension BleConnectStateExt on BleConnectState {
         return BleConnectState.disconnectByUser;
       case "disconnectFromSys":
         return BleConnectState.disconnectFromSys;
+      case "noBleConfigFound":
+        return BleConnectState.noBleConfigFound;
       case "emptyUuid":
         return BleConnectState.emptyUuid;
       case "noDeviceFound":
@@ -81,6 +83,10 @@ extension BleConnectStateExt on BleConnectState {
         return BleConnectState.charsFail;
       case "timeout":
         return BleConnectState.timeout;
+      case "bleError":
+        return BleConnectState.bleError;
+      case "systemError":
+        return BleConnectState.systemError;
       case "connected":
         return BleConnectState.connected;
       case "upgrade":

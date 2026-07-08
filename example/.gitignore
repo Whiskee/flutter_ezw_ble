@@ -43,3 +43,9 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Runtime BLE configs are entered in the app and cached in SharedPreferences.
+# Keep local paste files out of source control.
+ble_config*.json
+local_ble_config*.json
+.ble_config*.json

@@ -16,6 +16,11 @@ BleConfig _$BleConfigFromJson(Map<String, dynamic> json) => BleConfig(
       connectTimeout: (json['connectTimeout'] as num?)?.toDouble() ?? 15000,
       upgradeSwapTime: (json['upgradeSwapTime'] as num?)?.toDouble() ?? 60000,
       mtu: (json['mtu'] as num?)?.toInt() ?? 247,
+      autoReconnect: json['autoReconnect'] as bool? ?? false,
+      autoReconnectMaxAttempts:
+          (json['autoReconnectMaxAttempts'] as num?)?.toInt() ?? 0,
+      autoReconnectUseNativePassive:
+          json['autoReconnectUseNativePassive'] as bool? ?? true,
     );
 
 Map<String, dynamic> _$BleConfigToJson(BleConfig instance) => <String, dynamic>{
@@ -26,4 +31,7 @@ Map<String, dynamic> _$BleConfigToJson(BleConfig instance) => <String, dynamic>{
       'connectTimeout': instance.connectTimeout,
       'upgradeSwapTime': instance.upgradeSwapTime,
       'mtu': instance.mtu,
+      'autoReconnect': instance.autoReconnect,
+      'autoReconnectMaxAttempts': instance.autoReconnectMaxAttempts,
+      'autoReconnectUseNativePassive': instance.autoReconnectUseNativePassive,
     };

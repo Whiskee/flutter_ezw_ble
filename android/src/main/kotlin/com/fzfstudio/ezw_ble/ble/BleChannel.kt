@@ -1,166 +1,24 @@
 package com.fzfstudio.ezw_ble.ble
 
-import android.content.Context
-import android.content.Intent
-import android.net.Uri
-import android.provider.Settings
 import com.fzfstudio.ezw_ble.EZW_BLE_CHANNEL_NAME
 import com.fzfstudio.ezw_utils.extension.toCamelCase
-import com.fzfstudio.ezw_utils.extension.toUpperSnakeCase
-import com.fzfstudio.ezw_ble.ble.models.BleConfig
-import com.fzfstudio.ezw_utils.gson.toJson
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.EventChannel
-import io.flutter.plugin.common.MethodChannel
 
+/**
+ * 当前已注册的 EventChannel sink 缓存。
+ *
+ * Flutter 的 EventChannel 会按事件类型分别注册监听，这里用完整 channel name 做 key，
+ * 避免不同事件流之间互相覆盖。
+ */
 private val bleEvents: MutableMap<String, EventChannel.EventSink> = mutableMapOf()
 
-enum class BleMC {
-    //  当前平台
-    GET_PLATFORM_VERSION,
-    //  当前蓝牙状态
-    BLE_STATE,
-    //  开启蓝牙配置
-    INIT_CONFIGS,
-    //  开始扫描设备
-    START_SCAN,
-    //  停止扫描设备
-    STOP_SCAN,
-    //  检查目标外设是否已被系统持有连接（Android 无 ANCS 语义，固定 false）
-    IS_SYSTEM_CONNECTED_PERIPHERAL,
-    //  连接设备(uuid)
-    CONNECT_DEVICE,
-    //  设置设备预连接
-    DEVICE_PRE_CONNECTED,
-    //  主动回复设备连接成功
-    DEVICE_CONNECTED,
-    //  断连设备(uuid)
-    DISCONNECT_DEVICE,
-    //  发送指令
-    SEND_CMD,
-    //  发送指令(不等待写入结果)
-    SEND_CMD_NO_WAIT,
-    //  进入升级模式
-    ENTER_UPGRADE_STATE,
-    //  退出升级模式
-    QUITE_UPGRADE_STATE,
-    //  清除连接缓存
-    CLEAN_CONNECT_CACHE,
-    //  重置蓝牙
-    RESET_BLE,
-    //  打开蓝牙设置页面
-    OPEN_BLE_SETTINGS,
-    //  打开App设置页面
-    OPEN_APP_SETTINGS,
-    //  未知
-    UNKNOWN;
-
-    companion object {
-        fun from(method: String): BleMC = valueOf(method.toUpperSnakeCase())
-    }
-
-    /**
-     *  处理回调结果
-     */
-    fun handle(context: Context, arguments: Any?,  result: MethodChannel.Result) {
-        when (this) {
-            GET_PLATFORM_VERSION -> {
-                return result.success("Android ${android.os.Build.VERSION.RELEASE}")
-            }
-            BLE_STATE -> {
-                return result.success(BleManager.instance.currentBleState)
-            }
-            INIT_CONFIGS -> {
-                val jsonMap = arguments as List<*>?
-                val configs = jsonMap?.mapNotNull { (it as Map<*, *>).toJson<BleConfig>() }
-                if (configs != null) {
-                    BleManager.instance.initConfigs(configs)
-                }
-            }
-            START_SCAN -> {
-                val jsonMap = arguments as Map<*, *>?
-                val turnOnPureModel = jsonMap?.get("turnOnPureModel") as? Boolean ?: false
-                BleManager.instance.startScan(pureModel = turnOnPureModel)
-            }
-            STOP_SCAN -> {
-                BleManager.instance.stopScan()
-            }
-            IS_SYSTEM_CONNECTED_PERIPHERAL -> {
-                return result.success(false)
-            }
-            CONNECT_DEVICE -> {
-                val jsonMap = arguments as Map<*, *>?
-                val belongConfig = jsonMap?.get("belongConfig") as String??: ""
-                val uuid = jsonMap?.get("uuid") as String? ?: ""
-                val name = jsonMap?.get("name") as String? ?: ""
-                val sn = jsonMap?.get("sn") as String? ?: ""
-                val afterUpgrade = jsonMap?.get("afterUpgrade") as Boolean? == true
-                val directConnect = jsonMap?.get("directConnect") as Boolean? == true
-                if (uuid.isNotEmpty() && sn.isNotEmpty()) {
-                    BleManager.instance.connect(belongConfig, uuid, name, sn, afterUpgrade = afterUpgrade, directConnect = directConnect)
-                }
-            }
-            DEVICE_PRE_CONNECTED -> {
-                val uuid = arguments as String? ?: ""
-                BleManager.instance.setPreConnected(uuid)
-            }
-            DEVICE_CONNECTED -> {
-                val uuid = arguments as String? ?: ""
-                BleManager.instance.setConnected(uuid)
-            }
-            DISCONNECT_DEVICE -> {
-                val jsonMap = arguments as Map<*, *>?
-                val uuid = jsonMap?.get("uuid") as String? ?: ""
-                val removeBond = jsonMap?.get("removeBond") as Boolean? ?: false
-                BleManager.instance.disconnect(uuid, removeBond)
-            }
-            SEND_CMD -> {
-                val jsonMap = arguments as Map<*, *>?
-                val uuid = jsonMap?.get("uuid") as String? ?: ""
-                val data = jsonMap?.get("data") as ByteArray? ?: byteArrayOf()
-                val psType = jsonMap?.get("psType") as Int? ?: 0
-                BleManager.instance.sendCmd(uuid, data, psType)
-            }
-            SEND_CMD_NO_WAIT -> {
-                val jsonMap = arguments as Map<*, *>?
-                val uuid = jsonMap?.get("uuid") as String? ?: ""
-                val data = jsonMap?.get("data") as ByteArray? ?: byteArrayOf()
-                val psType = jsonMap?.get("psType") as Int? ?: 0
-                BleManager.instance.sendCmdNoWait(uuid, data, psType)
-            }
-            ENTER_UPGRADE_STATE -> {
-                val uuid = arguments as String? ?: ""
-                BleManager.instance.enterUpgradeState(uuid)
-            }
-            QUITE_UPGRADE_STATE -> {
-                val uuid = arguments as String? ?: ""
-                BleManager.instance.quiteUpgradeState(uuid)
-            }
-            CLEAN_CONNECT_CACHE -> {
-                BleManager.instance.cleanConnectCache()
-            }
-            RESET_BLE -> {
-                BleManager.instance.reset()
-            }
-            OPEN_BLE_SETTINGS -> {
-                val intent = Intent(Settings.ACTION_BLUETOOTH_SETTINGS).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-                context.startActivity(intent)
-            }
-            OPEN_APP_SETTINGS -> {
-                val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                    data = Uri.fromParts("package", context.packageName, null)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-                context.startActivity(intent)
-            }
-            else -> null
-        }
-        result.success(null)
-    }
-}
-
+/**
+ * Android EventChannel 枚举。
+ *
+ * 每个枚举值对应一个独立的 Flutter 事件流；事件发送方通过 `event` 取当前 sink，
+ * 注册流程通过 `registerEventChannel` 在插件启动时完成。
+ */
 enum class BleEC {
     //  蓝牙状态
     //  - unknown = 0
@@ -189,14 +47,27 @@ enum class BleEC {
         get() = bleEvents[eventLabel]
 
     /**
-     * 注册EventChannel
+     * 注册当前事件类型对应的 EventChannel。
+     *
+     * Flutter 端重新监听时会覆盖旧 sink；取消监听时会移除缓存，避免原生继续向无效 sink 发事件。
      */
     fun registerEventChannel(binaryMessenger: BinaryMessenger) {
         EventChannel(binaryMessenger, eventLabel).setStreamHandler(
             object : EventChannel.StreamHandler {
+                /**
+                 * Flutter 端开始监听该事件流。
+                 *
+                 * 这里只缓存 sink，不主动发送历史事件；历史状态由各业务入口按需查询。
+                 */
                 override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
                     events?.let { sink -> bleEvents[eventLabel] = sink  }
                 }
+
+                /**
+                 * Flutter 端取消监听该事件流。
+                 *
+                 * 移除 sink 可以避免后台 isolate 销毁后继续写事件导致 platform channel 异常。
+                 */
                 override fun onCancel(arguments: Any?) {
                     bleEvents.remove(eventLabel)
                 }

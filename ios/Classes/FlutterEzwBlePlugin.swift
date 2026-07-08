@@ -21,7 +21,13 @@ public class FlutterEzwBlePlugin: NSObject, FlutterPlugin {
     }
    
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
-        BleMC(rawValue: call.method)?.handle(arguments: call.arguments, result: result)
+        guard let method = BleMC(rawValue: call.method) else {
+            // MethodChannel 必须对每个 Dart 调用返回结果；未知方法如果静默丢弃，
+            // Dart 侧 Future 会永久 pending，最终表现为启动或操作超时。
+            result(FlutterMethodNotImplemented)
+            return
+        }
+        method.handle(arguments: call.arguments, result: result)
     }
     
 }

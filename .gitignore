@@ -37,3 +37,12 @@ build/
 
 # omx
 .omx/
+
+# Local BLE configs must stay off GitHub. The example app stores runtime
+# configs in SharedPreferences; these patterns only protect ad-hoc paste files.
+ble_config*.json
+local_ble_config*.json
+.ble_config*.json
+example/ble_config*.json
+example/local_ble_config*.json
+example/.ble_config*.json

@@ -20,7 +20,7 @@
 
 > **重要**：本仓库 `lib/` 是 Dart 侧实现的主入口。原生侧 `FlutterEzwBlePlugin` 已纳入仓库 `android/` 与 `ios/` 子目录（Kotlin / Swift），与 Dart 侧同仓维护：
 >
-> - `ios/Classes/`：`FlutterEzwBlePlugin.swift` 注册 + `ble/BleManager.swift`（CoreBluetooth）+ `ble/BleChannel.swift`（MethodChannel 分发）+ `ble/OtaWriteQueue.swift`（OTA `WriteWithoutResponse` 背压队列，配套规范 `IOS_OTA_NOWAIT_SPEC.md`）；
+> - `ios/Classes/`：`FlutterEzwBlePlugin.swift` 注册 + `ble/BleManager.swift`（CoreBluetooth）+ `ble/BleChannel.swift`（MethodChannel 分发）+ `ble/OtaWriteQueue.swift`（OTA `WriteWithoutResponse` 背压队列，配套规范 `docs/IOS_OTA_NOWAIT_SPEC.md`）；
 > - `android/src/main/kotlin/com/fzfstudio/ezw_ble/`：`FlutterEzwBlePlugin.kt` + `ble/BleManager.kt`，其中 `ble/extension/BluetoothDeviceExt.kt` 承载 Android 设备名解析与 `BleDevice` 转换。
 >
 > 改动 Dart API 时一并评估原生侧两端的联动；个别协议/性能改造（如 OTA 的 `sendCmdNoWait`）会有独立 spec 文档，落地时优先按 spec 走。
@@ -176,7 +176,7 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `devicePreConnected` | `Future<void> devicePreConnected(String uuid)` | "预连接"通知：业务确认要连这个设备前，让原生侧提前做准备（缓存、超时计时器复位），避免接下来的 `connectDevice` 超时。 |
 | `deviceConnected` | `Future<void> deviceConnected(String uuid)` | "真连上了"通知：业务侧（如收到设备配对回包后）告诉原生 "连接已业务就绪"，原生再 push `connectFinish` → `connected`。 |
 | `sendCmd` | `Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0})` | 写特征值，等待原生层 write 完成。`psType` 是"私有服务类型"，对应 `BlePrivateService.type`（0=基础，1=OTA，2+=自定义）。 |
-| `sendCmdNoWait` | `Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0})` | 不等 write callback，连发场景使用。Android：`WRITE_TYPE_NO_RESPONSE` 写入。iOS：`psType == 1`（OTA）走 `WriteWithoutResponse` + `canSendWriteWithoutResponse` 背压队列（见 `ios/Classes/ble/OtaWriteQueue.swift` 与 `IOS_OTA_NOWAIT_SPEC.md`），其它 `psType` 退化为 `WriteWithoutResponse` 立即返回路径。 |
+| `sendCmdNoWait` | `Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0})` | 不等 write callback，连发场景使用。Android：`WRITE_TYPE_NO_RESPONSE` 写入。iOS：`psType == 1`（OTA）走 `WriteWithoutResponse` + `canSendWriteWithoutResponse` 背压队列（见 `ios/Classes/ble/OtaWriteQueue.swift` 与 `docs/IOS_OTA_NOWAIT_SPEC.md`），其它 `psType` 退化为 `WriteWithoutResponse` 立即返回路径。 |
 | `enterUpgradeState` | `Future<void> enterUpgradeState(String uuid)` | 标记此 uuid 进入 OTA。原生侧据此切到 OTA 私有服务、延长断连超时（与 `BleConfig.upgradeSwapTime` 配合）。 |
 | `quiteUpgradeState` | `Future<void> quiteUpgradeState(String uuid)` | 退出 OTA 状态。 |
 | `openBleSettings` | `Future<void> openBleSettings()` | 跳系统蓝牙开关页。 |
@@ -232,6 +232,9 @@ class BleConfig {
   final double connectTimeout;    // 单次连接超时（ms），默认 15000
   final double upgradeSwapTime;   // 升级后启动新固件等待时间（ms），默认 60000，重连时用
   final int    mtu;               // 仅 Android 用，默认 247
+  final bool   autoReconnect;     // 是否启用原生自动回连，默认 false
+  final int    autoReconnectMaxAttempts;      // 兼容/日志字段，不再作为停止条件
+  final bool   autoReconnectUseNativePassive; // 是否允许平台被动回连，默认 true
 }
 ```
 
@@ -441,7 +444,51 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 
 - 任一非"连接中"终态（connected / 断开 / 错误）到达 → `handleConnectState` 清除该定时器。
 - `connectFinish`（BLE 物理连接完成、但应用层鉴权尚未完成）**不清除**定时器，作为鉴权阶段的安全兜底。
-- **鉴权宽限（重点）**：业务层收到 `connectFinish` 后会发鉴权/通道指令，期间调用 `devicePreConnected(uuid)`（iOS `setPreConnected` / Android `preConnectedDevices`）告知原生"即将连上"。历史实现是 pre-connected 后**永久豁免**超时——一旦 Dart 端鉴权流程异常/挂起（`deviceConnected` 永不到达），设备会永久停在 `connectFinish`（属 `isConnecting`），App UI 一直"连接中"且无法自愈。现改为**有界宽限**（`isAuthGrace`）：定时器触发时若已 pre-connected 但仍未 `connected`，再续一次（连接成功仍由 `handleConnectState` 清除）；二次到期仍未连接则强制上报 `timeout`，杜绝永久卡死。iOS/Android 行为对齐。
+- **鉴权宽限（重点）**：业务层收到 `connectFinish` 后先发鉴权指令；鉴权成功后调用 `devicePreConnected(uuid)`（iOS `setPreConnected` / Android `preConnectedDevices`）告知原生"即将连上"，随后执行必要的业务收尾指令并调用 `deviceConnected(uuid)`。历史实现是 pre-connected 后**永久豁免**超时——一旦 Dart 端鉴权流程异常/挂起（`deviceConnected` 永不到达），设备会永久停在 `connectFinish`（属 `isConnecting`），App UI 一直"连接中"且无法自愈。现改为**有界宽限**（`isAuthGrace`）：定时器触发时若已 pre-connected 但仍未 `connected`，再续一次（连接成功仍由 `handleConnectState` 清除）；二次到期仍未连接则强制上报 `timeout`，杜绝永久卡死。iOS/Android 行为对齐。
+
+### 8.6 原生自动回连（`autoReconnect`）
+
+`BleConfig.autoReconnect = true` 后，Android/iOS 原生层会在设备已经达到业务 `connected` 后注册一个长期回连意图。这个意图只处理系统异常断连和连接流程失败，不处理用户主动断连。
+
+触发回连：
+
+- `disconnectFromSys`
+- `timeout`
+- `serviceFail`
+- `charsFail`
+- `noDeviceFound`
+
+取消回连：
+
+- `disconnectByUser`
+- `resetBle`
+- `cleanConnectCache`
+- `removeBond`
+- 配置被删除或 `autoReconnect=false`
+- 插件释放
+
+不会取消回连：
+
+- 单次 `timeout`
+- 单次 `noDeviceFound`
+- 单次 `serviceFail`
+- 单次 `charsFail`
+- 蓝牙关闭
+
+蓝牙关闭只暂停任务；蓝牙重新开启后恢复任务。自动回连不再使用指数退避；`connectTimeout` 是单轮 passive reconnect 的最长等待时间，超时后关闭旧 GATT，并在固定 1.5s 防抖后重建 `connectGatt(true)`。`autoReconnectMaxAttempts` 仅保留兼容和日志意义，**不再作为停止条件**。也就是说，设备离开 30 分钟再回来，只要用户/业务没有主动取消，原生层仍应继续持有或重建回连任务。
+
+回连成功的门槛不是 GATT 物理连接成功，而是全部 `BleConfig.privateServices` 都重新恢复：
+
+1. 重新发现所有服务；
+2. 每条私有服务都找到 write/read characteristic；
+3. 每条 read characteristic 都重新打开 notify/CCCD；
+4. 全部成功后才上报 `connectFinish`，等待业务鉴权后调用 `deviceConnected` 进入 `connected`。
+
+Android 回连优先复用现有 `connect(...)` active 路径；当设备不可见且 `autoReconnectUseNativePassive = true` 时，可用 `connectGatt(autoConnect = true)` 持有被动回连，并由 watchdog 超时释放后进入下一轮退避。watchdog 是 zombie GATT 刷新机制，不是停止条件。
+
+iOS 回连优先走 `retrieveConnectedPeripherals` / `retrievePeripherals`，自动回连任务来源的 `centralManager.connect` 会携带系统 auto reconnect option；找不到 peripheral 但有稳定 name 时仍回退到 scan-by-name。已知 peripheral 的 pending connect 不能被短扫描 timeout 取消，因为它是 CoreBluetooth State Restoration 后续唤醒进程的系统等待点。
+
+完整方案见 `docs/AUTO_RECONNECT_SPEC.md`。iOS State Restoration 专项边界见 `docs/IOS_STATE_RESTORATION_SPEC.md`。
 
 ---
 
@@ -491,7 +538,7 @@ OTA 流程
   ├─ EzwBle.to.bleMC.sendCmdNoWait(..., psType=1)       ▶ 通过 OTA 私有服务连发
   │                                                       Android: WRITE_TYPE_NO_RESPONSE
   │                                                       iOS:     OtaWriteQueue + canSendWriteWithoutResponse 背压
-  │                                                       (与 Android packets-per-event 行为对齐, 详见 IOS_OTA_NOWAIT_SPEC.md)
+  │                                                       (与 Android packets-per-event 行为对齐, 详见 docs/IOS_OTA_NOWAIT_SPEC.md)
   ├─ （固件烧录、设备重启 → 系统断连）
   ├─ ◀ connectStatusEC: disconnectFromSys
   │      （iOS 侧 OtaWriteQueue 自动 cancelAll, 释放挂起的 await）
@@ -601,7 +648,7 @@ connectFinish 上报给 Dart
   → even_connect 发 AUTH/pairAuth
   → 业务确认成功
   → devicePreConnected(uuid)
-  → 业务收尾（G2 右腿 selectPipeChannel/timeSync）
+  → 业务收尾（G2 右腿 PIPE_ROLE_CHANGE(RIGHT)/TIME_SYNC）
   → deviceConnected(uuid)
   → handleConnectState(CONNECTED)
 ```
@@ -668,7 +715,35 @@ iOS 的关键差异：系统级 ANCS 连接会让外设停止广播，`scanForPe
 
 这个标记只描述 CoreBluetooth/GATT 流程，不代表 G2 应用层 AUTH 已成功；G2/Ring1 的最终成功仍由业务层调用 `deviceConnected`。
 
-### 11.8 状态映射回归清单
+### 11.8 iOS State Preservation / Restoration
+
+iOS State Restoration 是自动回连链路的一部分，不是独立业务入口。`centralManager(_:willRestoreState:)` 可能早于 Flutter 引擎、EventChannel 订阅和 `initConfigs`，因此 Swift 回调里只能缓存 restored peripherals，不能直接执行业务认证，也不能假设 `BleConfig` 已经存在。
+
+恢复流程：
+
+1. App 首连成功后，业务调用 `deviceConnected(uuid)`，原生持久化 reconnect target。
+2. 系统异常断连后，原生立即把已知 `CBPeripheral` 交回 `centralManager.connect`，让 CoreBluetooth 持有 pending connect。
+3. App 后台、挂起或被系统回收后，外设重新出现。
+4. CoreBluetooth 通过 State Restoration 恢复进程，并在 `willRestoreState` 里交回 peripheral。
+5. 原生等 `initConfigs` 完成后匹配 `BleConfig` 和 reconnect target。
+6. restored peripheral 进入同一套 GATT readiness gate。
+7. `connectFinish` 上报给 Dart，Dart 重新发送业务 AUTH / 通道切换 / 时间同步。
+8. Dart 再次调用 `deviceConnected(uuid)`，重新 arm 后续回连。
+
+重要边界：
+
+- 只有宿主 `Info.plist` 声明 `UIBackgroundModes = bluetooth-central` 时，iOS 才能带
+  `CBCentralManagerOptionRestoreIdentifierKey` 初始化 `CBCentralManager`。缺失时插件必须降级为普通
+  central manager，避免 Apple 直接抛 `NSException`。
+- State Restoration 不承诺把 App UI 拉到前台。
+- 用户显式强制退出后的后台恢复受 iOS 系统策略限制，不能作为稳定业务承诺。
+- `connectFinish` 只表示 GATT ready，不表示业务 connected。
+- 蓝牙 poweredOff 只暂停任务；poweredOn 后应继续 replay reconnect target。
+- EventChannel 订阅可能晚于恢复事件，原生需要缓冲关键 reconnect/restoration 事件供 Dart 补读。
+
+详细规范、脚本和验收项见 `docs/IOS_STATE_RESTORATION_SPEC.md`。
+
+### 11.9 状态映射回归清单
 
 改任何原生状态映射时，至少验证：
 
@@ -729,7 +804,7 @@ iOS 的关键差异：系统级 ANCS 连接会让外设停止广播，`scanForPe
 
 ### 12.6 iOS OTA `WriteWithoutResponse` 背压（`sendCmdNoWait` + `psType==1`）
 
-iOS 端 OTA 通道走单独的 per-peripheral 写队列 `OtaWriteQueue`，目标是把 packets-per-event 打满到 iOS 上限（4 包/事件），与 Android `WRITE_TYPE_NO_RESPONSE` 行为对齐。完整规范见 `IOS_OTA_NOWAIT_SPEC.md`。
+iOS 端 OTA 通道走单独的 per-peripheral 写队列 `OtaWriteQueue`，目标是把 packets-per-event 打满到 iOS 上限（4 包/事件），与 Android `WRITE_TYPE_NO_RESPONSE` 行为对齐。完整规范见 `docs/IOS_OTA_NOWAIT_SPEC.md`。
 
 关键约束（改原生侧前必读）：
 

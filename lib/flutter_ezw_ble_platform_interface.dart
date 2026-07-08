@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:flutter_ezw_ble/core/models/ble_config.dart';
+import 'package:flutter_ezw_ble/core/models/ble_device.dart';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
 import 'flutter_ezw_ble_method_channel.dart';
@@ -131,6 +132,15 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
         'deviceConnected(uuid: $uuid) has not been implemented.');
   }
 
+  /// 只补种 native 自动回连目标，不发起前台连接。
+  ///
+  /// 用于旧缓存/进程恢复场景：Dart 已知道用户允许 autoReconnect，但 native
+  /// 当前进程尚未经历 `deviceConnected`，需要先建立长期回连 owner。
+  Future<void> armAutoReconnectTargets(List<BleDevice> devices) {
+    throw UnimplementedError(
+        'armAutoReconnectTargets(devices: $devices) has not been implemented.');
+  }
+
   /// 发送指令
   ///
   /// - param uuid 设备唯一标识
@@ -193,5 +203,14 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// 清除连接缓存
   Future<void> cleanConnectCache() {
     throw UnimplementedError('cleanConnectCache() has not been implemented.');
+  }
+
+  /// 读取并清空原生自动回连/后台恢复期间持久化的事件。
+  ///
+  /// 用于 iOS State Restoration 或 Android 原生回连先于 Dart 监听器发生时，
+  /// 让业务层在启动后补齐 native 侧证据并决定是否继续业务鉴权流程。
+  Future<List<Map<String, dynamic>>> drainAutoReconnectEvents() {
+    throw UnimplementedError(
+        'drainAutoReconnectEvents() has not been implemented.');
   }
 }

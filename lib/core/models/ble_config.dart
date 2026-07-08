@@ -21,6 +21,12 @@ class BleConfig {
   final double upgradeSwapTime;
   //  仅Android使用
   final int mtu;
+  //  是否启用原生自动回连
+  final bool autoReconnect;
+  //  自动回连退避计数兼容字段；当前实现不把次数作为停止条件
+  final int autoReconnectMaxAttempts;
+  //  是否允许平台被动回连能力
+  final bool autoReconnectUseNativePassive;
 
   BleConfig(
     this.name,
@@ -30,6 +36,9 @@ class BleConfig {
     this.connectTimeout = 15000,
     this.upgradeSwapTime = 60000,
     this.mtu = 247,
+    this.autoReconnect = false,
+    this.autoReconnectMaxAttempts = 0,
+    this.autoReconnectUseNativePassive = true,
   });
 
   factory BleConfig.fromJson(Map<String, dynamic> json) =>

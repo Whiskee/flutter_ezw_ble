@@ -16,6 +16,7 @@ struct BleConnectedDevice {
     var readCharsDic: [Int: CBCharacteristic] = [:]
     var isConnected: Bool = false
     var readCharsNotify: Int = 0
+    var notifiedReadCharUUIDs: Set<String> = []
     /// BLE物理连接流程是否已完成（所有特征订阅确认后设置为true，断连/错误时重置为false）
     var isBleFlowCompleted: Bool = false
     /// 异常断连后需要先扫描再重连（disconnectFromSys时置true，重连时消费一次）
@@ -23,7 +24,7 @@ struct BleConnectedDevice {
     
     var isReadCharsNotifySuccess: Bool {
         get {
-            return readCharsNotify == readCharsDic.count
+            return notifiedReadCharUUIDs.count == readCharsDic.count
         }
     }
     
@@ -31,7 +32,18 @@ struct BleConnectedDevice {
      *  更新连接设备信息
      */
     func update(belongConfig: BleConfig, writeChars: [Int: CBCharacteristic], readChars: [Int: CBCharacteristic]) -> BleConnectedDevice {
-        return BleConnectedDevice(belongConfig: belongConfig, peripheral: peripheral, writeCharsDic: writeChars, readCharsDic: readChars, isConnected: isConnected)
+        var device = BleConnectedDevice(
+            belongConfig: belongConfig,
+            peripheral: peripheral,
+            writeCharsDic: writeChars,
+            readCharsDic: readChars,
+            isConnected: isConnected,
+            readCharsNotify: readCharsNotify,
+            notifiedReadCharUUIDs: notifiedReadCharUUIDs
+        )
+        device.isBleFlowCompleted = isBleFlowCompleted
+        device.needsScanBeforeReconnect = needsScanBeforeReconnect
+        return device
    }
    
     /**

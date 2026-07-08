@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_ezw_ble/core/models/ble_config.dart';
+import 'package:flutter_ezw_ble/core/models/ble_device.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble.dart';
 
 import 'flutter_ezw_ble_platform_interface.dart';
@@ -65,7 +66,7 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
         "uuid": uuid,
         "name": name,
         "sn": sn,
-        "afterUpgrade": afterUpgrade,
+        "afterUpgrade": afterUpgrade ?? false,
         "directConnect": directConnect,
       });
 
@@ -90,6 +91,13 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       methodChannel.invokeMethod("deviceConnected", uuid);
 
   @override
+  Future<void> armAutoReconnectTargets(List<BleDevice> devices) async =>
+      methodChannel.invokeMethod(
+        "armAutoReconnectTargets",
+        devices.map((device) => device.toJson()).toList(),
+      );
+
+  @override
   Future<void> sendCmd(
     String uuid,
     Uint8List data, {
@@ -105,7 +113,7 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
   /// - Android: 走 `WRITE_TYPE_NO_RESPONSE`;
   /// - iOS: psType==1(OTA) 走 `WriteWithoutResponse` + `canSendWriteWithoutResponse` 背压队列,
   ///   其它 psType 退化为现有 `WriteWithoutResponse` 立即返回;
-  /// - 详见 IOS_OTA_NOWAIT_SPEC.md.
+  /// - 详见 docs/IOS_OTA_NOWAIT_SPEC.md.
   @override
   Future<void> sendCmdNoWait(
     String uuid,
@@ -140,4 +148,16 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
   @override
   Future<void> cleanConnectCache() async =>
       methodChannel.invokeMethod("cleanConnectCache");
+
+  @override
+  Future<List<Map<String, dynamic>>> drainAutoReconnectEvents() async {
+    final result = await methodChannel
+        .invokeListMethod<Object?>("drainAutoReconnectEvents");
+    return (result ?? const <Object?>[])
+        .whereType<Map<Object?, Object?>>()
+        .map((item) => item.map(
+              (key, value) => MapEntry(key.toString(), value),
+            ))
+        .toList();
+  }
 }
