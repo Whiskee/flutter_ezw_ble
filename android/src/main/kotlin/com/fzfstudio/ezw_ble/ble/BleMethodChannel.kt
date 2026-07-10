@@ -36,6 +36,8 @@ enum class BleMC {
     DEVICE_CONNECTED,
     /** 补种 native 自动回连目标，不发起前台连接。 */
     ARM_AUTO_RECONNECT_TARGETS,
+    /** 前台 scan-first 未命中后恢复此前暂停的 native 自动回连。 */
+    RESUME_AUTO_RECONNECT_AFTER_SCAN_FALLBACK,
     /** 断开设备连接，可选移除系统绑定。 */
     DISCONNECT_DEVICE,
     /** 发送普通 GATT 指令。 */
@@ -149,6 +151,10 @@ enum class BleMC {
                 val targets = jsonArray?.mapNotNull { (it as? Map<*, *>)?.toReconnectSeed() }
                     ?: emptyList()
                 BleManager.instance.armAutoReconnectTargets(targets)
+            }
+            RESUME_AUTO_RECONNECT_AFTER_SCAN_FALLBACK -> {
+                // 1. 只有 Dart 已结束本轮 scan-first 窗口时才允许重新注册 passive GATT。
+                BleManager.instance.resumeAutoReconnectAfterScanFallback()
             }
             DISCONNECT_DEVICE -> {
                 // 1. 主动断连必须透传 removeBond，移除设备时需要清理系统绑定。

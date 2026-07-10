@@ -162,6 +162,30 @@ internal class BleAutoReconnectSupervisor(
     }
 
     /**
+     * 在 Dart 的前台 scan-first 窗口明确未命中后，恢复蓝牙关闭前暂停的长期回连。
+     *
+     * 这里不能在 `STATE_ON` 直接调用：那会让 passive `connectGatt(true)` 先于 Dart
+     * 扫描创建 owner。扫描结束后才调度，既保留 scan-first 契约，也不会让离线设备
+     * 永久失去 Android 系统级的被动回连等待点。
+     */
+    fun resumeAfterScanFallback() {
+        if (!isBluetoothEnabled() || bleState() != BLE_STATE_ON) {
+            return
+        }
+        val pausedTasks = reconnectTasks.values.filter { it.pausedByBluetoothOff }
+        pausedTasks.forEach { task ->
+            task.pausedByBluetoothOff = false
+            schedule(task.uuid, BleConnectState.DISCONNECT_FROM_SYS)
+        }
+        if (pausedTasks.isNotEmpty()) {
+            sendLog(
+                BleLoggerTag.d,
+                "Auto reconnect: resume ${pausedTasks.size} task(s) after Dart scan-first fallback",
+            )
+        }
+    }
+
+    /**
      * 判断某个设备是否处于自动回连中的连接尝试。
      */
     fun isAttempting(uuid: String): Boolean {

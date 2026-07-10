@@ -31,6 +31,8 @@ enum BleMC: String {
     case devicePreConnected
     /// Mark business-layer auth as complete and arm auto reconnect.
     case deviceConnected
+    /// Android scan-first fallback hook; iOS keeps its CoreBluetooth pending connect unchanged.
+    case resumeAutoReconnectAfterScanFallback
     /// Send one command and wait for the platform write path.
     case sendCmd
     /// Send without waiting; OTA uses the no-response backpressure queue.
@@ -123,6 +125,10 @@ enum BleMC: String {
         case .deviceConnected:
             let uuid = arguments as? String ?? ""
             BleManager.shared.setConnected(uuid: uuid)
+            break
+        case .resumeAutoReconnectAfterScanFallback:
+            // iOS 的 pending connect / State Restoration 在蓝牙恢复时由 CoreBluetooth 接管，
+            // 不应因 Android 的扫描兜底信号取消或重建系统级等待点。
             break
         case .devicePreConnected:
             let uuid = arguments as? String ?? ""

@@ -175,6 +175,7 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `disconnectDevice` | `Future<void> disconnectDevice(String uuid, String name, {bool removeBond = false})` | 主动断连。`removeBond=true`（仅 Android）会一并移除系统配对。 |
 | `devicePreConnected` | `Future<void> devicePreConnected(String uuid)` | "预连接"通知：业务确认要连这个设备前，让原生侧提前做准备（缓存、超时计时器复位），避免接下来的 `connectDevice` 超时。 |
 | `deviceConnected` | `Future<void> deviceConnected(String uuid)` | "真连上了"通知：业务侧（如收到设备配对回包后）告诉原生 "连接已业务就绪"，原生再 push `connectFinish` → `connected`。 |
+| `resumeAutoReconnectAfterScanFallback` | `Future<void> resumeAutoReconnectAfterScanFallback()` | Android 专用：宿主完成蓝牙恢复后的 scan-first 窗口且未命中时，恢复此前暂停的 passive reconnect；iOS 保持 CoreBluetooth pending connect / State Restoration，不执行额外操作。 |
 | `sendCmd` | `Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0})` | 写特征值，等待原生层 write 完成。`psType` 是"私有服务类型"，对应 `BlePrivateService.type`（0=基础，1=OTA，2+=自定义）。 |
 | `sendCmdNoWait` | `Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0})` | 不等 write callback，连发场景使用。Android：`WRITE_TYPE_NO_RESPONSE` 写入。iOS：`psType == 1`（OTA）走 `WriteWithoutResponse` + `canSendWriteWithoutResponse` 背压队列（见 `ios/Classes/ble/OtaWriteQueue.swift` 与 `docs/IOS_OTA_NOWAIT_SPEC.md`），其它 `psType` 退化为 `WriteWithoutResponse` 立即返回路径。 |
 | `enterUpgradeState` | `Future<void> enterUpgradeState(String uuid)` | 标记此 uuid 进入 OTA。原生侧据此切到 OTA 私有服务、延长断连超时（与 `BleConfig.upgradeSwapTime` 配合）。 |

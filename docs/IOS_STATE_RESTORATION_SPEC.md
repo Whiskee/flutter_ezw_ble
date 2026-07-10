@@ -136,7 +136,7 @@ readCharsNotify == bleConfig.privateServices.count
 - `charsFail`；
 - 蓝牙关闭。
 
-蓝牙关闭只能暂停任务。恢复到 poweredOn 后，iOS 原生层应重新 replay reconnect target，继续 pending connect 或 GATT pipeline。Android 前台“关开蓝牙”改由宿主的 scan-first 流程恢复，不能套用 iOS 的 pending-connect 规则。
+蓝牙关闭只能暂停任务。恢复到 poweredOn 后，iOS 原生层应重新 replay reconnect target，继续 pending connect 或 GATT pipeline。Android 前台“关开蓝牙”改由宿主的 scan-first 流程恢复；扫描未命中时宿主才会显式恢复 Android passive reconnect，不能套用 iOS 的 pending-connect 规则。
 
 ## 9. Dart / even_connect 职责
 

@@ -82,6 +82,9 @@ Pause the task on Bluetooth off. Recovery ownership depends on the platform:
   host's normal scan-first reconnect flow issue the foreground connection. That
   request cancels the same UUID's paused native task and re-arms it after the
   next business `connected`; native must not start `connectGatt(true)` first.
+  If that scan-first window expires without a match, the host explicitly calls
+  `resumeAutoReconnectAfterScanFallback`; only then may Android re-arm the
+  paused passive GATT so an out-of-range device can recover later.
 - iOS: resume the pending CoreBluetooth reconnect target when Bluetooth returns
   to powered on, because its pending connect / State Restoration path is the
   system-level background recovery mechanism.

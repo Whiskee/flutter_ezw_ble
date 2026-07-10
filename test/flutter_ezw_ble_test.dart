@@ -79,6 +79,11 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
+  Future<void> resumeAutoReconnectAfterScanFallback() {
+    throw UnimplementedError();
+  }
+
+  @override
   Future<void> sendCmd(
     String uuid,
     Uint8List data, {

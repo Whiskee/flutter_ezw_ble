@@ -98,6 +98,10 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       );
 
   @override
+  Future<void> resumeAutoReconnectAfterScanFallback() async =>
+      methodChannel.invokeMethod("resumeAutoReconnectAfterScanFallback");
+
+  @override
   Future<void> sendCmd(
     String uuid,
     Uint8List data, {

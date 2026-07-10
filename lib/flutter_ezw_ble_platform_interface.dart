@@ -141,6 +141,15 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
         'armAutoReconnectTargets(devices: $devices) has not been implemented.');
   }
 
+  /// Android 前台 scan-first 窗口未命中后，恢复此前因蓝牙关闭暂停的 native 回连。
+  ///
+  /// 调用方必须先结束本轮扫描；否则 passive `connectGatt(true)` 会重新抢占扫描编排。
+  Future<void> resumeAutoReconnectAfterScanFallback() {
+    throw UnimplementedError(
+      'resumeAutoReconnectAfterScanFallback() has not been implemented.',
+    );
+  }
+
   /// 发送指令
   ///
   /// - param uuid 设备唯一标识

@@ -289,6 +289,16 @@ class BleManager private constructor() {
     }
 
     /**
+     * 处理 Dart 前台 scan-first 未命中的收尾。
+     *
+     * 蓝牙刚恢复时 native 必须保持暂停，给宿主一次完整的扫描优先机会；只有宿主
+     * 明确宣告本轮扫描结束且未命中后，才恢复 Android passive GATT 的长期等待。
+     */
+    internal fun resumeAutoReconnectAfterScanFallback() {
+        autoReconnectSupervisor.resumeAfterScanFallback()
+    }
+
+    /**
      *  开启扫描
      */
     fun startScan(pureModel: Boolean = false) {

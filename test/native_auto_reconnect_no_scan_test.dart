@@ -7,6 +7,9 @@ void main() {
     final androidManager =
         File('android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleManager.kt')
             .readAsStringSync();
+    final androidReconnect = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleAutoReconnectSupervisor.kt',
+    ).readAsStringSync();
     final bluetoothStateListener = androidManager.substring(
       androidManager.indexOf('private fun createBleStateListener()'),
       androidManager.indexOf('override fun onDeviceBondStateChanged'),
@@ -19,6 +22,18 @@ void main() {
     expect(
       bluetoothStateListener,
       isNot(contains('autoReconnectSupervisor.resumeAfterBluetoothOn()')),
+    );
+    expect(
+      androidManager,
+      contains('resumeAutoReconnectAfterScanFallback()'),
+    );
+    expect(
+      androidReconnect,
+      contains('fun resumeAfterScanFallback()'),
+    );
+    expect(
+      androidReconnect,
+      contains('after Dart scan-first fallback'),
     );
   });
 
