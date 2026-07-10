@@ -76,7 +76,15 @@ Cancel the task only on:
 - config removed or `autoReconnect=false`
 - plugin release
 
-Pause the task on Bluetooth off. Resume paused tasks when Bluetooth returns to powered on.
+Pause the task on Bluetooth off. Recovery ownership depends on the platform:
+
+- Android foreground Bluetooth off/on: keep the native task paused and let the
+  host's normal scan-first reconnect flow issue the foreground connection. That
+  request cancels the same UUID's paused native task and re-arms it after the
+  next business `connected`; native must not start `connectGatt(true)` first.
+- iOS: resume the pending CoreBluetooth reconnect target when Bluetooth returns
+  to powered on, because its pending connect / State Restoration path is the
+  system-level background recovery mechanism.
 
 ## Trigger Rules
 
@@ -157,6 +165,12 @@ Android uses the existing active `connect(...)` path first. This preserves:
 
 When active reconnect cannot see the target and `autoReconnectUseNativePassive == true`, Android may use `BluetoothDevice.connectGatt(..., autoConnect = true, ...)` as a passive reconnect handle. The supervisor may keep a watchdog for diagnostics and missing-handle recovery, but a live pending GATT must remain registered with Android without emitting a Dart/UI timeout. This avoids turning passive reconnect into a high-frequency GATT churn loop while the visible app state remains connecting.
 
+Android must not create that passive handle as the immediate result of a user
+turning Bluetooth back on in the foreground. The host first performs the same
+scan-first discovery used at cold start; only the scan-matched foreground
+request may open GATT. This prevents a passive `CONNECTING` event from causing
+the Dart scan orchestrator to defer to a native owner that cannot complete.
+
 The Android watchdog is an observation/missing-handle recovery mechanism, not a
 stop condition or visible connection failure.
 If the device remains away for a long time, the supervisor keeps the pending
@@ -208,7 +222,8 @@ timeout just because the peripheral stayed away for minutes or hours.
 - User disconnect does not reconnect.
 - Device power loss then power restore reconnects to `connectFinish`.
 - All private services are writable and notify-capable after reconnect.
-- Bluetooth off pauses tasks; Bluetooth on resumes them.
+- Bluetooth off pauses tasks; Android foreground Bluetooth-on is recovered by
+  the host's scan-first flow, while iOS resumes its native pending connect.
 - iOS ANCS/system-connected devices do not fall into scan timeout.
 - Android out-of-range devices can recover through passive reconnect when enabled.
 - Long out-of-range periods do not stop native reconnect unless user/business explicitly cancels it.

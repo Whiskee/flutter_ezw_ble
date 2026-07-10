@@ -1116,7 +1116,15 @@ class BleManager private constructor() {
                     }
                 }
             } else {
-                autoReconnectSupervisor.resumeAfterBluetoothOn()
+                // Android 的蓝牙关开是前台可见的恢复场景：必须由 Dart 先扫描、命中后
+                // 再发起 connectGatt(false)。若这里抢先恢复 passive autoConnect，会先把
+                // endpoint 标为 CONNECTING，导致 even_connect 把扫描编排让给 native owner，
+                // 最终可能长期停在“连接中”。保留 task 的暂停态，前台连接会按 UUID 接管并在
+                // 业务 connected 后重新 arm；iOS 的 pending connect / State Restoration 不走此分支。
+                sendLog(
+                    BleLoggerTag.d,
+                    "Auto reconnect: bluetooth on, wait for Dart scan-first foreground reconnect",
+                )
             }
             sendLog(BleLoggerTag.d, "Ble statue listener: Original state = $state, to even state = $bleState")
             //  检查蓝牙权限

@@ -136,7 +136,7 @@ readCharsNotify == bleConfig.privateServices.count
 - `charsFail`；
 - 蓝牙关闭。
 
-蓝牙关闭只能暂停任务。恢复到 poweredOn 后，原生层应重新 replay reconnect target，继续 pending connect 或 GATT pipeline。
+蓝牙关闭只能暂停任务。恢复到 poweredOn 后，iOS 原生层应重新 replay reconnect target，继续 pending connect 或 GATT pipeline。Android 前台“关开蓝牙”改由宿主的 scan-first 流程恢复，不能套用 iOS 的 pending-connect 规则。
 
 ## 9. Dart / even_connect 职责
 
@@ -185,7 +185,7 @@ readCharsNotify == bleConfig.privateServices.count
 - App 首连成功后调用 `deviceConnected(uuid)`，原生持久化 reconnect target。
 - 外设离开后 App 后台，原生保持 pending connect，不用短 timeout 取消。
 - 系统恢复后能看到 `willRestoreState`，且 restored peripheral 被缓存到 `initConfigs` 之后 replay。
-- 蓝牙 poweredOff 只暂停，poweredOn 后继续恢复。
+- iOS 蓝牙 poweredOff 只暂停，poweredOn 后继续恢复；Android 前台关开蓝牙由宿主先扫描再连接。
 - ANCS / 系统已连接外设扫描不可见时仍可通过 retrieve 路径进入 GATT。
 - 每次恢复都重新 discovery service、characteristic、notify / CCCD。
 - `connectFinish` 后 Dart 重新发业务认证，认证成功后再 `deviceConnected`。

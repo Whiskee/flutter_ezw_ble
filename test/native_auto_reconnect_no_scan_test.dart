@@ -3,6 +3,25 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('Android Bluetooth-on defers to the host scan-first reconnect flow', () {
+    final androidManager =
+        File('android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleManager.kt')
+            .readAsStringSync();
+    final bluetoothStateListener = androidManager.substring(
+      androidManager.indexOf('private fun createBleStateListener()'),
+      androidManager.indexOf('override fun onDeviceBondStateChanged'),
+    );
+
+    expect(
+      bluetoothStateListener,
+      contains('wait for Dart scan-first foreground reconnect'),
+    );
+    expect(
+      bluetoothStateListener,
+      isNot(contains('autoReconnectSupervisor.resumeAfterBluetoothOn()')),
+    );
+  });
+
   test('native auto reconnect does not enter explicit scan routes', () {
     final androidManager =
         File('android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleManager.kt')

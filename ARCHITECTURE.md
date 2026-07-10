@@ -475,7 +475,7 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 - 单次 `charsFail`
 - 蓝牙关闭
 
-蓝牙关闭只暂停任务；蓝牙重新开启后恢复任务。自动回连不再使用指数退避；`connectTimeout` 是单轮 passive reconnect 的最长等待时间，超时后关闭旧 GATT，并在固定 1.5s 防抖后重建 `connectGatt(true)`。`autoReconnectMaxAttempts` 仅保留兼容和日志意义，**不再作为停止条件**。也就是说，设备离开 30 分钟再回来，只要用户/业务没有主动取消，原生层仍应继续持有或重建回连任务。
+蓝牙关闭只暂停任务。平台恢复策略不同：Android 的前台关开蓝牙由宿主先执行与冷启动一致的全局扫描，扫描命中后才发起前台连接；原生不得在 `STATE_ON` 时抢先启动 passive `connectGatt(true)`，否则会把设备置为 `connecting` 并阻断 Dart 扫描编排。iOS 则继续恢复 CoreBluetooth 的 pending connect / State Restoration 目标。自动回连不再使用指数退避；`connectTimeout` 是单轮 passive reconnect 的最长等待时间，超时后关闭旧 GATT，并在固定 1.5s 防抖后重建 `connectGatt(true)`。`autoReconnectMaxAttempts` 仅保留兼容和日志意义，**不再作为停止条件**。也就是说，设备离开 30 分钟再回来，只要用户/业务没有主动取消，原生层仍应继续持有或重建回连任务。
 
 回连成功的门槛不是 GATT 物理连接成功，而是全部 `BleConfig.privateServices` 都重新恢复：
 

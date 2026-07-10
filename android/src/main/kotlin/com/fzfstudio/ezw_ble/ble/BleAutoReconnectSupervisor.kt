@@ -138,7 +138,8 @@ internal class BleAutoReconnectSupervisor(
     /**
      * 蓝牙关闭时暂停所有回连任务。
      *
-     * Android 蓝牙关闭会让当前 GATT binder 失效；这里只暂停，等待蓝牙恢复后继续调度。
+     * Android 蓝牙关闭会让当前 GATT binder 失效；这里只暂停，等待宿主的 scan-first
+     * 前台连接按 UUID 接管，避免蓝牙恢复瞬间的 passive GATT 抢占扫描编排。
      */
     fun pauseForBluetoothOff() {
         // 1. 清掉延迟 timer，并标记为蓝牙关闭导致的暂停。
@@ -158,22 +159,6 @@ internal class BleAutoReconnectSupervisor(
         if (reconnectTasks.isNotEmpty()) {
             sendLog(BleLoggerTag.d, "Auto reconnect: pause ${reconnectTasks.size} task(s), bluetooth off")
         }
-    }
-
-    /**
-     * 蓝牙恢复后重启被暂停的回连任务。
-     *
-     * 所有任务都回到 passive `connectGatt(true)`，不再使用指数退避；自动回连是业务
-     * connected 后建立的持续意图，停止源只能是用户/业务主动取消、配置关闭或 reset/release。
-     */
-    fun resumeAfterBluetoothOn() {
-        // 1. 只恢复因蓝牙关闭暂停的任务。
-        reconnectTasks.values
-            .filter { it.pausedByBluetoothOff }
-            .forEach { task ->
-                task.pausedByBluetoothOff = false
-                schedule(task.uuid, BleConnectState.DISCONNECT_FROM_SYS)
-            }
     }
 
     /**
