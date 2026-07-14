@@ -29,11 +29,15 @@ void main() {
     );
     expect(
       managerSource,
-      contains('createConnectCallBack(plan.request.uuid)'),
+      matches(
+        RegExp(
+          r'createConnectCallBack\(\s*plan\.request\.uuid,\s*source = BleConnectSource\.FOREGROUND',
+        ),
+      ),
     );
     expect(
       reconnectSource,
-      contains('createConnectCallback(task.uuid)'),
+      contains('createConnectCallback(task.uuid, task.source)'),
     );
   });
 
@@ -44,26 +48,13 @@ void main() {
       'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleAutoReconnectSupervisor.kt',
     ).readAsStringSync();
 
-    expect(
-      reconnectSource,
-      contains('passiveGattIsLiveConnection'),
-    );
-    expect(
-      reconnectSource,
-      contains('passiveGatt == device.myGatt'),
-    );
-    expect(
-      reconnectSource,
-      contains('device.connectState.isConnected'),
-    );
-    expect(
-      reconnectSource,
-      contains('如果在 arm 阶段 close 它，Dart 已收到 connected，但系统 GATT 会立刻断开'),
-    );
-    expect(
-      reconnectSource,
-      contains('if (passiveGatt != null && !passiveGattIsLiveConnection)'),
-    );
+    final armStart = reconnectSource.indexOf('fun arm(');
+    final armEnd = reconnectSource.indexOf('fun activate(', armStart);
+    final armSource = reconnectSource.substring(armStart, armEnd);
+
+    expect(armSource, contains('pending GATT 必须复用'));
+    expect(armSource, isNot(contains('passiveGatt?.close()')));
+    expect(armSource, isNot(contains('passiveGatt?.disconnect()')));
   });
 
   test('Android plugin unregisters Activity lifecycle callbacks on detach', () {

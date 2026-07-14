@@ -51,4 +51,9 @@ final class BleStateRestorationCoordinator {
         pendingPeripherals.removeAll()
         return peripherals
     }
+
+    /// reset/clean 会使本次 runtime restoration session 全部失效。
+    func clearPendingPeripherals() {
+        pendingPeripherals.removeAll()
+    }
 }

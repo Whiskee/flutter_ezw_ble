@@ -10,6 +10,33 @@
 import CoreBluetooth
 import Foundation
 
+/// restored peripheral 没有授权 owner 时必须拒绝；只有配置尚未初始化才允许暂存重放。
+enum BleStateRestorationReplayDecision: Equatable {
+    case deferUntilConfigsReady
+    case restore
+    case rejectUnauthorized
+}
+
+enum BleStateRestorationAuthorization {
+    static func config(
+        persistedTarget: BleReconnectTarget?,
+        runtimeTask: BleReconnectTask?,
+        configs: [BleConfig]
+    ) -> BleConfig? {
+        let ownerConfigName = persistedTarget?.belongConfig ?? runtimeTask?.belongConfig
+        guard let ownerConfigName else { return nil }
+        return configs.first { $0.name == ownerConfigName && $0.autoReconnect }
+    }
+
+    static func replayDecision(
+        configsInitialized: Bool,
+        hasAuthorizedConfig: Bool
+    ) -> BleStateRestorationReplayDecision {
+        if hasAuthorizedConfig { return .restore }
+        return configsInitialized ? .rejectUnauthorized : .deferUntilConfigsReady
+    }
+}
+
 /**
  *  iOS State Restoration 恢复流程。
  *
@@ -20,36 +47,48 @@ extension BleManager {
     /**
      *  为 restored peripheral 找回 BleConfig。
      *
-     *  优先使用进行中的连接/连接缓存，其次使用持久化 reconnect target；只有单配置时才允许兜底。
+     *  只有明确 persisted/runtime owner 且其配置仍启用 autoReconnect 才允许恢复。
      */
     func findRestoredBleConfig(peripheral: CBPeripheral) -> BleConfig? {
-        if let config = findBleConfig(
-            uuid: peripheral.identifier.uuidString,
-            name: peripheral.name ?? ""
+        let uuid = peripheral.identifier.uuidString
+        let name = peripheral.name ?? ""
+        let target = persistedReconnectTarget(
+            uuid: uuid,
+            name: name
+        )
+        let runtimeTask = reconnectTasks.values.first { task in
+            task.uuid.caseInsensitiveCompare(uuid) == .orderedSame ||
+                (target != nil && task.belongConfig == target?.belongConfig && task.name == target?.name)
+        }
+        if let config = BleStateRestorationAuthorization.config(
+            persistedTarget: target,
+            runtimeTask: runtimeTask,
+            configs: bleConfigs
         ) {
             return config
         }
-        if let target = persistedReconnectTarget(
-            uuid: peripheral.identifier.uuidString,
-            name: peripheral.name ?? ""
-        ) {
-            // 持久化目标保存 belongConfig，解决 restoration 早于 Dart 业务上下文的问题。
-            guard let config = bleConfigs.first(where: { $0.name == target.belongConfig }) else {
-                // 配置可能被用户删除/改名。State Restoration 发生在启动早期，不能用
-                // 强解包让 App crash；清理过期目标后等待 Dart 重新写入有效配置。
-                loggerE(msg: "stateRestoration: stale reconnect target config=\(target.belongConfig), uuid=\(target.uuid), remove target")
-                removePersistedReconnectTarget(uuid: target.uuid, name: target.name)
-                return nil
-            }
-            return config
-        }
-        // State Restoration can run before Dart has replayed configs. Falling back
-        // is only safe in the single-config case because no device family ambiguity exists.
-        if bleConfigs.count == 1 {
-            loggerD(msg: "stateRestoration: fallback to single config \(bleConfigs.first?.name ?? ""), uuid=\(peripheral.identifier.uuidString)")
-            return bleConfigs.first
+        if let target, hasInitializedBleConfigs {
+            // 目标配置被删除/禁用后，restoration 不能凭单配置或旧 active request 猜测复活。
+            loggerE(msg: "stateRestoration: unauthorized/stale target config=\(target.belongConfig), uuid=\(target.uuid), remove target")
+            removePersistedReconnectTarget(uuid: target.uuid, name: target.name)
         }
         return nil
+    }
+
+    /// 当前 restored peripheral 是否仍有明确 persisted/runtime owner，仅用于 replay 决策。
+    private func hasAuthorizedRestorationOwner(_ peripheral: CBPeripheral) -> Bool {
+        let target = persistedReconnectTarget(
+            uuid: peripheral.identifier.uuidString,
+            name: peripheral.name ?? ""
+        )
+        let task = reconnectTasks.values.first {
+            $0.uuid.caseInsensitiveCompare(peripheral.identifier.uuidString) == .orderedSame
+        }
+        return BleStateRestorationAuthorization.config(
+            persistedTarget: target,
+            runtimeTask: task,
+            configs: bleConfigs
+        ) != nil
     }
 
     /**
@@ -85,10 +124,42 @@ extension BleManager {
         )
         loggerD(msg: "stateRestoration: restore peripheral source=\(source), uuid=\(uuid), name=\(name), state=\(peripheral.state.rawValue), services=\(peripheral.services?.count ?? 0)")
         guard let bleConfig = findRestoredBleConfig(peripheral: peripheral) else {
-            // 配置未准备好时不能猜测私有服务，继续缓存等待 initConfigs。
-            restorationCoordinator.enqueue(peripheral)
-            loggerE(msg: "stateRestoration: \(uuid)-\(name), wait for initConfigs to match BleConfig")
+            switch BleStateRestorationAuthorization.replayDecision(
+                configsInitialized: hasInitializedBleConfigs,
+                hasAuthorizedConfig: hasAuthorizedRestorationOwner(peripheral)
+            ) {
+            case .deferUntilConfigsReady:
+                restorationCoordinator.enqueue(peripheral)
+                loggerD(msg: "stateRestoration: \(uuid)-\(name), defer until initConfigs")
+            case .rejectUnauthorized:
+                if peripheral.state != .disconnected {
+                    centralManager.cancelPeripheralConnection(peripheral)
+                }
+                recordAutoReconnectEvent(
+                    type: "ios_restore_rejected",
+                    uuid: uuid,
+                    name: name,
+                    detail: "missing persisted/authorized autoReconnect owner"
+                )
+                loggerE(msg: "stateRestoration: \(uuid)-\(name), reject unauthorized restored peripheral")
+            case .restore:
+                // findRestoredBleConfig 与同一授权策略共享输入，理论上不可达；fail closed。
+                loggerE(msg: "stateRestoration: \(uuid)-\(name), authorized config lookup mismatch")
+            }
             return
+        }
+        // persisted owner 可能仍是旧 UUID A，而 restoration/辅助扫描已给出新 UUID B。
+        // 先补建长期 task，再复用同一原子迁移逻辑，保证 B 终态仍能继续自动回连。
+        if let target = persistedReconnectTarget(uuid: uuid, name: name) {
+            let targetKey = reconnectKey(uuid: target.uuid)
+            let restoredTask = reconnectTasks[targetKey] ?? BleReconnectTask(
+                belongConfig: target.belongConfig,
+                uuid: target.uuid,
+                name: target.name,
+                source: .autoReconnect
+            )
+            reconnectTasks[targetKey] = restoredTask
+            _ = migrateReconnectTaskIdentityIfNeeded(restoredTask, to: peripheral)
         }
         // 构造 active request 是为了让后续 didConnect/didDiscover 回调能复用现有连接状态机。
         var request = BleEasyConnect(
@@ -107,18 +178,24 @@ extension BleManager {
                 (!name.isEmpty && device.peripheral.name == name)
         }
         connectedDevices.append(BleConnectedDevice(belongConfig: bleConfig, peripheral: peripheral))
+        _ = registerConnectionAttempt(
+            peripheral: peripheral,
+            config: bleConfig,
+            deviceName: request.name,
+            afterUpgrade: false,
+            source: .stateRestoration
+        )
         if peripheral.state == .connected {
             // 已连接只表示物理链路存在，仍必须进入 GATT readiness gate。
-            handleAlreadyConnected(
-                peripheral: peripheral,
-                bleConfig: bleConfig,
-                deviceName: name,
-                tag: "stateRestoration"
+            enqueueRestoredPeripheralThroughGate(
+                peripheral,
+                config: bleConfig,
+                deviceName: request.name
             )
         } else {
-            // disconnected/connecting 都交还给 CoreBluetooth pending connect，不用短 timeout 抢占系统恢复。
-            handleConnectState(uuid: uuid, name: name, state: .connecting, tag: "stateRestoration")
-            connectPeripheral(peripheral, autoReconnect: true)
+            // disconnected/connecting 只建立 CoreBluetooth pending connect，物理 callback 前
+            // 不发 connecting，不启动 pipeline timeout。
+            connectPeripheralAfterCancellationBarrier(peripheral, autoReconnect: true)
         }
     }
 }

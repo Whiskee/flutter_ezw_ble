@@ -1,5 +1,6 @@
 package com.fzfstudio.flutter_ezw_ble
 
+import android.content.Context
 import com.fzfstudio.ezw_ble.FlutterEzwBlePlugin
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -18,6 +19,12 @@ internal class FlutterEzwBlePluginTest {
   @Test
   fun onMethodCall_getPlatformVersion_returnsExpectedValue() {
     val plugin = FlutterEzwBlePlugin()
+
+    // 单元测试没有 FlutterEngine attach 生命周期；只补齐分发入口要求的 application context。
+    FlutterEzwBlePlugin::class.java.getDeclaredField("context").apply {
+      isAccessible = true
+      set(plugin, Mockito.mock(Context::class.java))
+    }
 
     val call = MethodCall("getPlatformVersion", null)
     val mockResult: MethodChannel.Result = Mockito.mock(MethodChannel.Result::class.java)

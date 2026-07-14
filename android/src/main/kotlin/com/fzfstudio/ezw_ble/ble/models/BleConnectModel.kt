@@ -8,4 +8,6 @@ data class BleConnectModel(
     val name: String,
     val connectState: BleConnectState,
     val mtu: Int = 247,
+    val source: BleConnectSource = BleConnectSource.UNKNOWN,
+    val generation: Long = 0L,
 ): GsonSerializable()

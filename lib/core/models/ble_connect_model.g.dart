@@ -13,6 +13,10 @@ BleConnectModel _$BleConnectModelFromJson(Map<String, dynamic> json) =>
       const ConnectStateListConverter()
           .fromJson(json['connectState'] as String),
       mtu: (json['mtu'] as num?)?.toInt() ?? 512,
+      source: $enumDecodeNullable(_$BleConnectSourceEnumMap, json['source'],
+              unknownValue: BleConnectSource.unknown) ??
+          BleConnectSource.unknown,
+      generation: (json['generation'] as num?)?.toInt() ?? 0,
     );
 
 Map<String, dynamic> _$BleConnectModelToJson(BleConnectModel instance) =>
@@ -22,4 +26,14 @@ Map<String, dynamic> _$BleConnectModelToJson(BleConnectModel instance) =>
       'connectState':
           const ConnectStateListConverter().toJson(instance.connectState),
       'mtu': instance.mtu,
+      'source': _$BleConnectSourceEnumMap[instance.source]!,
+      'generation': instance.generation,
     };
+
+const _$BleConnectSourceEnumMap = {
+  BleConnectSource.unknown: 'unknown',
+  BleConnectSource.autoReconnect: 'autoReconnect',
+  BleConnectSource.manualReconnect: 'manualReconnect',
+  BleConnectSource.stateRestoration: 'stateRestoration',
+  BleConnectSource.foreground: 'foreground',
+};

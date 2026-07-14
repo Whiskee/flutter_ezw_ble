@@ -61,7 +61,8 @@ iOS 侧必须满足以下条件，否则 State Restoration 只会变成普通前
   -> CoreBluetooth 恢复 App 进程
   -> centralManager(_:willRestoreState:) 收到 restored peripheral
   -> initConfigs 完成后匹配 BleConfig
-  -> 进入统一 GATT pipeline
+  -> restored peripheral 以 source=stateRestoration 进入全局 admission Gate
+  -> Gate granted 后才启动 timeout 与统一 GATT pipeline
   -> connectFinish
   -> Dart 重新发送业务 AUTH / sync 命令
   -> Dart 再次调用 deviceConnected(uuid)
@@ -79,6 +80,8 @@ iOS 侧必须满足以下条件，否则 State Restoration 只会变成普通前
 | `BleAutoReconnectCoordinator` | 在业务 `connected` 后持有长期 reconnect intent，负责 pending connect、退避、蓝牙关闭暂停。 |
 | `BleReconnectStore` | 持久化 reconnect target，并缓存 EventChannel 尚未订阅时发生的 restoration / reconnect 事件。 |
 | `BleGattReadiness` | 聚合 service、write characteristic、read characteristic、notify ready 状态，保证 `connectFinish` 只发一次。 |
+| `BleConnectionAdmissionGate` | 串行所有 endpoint 的 service / characteristic / CCCD / 业务鉴权；restoration、普通 didConnect、already-connected 共用同一 Gate。 |
+| `BlePeripheralCancellationBarrierGate` | 用 exact token、2s watchdog 与每 endpoint 单个饱和 debt counter 隔离 cancel 的迟到终态。 |
 
 ## 5. Pending Connect 规则
 
@@ -87,9 +90,14 @@ iOS 自动回连的关键不是扫描，而是把已知 `CBPeripheral` 尽快交
 1. 优先 `retrieveConnectedPeripherals(withServices:)`，服务集合包含配置里的私有服务和 ANCS。
 2. 再尝试 `retrievePeripherals(withIdentifiers:)`。
 3. 只要拿到 known peripheral，就调用 `centralManager.connect(peripheral)`，让系统持有 pending connect。
-4. 没有 known peripheral 但有稳定 name 时，才回退 scan-by-name。
+4. 缓存端点 UUID 为空但完整设备名非空时，原生以 `belongConfig + 完整设备名` 建立 `identityPending` owner；若缓存 MAC 可用，再校验广播名的 MAC 后缀。此 owner 必须通过激活回执返回给 Dart，不能被静默丢弃。
+5. App 并行启动的最多 20s 扫描中，只有配置、完整广播名和可选 MAC 后缀全部匹配时，才允许 pending owner 在普通 MAC/SN 过滤之前吸收该 `CBPeripheral.identifier`，迁移成稳定 UUID task 并立即进入既有直连/Gate 流程。
+6. `manufacturerData` 为空的广播只能解析已经明确声明的 pending owner，不能作为普通扫描结果上报，也不能凭名称创建未声明连接。
+7. 没有 known peripheral 或 pending identity 时保持长期意图，不在插件内另起 scan-by-name；等待后续 App 扫描、retrieve 或 restoration。
 
-Pending connect 阶段不能使用短连接超时主动取消。设备离开几分钟、几十分钟甚至更久，都应该让 CoreBluetooth 持有这个系统级等待点；短 timeout 只能用于 `didConnect` 之后的 GATT 准备阶段，或前台用户主动连接的可见性反馈。
+Pending connect 与 Gate 排队阶段都不能使用短连接超时主动取消。设备离开几分钟、几十分钟甚至更久，都应该让 CoreBluetooth 持有这个系统级等待点；`connectTimeout` 只在 `didConnect` 获得 Gate 后启动，并持续覆盖 GATT readiness 与业务鉴权。UI 的 1 分钟展示超时由上层单独管理，不取消 pending connect。
+
+Dart 的 `notifyAutoReconnectTargetVisible` 仅用于 Android passive GATT 的节能退避唤醒；iOS MethodChannel 必须返回 `false` 且不执行 cancel/connect，避免破坏 CoreBluetooth pending connect 与 State Restoration 的单一 owner。
 
 ## 6. ANCS / 系统已连接场景
 
@@ -103,7 +111,15 @@ retrieveConnectedPeripherals(withServices: privateServices + [ANCS])
 
 命中后应直接进入 `centralManager.connect(peripheral)` / GATT pipeline，不应把扫描不可见映射成 `noDeviceFound`。
 
-## 7. GATT Readiness Gate
+## 7. 全局 Admission Gate 与 GATT Readiness
+
+所有目标可以同时处于 CoreBluetooth pending connect，但 `didConnect`、系统 already-connected 与 State Restoration callback 都必须提交同一个进程级 Admission Gate：
+
+- automatic / restoration 按真实物理 callback FIFO；
+- waiting manual 优先于 automatic，但不能抢占 active owner；
+- 只有 owner 能运行 service discovery、characteristic、notify / CCCD 与业务鉴权；
+- `connectFinish` 不释放 owner，只有业务 `deviceConnected` 或已确认 teardown 的终态释放；
+- 事件携带 `source` 与 `generation`，并通过 endpoint + generation + session + `CBPeripheral` 对象身份拒绝迟到 callback。
 
 State Restoration 恢复后，CoreBluetooth 可能交错返回 cached service、cached characteristic、notify 回调。原生层必须用 readiness gate 聚合状态，不能因第一条 notify 成功就上报 `connectFinish`。
 
@@ -117,9 +133,15 @@ readCharsNotify == bleConfig.privateServices.count
 
 任何一项失败都只能上报现有失败态，例如 `serviceFail`、`charsFail` 或 `timeout`，然后交给 auto reconnect 继续下一轮尝试。
 
+service/char/timeout 等非 CoreBluetooth 终态要先调用 cancel，并保持 Gate owner，直到 `didFailToConnect` / `didDisconnect` 确认 teardown；CoreBluetooth 永不回调时由 2 秒 exact-token watchdog 放行。watchdog 超时债务必须使用每 endpoint 一个饱和 counter，不能保存无限 token 数组。迟到 callback 先消费债务；若新代仍在途则 exact redrive，若新代已业务 connected 且 peripheral 实际断开，则仍继续正常 `disconnectFromSys` 清理与回连，不能把真实断连吞掉。收到终态后必须先释放 exact admission、移除旧 active request，再调度下一 generation；barrier completion 与普通终态只能有一个调度 owner。
+
+蓝牙关闭会清空当前 Gate，因此必须在 teardown 前冻结连接元数据：connecting 端点使用 active admission generation，已业务 connected 端点使用 runtime task 保存的 last connected generation。随后发送的 `disconnectFromSys` 必须携带该 generation，禁止回退为 `unknown/0`，否则 Dart epoch guard 会拒绝终态并保留陈旧已连接状态。
+
+同名扫描结果导致 UUID A→B→C 漂移时，task、持久化 target 与 Gate identity 必须在 admission 前原子迁移。每个 canonical target 最多保留两个 direct alias（最早 UI owner + 最近旧身份）；hard cancel 仍能从原 UI UUID 命中，同时历史 UUID/Gate generation 不线性增长。
+
 ## 8. 取消与继续
 
-以下事件会取消 restoration / auto reconnect 意图：
+以下事件会**真取消** restoration / auto reconnect 意图：
 
 - 用户或业务主动 `disconnectDevice`；
 - `removeDevice` / `removeBond`；
@@ -137,6 +159,8 @@ readCharsNotify == bleConfig.privateServices.count
 - 蓝牙关闭。
 
 蓝牙关闭只能暂停任务。恢复到 poweredOn 后，原生层应重新 replay reconnect target，继续 pending connect 或 GATT pipeline。
+
+任何界面上的“取消”都必须调用真取消入口：清 task、持久化 target、`identityPending` owner、pending peripheral/session、timer 与迟到 callback 的复活入口；此后只有再次明确手动点击连接才能重新 activate。自动/手动连接 UI 的 1 分钟超时只停止展示（手动可提示超时），不能隐式调用取消。蓝牙关闭则 teardown Gate/session 并把下一 attempt source 重置为 `autoReconnect`，旧 manual source 不跨 transport reset。
 
 ## 9. Dart / even_connect 职责
 
@@ -184,9 +208,14 @@ readCharsNotify == bleConfig.privateServices.count
 
 - App 首连成功后调用 `deviceConnected(uuid)`，原生持久化 reconnect target。
 - 外设离开后 App 后台，原生保持 pending connect，不用短 timeout 取消。
+- 冷启动/蓝牙恢复时所有 owner 先 activate pending 直连，App 扫描只并行补 cache，最多 20s。
 - 系统恢复后能看到 `willRestoreState`，且 restored peripheral 被缓存到 `initConfigs` 之后 replay。
-- 蓝牙 poweredOff 只暂停，poweredOn 后继续恢复。
+- 蓝牙 poweredOff 先用 active/last-connected generation 上报 `disconnectFromSys`，再暂停任务；poweredOn 后继续恢复。
 - ANCS / 系统已连接外设扫描不可见时仍可通过 retrieve 路径进入 GATT。
 - 每次恢复都重新 discovery service、characteristic、notify / CCCD。
 - `connectFinish` 后 Dart 重新发业务认证，认证成功后再 `deviceConnected`。
 - 用户主动断连或移除后不再自动恢复。
+- 多 endpoint 的 service/CCCD/业务鉴权不重叠；Gate 只在业务 connected 或 terminal teardown ack/watchdog 后释放。
+- 连续 1000 次 cancel watchdog 漏回调仍只有一个 debt counter slot；迟到 debt 不吞业务 connected 后的真实断连。
+- UUID 连续漂移仍只保留两个 alias，旧 UI owner 可真取消，历史 Gate identity 不增长。
+- UI 一分钟超时不停止 pending connect；点击取消会停止且在下一次手动点击前不会恢复。

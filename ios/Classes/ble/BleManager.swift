@@ -59,6 +59,8 @@ class BleManager: NSObject {
     //  =========== Variables
     //  - 当前蓝牙基础配置，必须实现
     lazy var bleConfigs: [BleConfig] = []
+    //  - 区分“willRestoreState 早于 initConfigs”与“initConfigs 明确传入空配置”。
+    var hasInitializedBleConfigs = false
     //  - 搜索：纯净搜索模式，只返回单个设备，且只有名称，uuid
     lazy var scanPureModel: Bool = false
     //  - 搜素：获取结果临时缓存(DeviceInfo, 蓝牙对象)
@@ -72,8 +74,6 @@ class BleManager: NSObject {
     private lazy var connectingTimeoutTimers: [(String, String, Timer)] = []
     //  - 扫描后再连接阶段的超时定时器集合(UUID, Name, 倒计时定时器)
     private lazy var scanConnectTimeoutTimers: [(String, String, Timer)] = []
-    //  - iOS native passive reconnect 观察定时器集合(UUID, Name, 倒计时定时器)
-    private lazy var passiveReconnectWatchdogTimers: [(String, String, Timer)] = []
     //  - 是否正在升级中
     lazy var upgradeDevices: [String]? = nil
     //  - 预连接设备集合（使用uuid作为key）
@@ -83,6 +83,29 @@ class BleManager: NSObject {
     private lazy var otaWriteQueues: [String: OtaWriteQueue] = [:]
     //  - 原生自动回连任务，只有业务 connected 后才会加入
     lazy var reconnectTasks: [String: BleReconnectTask] = [:]
+    //  - Code 14 配对失配恢复的有界扫描窗口。只在该任务自己启动扫描时才负责停止，
+    //    不能抢占发现页或 Dart 身份补全扫描的所有权。
+    var pairingRecoveryScanTimers: [String: (timer: Timer, ownsScan: Bool)] = [:]
+    //  - iOS 空 UUID 目标先以 config+完整名称持有 owner，扫描只负责补齐 peripheral UUID。
+    lazy var pendingReconnectIdentities: [String: BlePendingReconnectIdentity] = [:]
+    //  - 每个 canonical target 最多保留常数个 UUID 别名，兼顾旧 UI hard cancel 与长期内存有界。
+    let reconnectIdentityAliases = BleReconnectIdentityAliasIndex()
+    //  - 所有 CoreBluetooth 物理连接共用的串行 GATT readiness Gate。
+    let connectionAdmissionGate = BleConnectionAdmissionGate()
+    //  - generation 只用一个全局饱和序列；历史 UUID 不得在线性 map 中永久残留。
+    var connectionAttemptGenerationSequence: Int64 = 0
+    var connectionSessionSequence: Int64 = 0
+    var currentConnectionAdmissions: [String: BleConnectionAdmission] = [:]
+    var peripheralConnectionSessions: [Int64: BlePeripheralConnectionSession] = [:]
+    //  - CoreBluetooth cancel 回调不带 attempt id；token gate + 有界 watchdog 同时保证
+    //    旧回调不能终止新 generation，且系统漏回调时 deferred connect 也不会永久等待。
+    let peripheralCancellationBarrierGate = BlePeripheralCancellationBarrierGate()
+    var peripheralCancellationWatchdogs: [String: (token: Int64, workItem: DispatchWorkItem)] = [:]
+    //  - central.connect 到 didConnect 之间没有 GATT timeout；exact generation/session
+    //    watchdog 对自动回连只做观测，普通前台 attempt 才允许有界回收。
+    let pendingPhysicalConnectWatchdogs = BlePendingPhysicalConnectWatchdogRegistry()
+    let deferredPeripheralReconnectRegistry = BleDeferredPeripheralReconnectRegistry()
+    var pendingConnectionAdmissionTeardowns: [String: BlePendingConnectionAdmissionTeardown] = [:]
     let reconnectStore = BleReconnectStore()
     let restorationCoordinator = BleStateRestorationCoordinator()
     //  - 最近一次已输出的扫描配置签名，用于避免每次 startScan 都重复刷配置详情。
@@ -143,7 +166,15 @@ extension BleManager {
      *  Dart 的 `await initConfigs` 会阻塞首帧，表现为 App 停在启动阶段并触发 hang 日志。
      */
     func initConfigs(configs: [BleConfig]) {
+        let revokedConfigNames = BleReconnectConfigDiff.revokedConfigNames(
+            previous: bleConfigs,
+            current: configs
+        )
+        if !revokedConfigNames.isEmpty {
+            revokeReconnectConfigs(revokedConfigNames)
+        }
         self.bleConfigs = configs
+        self.hasInitializedBleConfigs = true
         // MethodChannel 调用必须尽快返回 Flutter。State Restoration / auto reconnect
         // 可能同步进入 GATT pipeline，放到下一轮主队列避免阻塞首帧和 Dart await。
         DispatchQueue.main.async { [weak self] in
@@ -153,6 +184,102 @@ extension BleManager {
             // 蓝牙已恢复但任务被 poweredOff 暂停时，在配置就绪后补偿恢复。
             self?.resumeReconnectTasksIfBluetoothOn(reason: "initConfigs")
         }
+    }
+
+    /**
+     * 配置删除或 autoReconnect=true→false 是 native owner 授权撤销。
+     *
+     * 先收集并原子失效 task/persisted owner/admission，再 cancel CoreBluetooth peripheral；
+     * 因而 active、Gate waiter、pre-physical 的任何迟到 callback 都无法复活旧连接。
+     */
+    private func revokeReconnectConfigs(_ configNames: Set<String>) {
+        let revokedTasks = reconnectTasks.values.filter { configNames.contains($0.belongConfig) }
+        let revokedTargets = reconnectStore.removeTargets(configNames: configNames)
+        let revokedDevices = connectedDevices.filter { configNames.contains($0.belongConfig.name) }
+        let revokedSessions = peripheralConnectionSessions.values.filter {
+            configNames.contains($0.config.name)
+        }
+        let requestEndpoints = (activeConnectRequests + startConnectInfos).compactMap { request in
+            configNames.contains(request.belongConfig) ? request.uuid : nil
+        }
+        let endpointIds = Set(
+            (revokedTasks.map(\.uuid) +
+                revokedTargets.map(\.uuid) +
+                revokedDevices.map { $0.peripheral.identifier.uuidString } +
+                revokedSessions.map { $0.admission.endpointId } +
+                requestEndpoints)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        )
+        let endpointKeys = Set(endpointIds.map(reconnectKey))
+
+        // 1. 所有长期 owner 与未来 timer 先失效，防止 teardown 期间再次建立 pending connect。
+        reconnectTasks = reconnectTasks.filter { !configNames.contains($0.value.belongConfig) }
+        pendingReconnectIdentities = pendingReconnectIdentities.filter {
+            !configNames.contains($0.value.belongConfig)
+        }
+        revokedTasks.forEach { task in
+            task.timer?.invalidate()
+            reconnectIdentityAliases.removeAliases(canonicalUuid: task.uuid)
+        }
+        revokedTargets.forEach {
+            reconnectIdentityAliases.removeAliases(canonicalUuid: $0.uuid)
+        }
+
+        // 2. current map/session 与 Gate 批量失效；只允许仍获授权的 next owner 被 grant。
+        let revokedAdmissionIds = Set(revokedSessions.map { $0.admission.sessionId })
+        currentConnectionAdmissions = currentConnectionAdmissions.filter {
+            !endpointKeys.contains($0.key)
+        }
+        peripheralConnectionSessions = peripheralConnectionSessions.filter {
+            !revokedAdmissionIds.contains($0.key)
+        }
+        let next = connectionAdmissionGate.cancelEndpoints(endpointIds)
+
+        // 3. 清理扫描、请求、倒计时和业务缓存，不给任何延迟闭包留下授权上下文。
+        activeConnectRequests.removeAll {
+            configNames.contains($0.belongConfig) || endpointKeys.contains(reconnectKey(uuid: $0.uuid))
+        }
+        startConnectInfos.removeAll {
+            configNames.contains($0.belongConfig) || endpointKeys.contains(reconnectKey(uuid: $0.uuid))
+        }
+        connectingTimeoutTimers = connectingTimeoutTimers.filter { uuid, _, timer in
+            let keep = !endpointKeys.contains(reconnectKey(uuid: uuid))
+            if !keep { timer.invalidate() }
+            return keep
+        }
+        scanConnectTimeoutTimers = scanConnectTimeoutTimers.filter { uuid, _, timer in
+            let keep = !endpointKeys.contains(reconnectKey(uuid: uuid))
+            if !keep { timer.invalidate() }
+            return keep
+        }
+        preConnectedDevices = Set(preConnectedDevices.filter {
+            !endpointKeys.contains(reconnectKey(uuid: $0))
+        })
+        upgradeDevices?.removeAll {
+            endpointKeys.contains(reconnectKey(uuid: $0))
+        }
+        endpointKeys.forEach { key in
+            otaWriteQueues.removeValue(forKey: key)?.cancelAll(reason: "initConfigs revoked")
+            pendingConnectionAdmissionTeardowns.removeValue(forKey: key)
+            peripheralCancellationWatchdogs.removeValue(forKey: key)?.workItem.cancel()
+            pairingRecoveryScanTimers.removeValue(forKey: key)?.timer.invalidate()
+        }
+        pendingPhysicalConnectWatchdogs.remove(endpointIds: endpointIds).forEach { $0.cancel() }
+        deferredPeripheralReconnectRegistry.remove(endpointIds: endpointIds)
+        peripheralCancellationBarrierGate.discard(endpointIds: endpointIds)
+
+        // 4. map 全部失效后再触发 CoreBluetooth cancel；后续 callback 只能走 stale 路径。
+        var cancelledPeripherals = Set<ObjectIdentifier>()
+        (revokedDevices.map(\.peripheral) + revokedSessions.map(\.peripheral)).forEach { peripheral in
+            guard cancelledPeripherals.insert(ObjectIdentifier(peripheral)).inserted else { return }
+            centralManager.cancelPeripheralConnection(peripheral)
+        }
+        connectedDevices.removeAll { configNames.contains($0.belongConfig.name) }
+        if let next {
+            startGrantedGattPipeline(next)
+        }
+        loggerD(msg: "initConfigs: revoked reconnect configs=\(configNames.sorted()), endpoints=\(endpointIds.count)")
     }
 
     /**
@@ -291,10 +418,12 @@ extension BleManager {
      *    c) 已完成连接流程的 peripheral
      */
     func disconnect(uuid: String, name: String) {
+        let effectiveUuid = reconnectIdentityAliases.resolvedCanonical(uuid: uuid) ?? uuid
         cancelReconnectTask(uuid: uuid, name: name)
         removePersistedReconnectTarget(uuid: uuid, name: name)
         //  1、移除预连接状态（uuid 为空则为 no-op，但保留以兼容旧路径）
         preConnectedDevices.remove(uuid)
+        preConnectedDevices.remove(effectiveUuid)
         //  注意：不要在此处调用 removeActiveConnectRequest；需先按 uuid/name 命中 in-flight 或
         // 未完成连接的外设（见 findUnfinishedConnectDevice），否则 Dart 空 uuid + 名称取消无法关联到 CB 外设。
 
@@ -302,7 +431,8 @@ extension BleManager {
         //     生成 temp-UUID 并追加到 startConnectInfos；此时还没有 connectedDevices / CBPeripheral，
         //     必须主动撤回 scan 触发器并通知 Dart 层。仅在字段非空时比较，避免空 uuid 误命中其他请求。
         let inFlightInfos = startConnectInfos.filter { info in
-            (!uuid.isEmpty && info.uuid == uuid) || (!name.isEmpty && info.name == name)
+            (!uuid.isEmpty && (info.uuid == uuid || info.uuid == effectiveUuid)) ||
+                (!name.isEmpty && info.name == name)
         }
         if !inFlightInfos.isEmpty {
             //  - 2.1、移除 startConnectInfos，防止 didDiscover 找到设备后又触发连接
@@ -324,9 +454,9 @@ extension BleManager {
         }
 
         //  2.5、命中 activeConnectRequest + 连接超时定时器，但尚未写入 connectedDevices 的 in-flight GATT connect。
-        if let request = findActiveConnectRequest(uuid: uuid, name: name) {
+        if let request = findActiveConnectRequest(uuid: effectiveUuid, name: name) {
             let hasTimer = connectingTimeoutTimers.contains { $0.0 == request.uuid || $0.1 == request.name }
-            if hasTimer, findUnfinishedConnectDevice(uuid: uuid, name: name) == nil {
+            if hasTimer, findUnfinishedConnectDevice(uuid: effectiveUuid, name: name) == nil {
                 if let match = scanResultTemp.first(where: { info in
                     (!request.uuid.isEmpty && !request.uuid.hasPrefix("temp-") && info.0.uuid == request.uuid) ||
                     (!request.name.isEmpty && (info.0.name == request.name || info.1.name == request.name))
@@ -344,7 +474,7 @@ extension BleManager {
         //     但 didConnect 回调尚未到达。此时 connectedDevices 存在条目但 isConnected=false。
         //     直接走 handleConnectState(.disconnectByUser)：内部会调用 cancelPeripheralConnection
         //     真正中断 in-progress 的 GATT 连接，避免连接挂起到系统超时
-        if let inProgressDevice = findUnfinishedConnectDevice(uuid: uuid, name: name) {
+        if let inProgressDevice = findUnfinishedConnectDevice(uuid: effectiveUuid, name: name) {
             let p = inProgressDevice.peripheral
             let realUuid = p.identifier.uuidString
             let realName = p.name ?? name
@@ -354,12 +484,12 @@ extension BleManager {
         }
 
         //  4、已建立连接的设备（isConnected == true）：按 uuid / 广播名匹配
-        removeActiveConnectRequest(uuid: uuid, name: name)
+        removeActiveConnectRequest(uuid: effectiveUuid, name: name)
         let connectedDevice = connectedDevices.first { device in
-            device.peripheral.identifier.uuidString == uuid || device.peripheral.name == name
+            device.peripheral.identifier.uuidString == effectiveUuid || device.peripheral.name == name
         }
-        updateConnectedDevice(uuid: uuid, name: connectedDevice?.peripheral.name ?? "", isConnected: false, updateByUser: true)
-        loggerD(msg: "disconnect:\(uuid)-\(name), disconnect by user")
+        updateConnectedDevice(uuid: effectiveUuid, name: connectedDevice?.peripheral.name ?? "", isConnected: false, updateByUser: true)
+        loggerD(msg: "disconnect:\(uuid)->\(effectiveUuid)-\(name), disconnect by user")
     }
     
     /**
@@ -476,11 +606,13 @@ extension BleManager {
      * 清除连接缓存
      */
     func cleanConnectCache() {
+        cancelAllConnectionAdmissions(reason: "cleanConnectCache")
         //  1、清理当前连接请求和搜索连接信息。
         activeConnectRequests.removeAll()
         startConnectInfos.removeAll()
         cancelAllReconnectTasks()
         clearPersistedReconnectTargets()
+        restorationCoordinator.clearPendingPeripherals()
         //  2、取消连接超时计时器。
         connectingTimeoutTimers.forEach { (uuid, name, timer) in
             timer.invalidate()
@@ -490,7 +622,6 @@ extension BleManager {
             timer.invalidate()
         }
         scanConnectTimeoutTimers.removeAll()
-        cancelAllNativePassiveReconnectWatchdogs()
     }
     
     /**
@@ -498,6 +629,7 @@ extension BleManager {
      */
     func reset() {
         stopScan()
+        cancelAllConnectionAdmissions(reason: "reset")
         connectedDevices.forEach { device in
             centralManager.cancelPeripheralConnection(device.peripheral)
         }
@@ -512,11 +644,12 @@ extension BleManager {
             timer.invalidate()
         }
         scanConnectTimeoutTimers.removeAll()
-        cancelAllNativePassiveReconnectWatchdogs()
         upgradeDevices?.removeAll()
         preConnectedDevices.removeAll()
+        restorationCoordinator.clearPendingPeripherals()
         cancelAllReconnectTasks()
-        clearPersistedReconnectTargets()
+        // resetBle 是中性 runtime teardown：持久 owner/autoReconnect 配置必须保留，
+        // 由 Dart 下一次 activate 或 State Restoration 重新建立全新 generation。
         //  清空所有 OTA 写队列, 通知 Dart 端 await 立即返回
         otaWriteQueues.values.forEach { $0.cancelAll(reason: "reset") }
         otaWriteQueues.removeAll()
@@ -785,30 +918,24 @@ extension BleManager {
      *  处理已经连接的设备
      */
     func handleAlreadyConnected(peripheral: CBPeripheral,  bleConfig: BleConfig, deviceName: String, tag: String = "") {
-        //  1、更新连接状态
-        handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .searchService, tag: tag)
-        //  2、更新已连接缓存设备信息
-        let uuid = peripheral.identifier.uuidString
-        connectedDevices.removeAll { device in
-            device.peripheral.identifier.uuidString == uuid || device.peripheral.name == deviceName
+        // 旧入口仅作为「已有物理链路」适配层，禁止直接 discoverServices。
+        if currentConnectionAdmission(uuid: peripheral.identifier.uuidString) == nil {
+            let source: BleConnectSource = tag.contains("stateRestoration")
+                ? .stateRestoration
+                : .foreground
+            _ = registerConnectionAttempt(
+                peripheral: peripheral,
+                config: bleConfig,
+                deviceName: deviceName,
+                afterUpgrade: false,
+                source: source
+            )
         }
-        connectedDevices.append(BleConnectedDevice(belongConfig: bleConfig, peripheral: peripheral))
-        //  3、获取设备服务
-        peripheral.delegate = self
-        let services = bleConfig.privateServices.map { $0.serviceUUID }
-        let cachedServices = peripheral.services ?? []
-        let cachedPrivateServices = cachedServices.filter { service in
-            bleConfig.privateServices.contains { $0.serviceUUID == service.uuid }
-        }
-        loggerD(msg: "connect-flow: \(uuid)-\(peripheral.name ?? deviceName), discover services requested=\(services.map { $0.uuidString }), cached=\(cachedServices.count), cachedMatched=\(cachedPrivateServices.count)/\(bleConfig.privateServices.count), tag=\(tag)")
-        if cachedPrivateServices.count == bleConfig.privateServices.count {
-            processDiscoveredServices(peripheral: peripheral, error: nil, tag: "\(tag) cached")
-        } else {
-            peripheral.discoverServices(services)
-        }
+        connectPeripheralAfterCancellationBarrier(peripheral, autoReconnect: false)
     }
 
-    private func processDiscoveredServices(peripheral: CBPeripheral, error: Error?, tag: String) {
+    func processDiscoveredServices(peripheral: CBPeripheral, error: Error?, tag: String) {
+        guard isCurrentConnectionPipeline(peripheral) else { return }
         //  1、根据条件判断服务是否正常获取
         //  - 1.1、搜索服务出现异常错误
         guard error == nil else {
@@ -845,7 +972,8 @@ extension BleManager {
         }
     }
 
-    private func processDiscoveredCharacteristics(peripheral: CBPeripheral, service: CBService, error: Error?, tag: String) {
+    func processDiscoveredCharacteristics(peripheral: CBPeripheral, service: CBService, error: Error?, tag: String) {
+        guard isCurrentConnectionPipeline(peripheral) else { return }
         //  1、处理错误回调
         guard error == nil else {
             handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .charsFail, tag: tag)
@@ -892,7 +1020,14 @@ extension BleManager {
     /**
      *  开始连接后，执行连接超时倒计时
      */
-    func startConnectingCountdown(currentConfig: BleConfig, uuid: String, name: String, afterUpgrade: Bool, isAuthGrace: Bool = false) {
+    func startConnectingCountdown(
+        currentConfig: BleConfig,
+        uuid: String,
+        name: String,
+        afterUpgrade: Bool,
+        isAuthGrace: Bool = false,
+        admission: BleConnectionAdmission? = nil
+    ) {
         //  1、检查是否存在相同的
         guard !connectingTimeoutTimers.contains(where: { info in
             isSameActiveConnectTarget(storedUuid: info.0, storedName: info.1, uuid: uuid, name: name)
@@ -902,6 +1037,10 @@ extension BleManager {
         //  2、创建连接超时倒计时定时器
         let timer = Timer.scheduledTimer(withTimeInterval: (currentConfig.connectTimeout + (afterUpgrade ? currentConfig.upgradeSwapTime : 0)) / 1000, repeats: false) { [weak self] timer in
             guard let self = self else { return }
+            if let admission = admission, self.currentConnectionAdmission(admission) == nil {
+                // Gate owner 已更换，说明本 timer 属于迟到 generation/session。
+                return
+            }
             //  先移除当前(一次性)超时定时器记录
             if let index = self.connectingTimeoutTimers.firstIndex(where: { info in
                 self.isSameActiveConnectTarget(storedUuid: info.0, storedName: info.1, uuid: uuid, name: name)
@@ -919,11 +1058,23 @@ extension BleManager {
             //  设备永久停在 connectFinish，App UI 一直显示"连接中"且无法自愈。
             if self.preConnectedDevices.contains(uuid) && !isAuthGrace {
                 self.loggerD(msg: "connect-flow: \(uuid)-\(name), pre-connected, start bounded auth grace")
-                self.startConnectingCountdown(currentConfig: currentConfig, uuid: uuid, name: name, afterUpgrade: afterUpgrade, isAuthGrace: true)
+                self.startConnectingCountdown(
+                    currentConfig: currentConfig,
+                    uuid: uuid,
+                    name: name,
+                    afterUpgrade: afterUpgrade,
+                    isAuthGrace: true,
+                    admission: admission
+                )
                 return
             }
             //  宽限期到期仍未连接(或本就不是预连接) → 强制超时，避免永久卡在 connecting。
-            self.handleConnectState(uuid: uuid, name: name, state: .timeout)
+            self.handleConnectState(
+                uuid: uuid,
+                name: name,
+                state: .timeout,
+                source: admission.flatMap { self.currentConnectionAdmission($0)?.source } ?? .unknown
+            )
         }
         connectingTimeoutTimers.append((uuid, name, timer))
         loggerD(msg: "connect-flow: \(uuid)-\(name), start connect time out timer\(isAuthGrace ? " (auth grace)" : "")")
@@ -978,71 +1129,52 @@ extension BleManager {
     }
 
     /**
-     *  启动 iOS native passive reconnect 观察 watchdog。
-     *
-     *  该 watchdog 只观测 pending connect 是否仍被系统持有，不再把等待态改成
-     *  timeout。autoReconnect 的产品语义是“用户未主动取消前持续连接中”，因此
-     *  CoreBluetooth pending connect 和 Dart/UI 的 connecting 必须保持一致。
-     */
-    func startNativePassiveReconnectWatchdog(currentConfig: BleConfig, uuid: String, name: String) {
-        // 1、同一 endpoint 只保留一个观察 timer，避免重复记录 pending 状态。
-        cancelNativePassiveReconnectWatchdog(uuid: uuid, name: name)
-        let timeout = currentConfig.connectTimeout / 1000
-        let timer = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { [weak self] _ in
-            guard let self = self else { return }
-            // 2、timer 触发后先移除自身记录；这是一次性 UI 观测，不做循环重试。
-            self.passiveReconnectWatchdogTimers.removeAll { info in
-                self.isSameActiveConnectTarget(storedUuid: info.0, storedName: info.1, uuid: uuid, name: name)
-            }
-            // 3、用户取消、reset 或真实连接已完成时，active request 会消失或设备已 connected。
-            guard self.findActiveConnectRequest(uuid: uuid, name: name) != nil else {
-                return
-            }
-            guard self.connectedDevices.first(where: { device in
-                device.peripheral.identifier.uuidString == uuid || device.peripheral.name == name
-            })?.isConnected != true else {
-                return
-            }
-            // 4、pending connect 仍有效时保持 Dart/UI 的 connecting 状态；真正退出只由
-            // 用户取消、蓝牙关闭/reset、真实连接成功或后续 CoreBluetooth 终态驱动。
-            self.loggerD(msg: "autoReconnect: \(uuid)-\(name), native passive watchdog observed pending connect, keep connecting")
-        }
-        passiveReconnectWatchdogTimers.append((uuid, name, timer))
-        loggerD(msg: "autoReconnect: \(uuid)-\(name), start native passive watchdog \(Int(timeout * 1000))ms")
-    }
-
-    /**
-     *  取消单个 native passive reconnect 观察 watchdog。
-     */
-    func cancelNativePassiveReconnectWatchdog(uuid: String, name: String) {
-        // 1、按 active connect owner 语义匹配，兼容 temp UUID / name fallback 阶段。
-        passiveReconnectWatchdogTimers = passiveReconnectWatchdogTimers.filter { info in
-            let shouldCancel = isSameActiveConnectTarget(storedUuid: info.0, storedName: info.1, uuid: uuid, name: name)
-            if shouldCancel {
-                info.2.invalidate()
-            }
-            return !shouldCancel
-        }
-    }
-
-    /**
-     *  取消全部 native passive reconnect 观察 watchdog。
-     */
-    func cancelAllNativePassiveReconnectWatchdogs() {
-        // 1、reset / clean / 蓝牙关闭时必须清掉旧 timer，避免 release 后仍向 Dart 推旧状态。
-        passiveReconnectWatchdogTimers.forEach { (_, _, timer) in
-            timer.invalidate()
-        }
-        passiveReconnectWatchdogTimers.removeAll()
-    }
-    
-    /**
      *  处理连接失败
      */
     private func handleConnectError(peripheral: CBPeripheral, error: Error?, formMethod: String) {
         //  1、连接识别标签
         let tag = "didDisconnect"
         let logHead = "didFailToConnect-\(formMethod):"
+        // 2. connecting/queued 外设即使尚未进 connectedDevices，也必须按 exact
+        // generation/session/peripheral 释放 Gate；禁止仅按 UUID 抓到后续新 attempt。
+        if let admission = currentConnectionAdmission(uuid: peripheral.identifier.uuidString) {
+            guard let session = peripheralConnectionSessions[admission.sessionId],
+                  session.peripheral === peripheral else {
+                loggerD(msg: "\(logHead) \(peripheral.identifier.uuidString), stale terminal peripheral ignored")
+                return
+            }
+            let nsError = error as NSError?
+            let hasAutoReconnectTask = reconnectTasks.values.contains { task in
+                isSameConnectTarget(
+                    storedUuid: task.uuid,
+                    storedName: task.name,
+                    uuid: peripheral.identifier.uuidString,
+                    name: peripheral.name ?? ""
+                )
+            }
+            if nsError?.code == 14, hasAutoReconnectTask {
+                // 对端已清除 bond 时，当前 system pending connect 已不可信；先标记为等待
+                // 新广告，再由后续 scheduleReconnect 统一重建，不能中断长期 autoReconnect owner。
+                preparePeerPairingRecovery(
+                    uuid: peripheral.identifier.uuidString,
+                    name: peripheral.name ?? session.deviceName
+                )
+            }
+            let state: BleConnectState = (nsError?.code == 14 && !hasAutoReconnectTask)
+                ? .alreadyBound
+                : .disconnectFromSys
+            handleConnectState(
+                uuid: admission.endpointId,
+                name: peripheral.name ?? session.deviceName,
+                state: state,
+                source: admission.source,
+                generation: admission.generation,
+                peripheralTerminalAcknowledged: true,
+                tag: tag
+            )
+            loggerE(msg: "\(logHead) \(admission.endpointId), queued/active terminal state=\(state.rawValue), error=\(String(describing: error))")
+            return
+        }
         //  2、获取我正在连接的设备
         guard let myDevice = connectedDevices.first(where: {$0.peripheral.identifier.uuidString == peripheral.identifier.uuidString}) else {
             loggerE(msg: "\(logHead) \(peripheral.identifier.uuidString), not my connected device")
@@ -1066,7 +1198,13 @@ extension BleManager {
                         )
                     }
                 let state: BleConnectState = shouldKeepReconnect ? .disconnectFromSys : .disconnectByUser
-                handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: state, tag: tag)
+                handleConnectState(
+                    uuid: peripheral.identifier.uuidString,
+                    name: peripheral.name ?? "",
+                    state: state,
+                    peripheralTerminalAcknowledged: true,
+                    tag: tag
+                )
                 loggerE(msg: "\(logHead) \(peripheral.identifier.uuidString), nil error disconnect mapped to \(state.rawValue), bluetooth=\(centralManager.state.label)")
             }
             return
@@ -1083,14 +1221,36 @@ extension BleManager {
             )
         }
         if error.code == 14, hasAutoReconnectTask {
-            handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .disconnectFromSys, tag: tag)
+            preparePeerPairingRecovery(
+                uuid: peripheral.identifier.uuidString,
+                name: peripheral.name ?? ""
+            )
+            handleConnectState(
+                uuid: peripheral.identifier.uuidString,
+                name: peripheral.name ?? "",
+                state: .disconnectFromSys,
+                peripheralTerminalAcknowledged: true,
+                tag: tag
+            )
             loggerE(msg: "\(logHead) \(peripheral.identifier.uuidString), error code = \(error.code), msg = \(error.localizedDescription), mapped to disconnectFromSys for autoReconnect")
             return
         }
         if error.code == 14 {
-            handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .alreadyBound, tag: tag)
+            handleConnectState(
+                uuid: peripheral.identifier.uuidString,
+                name: peripheral.name ?? "",
+                state: .alreadyBound,
+                peripheralTerminalAcknowledged: true,
+                tag: tag
+            )
         } else {
-            handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .disconnectFromSys, tag: tag)
+            handleConnectState(
+                uuid: peripheral.identifier.uuidString,
+                name: peripheral.name ?? "",
+                state: .disconnectFromSys,
+                peripheralTerminalAcknowledged: true,
+                tag: tag
+            )
         }
         loggerE(msg: "\(logHead) \(peripheral.identifier.uuidString), error code = \(error.code), msg = \(error.localizedDescription)")
     }
@@ -1172,6 +1332,9 @@ extension BleManager {
             loggerE(msg: "connect-flow readiness: \(uuid)-\(name), no cache device object")
             return
         }
+        guard isCurrentConnectionPipeline(connectedDevices[connectedIndex].peripheral) else {
+            return
+        }
         var connectedDevice = connectedDevices[connectedIndex]
         connectedDevice.readCharsNotify = connectedDevice.notifiedReadCharUUIDs.count
         connectedDevices[connectedIndex] = connectedDevice
@@ -1189,8 +1352,50 @@ extension BleManager {
     /**
      *  连接状态处理与队列管理
      */
-    func handleConnectState(uuid: String, name: String, state: BleConnectState, mtu: Int = 247, tag: String = "") {
+    func handleConnectState(
+        uuid: String,
+        name: String,
+        state: BleConnectState,
+        mtu: Int = 247,
+        source: BleConnectSource? = nil,
+        generation: Int64? = nil,
+        peripheralTerminalAcknowledged: Bool = false,
+        systemAutoReconnectInProgress: Bool = false,
+        tag: String = ""
+    ) {
         let fromTag = "\(tag.isNotEmpty ? " -- from: \(tag)" : "\"\"")"
+        // source 必须在 Gate release 前快照，否则 terminal/connected 事件会丢失本轮来源。
+        let currentAdmission = currentConnectionAdmission(uuid: uuid)
+        let currentDevice = connectedDevices.first(where: { device in
+            isSameConnectTarget(
+                storedUuid: device.peripheral.identifier.uuidString,
+                storedName: device.peripheral.name ?? "",
+                uuid: uuid,
+                name: name
+            )
+        })
+        let reconnectTask = reconnectTasks.values.first(where: { task in
+            isSameConnectTarget(
+                storedUuid: task.uuid,
+                storedName: task.name,
+                uuid: uuid,
+                name: name
+            )
+        })
+        let terminalMetadata = BleTerminalConnectionMetadataPolicy.resolve(
+            state: state,
+            currentAdmission: currentAdmission,
+            reconnectTask: reconnectTask,
+            isBusinessConnected: currentDevice?.isConnected == true
+        )
+        let eventSource = source ?? terminalMetadata?.source ?? .unknown
+        let eventGeneration = generation ?? terminalMetadata?.generation ?? 0
+        if currentAdmission == nil,
+           source == nil,
+           generation == nil,
+           let terminalMetadata = terminalMetadata {
+            loggerD(msg: "connect-flow: \(uuid)-\(name), reuse business-connected terminal epoch, state=\(state.rawValue), source=\(terminalMetadata.source.rawValue), generation=\(terminalMetadata.generation)")
+        }
         if state == .disconnectByUser {
             cancelReconnectTask(uuid: uuid, name: name)
         }
@@ -1209,11 +1414,7 @@ extension BleManager {
         if !state.isConnecting() {
             cancelScanConnectTimeout(uuid: uuid, name: name)
         }
-        if state != .connecting {
-            // native passive watchdog 只观察「pending connect 无任何 CoreBluetooth 回调」窗口；
-            // 一旦进入 didConnect/GATT/终态路径，后续交给普通连接超时和状态机处理。
-            cancelNativePassiveReconnectWatchdog(uuid: uuid, name: name)
-        }
+        var deferredAdmissionTeardown = false
         //  2、设备连接状态为失败或断连就要设置连接设备连接状态为false
         if state.isError() || state.isDisconnected(), let index = connectedDevices.firstIndex(where: { $0.peripheral.identifier.uuidString == uuid || $0.peripheral.name == name }) {
             var device = connectedDevices[index]
@@ -1231,7 +1432,22 @@ extension BleManager {
             device.readCharsNotify = 0
             device.notifiedReadCharUUIDs.removeAll()
             connectedDevices[index] = device
-            centralManager.cancelPeripheralConnection(device.peripheral)
+            if let currentAdmission = currentAdmission,
+               !peripheralTerminalAcknowledged,
+               device.peripheral.state != .disconnected {
+                // service/char/timeout/user-cancel 都必须等 CoreBluetooth 真正 teardown 后
+                // 才释放 Gate；否则下一 endpoint 会与旧 cancel 在 HCI 上重叠。
+                deferConnectionAdmissionReleaseUntilPeripheralTerminal(
+                    admission: currentAdmission,
+                    peripheral: device.peripheral,
+                    deviceName: device.peripheral.name ?? name,
+                    terminalState: state
+                )
+                deferredAdmissionTeardown = true
+            }
+            if !systemAutoReconnectInProgress {
+                centralManager.cancelPeripheralConnection(device.peripheral)
+            }
             //  断连/错误状态: 取消该外设的 OTA 写队列, 避免 Dart 端 await 挂起
             let queueKey = device.peripheral.identifier.uuidString
             if let queue = otaWriteQueues.removeValue(forKey: queueKey) {
@@ -1239,16 +1455,49 @@ extension BleManager {
             }
             loggerD(msg: "connect-flow: \(uuid)-\(name), state = \(state), tag = \(fromTag)")
         }
-        //  3、发送连接状态
-        sendConnectStateToFlutter(uuid: uuid, name: name, state: state, mtu: mtu)
+        // 3. 已收到 didFail/didDisconnect（或外设本就 disconnected）才可以同步释放；
+        //    其余终态由 cancellation barrier callback/watchdog 完成 release/start-next。
+        if (state.isError() || state.isDisconnected()),
+           let currentAdmission = currentAdmission,
+           !deferredAdmissionTeardown {
+            releaseConnectionAdmissionAndStartNext(currentAdmission, invalidateEndpoint: true)
+        }
+
+        //  4、发送连接状态
+        sendConnectStateToFlutter(
+            uuid: uuid,
+            name: name,
+            state: state,
+            mtu: mtu,
+            source: eventSource,
+            generation: eventGeneration
+        )
         if state == .connected, let device = connectedDevices.first(where: {
             $0.peripheral.identifier.uuidString == uuid || $0.peripheral.name == name
         }) {
-            armReconnectTask(device: device)
-        } else if state.isError() || state.isDisconnected() {
-            scheduleReconnect(uuid: uuid, name: name, state: state)
+            armReconnectTask(
+                device: device,
+                source: .autoReconnect,
+                businessConnected: true,
+                generation: eventGeneration
+            )
         }
-        //  4、连接流程中的状态处理
+        if state == .connected {
+            // 即使业务设备缓存暂时缺失，正常成功也必须释放本轮 Gate owner。
+            completeBusinessConnectionAdmission(uuid: uuid)
+        } else if (state.isError() || state.isDisconnected()) && !deferredAdmissionTeardown {
+            // admission 已在上方释放；再移除旧 request owner 后才允许创建下一代。
+            // 若反过来调度，scheduleReconnect 会命中旧 active request 并永久 defer。
+            removeActiveConnectRequest(uuid: uuid, name: name)
+            loggerD(msg: "connect-flow: \(uuid)-\(name), terminal cleanup before reconnect schedule, tag = \(fromTag)")
+            if systemAutoReconnectInProgress, let peripheral = currentDevice?.peripheral {
+                adoptSystemAutoReconnect(peripheral, name: name)
+                return
+            }
+            scheduleReconnect(uuid: uuid, name: name, state: state)
+            return
+        }
+        //  5、连接流程中的状态处理
         guard !state.isConnecting() else {
             //  connectFinish 表示 BLE 物理连接流程完成，移除当前请求缓存。
             //  超时定时器保留运行，作为协议层鉴权的安全兜底。
@@ -1258,7 +1507,7 @@ extension BleManager {
             }
             return
         }
-        //  5、非连接流程状态：移除当前请求缓存，不再由 native 推进其它设备。
+        //  6、非连接流程状态：移除当前请求缓存，不再由 native 推进其它设备。
         removeActiveConnectRequest(uuid: uuid, name: name)
         loggerD(msg: "connect-flow: \(uuid)-\(name), state = \(state), remove active request, tag = \(fromTag)")
     }
@@ -1277,10 +1526,24 @@ extension BleManager {
     /**
      * 发送连接状态
      */
-    private func sendConnectStateToFlutter(uuid: String, name: String, state: BleConnectState, mtu: Int) {
-        let connectModel = BleConnectModel(uuid: uuid, name: name, connectState: state, mtu: mtu)
+    private func sendConnectStateToFlutter(
+        uuid: String,
+        name: String,
+        state: BleConnectState,
+        mtu: Int,
+        source: BleConnectSource,
+        generation: Int64
+    ) {
+        let connectModel = BleConnectModel(
+            uuid: uuid,
+            name: name,
+            connectState: state,
+            mtu: mtu,
+            source: source,
+            generation: generation
+        )
         let jsonString = try? connectModel.toJsonString() ?? ""
-        loggerD(msg: "connectStatus -> Flutter: \(uuid)-\(name), state=\(state.rawValue), mtu=\(mtu)")
+        loggerD(msg: "connectStatus -> Flutter: \(uuid)-\(name), state=\(state.rawValue), mtu=\(mtu), source=\(source.rawValue), generation=\(generation)")
         BleEC.connectStatus.emit(jsonString)
     }
     
@@ -1310,23 +1573,26 @@ extension BleManager: CBCentralManagerDelegate {
         BleEC.bleState.emit(central.state.rawValue)
         //  1、如果蓝牙状态不是开启，则将所有已连接的设备设置为非连接状态
         if central.state != .poweredOn {
+            // admission/task 元数据必须先冻结；后续 Gate teardown 会清空当前 generation。
+            let transportOffSnapshots = bluetoothOffConnectionSnapshots()
             pauseReconnectTasksForBluetoothOff()
+            suspendConnectionAdmissionGateForBluetoothOff()
             //  - 1.1、移除所有升级设备，避免退出OTA时，重置会连接状态的设备
             upgradeDevices?.removeAll()
-            //  - 1.2、系统级蓝牙关闭：把已连接设备标记为 .disconnectFromSys（系统断连），
-            //         让 even_connect 的 EvenDeviceReconnectMixin 能在 BLE 恢复后自动接管重连。
+            //  - 1.2、系统级蓝牙关闭：把连接中/已连接端点标记为 .disconnectFromSys，
+            //         让 Dart 状态机先退出陈旧连接态；长期回连 task 仍由 native 暂停并在恢复后继续。
             //         ⚠️ 不能用 .bleError / .disconnectByUser：
             //            - .bleError 落在 isError 但不在重连白名单 isConnectError 里
             //            - .disconnectByUser 是用户主动断连语义
             //            两者都不会触发重连，BLE 关再开后会有部分设备（典型如戒指）永远不重连。
-            connectedDevices.forEach { matchDevice in
-                if matchDevice.isConnected {
-                    handleConnectState(
-                        uuid: matchDevice.peripheral.identifier.uuidString,
-                        name: matchDevice.peripheral.name ?? "",
-                        state: .disconnectFromSys
-                    )
-                }
+            transportOffSnapshots.forEach { snapshot in
+                handleConnectState(
+                    uuid: snapshot.uuid,
+                    name: snapshot.name,
+                    state: .disconnectFromSys,
+                    source: snapshot.source,
+                    generation: snapshot.generation
+                )
             }
             //  - 1.3、清除缓存
             startConnectInfos.removeAll()
@@ -1340,8 +1606,8 @@ extension BleManager: CBCentralManagerDelegate {
                 timer.invalidate()
             }
             scanConnectTimeoutTimers.removeAll()
-            cancelAllNativePassiveReconnectWatchdogs()
         } else {
+            resumeConnectionAdmissionGateAfterBluetoothOn()
             resumeReconnectTasksAfterBluetoothOn()
         }
         loggerD(msg: "centralManagerDidUpdateState: State = \(central.state.label), code = \(central.state.rawValue)")
@@ -1380,6 +1646,21 @@ extension BleManager: CBCentralManagerDelegate {
     
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, timestamp: CFAbsoluteTime, isReconnecting: Bool, error: (any Error)?) {
         loggerE(msg: "didDisconnectPeripheral: timestamp = \(timestamp), isReconnecting = \(isReconnecting), error = \(String(describing: error))")
+        if consumePeripheralCancellationBarrier(peripheral) { return }
+        if isReconnecting {
+            // 系统已持有 reconnect 时只结束旧业务 session 并重建 admission；再次 connect/cancel
+            // 会破坏 CoreBluetooth 的自动回连和 State Restoration rendezvous。
+            handleConnectState(
+                uuid: peripheral.identifier.uuidString,
+                name: peripheral.name ?? "",
+                state: .disconnectFromSys,
+                peripheralTerminalAcknowledged: true,
+                systemAutoReconnectInProgress: isReconnecting,
+                tag: "didDisconnectPeripheral(system auto reconnect)"
+            )
+            return
+        }
+        handleConnectError(peripheral: peripheral, error: error, formMethod: "didDisconnectPeripheral(timestamp)")
     }
     
     /**
@@ -1387,27 +1668,28 @@ extension BleManager: CBCentralManagerDelegate {
      */
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         let tag = "didConnect"
+        // hard cancel 后的旧 didConnect 不能复活已取消 session；继续 cancel 并等终态消费 barrier。
+        if hasPeripheralCancellationBarrier(peripheral) {
+            centralManager.cancelPeripheralConnection(peripheral)
+            loggerD(msg: "admission gate: \(peripheral.identifier.uuidString), stale didConnect blocked by cancellation barrier")
+            return
+        }
         //  1、检查是否获取到了蓝牙配置
         guard let connectRequest = findActiveConnectRequest(peripheral: peripheral),
               let bleConfig = connectRequest.bleConfig else {
             handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .noBleConfigFound, tag: tag)
             return
         }
-        //  2、发起服务发现
+        //  2、真实 didConnect 只提交 Gate；排队期间不启动 timeout/service discovery。
         loggerD(msg: "didConnect: \(peripheral.identifier.uuidString)-\(peripheral.name ?? ""), requestName=\(connectRequest.name), config=\(bleConfig.name)")
-        startConnectingCountdown(
-            currentConfig: bleConfig,
-            uuid: peripheral.identifier.uuidString,
-            name: connectRequest.name,
-            afterUpgrade: connectRequest.afterUpgrade
-        )
-        handleAlreadyConnected(peripheral: peripheral, bleConfig: bleConfig, deviceName: connectRequest.name, tag: tag)
+        enqueuePhysicalConnectionThroughGate(peripheral)
     }
 
     /**
      * 设备连接失败回调
      */
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        if consumePeripheralCancellationBarrier(peripheral) { return }
         handleConnectError(peripheral: peripheral, error: error, formMethod: "didFailToConnect")
     }
 
@@ -1415,6 +1697,7 @@ extension BleManager: CBCentralManagerDelegate {
      *  设备断连回调
      */
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        if consumePeripheralCancellationBarrier(peripheral) { return }
         handleConnectError(peripheral: peripheral, error: error, formMethod: "didDisconnectPeripheral")
     }
     
@@ -1453,6 +1736,7 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
      */
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         let tag = "didUpdateNotification"
+        guard isCurrentConnectionPipeline(peripheral) else { return }
         if let error = error {
             //  配对授权失败
             if let error = error as NSError?, error.domain == CBATTErrorDomain, error.code == 5 {

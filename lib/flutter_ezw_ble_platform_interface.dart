@@ -1,7 +1,9 @@
 import 'dart:typed_data';
 
 import 'package:flutter_ezw_ble/core/models/ble_config.dart';
+import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
 import 'package:flutter_ezw_ble/core/models/ble_device.dart';
+import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
 import 'flutter_ezw_ble_method_channel.dart';
@@ -139,6 +141,33 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   Future<void> armAutoReconnectTargets(List<BleDevice> devices) {
     throw UnimplementedError(
         'armAutoReconnectTargets(devices: $devices) has not been implemented.');
+  }
+
+  /// 建立并立即激活长期自动回连目标。
+  ///
+  /// 与 arm-only 兼容入口不同，本方法会马上把所有目标交给系统 pending connect；
+  /// [source] 会随真实物理连接回调上报，用于上层区分自动/手动恢复展示。
+  Future<List<BleReconnectActivationResult>> activateAutoReconnectTargets(
+    List<BleDevice> devices, {
+    BleConnectSource source = BleConnectSource.autoReconnect,
+  }) {
+    throw UnimplementedError(
+      'activateAutoReconnectTargets(devices: $devices, source: $source) has not been implemented.',
+    );
+  }
+
+  /// 通知原生：辅助扫描已经重新看到某个自动回连目标。
+  ///
+  /// Android 只会唤醒该 UUID 当前尚未物理连接的 passive GATT/重建定时器；
+  /// 已进入 Gate、已连接、已取消或蓝牙关闭时返回 false。iOS 不依赖扫描
+  /// 唤醒 CoreBluetooth pending connect，因此安全返回 false。
+  Future<bool> notifyAutoReconnectTargetVisible({
+    required String uuid,
+    String name = '',
+  }) {
+    throw UnimplementedError(
+      'notifyAutoReconnectTargetVisible(uuid: $uuid, name: $name) has not been implemented.',
+    );
   }
 
   /// 发送指令

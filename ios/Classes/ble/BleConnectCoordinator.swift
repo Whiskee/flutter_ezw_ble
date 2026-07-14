@@ -53,6 +53,13 @@ extension BleManager {
             return
         }
 
+        // 手动点击复用已存在的 autoReconnect pending session，只提升本轮 source/等待优先级；
+        // 不 cancel CoreBluetooth 后重开同一外设，避免旧终态回调与新 generation 交叉。
+        if easyConnect.uuid.isNotEmpty, promotePendingAttempt(uuid: easyConnect.uuid) {
+            loggerD(msg: "connect-flow: \(easyConnect.uuid)-\(easyConnect.name), reuse and promote pending autoReconnect attempt")
+            return
+        }
+
         // 空 UUID 无法贯穿异步回调，临时 UUID 只作为本次 session 的请求标识。
         let newUuid = easyConnect.uuid.isEmpty ? "temp-\(UUID().uuidString)" : easyConnect.uuid
         var newEasyConnect = BleEasyConnect(
@@ -235,31 +242,22 @@ extension BleManager {
             connectedDevices.append(BleConnectedDevice(belongConfig: bleConfig, peripheral: oldPeripheral))
         }
         oldPeripheral.delegate = self
-        let nativePassiveReconnect = isNativePassiveReconnectAttempt(
-            uuid: newEasyConnect.uuid,
-            name: newEasyConnect.name,
-            config: bleConfig
+        // 前台连接也先注册 Gate session；排队期间不起 pipeline timeout。
+        if currentConnectionAdmission(uuid: oldPeripheral.identifier.uuidString) == nil {
+            _ = registerConnectionAttempt(
+                peripheral: oldPeripheral,
+                config: bleConfig,
+                deviceName: newEasyConnect.name,
+                afterUpgrade: newEasyConnect.afterUpgrade,
+                source: .foreground
+            )
+        }
+        connectPeripheralAfterCancellationBarrier(oldPeripheral, autoReconnect: false)
+        handleConnectState(
+            uuid: oldPeripheral.identifier.uuidString,
+            name: easyConnect.name,
+            state: .connecting,
+            source: .foreground
         )
-        if oldPeripheral.state == .connected {
-            handleAlreadyConnected(peripheral: oldPeripheral, bleConfig: bleConfig, deviceName: easyConnect.name, tag: "start connect")
-        } else {
-            connectPeripheral(
-                oldPeripheral,
-                autoReconnect: nativePassiveReconnect
-            )
-        }
-        if nativePassiveReconnect && oldPeripheral.state != .connected {
-            // 被动回连必须让 CoreBluetooth 长时间持有 pending connect，短 timer 会破坏 State Restoration 唤醒点。
-            // 这里的 watchdog 只记录 pending 是否仍被系统持有，UI 继续保持 connecting。
-            startNativePassiveReconnectWatchdog(
-                currentConfig: bleConfig,
-                uuid: newEasyConnect.uuid,
-                name: newEasyConnect.name
-            )
-            loggerD(msg: "autoReconnect: \(newEasyConnect.uuid)-\(newEasyConnect.name), native pending connect armed without short timeout")
-        } else {
-            startConnectingCountdown(currentConfig: bleConfig, uuid: newEasyConnect.uuid, name: newEasyConnect.name, afterUpgrade: easyConnect.afterUpgrade)
-        }
-        handleConnectState(uuid: newEasyConnect.uuid, name: easyConnect.name, state: .connecting)
     }
 }

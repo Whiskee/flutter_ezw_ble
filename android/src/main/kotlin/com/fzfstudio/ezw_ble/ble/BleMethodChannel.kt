@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.provider.Settings
 import com.fzfstudio.ezw_ble.ble.models.BleConfig
+import com.fzfstudio.ezw_ble.ble.models.BleConnectSource
 import com.fzfstudio.ezw_ble.ble.models.BlePrivateService
 import com.fzfstudio.ezw_ble.ble.models.BleScan
 import com.fzfstudio.ezw_ble.ble.models.BleSnRule
@@ -36,8 +37,14 @@ enum class BleMC {
     DEVICE_CONNECTED,
     /** 补种 native 自动回连目标，不发起前台连接。 */
     ARM_AUTO_RECONNECT_TARGETS,
+    /** 立即建立/复用所有目标的 native 直连，并保留调用来源。 */
+    ACTIVATE_AUTO_RECONNECT_TARGETS,
+    /** 辅助扫描重新看到目标时，唤醒 exact pre-physical passive owner。 */
+    NOTIFY_AUTO_RECONNECT_TARGET_VISIBLE,
     /** 断开设备连接，可选移除系统绑定。 */
     DISCONNECT_DEVICE,
+    /** 中性释放 endpoint runtime，保留持久自动回连 owner。 */
+    RELEASE_DEVICE,
     /** 发送普通 GATT 指令。 */
     SEND_CMD,
     /** 发送不等待写入回调的 GATT 指令。 */
@@ -150,12 +157,40 @@ enum class BleMC {
                     ?: emptyList()
                 BleManager.instance.armAutoReconnectTargets(targets)
             }
+            ACTIVATE_AUTO_RECONNECT_TARGETS -> {
+                // 1. 新 API 使用 Map 携带 targets + source；未知来源必须向后兼容降级。
+                val jsonMap = arguments as? Map<*, *>
+                val targets = (jsonMap?.get("devices") as? List<*>)
+                    ?.mapNotNull { (it as? Map<*, *>)?.toReconnectSeed() }
+                    ?: emptyList()
+                val source = BleConnectSource.fromFlutterValue(jsonMap?.get("source") as? String)
+                return result.success(
+                    BleManager.instance.activateAutoReconnectTargets(targets, source)
+                        .map { it.toFlutterMap() },
+                )
+            }
+            NOTIFY_AUTO_RECONNECT_TARGET_VISIBLE -> {
+                // 只传递可见信号；manager/supervisor 决定当前 exact owner 是否可被唤醒。
+                val jsonMap = arguments as? Map<*, *>
+                val uuid = jsonMap?.get("uuid") as? String ?: ""
+                val name = jsonMap?.get("name") as? String ?: ""
+                return result.success(
+                    BleManager.instance.notifyAutoReconnectTargetVisible(uuid, name),
+                )
+            }
             DISCONNECT_DEVICE -> {
                 // 1. 主动断连必须透传 removeBond，移除设备时需要清理系统绑定。
                 val jsonMap = arguments as Map<*, *>?
                 val uuid = jsonMap?.get("uuid") as? String ?: ""
                 val removeBond = jsonMap?.get("removeBond") as Boolean? ?: false
                 BleManager.instance.disconnect(uuid, removeBond)
+            }
+            RELEASE_DEVICE -> {
+                // dispose/reset 只释放 runtime；禁止复用 disconnect 的持久 owner 删除语义。
+                val jsonMap = arguments as Map<*, *>?
+                val uuid = jsonMap?.get("uuid") as? String ?: ""
+                val name = jsonMap?.get("name") as? String ?: ""
+                BleManager.instance.releaseDevice(uuid, name)
             }
             SEND_CMD -> {
                 // 1. GATT 写入由 BleManager 按 uuid 队列化，channel 层只传递 payload。
@@ -259,9 +294,8 @@ private fun Map<*, *>.toReconnectSeed(): BleReconnectSeed? {
     val name = get("name") as? String ?: ""
     val sn = get("sn") as? String ?: ""
     val rssi = get("rssi").toIntOrDefault(0)
-    if (belongConfig.isEmpty() || uuid.isEmpty()) {
-        return null
-    }
+    // activation 需要保留空 uuid 让 manager 返回 rejected；arm-only 仍由 manager 严格过滤。
+    if (belongConfig.isBlank()) return null
     return BleReconnectSeed(
         belongConfig = belongConfig,
         uuid = uuid,

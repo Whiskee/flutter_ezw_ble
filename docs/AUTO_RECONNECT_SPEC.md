@@ -27,7 +27,29 @@ Add these fields to `BleConfig`:
 | `autoReconnectMaxAttempts` | `0` | Legacy/backoff compatibility field. Native reconnect no longer stops because this count is reached. |
 | `autoReconnectUseNativePassive` | `true` | Allows platform passive reconnect paths when active reconnect cannot see the device. |
 
-The default behavior remains unchanged. Existing callers must explicitly opt in.
+`autoReconnectUseNativePassive` is now a legacy compatibility field. Reconnect
+activation always uses the platform-native pending/direct path and never falls
+back to scan-first because this flag is false.
+
+Public methods:
+
+- `armAutoReconnectTargets(devices)` records long-lived owners only.
+- `activateAutoReconnectTargets(devices, source)` immediately opens or reuses a
+  pending direct connection for every target. `source` is `autoReconnect` or
+  `manualReconnect`; manual activation promotes the same pending session rather
+  than opening a duplicate connection. It returns one acknowledgement per
+  target: `resolved` means native owns a stable UUID/address,
+  `identityPending` means iOS owns an exact config/name identity awaiting a
+  CoreBluetooth UUID, and `rejected` means no native reconnect owner exists.
+  Callers must not treat desired targets as active until an acknowledgement is
+  accepted; missing, duplicated, or unknown acknowledgement states fail closed.
+- `notifyAutoReconnectTargetVisible(uuid, name)` is a scan hint, not a second
+  connection owner. Android returns `true` only when it wakes that exact
+  target's pre-physical passive GATT or pending retry. iOS returns `false`
+  because CoreBluetooth pending connect and State Restoration remain authoritative.
+
+Every reconnect status event carries `source` and `generation`. Old payloads
+decode as `source=unknown` and `generation=0`.
 
 ## State Flow
 
@@ -36,14 +58,17 @@ Native auto reconnect reuses the existing connection states:
 ```text
 connected
   -> disconnectFromSys
-  -> connecting
+  -> [native pending direct connect; no visible state]
+  -> contactDevice(source, generation)
   -> searchService
   -> searchChars
   -> connectFinish
   -> connected
 ```
 
-No new EventChannel is required. Native may emit repeated `connecting` and existing terminal error states (`timeout`, `serviceFail`, `charsFail`, `noDeviceFound`) while it keeps retrying internally.
+No new EventChannel is required. Automatic reconnect must not emit `connecting`
+before a physical callback. Existing terminal states (`timeout`, `serviceFail`,
+`charsFail`, `noDeviceFound`) describe one attempt and do not delete the task.
 
 ## Reconnect Task Lifecycle
 
@@ -55,13 +80,15 @@ uuid
 name
 sn or mac
 attempt
-foreground watchdog timer or job
 pending native connection handle owned by the OS
 pausedByBluetoothOff
-cancelledByUser
+attempt source and generation
 ```
 
-The task is armed only after the app confirms business success through `deviceConnected(uuid)`. First-connect failures are not auto retried unless the device was previously business-connected.
+The task is normally armed after `deviceConnected(uuid)`. On a later cold start,
+Dart may seed the already-bound targets and activate them immediately; this is
+still recovery of a previously authorized owner, not retry of an unknown
+first-connect failure.
 
 The task is a long-lived reconnect intent. Native must keep it alive until an
 explicit owner cancels it, because timeout/noDeviceFound/service failures only
@@ -76,14 +103,16 @@ Cancel the task only on:
 - config removed or `autoReconnect=false`
 - plugin release
 
-Pause the task on Bluetooth off. Resume paused tasks when Bluetooth returns to powered on.
+Pause the task on Bluetooth off. Resume paused tasks when Bluetooth returns to
+powered on, with source reset to `autoReconnect` so an old manual click cannot
+leak across a transport reset.
 
 ## Trigger Rules
 
 Schedule reconnect when all are true:
 
 - The device's `BleConfig.autoReconnect == true`.
-- The device has reached business `connected` at least once in this manager lifetime.
+- The device has reached business `connected` before, or Dart has seeded it from the bound-device cache.
 - The state is `disconnectFromSys`, `timeout`, `serviceFail`, `charsFail`, or `noDeviceFound`.
 - The failure was not caused by user disconnect, reset, remove-bond, or expected OTA transition.
 - Bluetooth is currently usable, or the task can be paused until it is usable.
@@ -99,32 +128,49 @@ Do not schedule reconnect for:
 - `systemError`
 - Devices currently in `upgrade`
 
-## Passive Session Deadline
+## Pending Session and Timeout Boundary
 
 Native reconnect is a persistent intent after `deviceConnected(uuid)`. Reaching
 `autoReconnectMaxAttempts`, `timeout`, `noDeviceFound`, `serviceFail`, or
 `charsFail` must not delete the task.
 
-```text
-connectGatt(true)
-  -> wait connectTimeout
-  -> close stale passive GATT if still not connected
-  -> debounce 1.5s
-  -> recreate connectGatt(true)
-```
+Waiting in the global admission queue is not part of `connectTimeout`. The
+business-pipeline timeout starts only after a real
+`STATE_CONNECTED` / `didConnect` callback has been granted the Gate and service
+discovery begins. It remains active through `connectFinish` until final
+`deviceConnected`, with the existing bounded auth grace.
 
-Those states only refresh a native passive handle. A successful business `connected` resets the
-attempt counter.
+Android bounds only the pre-physical-callback lifetime of each pending
+`connectGatt(autoConnect=true)` by `BleConfig.connectTimeout` (minimum 1s). On
+expiry it atomically invalidates that exact GATT/admission and closes it. Consecutive
+pre-physical deadline failures rebuild after 1.5s for failures 1–3, 5s for
+failures 4–10, and 30s from failure 11 onward. A matching scan-visible hint
+resets the streak and rebuilds after a 250ms debounce. This refresh is
+native-only: it neither emits Dart/UI `timeout` nor deletes the long-lived
+reconnect task. Receiving `STATE_CONNECTED` cancels this deadline before Gate
+admission, so a queued GATT is never recycled while waiting for another endpoint.
+iOS immediately leaves a known `CBPeripheral` pending in CoreBluetooth; its
+pending connect is not recycled by this Android-specific deadline.
 
-Android passive reconnect must preserve the pending `autoConnect=true` GATT.
-Once the supervisor owns that GATT, the watchdog may observe and log that the
-pending connect is still held, but it must not repeatedly close/recreate the
-handle. Frequent unregister/register cycles reset Android's native rendezvous
-point and can make return-near-phone recovery worse than waiting.
+## Global Connection Admission Gate
 
-Backoff is not the primary wakeup mechanism on iOS. When a known iOS peripheral supports native passive reconnect, the reconnect attempt should immediately create a CoreBluetooth pending connect and let the OS hold it while the app is backgrounded, suspended, or later restored. App timers are allowed only as foreground/manual-connect watchdogs or Android vendor-stack cleanup; they must not be the thing that waits for an iOS device to return.
+All targets may be pending at the physical-link layer at the same time. From
+the first physical callback onward, one process-wide Gate serializes service
+discovery, characteristic discovery, CCCD/notify setup, and business auth:
 
-## GATT Restoration Gate
+- automatic callbacks enter FIFO order;
+- a manual reconnect already waiting is preferred over automatic waiters;
+- manual never preempts the active owner;
+- queue time is excluded from the timeout;
+- `connectFinish` does not release the owner;
+- business `deviceConnected`, or an acknowledged terminal teardown, releases
+  the owner and starts the next endpoint.
+
+Every admission is identified by endpoint + generation + session and, at the
+platform boundary, the exact GATT/peripheral object. Stale callbacks fail
+closed.
+
+## GATT Restoration Readiness
 
 Native reconnect is successful only after every configured private service is restored:
 
@@ -148,34 +194,38 @@ This prevents multi-service devices from reaching `connectFinish` after only the
 
 ## Android Strategy
 
-Android uses the existing active `connect(...)` path first. This preserves:
+Reconnect activation always calls
+`BluetoothDevice.connectGatt(..., autoConnect=true, ...)` for every target. It
+does not first enter `connect(...)`, scan-refresh, or the scan-then-connect
+queue. The app may scan concurrently for at most 20 seconds, but scan visibility
+is not an admission prerequisite.
 
-- Stable device name resolution.
-- Scan-before-connect when Bluetooth stack cache is stale.
-- System GATT connected detection.
-- Scan-then-connect pending queue and self-lock prevention.
+Each Android passive handle has an exact pre-physical deadline as described
+above. The deadline must compare the GATT object and admission generation before
+closing; a late callback from an expired handle must fail closed and a GATT that
+has reached the Gate must remain alive until normal terminal teardown.
 
-When active reconnect cannot see the target and `autoReconnectUseNativePassive == true`, Android may use `BluetoothDevice.connectGatt(..., autoConnect = true, ...)` as a passive reconnect handle. The supervisor may keep a watchdog for diagnostics and missing-handle recovery, but a live pending GATT must remain registered with Android without emitting a Dart/UI timeout. This avoids turning passive reconnect into a high-frequency GATT churn loop while the visible app state remains connecting.
-
-The Android watchdog is an observation/missing-handle recovery mechanism, not a
-stop condition or visible connection failure.
-If the device remains away for a long time, the supervisor keeps the pending
-autoConnect handle alive until the task is explicitly cancelled.
-The scheduled refresh attempt must clear the fired timer before duplicate
-connection guards run; otherwise the supervisor can reject its own refresh while
-the device is still visibly `CONNECTING` and `passiveGatt` has already been
-closed.
+After business `deviceConnected` releases the Gate, the live GATT remains the
+physical owner. Android stores its exact admission metadata and GATT identity.
+A later `STATE_DISCONNECTED` from that exact `(sessionId, GATT)` must still emit
+`disconnectFromSys`, clear the task's `passiveGatt`, and create a new passive
+handle. A callback from any older GATT/session must not change the newer
+attempt.
 
 ## iOS Strategy
 
-iOS uses CoreBluetooth pending connects before scanning. The important rule is: after a previously business-connected device disconnects unexpectedly, the app must hand a known `CBPeripheral` back to CoreBluetooth immediately. That pending `connect` is the preserved operation that can wake or relaunch the app later.
+iOS uses CoreBluetooth pending connects without an internal scan-first phase.
+After a previously business-connected device disconnects, the app hands a known
+`CBPeripheral` back to CoreBluetooth immediately. That pending `connect` is the
+preserved operation that can wake or relaunch the app later.
 
 iOS lookup order:
 
 1. `retrieveConnectedPeripherals(withServices:)`, using configured private services plus ANCS.
 2. `retrievePeripherals(withIdentifiers:)`.
 3. If a peripheral is known, call `centralManager.connect` immediately with the native reconnect option when available.
-4. If no peripheral is known but a stable name exists, scan by name with the existing scan-connect timeout.
+4. If no peripheral is known, keep the task armed and wait for the app's
+   concurrent scan/cache update or a later retrieve/restoration opportunity.
 
 iOS 17+ may pass `CBConnectPeripheralOptionEnableAutoReconnect` when available. Lower versions still keep a pending `centralManager.connect` for a known peripheral and rely on CoreBluetooth to complete the connection when the device returns. Apps that need background reconnect must configure `UIBackgroundModes = bluetooth-central` and use CoreBluetooth state restoration.
 
@@ -191,26 +241,79 @@ CoreBluetooth pending connect is the iOS long-wait mechanism. App timers may
 update diagnostics, but must not cancel the pending connect or emit a Dart/UI
 timeout just because the peripheral stayed away for minutes or hours.
 
+Non-CoreBluetooth terminal states must not release the global Gate until
+`didFailToConnect` / `didDisconnect` acknowledges teardown. A bounded 2-second
+watchdog prevents permanent blocking when CoreBluetooth omits the callback.
+Timed-out cancellation debt is stored as one saturating counter per endpoint,
+not an array. Late callbacks consume debt before an active barrier; however, if
+the new generation has already reached business `connected`, a real
+`didDisconnect` must continue through normal cleanup/reconnect instead of being
+swallowed as old debt.
+
+After an acknowledged terminal releases admission, iOS must remove the old
+active request before scheduling the next generation. Barrier completion owns
+this ordering for deferred teardown; the ordinary terminal path must use the
+same cleanup-before-schedule rule and must not schedule a second time.
+
+Before Bluetooth-off teardown clears admission, iOS snapshots the active
+generation for connecting endpoints. A business-connected reconnect task keeps
+its last successful generation. The emitted `disconnectFromSys` reuses that
+accepted generation instead of falling back to `source=unknown, generation=0`.
+
+If a concurrent scan finds the same stable device name under a new
+CoreBluetooth UUID, task, persistence owner, and Gate identity migrate
+atomically before admission. Each canonical target retains at most two direct
+aliases: the earliest UI owner and the most recent old identity. This preserves
+hard cancel reachability without linear memory growth.
+
 ## even_connect Integration
 
 1. Enable `autoReconnect` on the desired `BleConfig`.
-2. For G2, configure `scan.matchCount = 2` and show scan results only after native emits the paired `BleMatchDevice` containing both endpoints.
-3. Keep listening to `connectStatusEC`.
-4. Stop running a parallel Dart reconnect loop for native-managed configs.
-5. On `connectFinish`, send G2 `AUTHENTICATION(0x04)` through `UX_DEVICE_SETTINGS_APP_ID(0x80)` with `AuthMgr.secAuth = true`, the platform-specific `phoneType`, `syncBoth = false`, `timeout = 500ms`, and `maxRetry = 1`.
-6. Wait for the `DevCfgDataPackage` callback. Only when `authMgr.secAuth == true`, call `devicePreConnected(uuid)` to enter the bounded auth grace window.
-7. For the right leg, send `PIPE_ROLE_CHANGE(0x05)` with `asCmdRole = RIGHT`, then send `TIME_SYNC(0x80)` with the current timestamp and 15-minute timezone unit.
-8. Call `deviceConnected(uuid)` in the post-auth `finally` path so native can publish the final `connected` state.
-9. On user disconnect, call `disconnectDevice`; native cancels the reconnect task.
+2. On cold start, Bluetooth recovery, or reconnect entry, call
+   `activateAutoReconnectTargets` once with all bound endpoints. Use
+   `manualReconnect` only for a user click; otherwise use `autoReconnect`.
+   Keep desired, activation-in-flight, and native-accepted targets separate so
+   a rejected or lost acknowledgement cannot leave a phantom active batch.
+3. Start the app-level scan concurrently, never before direct activation. Stop
+   it when all devices connect or at 20 seconds, whichever comes first. A later
+   Bluetooth-on recovery trigger may reopen only this scan window for the same
+   native owner; it must not activate the targets again or advance generation.
+4. For G2, keep `scan.matchCount = 2`; scan aggregation must not serialize the
+   native direct attempts.
+5. Keep listening to `connectStatusEC`. Show automatic "connecting" UI only
+   after a reconnect-owned status callback actually arrives. Hide that UI after
+   one minute without cancelling native reconnect. A manual request uses the
+   same one-minute display timeout and may show a timeout prompt, but still does
+   not cancel native reconnect.
+6. Stop running a parallel Dart reconnect loop for native-managed configs.
+7. On `connectFinish`, send G2 `AUTHENTICATION(0x04)` through `UX_DEVICE_SETTINGS_APP_ID(0x80)` with `AuthMgr.secAuth = true`, the platform-specific `phoneType`, `syncBoth = false`, `timeout = 500ms`, and `maxRetry = 1`.
+8. Wait for the `DevCfgDataPackage` callback. Only when `authMgr.secAuth == true`, call `devicePreConnected(uuid)` to enter the bounded auth grace window.
+9. For the right leg, send `PIPE_ROLE_CHANGE(0x05)` with `asCmdRole = RIGHT`, then send `TIME_SYNC(0x80)` with the current timestamp and 15-minute timezone unit.
+10. Call `deviceConnected(uuid)` in the post-auth `finally` path so native can publish the final `connected` state and release the Gate.
+11. Any visible cancel action is a hard cancel: call `disconnectDevice`, stop
+    automatic connection, and do not reactivate until the next explicit manual
+    connect.
 
 ## Acceptance Matrix
 
 - User disconnect does not reconnect.
+- A visible cancel is a hard cancel; a one-minute UI timeout alone is not.
+- All endpoints enter pending direct connect before the concurrent scan starts.
+- Concurrent scan stops at all-connected or 20 seconds.
+- Automatic UI appears only after a reconnect-owned status callback and hides
+  after one minute without stopping native reconnect.
 - Device power loss then power restore reconnects to `connectFinish`.
 - All private services are writable and notify-capable after reconnect.
 - Bluetooth off pauses tasks; Bluetooth on resumes them.
+- Bluetooth-off terminals preserve the active or last business-connected
+  generation, so Dart can accept the disconnect before reconnect resumes.
 - iOS ANCS/system-connected devices do not fall into scan timeout.
-- Android out-of-range devices can recover through passive reconnect when enabled.
+- Android out-of-range devices recover through the mandatory passive reconnect path.
+- Android business-connected system disconnect rebuilds `passiveGatt`; an old
+  GATT/session cannot terminate a newer attempt.
+- iOS repeated cancellation watchdog expiry remains constant-memory, and a live
+  system disconnect is not hidden by old cancellation debt.
+- Repeated iOS UUID drift keeps at most two aliases per canonical target.
 - Long out-of-range periods do not stop native reconnect unless user/business explicitly cancels it.
 - OTA state is not hijacked by normal auto reconnect.
 - Authentication hang after `connectFinish` times out and retries instead of getting stuck.

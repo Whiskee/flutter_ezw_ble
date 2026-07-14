@@ -1,7 +1,9 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_ezw_ble/core/models/ble_config.dart';
+import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
 import 'package:flutter_ezw_ble/core/models/ble_device.dart';
+import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble.dart';
 
 import 'flutter_ezw_ble_platform_interface.dart';
@@ -96,6 +98,37 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
         "armAutoReconnectTargets",
         devices.map((device) => device.toJson()).toList(),
       );
+
+  @override
+  Future<List<BleReconnectActivationResult>> activateAutoReconnectTargets(
+    List<BleDevice> devices, {
+    BleConnectSource source = BleConnectSource.autoReconnect,
+  }) async {
+    final raw = await methodChannel.invokeListMethod<Object?>(
+      "activateAutoReconnectTargets",
+      {
+        "devices": devices.map((device) => device.toJson()).toList(),
+        "source": source.name,
+      },
+    );
+    return (raw ?? const <Object?>[])
+        .map(BleReconnectActivationResult.fromNative)
+        .toList(growable: false);
+  }
+
+  @override
+  Future<bool> notifyAutoReconnectTargetVisible({
+    required String uuid,
+    String name = '',
+  }) async =>
+      await methodChannel.invokeMethod<bool>(
+        'notifyAutoReconnectTargetVisible',
+        {
+          'uuid': uuid,
+          'name': name,
+        },
+      ) ??
+      false;
 
   @override
   Future<void> sendCmd(

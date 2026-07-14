@@ -189,6 +189,20 @@ internal class BleReconnectStore {
     }
 
     /**
+     * 配置删除/关闭 autoReconnect 时移除该配置全部持久 owner，并返回被撤销 endpoint。
+     * 先读出 removed 再一次性保存 remaining，避免逐条 apply 暴露中间态。
+     */
+    fun removeTargetsForConfigs(context: Context?, configNames: Set<String>): Set<String> {
+        if (configNames.isEmpty()) {
+            return emptySet()
+        }
+        val existing = targets(context)
+        val removed = existing.filter { it.belongConfig in configNames }
+        saveTargets(context, existing.filterNot { it.belongConfig in configNames })
+        return removed.map { it.uuid }.toSet()
+    }
+
+    /**
      * 读取全部持久化回连目标。
      *
      * 损坏数据会降级为空列表，避免持久化脏数据破坏启动流程。

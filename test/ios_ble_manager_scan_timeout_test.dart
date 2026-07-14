@@ -56,7 +56,8 @@ void main() {
       contains('state: .noDeviceFound, tag: "scan timestamp fallback"'),
     );
     expect(source, isNot(contains('peripheral.name!')));
-    expect(source, contains('afterUpgrade: afterUpgrade, isAuthGrace: true'));
+    expect(source, contains('isAuthGrace: true,'));
+    expect(source, contains('admission: admission'));
     expect(
         source,
         contains(

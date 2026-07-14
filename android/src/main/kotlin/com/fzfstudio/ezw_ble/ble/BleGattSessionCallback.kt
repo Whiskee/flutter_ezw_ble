@@ -30,6 +30,10 @@ internal class BleGattSessionCallback(
     private val currentDeviceForGatt: (BluetoothGatt, String) -> BleDevice?,
     /** 将连接阶段推进给 manager，由 manager 统一更新状态和 EventChannel。 */
     private val handleConnectState: (String, String, BleConnectState, Int) -> Unit,
+    /** 真实物理连接只提交给全局 Gate；Gate owner 才能开始 service discovery。 */
+    private val onPhysicalConnected: (BluetoothGatt, BleDevice) -> Unit,
+    /** 当前 session 进入终态时，由 manager 先释放 Gate、再清理状态并启动下一条 pipeline。 */
+    private val onSessionTerminal: (BluetoothGatt, BleConnectState, Int) -> Unit,
     /** 查询系统蓝牙是否仍可用；蓝牙关闭时断连由系统状态监听统一处理。 */
     private val isBluetoothEnabled: () -> Boolean,
     /** 处理 Android 授权失败，必要时由 manager 清理 stale bond / 标记扫描刷新。 */
@@ -62,14 +66,14 @@ internal class BleGattSessionCallback(
         val address = gatt.device.address
         descriptorQueue.clear()
 
-        // 2. 物理链路建立后立即 discover services；业务 connected 必须等 GATT readiness。
+        // 2. 物理链路建立后只提交全局 Gate。禁止在 callback 内直接 discoverServices，
+        //    否则多设备会同时占用 HCI/GATT 初始化通道。
         if (newState == BluetoothProfile.STATE_CONNECTED) {
             val connectedDevice = currentExpectedDeviceForGatt(gatt, "connection connected") ?: return
-            gatt.discoverServices()
-            handleConnectState(address, connectedDevice.name, BleConnectState.SEARCH_SERVICE, DEFAULT_MTU)
+            onPhysicalConnected(gatt, connectedDevice)
             sendLog(
                 BleLoggerTag.d,
-                "Connect call back: $address had contact device, state = STATE_CONNECTED(code:2), start search services",
+                "Connect call back: $address had contact device, state = STATE_CONNECTED(code:2), wait global admission gate",
             )
             return
         }
@@ -107,7 +111,7 @@ internal class BleGattSessionCallback(
                 BleLoggerTag.e,
                 "Connect call back: $address disconnected while connecting, fail active connect as timeout, code=${BluetoothGattStatus.getStatusDescription(status)}",
             )
-            handleConnectState(address, device.name, BleConnectState.TIMEOUT, DEFAULT_MTU)
+            onSessionTerminal(gatt, BleConnectState.TIMEOUT, DEFAULT_MTU)
             return
         }
 
@@ -133,7 +137,7 @@ internal class BleGattSessionCallback(
             BleLoggerTag.e,
             "Connect call back: $address state = STATE_DISCONNECTED(code:${BluetoothGattStatus.getStatusDescription(status)})",
         )
-        handleConnectState(address, device.name, BleConnectState.DISCONNECT_FROM_SYS, DEFAULT_MTU)
+        onSessionTerminal(gatt, BleConnectState.DISCONNECT_FROM_SYS, DEFAULT_MTU)
     }
 
     /**
@@ -150,7 +154,7 @@ internal class BleGattSessionCallback(
 
         // 2. 服务发现失败直接进入 SERVICE_FAIL，等待上层或自动回连策略处理。
         if (status != BluetoothGatt.GATT_SUCCESS) {
-            handleConnectState(address, name, BleConnectState.SERVICE_FAIL, DEFAULT_MTU)
+            onSessionTerminal(gatt, BleConnectState.SERVICE_FAIL, DEFAULT_MTU)
             sendLog(BleLoggerTag.e, "Connect call back: $address, discover service failure")
             return
         }
@@ -162,7 +166,7 @@ internal class BleGattSessionCallback(
             val writeChars = service?.getCharacteristic(privateService.writeCharsUUID)
             if (writeChars == null) {
                 sendLog(BleLoggerTag.e, "Connect call back: $address, ${privateService.service}, write characteristic not found")
-                handleConnectState(address, name, BleConnectState.CHARS_FAIL, DEFAULT_MTU)
+                onSessionTerminal(gatt, BleConnectState.CHARS_FAIL, DEFAULT_MTU)
                 isPrivateServiceReady = false
                 return
             }
@@ -170,7 +174,7 @@ internal class BleGattSessionCallback(
             val readChars = service.getCharacteristic(privateService.readCharsUUID)
             if (readChars == null) {
                 sendLog(BleLoggerTag.e, "Connect call back: $address, ${privateService.service}, read characteristic not found")
-                handleConnectState(address, name, BleConnectState.CHARS_FAIL, DEFAULT_MTU)
+                onSessionTerminal(gatt, BleConnectState.CHARS_FAIL, DEFAULT_MTU)
                 isPrivateServiceReady = false
                 return
             }
@@ -229,7 +233,7 @@ internal class BleGattSessionCallback(
                 BleLoggerTag.e,
                 "Connect call back: ${gatt.device.address} descriptor write failed, status=${BluetoothGattStatus.getStatusDescription(status)}",
             )
-            handleConnectState(gatt.device.address, device.name, BleConnectState.CHARS_FAIL, DEFAULT_MTU)
+            onSessionTerminal(gatt, BleConnectState.CHARS_FAIL, DEFAULT_MTU)
             return
         }
 
@@ -368,7 +372,7 @@ internal class BleGattSessionCallback(
                 BleLoggerTag.e,
                 "Connect call back: ${gatt.device.address} descriptor write request rejected, psType=${item.first}",
             )
-            handleConnectState(gatt.device.address, device.name, BleConnectState.CHARS_FAIL, DEFAULT_MTU)
+            onSessionTerminal(gatt, BleConnectState.CHARS_FAIL, DEFAULT_MTU)
         }
     }
 

@@ -31,6 +31,12 @@ enum BleMC: String {
     case devicePreConnected
     /// Mark business-layer auth as complete and arm auto reconnect.
     case deviceConnected
+    /// 仅补种 native 长期回连意图。
+    case armAutoReconnectTargets
+    /// 立即建立/复用所有目标的 CoreBluetooth pending connect。
+    case activateAutoReconnectTargets
+    /// Android 扫描唤醒提示；iOS State Restoration/pending connect 不需要处理。
+    case notifyAutoReconnectTargetVisible
     /// Send one command and wait for the platform write path.
     case sendCmd
     /// Send without waiting; OTA uses the no-response backpressure queue.
@@ -128,6 +134,45 @@ enum BleMC: String {
             let uuid = arguments as? String ?? ""
             BleManager.shared.setPreConnected(uuid: uuid)
             break
+        case .armAutoReconnectTargets:
+            let targets = (arguments as? [[String: Any]] ?? []).compactMap { data -> BleReconnectTarget? in
+                guard let belongConfig = data["belongConfig"] as? String,
+                      let uuid = data["uuid"] as? String,
+                      !belongConfig.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      !uuid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    return nil
+                }
+                return BleReconnectTarget(
+                    belongConfig: belongConfig,
+                    uuid: uuid,
+                    name: data["name"] as? String ?? ""
+                )
+            }
+            BleManager.shared.armAutoReconnectTargets(targets)
+            break
+        case .activateAutoReconnectTargets:
+            let data = arguments as? [String: Any] ?? [:]
+            let targets = (data["devices"] as? [[String: Any]] ?? []).map { item in
+                let mac = item["mac"] as? String ?? ""
+                return BleReconnectTarget(
+                    belongConfig: item["belongConfig"] as? String ?? "",
+                    uuid: item["uuid"] as? String ?? "",
+                    name: item["name"] as? String ?? "",
+                    expectedMacSuffix: String(mac.filter(\.isHexDigit).suffix(6)).uppercased()
+                )
+            }
+            let source = BleConnectSource(rawValue: data["source"] as? String ?? "") ?? .unknown
+            let acknowledgements = BleManager.shared.activateAutoReconnectTargets(
+                targets,
+                source: source
+            )
+            result(acknowledgements.map(\.raw))
+            return
+        case .notifyAutoReconnectTargetVisible:
+            // CoreBluetooth 的 pending connect 与 State Restoration 自主管理恢复；
+            // 扫描命中不能重复 cancel/connect，因此固定安全 no-op。
+            result(false)
+            return
         case .disconnectDevice:
             let jsonData = arguments as? [String: Any] ?? [:]
             let uuid: String = jsonData["uuid"] as? String ?? ""

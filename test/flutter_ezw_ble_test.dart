@@ -2,7 +2,9 @@ import 'dart:typed_data';
 
 import 'package:flutter_ezw_ble/core/models/ble_config.dart';
 import 'package:flutter_ezw_ble/core/models/ble_cmd.dart';
+import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
 import 'package:flutter_ezw_ble/core/models/ble_device.dart';
+import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_method_channel.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_platform_interface.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -75,6 +77,22 @@ class MockFlutterEzwBlePlatform
 
   @override
   Future<void> armAutoReconnectTargets(List<BleDevice> devices) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<List<BleReconnectActivationResult>> activateAutoReconnectTargets(
+    List<BleDevice> devices, {
+    BleConnectSource source = BleConnectSource.autoReconnect,
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<bool> notifyAutoReconnectTargetVisible({
+    required String uuid,
+    String name = '',
+  }) {
     throw UnimplementedError();
   }
 

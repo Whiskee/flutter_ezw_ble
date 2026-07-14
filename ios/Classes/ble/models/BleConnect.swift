@@ -14,6 +14,22 @@ struct BleConnectModel: Codable {
     var name: String
     var connectState: BleConnectState
     var mtu: Int = 247
+    var source: BleConnectSource = .unknown
+    var generation: Int64 = 0
+}
+
+/// 与 Dart `BleConnectSource` raw value 一致；未知未来值解码时回退 unknown。
+enum BleConnectSource: String, Codable {
+    case unknown
+    case autoReconnect
+    case manualReconnect
+    case stateRestoration
+    case foreground
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        self = BleConnectSource(rawValue: (try? container.decode(String.self)) ?? "") ?? .unknown
+    }
 }
 
 enum BleConnectState: String, Codable {

@@ -10,6 +10,9 @@ void main() {
     final androidReconnect = File(
       'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleAutoReconnectSupervisor.kt',
     ).readAsStringSync();
+    final androidAttemptDispatcher = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleReconnectAttemptDispatcher.kt',
+    ).readAsStringSync();
     final iosReconnect =
         File('ios/Classes/ble/BleAutoReconnectCoordinator.swift')
             .readAsStringSync();
@@ -33,11 +36,11 @@ void main() {
 
     expect(
       iosReconnect,
-      contains('autoReconnect 已经持有稳定 CoreBluetooth identity'),
+      contains('beginDirectReconnectAttempt'),
     );
     expect(
       iosReconnect,
-      contains('directConnect: true'),
+      contains('connectPeripheralAfterCancellationBarrier'),
     );
     expect(
       iosReconnect,
@@ -45,24 +48,47 @@ void main() {
     );
     expect(
       iosReconnect,
-      contains('按固定防抖等下一轮系统恢复机会'),
+      contains('no peripheral cache yet, wait concurrent scan/retrieve'),
     );
-    expect(
-      iosReconnect,
-      isNot(contains('directConnect: config.autoReconnectUseNativePassive')),
+    // UUID 已知的常规回连不扫描；仅 CBError 14 的配对失配恢复才有一个 20 秒、
+    // 精确 owner 的例外扫描窗口，不能回退为所有 autoReconnect scan-first。
+    final normalReconnect = iosReconnect.substring(
+      iosReconnect.indexOf('func beginDirectReconnectAttempt'),
+      iosReconnect.indexOf('func preparePeerPairingRecovery'),
     );
+    expect(normalReconnect, isNot(contains('startScan()')));
+    expect(iosReconnect,
+        contains('pairingRecoveryDiscoveryTimeout: TimeInterval { 20.0 }'));
+    expect(iosReconnect, contains('resumePeerPairingRecoveryIfMatched'));
     expect(
       iosConnect,
       contains('autoReconnect directConnect: no peripheral cache, skip scan'),
     );
     expect(
-      iosConnect,
-      contains('startNativePassiveReconnectWatchdog'),
+      iosManager,
+      isNot(contains('passiveReconnectWatchdogTimers')),
+    );
+    expect(
+      iosReconnect,
+      contains('[CBConnectPeripheralOptionEnableAutoReconnect: true]'),
+    );
+    expect(
+      iosReconnect,
+      isNot(
+        contains('["CBConnectPeripheralOptionEnableAutoReconnect": true]'),
+      ),
     );
     expect(
       iosManager,
-      contains(
-          'native passive watchdog observed pending connect, keep connecting'),
+      contains('systemAutoReconnectInProgress: isReconnecting'),
+    );
+    expect(
+      iosManager,
+      contains('adoptSystemAutoReconnect'),
+    );
+    expect(
+      iosManager,
+      contains('pendingPhysicalConnectWatchdogs'),
     );
     expect(
       iosManager,
@@ -72,16 +98,31 @@ void main() {
       ),
     );
     expect(
+      androidAttemptDispatcher,
+      contains('所有回连路径固定使用 autoConnect=true'),
+    );
+    expect(androidAttemptDispatcher, contains('device.connectGatt('));
+    expect(androidAttemptDispatcher,
+        contains('device.connectGatt(context, true, callback)'));
+    expect(
       androidReconnect,
-      contains('passive deadline reached, rebuild after'),
+      contains('startPendingPhysicalDeadline'),
     );
     expect(
       androidReconnect,
-      contains('passive watchdog rebuild missing handle'),
+      contains('pendingPhysicalDeadlineMs(config)'),
     );
     expect(
       androidReconnect,
-      contains('过高频率 register/unregister'),
+      contains('invalidatePendingPassiveGatt(uuid, expectedGatt)'),
+    );
+    expect(
+      androidReconnect,
+      contains('不经 handleConnectState(TIMEOUT)'),
+    );
+    expect(
+      androidReconnect,
+      isNot(contains('BleConnectState.CONNECTING')),
     );
     expect(
       androidReconnect,
@@ -90,10 +131,6 @@ void main() {
     expect(
       androidReconnect,
       contains('误判为“仍有等待任务”而无法重建 GATT'),
-    );
-    expect(
-      androidReconnect,
-      isNot(contains('task.timer == null')),
     );
     expect(
       androidReconnect,

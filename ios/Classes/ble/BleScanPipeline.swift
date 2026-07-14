@@ -90,7 +90,29 @@ extension BleManager {
             return
         }
 
-        // 7. 普通模式先解析 MAC；没有 MAC 的广播需要继续等待下一次 advertisement。
+        // 7. name-only 自动回连 owner 先于 MAC/SN 规则解析。只有 config + 完整名称
+        // 精确命中的已声明 owner 才能消费该广播；普通 mfrSize=0 设备仍在下方丢弃。
+        if resolvePendingReconnectIdentity(
+            peripheral: peripheral,
+            advertisedName: advertisedName,
+            belongConfig: bleConfig.name,
+            rssi: rssi.intValue
+        ) {
+            return
+        }
+
+        // Code 14 恢复必须等待失败之后的新目标广告；该分支只消费精确 owner，不把结果
+        // 暴露为普通扫描设备，也不依赖制造商数据，避免配对失配期间漏掉同一已绑定戒指。
+        if resumePeerPairingRecoveryIfMatched(
+            peripheral: peripheral,
+            advertisedName: advertisedName,
+            belongConfig: bleConfig.name,
+            rssi: rssi.intValue
+        ) {
+            return
+        }
+
+        // 8. 普通模式先解析 MAC；没有 MAC 的广播需要继续等待下一次 advertisement。
         let deviceMac = parseDataToMac(manufactureData: manufactureData, macRule: bleConfig.scan.macRule)
         guard deviceMac.isNotEmpty else {
             logScanDropOnce(
@@ -100,7 +122,7 @@ extension BleManager {
             return
         }
 
-        // 8. 再解析 SN；SN 过滤失败时不向 Flutter 暴露该设备。
+        // 9. 再解析 SN；SN 过滤失败时不向 Flutter 暴露该设备。
         guard let deviceSn = resolveDeviceSn(
             peripheralName: advertisedName,
             manufactureData: manufactureData,
@@ -117,7 +139,7 @@ extension BleManager {
             return
         }
 
-        // 9. 设备身份完整后，缓存并按 matchCount 决定是否聚合上报。
+        // 10. 设备身份完整后，缓存并按 matchCount 决定是否聚合上报。
         emitMatchedScanResult(
             peripheral: peripheral,
             advertisedName: advertisedName,
