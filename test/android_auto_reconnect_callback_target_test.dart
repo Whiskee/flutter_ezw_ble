@@ -57,6 +57,33 @@ void main() {
     expect(armSource, isNot(contains('passiveGatt?.disconnect()')));
   });
 
+  test('manual activation promotes a pending owner without reopening GATT', () {
+    final reconnectSource = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleAutoReconnectSupervisor.kt',
+    ).readAsStringSync();
+    final managerSource =
+        File('android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleManager.kt')
+            .readAsStringSync();
+
+    final activateStart = reconnectSource.indexOf('fun activate(');
+    final promoteStart = reconnectSource.indexOf(
+      'fun promotePendingAttempt(',
+      activateStart,
+    );
+    final activateSource =
+        reconnectSource.substring(activateStart, promoteStart);
+
+    expect(activateSource,
+        contains('task.passiveGatt != null || task.timer != null'));
+    expect(activateSource,
+        contains('source == BleConnectSource.MANUAL_RECONNECT'));
+    expect(activateSource, contains('promotePendingAdmission(device.uuid)'));
+    expect(activateSource, isNot(contains('passiveGatt?.close()')));
+    expect(activateSource, isNot(contains('passiveGatt?.disconnect()')));
+    expect(managerSource,
+        contains('autoReconnectSupervisor.activate(seedDevice, source)'));
+  });
+
   test('Android plugin unregisters Activity lifecycle callbacks on detach', () {
     final pluginSource = File(
       'android/src/main/kotlin/com/fzfstudio/ezw_ble/FlutterEzwBlePlugin.kt',

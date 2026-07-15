@@ -27,4 +27,24 @@ void main() {
     expect(reconnect, contains('let usesSystemAutoReconnect'));
     expect(scan, contains('resumePeerPairingRecoveryIfMatched('));
   });
+
+  test(
+      'iOS manual activation promotes the pending admission without reconnecting',
+      () {
+    final reconnect = File('ios/Classes/ble/BleAutoReconnectCoordinator.swift')
+        .readAsStringSync();
+    final activationStart = reconnect.indexOf(
+      'private func activateArmedReconnectTask',
+    );
+    final activationEnd = reconnect.indexOf(
+      '/// 扫描仅为已声明的 name-only owner',
+      activationStart,
+    );
+    final activation = reconnect.substring(activationStart, activationEnd);
+
+    expect(activation, contains('if source == .manualReconnect'));
+    expect(activation, contains('_ = promotePendingAttempt(uuid: task.uuid)'));
+    expect(activation, contains('return'));
+    expect(activation, isNot(contains('cancelPeripheral(')));
+  });
 }
