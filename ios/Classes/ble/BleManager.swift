@@ -1385,8 +1385,7 @@ extension BleManager {
         let terminalMetadata = BleTerminalConnectionMetadataPolicy.resolve(
             state: state,
             currentAdmission: currentAdmission,
-            reconnectTask: reconnectTask,
-            isBusinessConnected: currentDevice?.isConnected == true
+            reconnectTask: reconnectTask
         )
         let eventSource = source ?? terminalMetadata?.source ?? .unknown
         let eventGeneration = generation ?? terminalMetadata?.generation ?? 0
@@ -1395,6 +1394,15 @@ extension BleManager {
            generation == nil,
            let terminalMetadata = terminalMetadata {
             loggerD(msg: "connect-flow: \(uuid)-\(name), reuse business-connected terminal epoch, state=\(state.rawValue), source=\(terminalMetadata.source.rawValue), generation=\(terminalMetadata.generation)")
+        }
+        if state == .disconnectFromSys,
+           currentAdmission == nil,
+           source == nil,
+           generation == nil,
+           terminalMetadata == nil {
+            // 终态绝不能静默退化：保留 task 与缓存快照，便于定位 identity/task 被错误
+            // 清除的路径；Dart 侧仍会严格拒绝 unknown/0，避免迟到回调污染新会话。
+            loggerE(msg: "connect-flow: \(uuid)-\(name), missing terminal epoch, cachedConnected=\(currentDevice?.isConnected == true), taskFound=\(reconnectTask != nil), taskGeneration=\(reconnectTask?.lastConnectedGeneration ?? 0), taskSource=\(reconnectTask?.source.rawValue ?? "unknown")")
         }
         if state == .disconnectByUser {
             cancelReconnectTask(uuid: uuid, name: name)

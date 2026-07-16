@@ -335,14 +335,13 @@ class RunnerTests: XCTestCase {
       BleTerminalConnectionMetadataPolicy.resolve(
         state: .disconnectFromSys,
         currentAdmission: nil,
-        reconnectTask: task,
-        isBusinessConnected: true
+        reconnectTask: task
       ),
       BleTerminalConnectionMetadata(source: .autoReconnect, generation: 9)
     )
   }
 
-  func testStaleDisconnectCannotReuseLastAcceptedGeneration() {
+  func testTerminalEpochSurvivesVolatileConnectedCacheReset() {
     var task = BleReconnectTask(
       belongConfig: "ring_bcl_1",
       uuid: "ring",
@@ -351,17 +350,18 @@ class RunnerTests: XCTestCase {
     )
     task.lastConnectedGeneration = 9
 
-    XCTAssertNil(BleTerminalConnectionMetadataPolicy.resolve(
+    // didDisconnect 进入 manager 前，connectedDevices 的本地 bool 可能已被底层清理。
+    // 只要 reconnect task 仍持有最后一次真实业务成功 epoch，就必须保持同代终态，
+    // 否则 Dart epoch guard 会把真实断连误判为陈旧回调。
+    XCTAssertEqual(BleTerminalConnectionMetadataPolicy.resolve(
       state: .disconnectFromSys,
       currentAdmission: nil,
-      reconnectTask: task,
-      isBusinessConnected: false
-    ))
+      reconnectTask: task
+    ), BleTerminalConnectionMetadata(source: .autoReconnect, generation: 9))
     XCTAssertNil(BleTerminalConnectionMetadataPolicy.resolve(
       state: .disconnectByUser,
       currentAdmission: nil,
-      reconnectTask: task,
-      isBusinessConnected: true
+      reconnectTask: task
     ))
   }
 
@@ -384,8 +384,7 @@ class RunnerTests: XCTestCase {
       BleTerminalConnectionMetadataPolicy.resolve(
         state: .disconnectFromSys,
         currentAdmission: admission,
-        reconnectTask: task,
-        isBusinessConnected: true
+        reconnectTask: task
       ),
       BleTerminalConnectionMetadata(source: .manualReconnect, generation: 10)
     )

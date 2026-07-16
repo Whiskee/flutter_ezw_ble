@@ -51,8 +51,7 @@ enum BleTerminalConnectionMetadataPolicy {
     static func resolve(
         state: BleConnectState,
         currentAdmission: BleConnectionAdmission?,
-        reconnectTask: BleReconnectTask?,
-        isBusinessConnected: Bool
+        reconnectTask: BleReconnectTask?
     ) -> BleTerminalConnectionMetadata? {
         // 连接中/排队中的终态始终归属当前 Gate owner，不能被历史 task 覆盖。
         if let admission = currentAdmission, admission.generation > 0 {
@@ -62,9 +61,14 @@ enum BleTerminalConnectionMetadataPolicy {
             )
         }
         // Gate 在业务 connected 后会释放；此后的真实系统断连只能继承最后一次
-        // 业务成功代次。仍未业务连接的迟到 cancel callback 禁止走该 fallback。
+        // 业务成功代次。不能依赖 connectedDevices.isConnected：CoreBluetooth 的
+        // didDisconnect 到达前，该易变缓存可能已被其它清理分支清成 false，导致真实
+        // 终态退化为 unknown/0 并被 Dart epoch guard 拒绝。
+        //
+        // lastConnectedGeneration 只在业务 connected 后写入；显式取消、换设备会删除
+        // reconnect task，而正在进行的新连接优先由上方 admission 归属。因此它是比
+        // 当前缓存布尔值更稳定、且不会放宽旧 cancel callback 的终态凭据。
         guard state == .disconnectFromSys,
-              isBusinessConnected,
               let task = reconnectTask,
               let generation = task.lastConnectedGeneration,
               generation > 0 else {

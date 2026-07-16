@@ -297,7 +297,6 @@ void main() {
       contains('enum BleTerminalConnectionMetadataPolicy'),
     );
     expect(reconnectStore, contains('state == .disconnectFromSys'));
-    expect(reconnectStore, contains('isBusinessConnected'));
     expect(reconnectStore, contains('task.lastConnectedGeneration'));
     expect(
       manager,
@@ -305,7 +304,8 @@ void main() {
     );
     expect(
       manager,
-      contains('isBusinessConnected: currentDevice?.isConnected == true'),
+      isNot(
+          contains('isBusinessConnected: currentDevice?.isConnected == true')),
     );
     expect(
       manager,
