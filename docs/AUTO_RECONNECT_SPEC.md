@@ -44,9 +44,12 @@ Public methods:
   Callers must not treat desired targets as active until an acknowledgement is
   accepted; missing, duplicated, or unknown acknowledgement states fail closed.
 - `notifyAutoReconnectTargetVisible(uuid, name)` is a scan hint, not a second
-  connection owner. Android returns `true` only when it wakes that exact
-  target's pre-physical passive GATT or pending retry. iOS returns `false`
-  because CoreBluetooth pending connect and State Restoration remain authoritative.
+  connection owner. Android returns `true` only when it takes over that exact
+  target's pre-physical passive GATT or pending retry and queues one serialized
+  `connectGatt(autoConnect=false)` attempt. It keeps the same autoReconnect
+  source and long-lived passive owner after that direct attempt ends. iOS returns
+  `false` because CoreBluetooth pending connect and State Restoration remain
+  authoritative.
 
 Every reconnect status event carries `source` and `generation`. Old payloads
 decode as `source=unknown` and `generation=0`.
@@ -198,7 +201,10 @@ Reconnect activation always calls
 `BluetoothDevice.connectGatt(..., autoConnect=true, ...)` for every target. It
 does not first enter `connect(...)`, scan-refresh, or the scan-then-connect
 queue. The app may scan concurrently for at most 20 seconds, but scan visibility
-is not an admission prerequisite.
+is not an admission prerequisite. When that auxiliary scan does confirm an
+unresolved target, Android atomically replaces only its exact pre-physical
+passive GATT with one globally serialized `connectGatt(..., autoConnect=false,
+...)` attempt; this is an acceleration path, not a second owner or a UI state.
 
 Each Android passive handle has an exact pre-physical deadline as described
 above. The deadline must compare the GATT object and admission generation before
@@ -240,6 +246,16 @@ Do not start the short connect timeout while the reconnect is only pending in Co
 CoreBluetooth pending connect is the iOS long-wait mechanism. App timers may
 update diagnostics, but must not cancel the pending connect or emit a Dart/UI
 timeout just because the peripheral stayed away for minutes or hours.
+
+`connectedDevices` is only a per-process business/GATT cache, never the source
+of truth for a physical iOS link. It is keyed by stable CoreBluetooth UUID, not
+the `CBPeripheral` object identity: retrieve/restoration may return a different
+object instance for the same UUID. A reconnect may skip `centralManager.connect`
+only when the cache is business-connected **and** that peripheral's physical
+state is `.connected`. On every terminal state all same-UUID cache entries are
+invalidated; before a new pending attempt they are replaced by one current
+peripheral entry. This prevents a stale `isConnected=true` entry from silently
+leaving an autoReconnect task armed without a CoreBluetooth pending connect.
 
 Non-CoreBluetooth terminal states must not release the global Gate until
 `didFailToConnect` / `didDisconnect` acknowledges teardown. A bounded 2-second

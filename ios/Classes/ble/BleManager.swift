@@ -101,6 +101,10 @@ class BleManager: NSObject {
     //    旧回调不能终止新 generation，且系统漏回调时 deferred connect 也不会永久等待。
     let peripheralCancellationBarrierGate = BlePeripheralCancellationBarrierGate()
     var peripheralCancellationWatchdogs: [String: (token: Int64, workItem: DispatchWorkItem)] = [:]
+    // OTA reboot 主动断开已先发出同代终态；随后 CoreBluetooth 的确认回调不能再次
+    // schedule reconnect，否则会和 App 的 afterUpgrade activation 竞争。
+    private var otaRebootDisconnectSuppressions: Set<String> = []
+    private var otaRebootDisconnectWatchdogs: [String: DispatchWorkItem] = [:]
     //  - central.connect 到 didConnect 之间没有 GATT timeout；exact generation/session
     //    watchdog 对自动回连只做观测，普通前台 attempt 才允许有界回收。
     let pendingPhysicalConnectWatchdogs = BlePendingPhysicalConnectWatchdogRegistry()
@@ -490,6 +494,62 @@ extension BleManager {
         }
         updateConnectedDevice(uuid: effectiveUuid, name: connectedDevice?.peripheral.name ?? "", isConnected: false, updateByUser: true)
         loggerD(msg: "disconnect:\(uuid)->\(effectiveUuid)-\(name), disconnect by user")
+    }
+
+    /**
+     * OTA 成功后的固件 reboot 专用断开。
+     *
+     * 不能复用 [disconnect]：那条路径代表用户取消，会删除 reconnect task 与持久 owner。
+     * 本方法带当前业务 session 的 source/generation 发出 .disconnectFromSys，使 Dart
+     * 清理已失效的连接态；原生不在固件 reboot 期间抢跑建链，回连由 afterUpgrade 激活。
+     */
+    func disconnectForOtaReboot(uuid: String, name: String) {
+        let effectiveUuid = reconnectIdentityAliases.resolvedCanonical(uuid: uuid) ?? uuid
+        guard let device = connectedDevices.first(where: { device in
+            isSameConnectTarget(
+                storedUuid: device.peripheral.identifier.uuidString,
+                storedName: device.peripheral.name ?? "",
+                uuid: effectiveUuid,
+                name: name
+            )
+        }) else {
+            loggerE(msg: "ota reboot disconnect: \(uuid)-\(name), no connected device cache")
+            return
+        }
+        let physicalUuid = device.peripheral.identifier.uuidString
+        let physicalName = device.peripheral.name ?? name
+        markOtaRebootDisconnectSuppression(uuid: physicalUuid)
+        handleConnectState(
+            uuid: physicalUuid,
+            name: physicalName,
+            state: .disconnectFromSys,
+            suppressReconnectSchedule: true,
+            tag: "OTA reboot teardown"
+        )
+        loggerD(msg: "ota reboot disconnect: \(physicalUuid)-\(physicalName), owner preserved")
+    }
+
+    /// 标记/消费 OTA 主动 cancel 的唯一 CoreBluetooth 确认回调，禁止跨越到新会话。
+    private func markOtaRebootDisconnectSuppression(uuid: String) {
+        let key = reconnectKey(uuid: uuid)
+        otaRebootDisconnectWatchdogs[key]?.cancel()
+        otaRebootDisconnectSuppressions.insert(key)
+        let watchdog = DispatchWorkItem { [weak self] in
+            self?.otaRebootDisconnectSuppressions.remove(key)
+            self?.otaRebootDisconnectWatchdogs.removeValue(forKey: key)
+        }
+        otaRebootDisconnectWatchdogs[key] = watchdog
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: watchdog)
+    }
+
+    private func consumeOtaRebootDisconnectSuppression(peripheral: CBPeripheral) -> Bool {
+        let key = reconnectKey(uuid: peripheral.identifier.uuidString)
+        guard otaRebootDisconnectSuppressions.remove(key) != nil else {
+            return false
+        }
+        otaRebootDisconnectWatchdogs.removeValue(forKey: key)?.cancel()
+        loggerD(msg: "ota reboot disconnect: consume CoreBluetooth terminal \(peripheral.identifier.uuidString)")
+        return true
     }
     
     /**
@@ -1132,6 +1192,11 @@ extension BleManager {
      *  处理连接失败
      */
     private func handleConnectError(peripheral: CBPeripheral, error: Error?, formMethod: String) {
+        // OTA reboot teardown 已同步上报同代断连并主动 cancel；这条回调只是系统确认。
+        // 若按普通系统断连再次调度，会在固件 reboot 期间与 afterUpgrade activation 竞争。
+        if consumeOtaRebootDisconnectSuppression(peripheral: peripheral) {
+            return
+        }
         //  1、连接识别标签
         let tag = "didDisconnect"
         let logHead = "didFailToConnect-\(formMethod):"
@@ -1307,18 +1372,21 @@ extension BleManager {
             }
         }
         //  - 设置连接状态
+        var reportedState: BleConnectState?
         if let isConnected = isConnected {
             connectedDevice.isConnected = isConnected
-            //  - 回复连接成功
-            if isConnected {
-                handleConnectState(uuid: uuid, name: name, state: .connected)
-            }
-            //  - 发起断连
-            else {
-                handleConnectState(uuid: uuid, name: name, state: updateByUser ? .disconnectByUser : .disconnectFromSys)
-            }
+            reportedState = isConnected
+                ? .connected
+                : (updateByUser ? .disconnectByUser : .disconnectFromSys)
         }
+
+        // 所有缓存字段必须在状态上报前一次性提交。`handleConnectState(.connected)` 会释放
+        // admission Gate 并可能同步启动下一 endpoint 的 pipeline；后者会重排
+        // connectedDevices，因此不能跨状态上报继续持有本次查到的数组 index。
         connectedDevices[index] = connectedDevice
+        if let reportedState = reportedState {
+            handleConnectState(uuid: uuid, name: name, state: reportedState)
+        }
         loggerD(msg: "updateConnectedDevice: \(uuid), state = \(connectedDevice.peripheral.state), device = \(connectedDevice.toString())")
         if shouldCheckBleFlow {
             tryEmitConnectFinish(uuid: uuid, name: name, bleConfig: connectedDevice.belongConfig, tag: "updateConnectedDevice")
@@ -1361,6 +1429,7 @@ extension BleManager {
         generation: Int64? = nil,
         peripheralTerminalAcknowledged: Bool = false,
         systemAutoReconnectInProgress: Bool = false,
+        suppressReconnectSchedule: Bool = false,
         tag: String = ""
     ) {
         let fromTag = "\(tag.isNotEmpty ? " -- from: \(tag)" : "\"\"")"
@@ -1424,22 +1493,28 @@ extension BleManager {
         }
         var deferredAdmissionTeardown = false
         //  2、设备连接状态为失败或断连就要设置连接设备连接状态为false
-        if state.isError() || state.isDisconnected(), let index = connectedDevices.firstIndex(where: { $0.peripheral.identifier.uuidString == uuid || $0.peripheral.name == name }) {
-            var device = connectedDevices[index]
-            device.isConnected = false
-            device.isBleFlowCompleted = false
-            //  异常断连标记：下次重连前需先扫描刷新 CoreBluetooth 缓存
-            //  - disconnectFromSys：系统异常断连，CoreBT peripheral 元数据可能 stale
-            //  - timeout：connect() 静默无反应，同样是 CoreBT 缓存问题的典型表现
-            if state == .disconnectFromSys || state == .timeout {
-                device.needsScanBeforeReconnect = true
+        let cacheIndexes = connectionCacheIndexes(uuid: uuid, name: name)
+        if state.isError() || state.isDisconnected(), cacheIndexes.isNotEmpty {
+            // 历史版本可能因 retrieve/restoration 返回不同对象而留下同 UUID 多条缓存。
+            // 终态必须失效全部条目，不能只更新第一条后让回连看到另一条假已连接记录。
+            for index in cacheIndexes {
+                var device = connectedDevices[index]
+                device.isConnected = false
+                device.isBleFlowCompleted = false
+                //  异常断连标记：下次重连前需先扫描刷新 CoreBluetooth 缓存
+                //  - disconnectFromSys：系统异常断连，CoreBT peripheral 元数据可能 stale
+                //  - timeout：connect() 静默无反应，同样是 CoreBT 缓存问题的典型表现
+                if state == .disconnectFromSys || state == .timeout {
+                    device.needsScanBeforeReconnect = true
+                }
+                for (_, readChar) in device.readCharsDic {
+                    device.peripheral.setNotifyValue(false, for: readChar)
+                }
+                device.readCharsNotify = 0
+                device.notifiedReadCharUUIDs.removeAll()
+                connectedDevices[index] = device
             }
-            for (_, readChar) in device.readCharsDic {
-                device.peripheral.setNotifyValue(false, for: readChar)
-            }
-            device.readCharsNotify = 0
-            device.notifiedReadCharUUIDs.removeAll()
-            connectedDevices[index] = device
+            let device = currentDevice ?? connectedDevices[cacheIndexes[0]]
             if let currentAdmission = currentAdmission,
                !peripheralTerminalAcknowledged,
                device.peripheral.state != .disconnected {
@@ -1461,7 +1536,7 @@ extension BleManager {
             if let queue = otaWriteQueues.removeValue(forKey: queueKey) {
                 queue.cancelAll(reason: "device state=\(state.rawValue)")
             }
-            loggerD(msg: "connect-flow: \(uuid)-\(name), state = \(state), tag = \(fromTag)")
+            loggerD(msg: "connect-flow: \(uuid)-\(name), state = \(state), cacheEntries=\(cacheIndexes.count), tag = \(fromTag)")
         }
         // 3. 已收到 didFail/didDisconnect（或外设本就 disconnected）才可以同步释放；
         //    其余终态由 cancellation barrier callback/watchdog 完成 release/start-next。
@@ -1500,6 +1575,10 @@ extension BleManager {
             loggerD(msg: "connect-flow: \(uuid)-\(name), terminal cleanup before reconnect schedule, tag = \(fromTag)")
             if systemAutoReconnectInProgress, let peripheral = currentDevice?.peripheral {
                 adoptSystemAutoReconnect(peripheral, name: name)
+                return
+            }
+            if suppressReconnectSchedule {
+                loggerD(msg: "connect-flow: \(uuid)-\(name), OTA reboot teardown suppresses native reconnect schedule")
                 return
             }
             scheduleReconnect(uuid: uuid, name: name, state: state)

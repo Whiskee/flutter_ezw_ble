@@ -13,6 +13,9 @@ void main() {
     final task = File(
       'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleReconnectModels.kt',
     ).readAsStringSync();
+    final dispatcher = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleReconnectAttemptDispatcher.kt',
+    ).readAsStringSync();
     final androidChannel = File(
       'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleMethodChannel.kt',
     ).readAsStringSync();
@@ -33,7 +36,18 @@ void main() {
     expect(reconnect, contains('fun notifyTargetVisible'));
     expect(reconnect, contains('hasPrePhysicalGatt'));
     expect(reconnect, contains('hasPendingRetry'));
-    expect(reconnect, contains('reason = "targetVisible"'));
+    expect(reconnect, contains('prepareTargetVisibleDirectConnect'));
+    expect(reconnect, contains('scheduleTargetVisibleDirectConnect'));
+    expect(reconnect, contains('beginVisibleDirectReconnect'));
+    expect(reconnect, contains('acquireVisibleDirectConnectSlot'));
+    expect(reconnect, contains('releaseVisibleDirectConnectSlot'));
+    expect(reconnect, contains('visibleDirectConnectQueue'));
+    expect(reconnect, contains('activeVisibleDirectConnectUuid'));
+    expect(task, contains('visibleDirectConnectRequested'));
+    expect(task, contains('pendingVisibleDirectConnect'));
+    expect(dispatcher, contains('AndroidBleVisibleDirectGattFactory'));
+    expect(
+        dispatcher, contains('device.connectGatt(context, false, callback)'));
     expect(reconnect, contains('task.retryScheduleGeneration'));
     expect(reconnect, contains('visibilityWakeEligible = true'));
     expect(

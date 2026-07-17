@@ -121,6 +121,8 @@ retrieveConnectedPeripherals(withServices: privateServices + [ANCS])
 - `connectFinish` 不释放 owner，只有业务 `deviceConnected` 或已确认 teardown 的终态释放；
 - 事件携带 `source` 与 `generation`，并通过 endpoint + generation + session + `CBPeripheral` 对象身份拒绝迟到 callback。
 
+`CBPeripheral` 对象身份只用于拒绝迟到 callback，不能用于 `connectedDevices` 缓存判重。恢复、retrieve 或蓝牙开关后，系统可为同一稳定 UUID 返回不同对象实例；缓存必须按 UUID 单例化。业务缓存显示已连接时，还必须同时确认该实例的 `peripheral.state == .connected` 才能跳过新 pending connect。收到终态要失效全部同 UUID 缓存项，随后由新一代连接替换为当前实例，避免陈旧 `isConnected=true` 把自动回连静默短路。
+
 State Restoration 恢复后，CoreBluetooth 可能交错返回 cached service、cached characteristic、notify 回调。原生层必须用 readiness gate 聚合状态，不能因第一条 notify 成功就上报 `connectFinish`。
 
 iOS gate 最低要求：

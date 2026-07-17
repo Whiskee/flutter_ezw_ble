@@ -85,6 +85,13 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       });
 
   @override
+  Future<void> disconnectForOtaReboot(String uuid, String name) async =>
+      methodChannel.invokeMethod("disconnectForOtaReboot", {
+        "uuid": uuid,
+        "name": name,
+      });
+
+  @override
   Future<void> devicePreConnected(String uuid) async =>
       methodChannel.invokeMethod("devicePreConnected", uuid);
 

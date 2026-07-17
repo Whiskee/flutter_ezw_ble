@@ -29,7 +29,7 @@ void main() {
   });
 
   test(
-      'iOS manual activation promotes the pending admission without reconnecting',
+      'iOS manual activation promotes a healthy pending admission without reconnecting',
       () {
     final reconnect = File('ios/Classes/ble/BleAutoReconnectCoordinator.swift')
         .readAsStringSync();
@@ -43,6 +43,7 @@ void main() {
     final activation = reconnect.substring(activationStart, activationEnd);
 
     expect(activation, contains('if source == .manualReconnect'));
+    expect(activation, contains('replaceStalePendingManualAttemptIfNeeded'));
     expect(activation, contains('_ = promotePendingAttempt(uuid: task.uuid)'));
     expect(activation, contains('return'));
     expect(activation, isNot(contains('cancelPeripheral(')));

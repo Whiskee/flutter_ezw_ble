@@ -99,11 +99,21 @@ void main() {
     );
     expect(
       androidAttemptDispatcher,
-      contains('所有回连路径固定使用 autoConnect=true'),
+      contains('常态保持 `autoConnect=true` 的系统 pending 请求'),
     );
     expect(androidAttemptDispatcher, contains('device.connectGatt('));
     expect(androidAttemptDispatcher,
         contains('device.connectGatt(context, true, callback)'));
+    expect(
+      androidAttemptDispatcher,
+      contains('AndroidBleVisibleDirectGattFactory'),
+    );
+    expect(
+      androidAttemptDispatcher,
+      contains('device.connectGatt(context, false, callback)'),
+    );
+    expect(androidReconnect, contains('visibleDirectConnectQueue'));
+    expect(androidReconnect, contains('beginVisibleDirectReconnect'));
     expect(
       androidReconnect,
       contains('startPendingPhysicalDeadline'),

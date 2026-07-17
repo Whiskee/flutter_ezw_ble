@@ -66,6 +66,11 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
+  Future<void> disconnectForOtaReboot(String uuid, String name) {
+    throw UnimplementedError();
+  }
+
+  @override
   Future<void> devicePreConnected(String uuid) {
     throw UnimplementedError();
   }

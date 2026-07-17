@@ -12,6 +12,72 @@ extension BleManager {
     // UI 的一分钟展示与 native 长期回连解耦；这里的一分钟只观察自动回连，
     // 普通前台连接才允许回收静默的 pre-didConnect attempt。
     private var pendingPhysicalConnectWatchdogTimeout: TimeInterval { 60.0 }
+    // 手动接管正常应只提升 pending owner；超过一个辅助扫描窗口仍无任何物理回调时，
+    // 才允许通过 cancellation barrier 替换卡住的 CoreBluetooth pending connect。
+    private var manualPendingReplacementThreshold: TimeInterval { 20.0 }
+
+    /// 同一 CoreBluetooth UUID 在本进程内只能有一个连接缓存 owner。iOS 在蓝牙恢复、
+    /// retrieve 或 restoration 后可能返回新的 CBPeripheral 实例，不能再用对象引用判重，
+    /// 否则旧实例的 `isConnected=true` 会把实际已经断开的回连短路掉。
+    func connectionCacheIndexes(uuid: String, name: String = "") -> [Int] {
+        guard uuid.isNotEmpty || name.isNotEmpty else { return [] }
+        return connectedDevices.indices.filter { index in
+            let device = connectedDevices[index]
+            if uuid.isNotEmpty {
+                return device.peripheral.identifier.uuidString == uuid
+            }
+            return device.peripheral.name == name
+        }
+    }
+
+    /// 只有业务缓存和 CoreBluetooth 都确认 connected 时，才允许跳过新的 pending connect。
+    /// 物理状态已断开的陈旧条目会先失效，保证断连后的长期 autoReconnect 一定能继续下发。
+    func businessConnectedCacheDevice(uuid: String) -> BleConnectedDevice? {
+        let indexes = connectionCacheIndexes(uuid: uuid)
+        guard indexes.isNotEmpty else { return nil }
+
+        var staleConnectedIndexes: [Int] = []
+        var physicallyConnectedDevice: BleConnectedDevice?
+        for index in indexes {
+            let device = connectedDevices[index]
+            if device.isConnected, device.peripheral.state == .connected {
+                if physicallyConnectedDevice == nil {
+                    physicallyConnectedDevice = device
+                }
+            } else if device.isConnected {
+                staleConnectedIndexes.append(index)
+            }
+        }
+
+        for index in staleConnectedIndexes {
+            var stale = connectedDevices[index]
+            stale.isConnected = false
+            stale.isBleFlowCompleted = false
+            stale.readCharsNotify = 0
+            stale.notifiedReadCharUUIDs.removeAll()
+            connectedDevices[index] = stale
+        }
+        if indexes.count > 1 || staleConnectedIndexes.isNotEmpty {
+            loggerD(msg: "connection cache: \(uuid), entries=\(indexes.count), staleBusinessConnected=\(staleConnectedIndexes.count), physicalConnected=\(physicallyConnectedDevice != nil)")
+        }
+        return physicallyConnectedDevice
+    }
+
+    /// 新一代 pending connect 只能保留当前 peripheral 的缓存。先按稳定 UUID 替换，防止
+    /// retrieve 返回的新对象与旧对象并存，让终态更新第一个条目、回连短路命中另一个条目。
+    func replaceConnectionCache(
+        peripheral: CBPeripheral,
+        config: BleConfig,
+        reason: String
+    ) {
+        let uuid = peripheral.identifier.uuidString
+        let removedCount = connectionCacheIndexes(uuid: uuid).count
+        connectedDevices.removeAll { $0.peripheral.identifier.uuidString == uuid }
+        connectedDevices.append(BleConnectedDevice(belongConfig: config, peripheral: peripheral))
+        if removedCount > 0 {
+            loggerD(msg: "connection cache: \(uuid), replace entries=\(removedCount), reason=\(reason)")
+        }
+    }
 
     /// central.connect 发出后开始 attempt-scoped watchdog；自动回连必须保留系统长期请求。
     func startPendingPhysicalConnectWatchdog(
@@ -391,7 +457,8 @@ extension BleManager {
             peripheral: peripheral,
             config: config,
             deviceName: deviceName,
-            afterUpgrade: afterUpgrade
+            afterUpgrade: afterUpgrade,
+            pendingConnectStartedAt: Date()
         )
         return admission
     }
@@ -428,12 +495,16 @@ extension BleManager {
     /// 真实物理连接回调的唯一入口；只在此刻发 source-tagged contactDevice。
     func enqueuePhysicalConnectionThroughGate(_ peripheral: CBPeripheral) {
         guard let admission = currentConnectionAdmission(uuid: peripheral.identifier.uuidString),
-              let session = peripheralConnectionSessions[admission.sessionId],
+              var session = peripheralConnectionSessions[admission.sessionId],
               session.peripheral === peripheral else {
             loggerD(msg: "admission gate: \(peripheral.identifier.uuidString), unowned physical callback ignored")
             centralManager.cancelPeripheralConnection(peripheral)
             return
         }
+        // physical callback 一旦到达，之后的手动点击只可以提升 Gate 优先级，不能取消
+        // 已建立的链路并重开 GATT；这也是区别“陈旧 pending”与正常慢连接的边界。
+        session.hasObservedPhysicalContact = true
+        peripheralConnectionSessions[admission.sessionId] = session
         pendingPhysicalConnectWatchdogs.takeIfCurrent(admission)?.cancel()
         switch connectionAdmissionGate.onPhysicalConnected(admission) {
         case .granted:
@@ -585,6 +656,40 @@ extension BleManager {
             generation: current.generation,
             sessionId: current.sessionId
         )
+        return true
+    }
+
+    /// 手动连接的受控逃逸口：仅替换超过阈值、从未收到物理连接回调且未处于取消
+    /// barrier 的 pending owner。正常 autoReconnect 继续长期交给 CoreBluetooth，不能因
+    /// 每次点击被重置；这里的 cancel 也必须先建立 barrier，确保旧 callback 不会污染新代。
+    @discardableResult
+    func replaceStalePendingManualAttemptIfNeeded(_ peripheral: CBPeripheral) -> Bool {
+        guard let admission = currentConnectionAdmission(uuid: peripheral.identifier.uuidString),
+              let session = peripheralConnectionSessions[admission.sessionId],
+              session.peripheral === peripheral,
+              !session.hasObservedPhysicalContact,
+              peripheral.state != .connected,
+              !hasPeripheralCancellationBarrier(peripheral) else {
+            return false
+        }
+        let elapsed = Date().timeIntervalSince(session.pendingConnectStartedAt)
+        guard elapsed >= manualPendingReplacementThreshold else {
+            return false
+        }
+
+        // 先取消旧 watchdog 和旧 owner，再由调用方在同一 barrier 后注册新 generation。
+        // completion 的 exact admission guard 会只释放旧 session，deferred registry 则保证
+        // 新 central.connect 必须等 didFail/didDisconnect 或 barrier watchdog 后才真正执行。
+        pendingPhysicalConnectWatchdogs.takeIfCurrent(admission)?.cancel()
+        deferConnectionAdmissionReleaseUntilPeripheralTerminal(
+            admission: admission,
+            peripheral: peripheral,
+            deviceName: session.deviceName,
+            terminalState: .disconnectFromSys
+        )
+        centralManager.cancelPeripheralConnection(peripheral)
+        let elapsedDescription = String(format: "%.1f", elapsed)
+        loggerD(msg: "admission gate: \(admission.endpointId), manual stale pending replacement generation=\(admission.generation), elapsed=\(elapsedDescription)s")
         return true
     }
 

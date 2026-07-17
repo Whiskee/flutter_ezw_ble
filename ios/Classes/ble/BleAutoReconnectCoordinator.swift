@@ -365,6 +365,16 @@ extension BleManager {
                 } == true
                 if source != .manualReconnect || !currentIsPendingTeardown {
                     if source == .manualReconnect {
+                        // 默认仅提升同一 pending owner，避免手动点击引入第二条 GATT。
+                        // 只有旧 owner 已超过 20 秒且从未收到物理回调，才先走 cancel
+                        // barrier 后建立新 generation，给 CoreBluetooth 卡住的 pending 一个
+                        // 有界恢复机会。
+                        if let session = peripheralConnectionSessions[current.sessionId],
+                           replaceStalePendingManualAttemptIfNeeded(session.peripheral) {
+                            loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), manual stale pending replacement requested")
+                            beginReconnectAttempt(uuid: task.uuid)
+                            return
+                        }
                         _ = promotePendingAttempt(uuid: task.uuid)
                     }
                     return
@@ -671,9 +681,9 @@ extension BleManager {
 
     /// 构造一条不经扫描前置、不提前起超时的 CoreBluetooth pending connect。
     func beginDirectReconnectAttempt(task: BleReconnectTask, config: BleConfig) {
-        if let connected = connectedDevices.first(where: {
-            $0.peripheral.identifier.uuidString.caseInsensitiveCompare(task.uuid) == .orderedSame && $0.isConnected
-        }) {
+        // 不能只看业务缓存 isConnected：断连后 retrieve/restoration 可能保留同 UUID 的
+        // 旧 CBPeripheral 实例。只有物理连接仍在时才短路，否则必须重建系统 pending connect。
+        if let connected = businessConnectedCacheDevice(uuid: task.uuid) {
             armReconnectTask(device: connected, source: .autoReconnect, businessConnected: true)
             return
         }
@@ -724,6 +734,12 @@ extension BleManager {
                 $0.admission.generation != current.generation ||
                     $0.admission.sessionId != current.sessionId
             } == true
+            // beginReconnectAttempt 也可能直接由其它入口以 manual source 调用。保持与
+            // activation 的陈旧 pending 策略一致，避免绕过受控 replacement 边界。
+            if activeTask.source == .manualReconnect,
+               replaceStalePendingManualAttemptIfNeeded(peripheral) {
+                loggerD(msg: "autoReconnect: \(activeTask.uuid)-\(activeTask.name), direct manual stale pending replacement requested")
+            }
             let barrierBlocking = hasPeripheralCancellationBarrier(peripheral)
 
             if activeTask.source == .manualReconnect && barrierBlocking {
@@ -755,9 +771,11 @@ extension BleManager {
         request.bleConfig = config
         upsertActiveConnectRequest(request)
         peripheral.delegate = self
-        if !connectedDevices.contains(where: { $0.peripheral === peripheral }) {
-            connectedDevices.append(BleConnectedDevice(belongConfig: config, peripheral: peripheral))
-        }
+        replaceConnectionCache(
+            peripheral: peripheral,
+            config: config,
+            reason: "auto reconnect pending"
+        )
         guard registerConnectionAttempt(
             peripheral: peripheral,
             config: config,
@@ -917,9 +935,11 @@ extension BleManager {
         request.bleConfig = config
         upsertActiveConnectRequest(request)
         peripheral.delegate = self
-        if !connectedDevices.contains(where: { $0.peripheral === peripheral }) {
-            connectedDevices.append(BleConnectedDevice(belongConfig: config, peripheral: peripheral))
-        }
+        replaceConnectionCache(
+            peripheral: peripheral,
+            config: config,
+            reason: "adopt system auto reconnect"
+        )
         guard let admission = registerConnectionAttempt(
             peripheral: peripheral,
             config: config,

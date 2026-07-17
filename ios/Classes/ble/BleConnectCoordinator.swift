@@ -55,9 +55,22 @@ extension BleManager {
 
         // 手动点击复用已存在的 autoReconnect pending session，只提升本轮 source/等待优先级；
         // 不 cancel CoreBluetooth 后重开同一外设，避免旧终态回调与新 generation 交叉。
-        if easyConnect.uuid.isNotEmpty, promotePendingAttempt(uuid: easyConnect.uuid) {
-            loggerD(msg: "connect-flow: \(easyConnect.uuid)-\(easyConnect.name), reuse and promote pending autoReconnect attempt")
-            return
+        if easyConnect.uuid.isNotEmpty,
+           let current = currentConnectionAdmission(uuid: easyConnect.uuid) {
+            if let session = peripheralConnectionSessions[current.sessionId],
+               reconnectTasks[reconnectKey(uuid: easyConnect.uuid)] != nil,
+               replaceStalePendingManualAttemptIfNeeded(session.peripheral) {
+                // 此处只处理已有长期 autoReconnect owner 的陈旧 pending。replacement
+                // 已建立 cancellation barrier；beginReconnectAttempt 会注册新 generation，
+                // 新 connect 必须等旧 CoreBluetooth 终态或 barrier watchdog 后才发出。
+                loggerD(msg: "connect-flow: \(easyConnect.uuid)-\(easyConnect.name), replace stale pending autoReconnect attempt")
+                beginReconnectAttempt(uuid: easyConnect.uuid)
+                return
+            }
+            if promotePendingAttempt(uuid: easyConnect.uuid) {
+                loggerD(msg: "connect-flow: \(easyConnect.uuid)-\(easyConnect.name), reuse and promote pending autoReconnect attempt")
+                return
+            }
         }
 
         // 空 UUID 无法贯穿异步回调，临时 UUID 只作为本次 session 的请求标识。

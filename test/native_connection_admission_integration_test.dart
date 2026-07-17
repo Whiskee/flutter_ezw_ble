@@ -186,6 +186,37 @@ void main() {
     );
   });
 
+  test('iOS manual handoff only replaces a stale no-contact pending request',
+      () {
+    final reconnect = File('ios/Classes/ble/BleAutoReconnectCoordinator.swift')
+        .readAsStringSync();
+    final flow = File('ios/Classes/ble/BleConnectionAdmissionFlow.swift')
+        .readAsStringSync();
+    final gate = File('ios/Classes/ble/BleConnectionAdmissionGate.swift')
+        .readAsStringSync();
+    final connect =
+        File('ios/Classes/ble/BleConnectCoordinator.swift').readAsStringSync();
+
+    // 20 秒是恢复 batch 的单次辅助扫描预算：阈值内的手动点击仍只是 promote，
+    // 防止用户连续点击把正常的 CoreBluetooth pending connect 反复重置。
+    expect(flow,
+        contains('manualPendingReplacementThreshold: TimeInterval { 20.0 }'));
+    expect(flow, contains('!session.hasObservedPhysicalContact'));
+    expect(flow, contains('elapsed >= manualPendingReplacementThreshold'));
+    expect(flow, contains('!hasPeripheralCancellationBarrier(peripheral)'));
+    expect(flow,
+        contains('deferConnectionAdmissionReleaseUntilPeripheralTerminal('));
+    expect(flow,
+        contains('centralManager.cancelPeripheralConnection(peripheral)'));
+    expect(flow, contains('manual stale pending replacement'));
+    expect(gate, contains('let pendingConnectStartedAt: Date'));
+    expect(gate, contains('var hasObservedPhysicalContact: Bool = false'));
+    expect(reconnect, contains('replaceStalePendingManualAttemptIfNeeded'));
+    expect(reconnect, contains('beginReconnectAttempt(uuid: task.uuid)'));
+    expect(connect, contains('replaceStalePendingManualAttemptIfNeeded'));
+    expect(connect, contains('replace stale pending autoReconnect attempt'));
+  });
+
   test(
       'connectFinish keeps the auth watchdog until business connected on both hosts',
       () {
@@ -257,6 +288,26 @@ void main() {
     );
   });
 
+  test('iOS stale business cache cannot suppress a pending auto reconnect', () {
+    final manager = File('ios/Classes/ble/BleManager.swift').readAsStringSync();
+    final reconnect = File(
+      'ios/Classes/ble/BleAutoReconnectCoordinator.swift',
+    ).readAsStringSync();
+    final flow = File('ios/Classes/ble/BleConnectionAdmissionFlow.swift')
+        .readAsStringSync();
+
+    // 断连时必须失效同 UUID 的所有缓存；回连只可相信 CoreBluetooth 仍处于 connected
+    // 的业务缓存，防止陈旧 isConnected=true 跳过 system pending connect。
+    expect(manager, contains('let cacheIndexes = connectionCacheIndexes'));
+    expect(manager, contains('for index in cacheIndexes'));
+    expect(
+        reconnect, contains('businessConnectedCacheDevice(uuid: task.uuid)'));
+    expect(reconnect, contains('replaceConnectionCache('));
+    expect(flow, contains('peripheral.state == .connected'));
+    expect(flow, contains('staleBusinessConnected'));
+    expect(flow, contains('retrieve 或 restoration'));
+  });
+
   test('iOS bluetooth-off terminals preserve an epoch-accepted generation', () {
     final manager = File('ios/Classes/ble/BleManager.swift').readAsStringSync();
     final reconnectStore =
@@ -285,6 +336,45 @@ void main() {
     );
     expect(manager, contains('source: snapshot.source'));
     expect(manager, contains('generation: snapshot.generation'));
+  });
+
+  test('Android bluetooth-off terminals preserve an epoch-accepted generation',
+      () {
+    final manager = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleManager.kt',
+    ).readAsStringSync();
+    final policy = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleBluetoothOffTerminalMetadataPolicy.kt',
+    ).readAsStringSync();
+    final setConnectedStart = manager.indexOf('fun setConnected(uuid: String)');
+    final setConnectedEnd =
+        manager.indexOf('fun disconnect(', setConnectedStart);
+    final setConnected = manager.substring(setConnectedStart, setConnectedEnd);
+
+    // 业务 connected 只接受有 source/generation 的 admission，因此 transport-off
+    // 在 Gate release 前后都能从 current 或 business-connected session 取到同代终态。
+    expect(policy, contains('currentAdmission.takeIf(::isEpochAccepted)'));
+    expect(policy,
+        contains('businessConnectedAdmission.takeIf(::isEpochAccepted)'));
+    expect(policy, contains('admission.source != BleConnectSource.UNKNOWN'));
+    expect(policy, contains('admission.generation > 0L'));
+    // Kotlin 明确绑定通过校验的非空 admission，避免依赖 policy 调用后的 smart-cast。
+    expect(setConnected, contains('isEpochAccepted(acceptedAdmission)'));
+    expect(setConnected, contains('source = acceptedAdmission.source'));
+    expect(setConnected, contains('generation = acceptedAdmission.generation'));
+    expect(setConnected, isNot(contains('BleConnectSource.UNKNOWN')));
+
+    expect(manager, contains('val transportOffTerminalSnapshots ='));
+    expect(
+      manager.indexOf('val transportOffTerminalSnapshots ='),
+      lessThan(manager.indexOf('connectionAdmissionGate.suspendAndReset()')),
+    );
+    expect(
+        manager,
+        contains(
+            'businessConnectedAdmission = businessConnectedGattSessions[key]?.admission'));
+    expect(manager, contains('source = snapshot.source'));
+    expect(manager, contains('generation = snapshot.generation'));
   });
 
   test('iOS live system disconnect reuses the business-connected epoch', () {

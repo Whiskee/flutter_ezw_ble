@@ -31,22 +31,29 @@ internal data class BleReconnectTask(
     var attempt: Int = 0,
     /** Backoff timer for active reconnect mode. */
     var timer: BleReconnectScheduleHandle? = null,
-    /** 当前 timer 是否由 pre-physical deadline 产生；目标可见只允许唤醒这种 timer。 */
+    /** 当前 timer 是否由 pre-physical deadline 产生；目标可见只允许接管这种 timer。 */
     var pendingPassiveRetry: Boolean = false,
     /** 重建 timer 的代际；被取消的旧 timer 即使迟到执行也不能启动新 GATT。 */
     var retryScheduleGeneration: Long = 0L,
     /** 连续未收到物理连接 callback 的 deadline 次数，用于长离线自适应退避。 */
     var consecutivePrePhysicalTimeouts: Int = 0,
     /**
-     * 单轮 passive GATT 在收到真实物理连接回调前的 deadline。
+     * 单轮自动回连 GATT 在收到真实物理连接回调前的 deadline。
      *
-     * 它只回收 Android 长时间无回调的 zombie `connectGatt(true)`；一旦进入
+     * 它回收 Android 长时间无回调的 passive 或“目标可见直连” GATT；一旦进入
      * admission Gate（包含 queued），就必须被取消，不能把 Gate 等待误判为连接失败。
      */
     var pendingPhysicalDeadline: BleReconnectScheduleHandle? = null,
-    /** Passive autoConnect GATT kept so zombie sessions can be explicitly closed. */
+    /**
+     * 当前 pre-physical GATT。常态为 passive `autoConnect=true`，扫描命中后可短暂
+     * 保存一次 `autoConnect=false` 的直连句柄，二者都必须按 exact identity 回收。
+     */
     var passiveGatt: BluetoothGatt? = null,
-    /** 启动当前 passive GATT 的单调时间，仅用于输出物理回调等待诊断。 */
+    /** 当前 GATT 是否来自一次扫描可见后的真实直连。 */
+    var pendingVisibleDirectConnect: Boolean = false,
+    /** 当前目标是否等待获得全局可见性直连槽位。 */
+    var visibleDirectConnectRequested: Boolean = false,
+    /** 启动当前 GATT 的单调时间，仅用于输出物理回调等待诊断。 */
     var passiveStartedAtMs: Long = 0L,
     /** Bluetooth adapter is off; keep task but pause attempts until powered on. */
     var pausedByBluetoothOff: Boolean = false,

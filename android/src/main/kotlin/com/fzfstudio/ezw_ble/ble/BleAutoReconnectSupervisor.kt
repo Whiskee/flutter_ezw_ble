@@ -12,6 +12,7 @@ import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
 import com.fzfstudio.ezw_ble.ble.models.enums.BleLoggerTag
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
+import java.util.ArrayDeque
 import java.util.Collections
 
 /**
@@ -54,8 +55,10 @@ internal class BleAutoReconnectSupervisor(
      * session 返回 false，避免把 queued GATT 当作 zombie 关闭。
      */
     private val invalidatePendingPassiveGatt: (String, BluetoothGatt) -> Boolean,
-    /** 创建 passive GATT 的平台边界；测试可注入 fake 验证 autoConnect pending 次序。 */
+    /** 创建长期 passive GATT 的平台边界；测试可注入 fake 验证 autoConnect pending 次序。 */
     private val passiveGattFactory: BlePassiveGattFactory = AndroidBlePassiveGattFactory,
+    /** 扫描确认目标可见后的单次 `autoConnect=false` 直连平台边界。 */
+    private val visibleDirectGattFactory: BlePassiveGattFactory = AndroidBleVisibleDirectGattFactory,
     /** 延迟重试调度边界；首轮 activation 永远不进入此 scheduler。 */
     attemptScheduler: BleReconnectAttemptScheduler? = null,
 ) {
@@ -74,6 +77,15 @@ internal class BleAutoReconnectSupervisor(
     /** 已 arm 的自动回连任务；key 使用小写 uuid，避免 Android MAC 大小写差异。 */
     private val reconnectTasks: MutableMap<String, BleReconnectTask> =
         Collections.synchronizedMap(mutableMapOf())
+
+    /**
+     * 目标可见不再只重建 passive owner，而是排队执行一次真实直连。
+     *
+     * 这里仅串行“发起物理直连”阶段；收到 `STATE_CONNECTED` 后仍交给既有 admission
+     * Gate 串行 service/CCCD/鉴权。这样不会让扫描 burst 同时打开多条 HCI 建链。
+     */
+    private val visibleDirectConnectQueue = ArrayDeque<String>()
+    private var activeVisibleDirectConnectUuid: String? = null
 
     /**
      * 将业务确认 connected 的设备加入 native 自动回连。
@@ -163,7 +175,7 @@ internal class BleAutoReconnectSupervisor(
     /**
      * 真实 `STATE_CONNECTED` callback 到达时，取消相同 GATT 的 pending deadline。
      *
-     * 保留 `passiveGatt` 作为业务 connected 后系统断连的 exact owner；只清 deadline，
+     * 保留 exact GATT 作为业务 connected 后系统断连的 owner；只清 deadline，
      * 因而 Gate queued 的连接不会在排队期间被超时任务误杀。
      */
     @Synchronized
@@ -177,10 +189,13 @@ internal class BleAutoReconnectSupervisor(
         task.consecutivePrePhysicalTimeouts = 0
         invalidateRetrySchedule(task)
         val waitedMs = (SystemClock.elapsedRealtime() - task.passiveStartedAtMs).coerceAtLeast(0L)
+        val mode = if (task.pendingVisibleDirectConnect) "visible direct" else "passive"
+        task.pendingVisibleDirectConnect = false
         sendLog(
             BleLoggerTag.d,
-            "Auto reconnect: $uuid, passive physical callback after ${waitedMs}ms, attempt=${task.attempt}",
+            "Auto reconnect: $uuid, $mode physical callback after ${waitedMs}ms, attempt=${task.attempt}",
         )
+        releaseVisibleDirectConnectSlot(uuid)
         return true
     }
 
@@ -202,6 +217,8 @@ internal class BleAutoReconnectSupervisor(
         task.consecutivePrePhysicalTimeouts = 0
         task.pendingPhysicalDeadline?.cancel()
         task.pendingPhysicalDeadline = null
+        task.pendingVisibleDirectConnect = false
+        task.visibleDirectConnectRequested = false
         try {
             task.passiveGatt?.disconnect()
             task.passiveGatt?.close()
@@ -210,6 +227,7 @@ internal class BleAutoReconnectSupervisor(
         }
         task.passiveGatt = null
         task.passiveStartedAtMs = 0L
+        releaseVisibleDirectConnectSlot(uuid)
         sendLog(BleLoggerTag.d, "Auto reconnect: $uuid, task cancelled, reason=$reason")
     }
 
@@ -256,6 +274,11 @@ internal class BleAutoReconnectSupervisor(
      * Android 蓝牙关闭会让当前 GATT binder 失效；这里只暂停，等待蓝牙恢复后继续调度。
      */
     fun pauseForBluetoothOff() {
+        // transport reset 不能遗留一个永远占用的直连槽位；所有 task 都会在恢复后回到 passive。
+        synchronized(this) {
+            visibleDirectConnectQueue.clear()
+            activeVisibleDirectConnectUuid = null
+        }
         // 1. 清掉延迟 timer，并标记为蓝牙关闭导致的暂停。
         reconnectTasks.values.forEach { task ->
             task.pausedByBluetoothOff = true
@@ -264,6 +287,8 @@ internal class BleAutoReconnectSupervisor(
             task.consecutivePrePhysicalTimeouts = 0
             task.pendingPhysicalDeadline?.cancel()
             task.pendingPhysicalDeadline = null
+            task.pendingVisibleDirectConnect = false
+            task.visibleDirectConnectRequested = false
 
             // 2. passive GATT 不可复用，必须 close 后等待下一轮重新 connectGatt。
             try {
@@ -363,6 +388,10 @@ internal class BleAutoReconnectSupervisor(
             task.passiveGatt = null
             task.passiveStartedAtMs = 0L
         }
+        // 直连收到失败终态时必须交还物理槽位；否则后续已可见 endpoint 会永久停在队列。
+        task.pendingVisibleDirectConnect = false
+        task.visibleDirectConnectRequested = false
+        releaseVisibleDirectConnectSlot(uuid)
 
         // 7. 首轮立即开始；普通终态保留 1.5s 防抖，连续 pre-physical deadline
         //    通过显式 override 自适应退避，避免长离线 register/unregister 过频。
@@ -393,7 +422,8 @@ internal class BleAutoReconnectSupervisor(
     /**
      * 执行一次自动回连尝试。
      *
-     * 每次尝试都使用 Android passive `connectGatt(true)`。
+     * 常态使用 Android passive `connectGatt(true)`；只有辅助扫描确认目标可见时才消费
+     * 一次直连请求，并且必须先取得全局物理连接槽位。
      */
     private fun beginAttempt(uuid: String, expectedScheduleGeneration: Long?) {
         // 1. timer 触发时 task/config 可能已取消或变化，必须重新读取。
@@ -438,15 +468,26 @@ internal class BleAutoReconnectSupervisor(
             return
         }
 
-        // 5. 递增 attempt，并清理上一轮 passive GATT。attempt 只参与日志诊断，
+        // 5. 可见目标必须走一次真实直连，而不是把 `connectGatt(true)` 重新注册给系统。
+        //    未取得槽位时保留请求并等待前一个目标收到物理回调或 deadline，避免 HCI 并发。
+        val useVisibleDirectConnect = task.visibleDirectConnectRequested
+        if (useVisibleDirectConnect && !acquireVisibleDirectConnectSlot(task.uuid)) {
+            return
+        }
+
+        // 6. 递增 attempt，并清理上一轮 GATT。attempt 只参与日志诊断，
         //    不再决定是否停止回连，避免设备离开较久后 native 主动放弃。
         task.attempt = nextAttemptCount(task.attempt)
         task.passiveGatt?.close()
         task.passiveGatt = null
         task.passiveStartedAtMs = 0L
+        task.visibleDirectConnectRequested = false
 
-        // 6. 新回连契约统一使用 passive autoConnect，不再由旧配置开关退回扫描/主动连接。
-        beginPassiveReconnect(task, config)
+        if (useVisibleDirectConnect) {
+            beginVisibleDirectReconnect(task, config)
+        } else {
+            beginPassiveReconnect(task, config)
+        }
     }
 
     /**
@@ -455,6 +496,37 @@ internal class BleAutoReconnectSupervisor(
      * passive 只恢复物理链路；连接成功后仍会进入同一套 service/char/notify 初始化。
      */
     private fun beginPassiveReconnect(task: BleReconnectTask, config: BleConfig) {
+        beginReconnectGatt(
+            task = task,
+            config = config,
+            gattFactory = passiveGattFactory,
+            isVisibleDirectConnect = false,
+        )
+    }
+
+    /** 扫描已确认目标广播正常时，执行一次 `autoConnect=false` 的真实物理建链。 */
+    private fun beginVisibleDirectReconnect(task: BleReconnectTask, config: BleConfig) {
+        beginReconnectGatt(
+            task = task,
+            config = config,
+            gattFactory = visibleDirectGattFactory,
+            isVisibleDirectConnect = true,
+        )
+    }
+
+    /**
+     * 两种自动回连 GATT 的共享启动逻辑。
+     *
+     * 直连仍保留 autoReconnect source，因而物理 callback 前不会展示 UI connecting；它仅
+     * 改变 Android 是否立即发起建链，不创建 foreground 第二 owner。
+     */
+    private fun beginReconnectGatt(
+        task: BleReconnectTask,
+        config: BleConfig,
+        gattFactory: BlePassiveGattFactory,
+        isVisibleDirectConnect: Boolean,
+    ) {
+        val mode = if (isVisibleDirectConnect) "visible direct" else "passive"
         // 1. 通过已知 address 构造 BluetoothDevice；真正连接由 Android 协议栈等待设备出现。
         val remoteDevice = bluetoothAdapter().getRemoteDevice(task.uuid)
         val cachedDevice = connectedDevices.firstOrNull { it.uuid.equals(task.uuid, ignoreCase = true) }
@@ -462,7 +534,10 @@ internal class BleAutoReconnectSupervisor(
 
         // 2. 没有稳定 name 时不能进入 GATT，否则状态/日志无法匹配业务设备。
         if (resolvedName == null) {
-            sendLog(BleLoggerTag.e, "Auto reconnect: ${task.uuid}, passive skipped, device name missing")
+            sendLog(BleLoggerTag.e, "Auto reconnect: ${task.uuid}, $mode skipped, device name missing")
+            if (isVisibleDirectConnect) {
+                releaseVisibleDirectConnectSlot(task.uuid)
+            }
             schedule(task.uuid, BleConnectState.NO_DEVICE_FOUND)
             return
         }
@@ -477,25 +552,29 @@ internal class BleAutoReconnectSupervisor(
         // 4. 自动路径在真实 STATE_CONNECTED callback 前不发用户可见 connecting。
         val callback = createConnectCallback(task.uuid, task.source)
 
-        // 5. 关键：autoConnect=true 让系统在设备回来时恢复物理链路。
-        val gatt = passiveGattFactory.connect(remoteDevice, context(), callback)
+        // 5. 常态由 autoConnect=true 保留长期意图；可见目标只在单槽位中直连一次。
+        val gatt = gattFactory.connect(remoteDevice, context(), callback)
 
         // 6. 系统未创建 GATT session 时，按 timeout 进入下一轮调度。
         if (gatt == null) {
-            sendLog(BleLoggerTag.e, "Auto reconnect: ${task.uuid}, passive connectGatt returned null")
+            sendLog(BleLoggerTag.e, "Auto reconnect: ${task.uuid}, $mode connectGatt returned null")
+            if (isVisibleDirectConnect) {
+                releaseVisibleDirectConnectSlot(task.uuid)
+            }
             schedule(task.uuid, BleConnectState.TIMEOUT)
             return
         }
 
-        // 7. 保存 passive GATT 并只监控“尚未收到 STATE_CONNECTED”的阶段。deadline
+        // 7. 保存 exact GATT 并只监控“尚未收到 STATE_CONNECTED”的阶段。deadline
         //    到期不会上报 Dart timeout 或停掉长期 intent，而是 exact close + 自适应退避重建。
         bleDevice.update(gatt)
         task.passiveGatt = gatt
+        task.pendingVisibleDirectConnect = isVisibleDirectConnect
         task.passiveStartedAtMs = SystemClock.elapsedRealtime()
         startPendingPhysicalDeadline(task, config, gatt)
         sendLog(
             BleLoggerTag.d,
-            "Auto reconnect: ${task.uuid}, passive attempt ${task.attempt} started, physicalDeadline=${pendingPhysicalDeadlineMs(config)}ms",
+            "Auto reconnect: ${task.uuid}, $mode attempt ${task.attempt} started, physicalDeadline=${pendingPhysicalDeadlineMs(config)}ms",
         )
     }
 
@@ -534,7 +613,7 @@ internal class BleAutoReconnectSupervisor(
             return
         }
 
-        val (timeoutCount, retryDelayMs) = synchronized(this) {
+        val (timeoutCount, retryDelayMs, wasVisibleDirectConnect) = synchronized(this) {
             val task = reconnectTasks[reconnectKey(uuid)] ?: return
             if (task.passiveGatt !== expectedGatt || task.pendingPhysicalDeadline == null) {
                 return
@@ -543,14 +622,23 @@ internal class BleAutoReconnectSupervisor(
             task.pendingPhysicalDeadline = null
             task.passiveGatt = null
             task.passiveStartedAtMs = 0L
+            val wasVisibleDirectConnect = task.pendingVisibleDirectConnect
+            task.pendingVisibleDirectConnect = false
             task.consecutivePrePhysicalTimeouts = nextAttemptCount(task.consecutivePrePhysicalTimeouts)
             val timeoutCount = task.consecutivePrePhysicalTimeouts
-            timeoutCount to BlePassiveReconnectDelayPolicy
-                .delayAfterConsecutivePrePhysicalTimeouts(timeoutCount)
+            Triple(
+                timeoutCount,
+                BlePassiveReconnectDelayPolicy.delayAfterConsecutivePrePhysicalTimeouts(timeoutCount),
+                wasVisibleDirectConnect,
+            )
         }
+        if (wasVisibleDirectConnect) {
+            releaseVisibleDirectConnectSlot(uuid)
+        }
+        val mode = if (wasVisibleDirectConnect) "visible direct" else "passive"
         sendLog(
             BleLoggerTag.d,
-            "Auto reconnect: $uuid, passive deadline ${deadlineMs}ms reached, consecutive=$timeoutCount, rebuild after ${retryDelayMs}ms",
+            "Auto reconnect: $uuid, $mode deadline ${deadlineMs}ms reached, consecutive=$timeoutCount, rebuild after ${retryDelayMs}ms",
         )
         // 不经 handleConnectState(TIMEOUT)：这只是 native passive handle 的后台刷新，
         // 不能停止 autoReconnect 或触发 Dart/UI 的一次性超时展示。
@@ -564,10 +652,10 @@ internal class BleAutoReconnectSupervisor(
     }
 
     /**
-     * 扫描重新看到目标时，只唤醒 exact pre-physical owner 或它的 pending retry。
+     * 扫描重新看到目标时，接管 exact pre-physical owner 或它的 pending retry。
      *
-     * 已物理连接/Gate queued、用户取消、蓝牙关闭均返回 false；唤醒后仍使用同一个
-     * `connectGatt(true)` 管线，不创建 foreground 第二 owner，也不触发 Dart/UI timeout。
+     * 已物理连接/Gate queued、用户取消、蓝牙关闭均返回 false。接管后会在单槽位中执行
+     * 一次 `connectGatt(false)`，并继续保持 autoReconnect source 与长期 passive owner。
      */
     fun notifyTargetVisible(uuid: String, name: String): Boolean {
         var expectedGatt: BluetoothGatt? = null
@@ -584,6 +672,12 @@ internal class BleAutoReconnectSupervisor(
                 return false
             }
 
+            // 已经在执行可见性直连时，扫描 burst 不得把它再次 close/reopen；否则会把
+            // 真正的 HCI 建链反复打断。返回 true 表示该次可见性已被当前 attempt 消费。
+            if (task.pendingVisibleDirectConnect || task.visibleDirectConnectRequested) {
+                return true
+            }
+
             val exactGatt = task.passiveGatt
             val hasPrePhysicalGatt = exactGatt != null && task.pendingPhysicalDeadline != null
             val hasPendingRetry = exactGatt == null && task.timer != null && task.pendingPassiveRetry
@@ -592,7 +686,7 @@ internal class BleAutoReconnectSupervisor(
             }
 
             if (hasPendingRetry) {
-                prepareTargetVisibleWake(task, name)
+                prepareTargetVisibleDirectConnect(task, name)
                 true
             } else {
                 expectedGatt = exactGatt
@@ -602,7 +696,7 @@ internal class BleAutoReconnectSupervisor(
         if (pendingRetryWake) {
             // 调度放在 supervisor monitor 外；用户 cancel 与本次 wake 竞争时由 task
             // identity 自然 fail closed，且不会把锁带入 Timer/GATT 创建路径。
-            scheduleTargetVisibleWake(uuid)
+            scheduleTargetVisibleDirectConnect(uuid)
             return true
         }
 
@@ -622,36 +716,99 @@ internal class BleAutoReconnectSupervisor(
             task.pendingPhysicalDeadline = null
             task.passiveGatt = null
             task.passiveStartedAtMs = 0L
-            prepareTargetVisibleWake(task, name)
+            prepareTargetVisibleDirectConnect(task, name)
             true
         }
         if (!clearedExactGatt) {
             return false
         }
         // 与 deadline 路径一致，schedule 不持 supervisor monitor，保持单向锁序。
-        scheduleTargetVisibleWake(uuid)
+        scheduleTargetVisibleDirectConnect(uuid)
         return true
     }
 
-    /** 在 supervisor 锁内重置可见目标的长离线计数与旧重试代际。 */
-    private fun prepareTargetVisibleWake(task: BleReconnectTask, name: String) {
+    /** 在 supervisor 锁内重置可见目标的长离线计数，并标记一次真实直连。 */
+    private fun prepareTargetVisibleDirectConnect(task: BleReconnectTask, name: String) {
         invalidateRetrySchedule(task)
         if (name.isNotBlank()) {
             task.name = name
         }
         task.consecutivePrePhysicalTimeouts = 0
+        task.visibleDirectConnectRequested = true
     }
 
-    /** 可见唤醒仍走原 passive 调度器；250ms 防抖不会产生 foreground owner。 */
-    private fun scheduleTargetVisibleWake(uuid: String) {
-        schedule(
-            uuid,
-            BleConnectState.TIMEOUT,
-            preserveAttemptSource = true,
-            retryDelayOverrideMs = BlePassiveReconnectDelayPolicy.VISIBLE_WAKE_DEBOUNCE_MS,
-            reason = "targetVisible",
+    /**
+     * 可见性直连使用 250ms 防抖，但不复用 schedule(TIMEOUT)：后者会关闭这次 direct
+     * 标记并退回 passive。真实连接的来源仍是 autoReconnect，不触发 Dart/UI connecting。
+     */
+    private fun scheduleTargetVisibleDirectConnect(uuid: String) {
+        val task = synchronized(this) { reconnectTasks[reconnectKey(uuid)] } ?: return
+        val scheduleGeneration = synchronized(this) {
+            val current = reconnectTasks[reconnectKey(uuid)] ?: return
+            val next = nextScheduleGeneration(current.retryScheduleGeneration)
+            current.retryScheduleGeneration = next
+            current.timer = attemptDispatcher.dispatch(
+                current.uuid,
+                BlePassiveReconnectDelayPolicy.VISIBLE_WAKE_DEBOUNCE_MS,
+                next,
+            )
+            next
+        }
+        sendLog(
+            BleLoggerTag.d,
+            "Auto reconnect: ${task.uuid}, target visible, schedule direct reconnect after ${BlePassiveReconnectDelayPolicy.VISIBLE_WAKE_DEBOUNCE_MS}ms, generation=$scheduleGeneration",
         )
-        sendLog(BleLoggerTag.d, "Auto reconnect: $uuid, target visible, wake passive retry")
+    }
+
+    /**
+     * 取得全局一次性直连槽位。相同 UUID 的重入视为已取得，其他 endpoint 只入队，不会
+     * 同时调用 `connectGatt(false)`；原有 admission Gate 继续负责物理 callback 后的流程。
+     */
+    private fun acquireVisibleDirectConnectSlot(uuid: String): Boolean = synchronized(this) {
+        val key = reconnectKey(uuid)
+        when {
+            activeVisibleDirectConnectUuid == key -> true
+            activeVisibleDirectConnectUuid == null -> {
+                activeVisibleDirectConnectUuid = key
+                true
+            }
+            else -> {
+                if (!visibleDirectConnectQueue.contains(key)) {
+                    visibleDirectConnectQueue.addLast(key)
+                }
+                sendLog(BleLoggerTag.d, "Auto reconnect: $uuid, visible direct reconnect queued behind $activeVisibleDirectConnectUuid")
+                false
+            }
+        }
+    }
+
+    /**
+     * 当前直连拿到物理 callback、deadline 或终态后释放槽位，并异步启动下一条仍有效的请求。
+     * `beginAttempt` 会再次校验 task、蓝牙状态和直连标记，所以 cancel/reset 的迟到排队项
+     * 会自然 fail closed。
+     */
+    private fun releaseVisibleDirectConnectSlot(uuid: String) {
+        val nextUuid = synchronized(this) {
+            val key = reconnectKey(uuid)
+            if (activeVisibleDirectConnectUuid != key) {
+                visibleDirectConnectQueue.remove(key)
+                return@synchronized null
+            }
+            activeVisibleDirectConnectUuid = null
+            while (visibleDirectConnectQueue.isNotEmpty()) {
+                val queuedKey = visibleDirectConnectQueue.removeFirst()
+                val queuedTask = reconnectTasks[queuedKey] ?: continue
+                if (!queuedTask.visibleDirectConnectRequested || queuedTask.passiveGatt != null) {
+                    continue
+                }
+                activeVisibleDirectConnectUuid = queuedKey
+                return@synchronized queuedTask.uuid
+            }
+            null
+        }
+        nextUuid?.let { queuedUuid ->
+            mainScope().launch { beginAttempt(queuedUuid, expectedScheduleGeneration = null) }
+        }
     }
 
     /** config 以毫秒表达；异常值仍至少保留 1 秒，避免 0ms 注册/关闭风暴。 */

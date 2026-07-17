@@ -27,6 +27,8 @@ enum BleMC: String {
     case connectDevice
     /// Disconnect or cancel an in-flight connect request.
     case disconnectDevice
+    /// OTA reboot teardown: disconnect physical transport without revoking reconnect intent.
+    case disconnectForOtaReboot
     /// Mark business-layer auth as about to complete.
     case devicePreConnected
     /// Mark business-layer auth as complete and arm auto reconnect.
@@ -178,6 +180,12 @@ enum BleMC: String {
             let uuid: String = jsonData["uuid"] as? String ?? ""
             let name: String = jsonData["name"] as? String ?? ""
             BleManager.shared.disconnect(uuid: uuid, name: name)
+            break
+        case .disconnectForOtaReboot:
+            let jsonData = arguments as? [String: Any] ?? [:]
+            let uuid: String = jsonData["uuid"] as? String ?? ""
+            let name: String = jsonData["name"] as? String ?? ""
+            BleManager.shared.disconnectForOtaReboot(uuid: uuid, name: name)
             break
         case .sendCmd:
             let jsonData: [String: Any] = arguments as? [String: Any] ?? [:]

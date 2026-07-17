@@ -116,6 +116,17 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
         'disconnectDevice(uuid: $uuid, name: $name, removeBond: $removeBond) has not been implemented.');
   }
 
+  /// OTA 成功后设备重启前的专用物理断开。
+  ///
+  /// 这不是用户取消：必须保留 native autoReconnect owner 和持久化目标，同时用当前
+  /// source/generation 上报系统断连，让 Dart 先清除已经失效的业务连接态。实际回连
+  /// 由上层在固件 reboot 窗口结束后以 afterUpgrade 流程重新激活，不能在此处抢跑。
+  Future<void> disconnectForOtaReboot(String uuid, String name) {
+    throw UnimplementedError(
+      'disconnectForOtaReboot(uuid: $uuid, name: $name) has not been implemented.',
+    );
+  }
+
   /// 设备预连接：告知原生设备即将连接，允许在连接成功前做一些准备工作，避免超时退出
   ///
   /// - param uuid 设备唯一标识
@@ -158,8 +169,9 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
 
   /// 通知原生：辅助扫描已经重新看到某个自动回连目标。
   ///
-  /// Android 只会唤醒该 UUID 当前尚未物理连接的 passive GATT/重建定时器；
-  /// 已进入 Gate、已连接、已取消或蓝牙关闭时返回 false。iOS 不依赖扫描
+  /// Android 会接管该 UUID 当前尚未物理连接的 passive GATT/重建定时器，并在全局
+  /// 单槽位中执行一次 `autoConnect=false` 真实直连；成功或终态后仍保留长期 passive
+  /// owner。已进入 Gate、已连接、已取消或蓝牙关闭时返回 false。iOS 不依赖扫描
   /// 唤醒 CoreBluetooth pending connect，因此安全返回 false。
   Future<bool> notifyAutoReconnectTargetVisible({
     required String uuid,

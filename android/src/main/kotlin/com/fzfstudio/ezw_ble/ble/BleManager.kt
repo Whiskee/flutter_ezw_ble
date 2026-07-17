@@ -98,6 +98,10 @@ class BleManager private constructor() {
     //    系统稍后断连时据此区分 live session 与旧 callback。
     private val businessConnectedGattSessions: MutableMap<String, BusinessConnectedGattSession> =
         Collections.synchronizedMap(mutableMapOf())
+    // OTA reboot 主动 close 后仍会收到一条旧 GATT 的 STATE_DISCONNECTED。它已经由
+    // disconnectForOtaReboot 上报过同代终态，必须只消费一次，不能再 schedule retry。
+    private val otaRebootDisconnectSuppressions: MutableSet<String> =
+        Collections.synchronizedSet(mutableSetOf())
 
     /** Gate 排队期间保留真实 GATT；只有获得准入后才启动 timeout 和 service discovery。 */
     private data class GrantedGattSession(
@@ -111,6 +115,14 @@ class BleManager private constructor() {
     private data class BusinessConnectedGattSession(
         val admission: BleConnectionAdmission,
         val gatt: BluetoothGatt,
+    )
+
+    /** 蓝牙关闭前冻结的终态事件 metadata；Gate 清理后不能再从 runtime 表读取它。 */
+    private data class BluetoothOffTerminalSnapshot(
+        val uuid: String,
+        val name: String,
+        val source: BleConnectSource,
+        val generation: Long,
     )
 
     //  - 扫描命中后再连接的待处理请求（非 directConnect 且目标未出现在 scanResultTemp 时入队）
@@ -1044,17 +1056,29 @@ class BleManager private constructor() {
             sendLog(BleLoggerTag.e, "Set $uuid connected failed, not pre-connected")
             return
         }
+        val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
+        val admission = currentAdmissions[reconnectKey(uuid)]
+        // 策略校验不带 Kotlin contract；先显式绑定非空值，避免后续 source/generation
+        // 读取依赖不可靠的 smart-cast，同时维持 unknown/0 fail-closed 约束。
+        val acceptedAdmission = admission ?: run {
+            sendLog(BleLoggerTag.e, "Set $uuid connected failed, no epoch-accepted admission")
+            return
+        }
+        // 业务 connected 后 Gate 会释放，所以此刻必须已经持有可被 Dart epoch guard 接受的
+        // admission。拒绝 unknown/0，确保蓝牙关闭时总能从 current/business session 取到终态。
+        if (!BleBluetoothOffTerminalMetadataPolicy.isEpochAccepted(acceptedAdmission)) {
+            sendLog(BleLoggerTag.e, "Set $uuid connected failed, no epoch-accepted admission")
+            return
+        }
         sendLog(BleLoggerTag.d, "Set $uuid connected")
         //  移除预连接状态
         preConnectedDevices.remove(uuid)
-        val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
-        val admission = currentAdmissions[reconnectKey(uuid)]
         handleConnectState(
             uuid,
             connectedDevice?.name ?: "",
             BleConnectState.CONNECTED,
-            source = admission?.source ?: BleConnectSource.UNKNOWN,
-            generation = admission?.generation ?: 0L,
+            source = acceptedAdmission.source,
+            generation = acceptedAdmission.generation,
         )
         // connectFinish 仍持有 Gate；只有业务确认 connected 才允许下一 endpoint 开始 pipeline。
         completeBusinessConnectionAdmission(uuid)
@@ -1080,6 +1104,60 @@ class BleManager private constructor() {
         handleConnectState(uuid, connectedDevice?.name ?: "", BleConnectState.DISCONNECT_BY_USER, removeBond)
         cancelConnectionAdmission(uuid, reason = "user disconnect")
     }
+
+    /**
+     * OTA 成功后 firmware reboot 的专用断开。
+     *
+     * 它与 [disconnect] 的唯一关键差异是：不撤销 persisted/native autoReconnect owner。
+     * 先冻结本次业务 connected 的 admission metadata，再上报可被 Dart epoch guard 接受
+     * 的系统断连；本次 terminal 不调度 native retry，避免与上层 afterUpgrade activation
+     * 在设备尚未 reboot 完成时竞争 GATT。
+     */
+    fun disconnectForOtaReboot(uuid: String, name: String = "") {
+        val device = connectedDevices.firstOrNull { candidate ->
+            candidate.uuid.equals(uuid, ignoreCase = true) ||
+                (name.isNotBlank() && candidate.name == name)
+        }
+        if (device == null) {
+            sendLog(BleLoggerTag.e, "OTA reboot disconnect: $uuid-$name, no connected device cache")
+            return
+        }
+        val key = reconnectKey(device.uuid)
+        val admission = BleBluetoothOffTerminalMetadataPolicy.resolve(
+            currentAdmission = currentAdmissions[key],
+            businessConnectedAdmission = businessConnectedGattSessions[key]?.admission,
+        )
+        if (!BleBluetoothOffTerminalMetadataPolicy.isEpochAccepted(admission)) {
+            // 不能把 unknown/0 发给 Dart：它会被 epoch guard 拒绝并留下假连接。OTA
+            // 收尾只允许业务已确认 connected 的 endpoint 进入，因此这属于不变量破坏。
+            sendLog(BleLoggerTag.e, "OTA reboot disconnect: ${device.uuid}, missing epoch-accepted admission")
+            return
+        }
+        markOtaRebootDisconnectSuppression(device.uuid)
+        preConnectedDevices.remove(device.uuid)
+        handleConnectState(
+            device.uuid,
+            device.name,
+            BleConnectState.DISCONNECT_FROM_SYS,
+            source = admission.source,
+            generation = admission.generation,
+            scheduleAutoReconnect = false,
+        )
+        sendLog(BleLoggerTag.d, "OTA reboot disconnect: ${device.uuid}, owner preserved")
+    }
+
+    /** 只屏蔽本次主动 close 的迟到 callback；10 秒内没有回调则自动失效，不能污染新会话。 */
+    private fun markOtaRebootDisconnectSuppression(uuid: String) {
+        val key = reconnectKey(uuid)
+        otaRebootDisconnectSuppressions.add(key)
+        mainScope.launch {
+            delay(10_000)
+            otaRebootDisconnectSuppressions.remove(key)
+        }
+    }
+
+    private fun consumeOtaRebootDisconnectSuppression(uuid: String): Boolean =
+        otaRebootDisconnectSuppressions.remove(reconnectKey(uuid))
 
     /**
      * 中性释放单个 endpoint 的 native runtime，不删除 persisted reconnect owner/config。
@@ -1423,6 +1501,35 @@ class BleManager private constructor() {
     }
 
     /**
+     * 在蓝牙关闭 teardown 前收集所有业务连接终态。
+     *
+     * Gate 尚未释放的 endpoint 优先复用 current admission；已执行 deviceConnected 的
+     * endpoint 则复用 businessConnectedGattSessions 保存的 exact admission。setConnected
+     * 已建立“业务 connected 必有有效 admission”的不变量；这里若缺失必须显式失败，不能把
+     * 断连静默降级为 unknown/0 或直接跳过。
+     */
+    private fun captureBluetoothOffTerminalSnapshots(): List<BluetoothOffTerminalSnapshot> =
+        connectedDevices
+            .filter { it.connectState.isConnected }
+            .map { device ->
+                val key = reconnectKey(device.uuid)
+                val admission = checkNotNull(
+                    BleBluetoothOffTerminalMetadataPolicy.resolve(
+                        currentAdmission = currentAdmissions[key],
+                        businessConnectedAdmission = businessConnectedGattSessions[key]?.admission,
+                    ),
+                ) {
+                    "Bluetooth off terminal invariant violated for ${device.uuid}: missing epoch-accepted admission"
+                }
+                BluetoothOffTerminalSnapshot(
+                    uuid = device.uuid,
+                    name = device.name,
+                    source = admission.source,
+                    generation = admission.generation,
+                )
+            }
+
+    /**
      * 创建蓝牙状态监听器
      */
     private fun createBleStateListener(): BluetoothStateCallback = object : BluetoothStateCallback {
@@ -1441,6 +1548,9 @@ class BleManager private constructor() {
                 else -> return
             }
             if (bleState != 5) {
+                // transport teardown 会清空 Gate/current/business session；必须先冻结每个
+                // 业务已连接 endpoint 的 source/generation，避免后续终态事件退化为 unknown/0。
+                val transportOffTerminalSnapshots = captureBluetoothOffTerminalSnapshots()
                 autoReconnectSupervisor.pauseForBluetoothOff()
                 // 蓝牙关闭先快照并关闭 active/queued/pre-physical GATT。只清 map 会留下
                 // binder handle，迟到 services/descriptor callback 仍可能与蓝牙恢复后的新 pipeline 竞态。
@@ -1475,12 +1585,17 @@ class BleManager private constructor() {
                 //     OTA 升级中的设备 connectState = UPGRADE，若用后者会被漏掉，
                 //     导致蓝牙关闭时不释放其 GATT。蓝牙重开后该 GATT 的 binder 已死，
                 //     业务层仍以为"已连接"继续发指令 → android.os.DeadObjectException 刷屏。
-                connectedDevices.forEach {
-                    if (it.connectState.isConnected) {
-                        //  与 disconnect() 一致：清理预连接标记，避免残留状态影响下次重连判定
-                        preConnectedDevices.remove(it.uuid)
-                        handleConnectState(it.uuid, it.name, BleConnectState.DISCONNECT_FROM_SYS)
-                    }
+                transportOffTerminalSnapshots.forEach { snapshot ->
+                    // 与 disconnect() 一致：清理预连接标记，避免残留状态影响下次重连判定。
+                    // 显式传入 teardown 前冻结的 metadata，绝不能依赖已被清空的 runtime 表默认值。
+                    preConnectedDevices.remove(snapshot.uuid)
+                    handleConnectState(
+                        snapshot.uuid,
+                        snapshot.name,
+                        BleConnectState.DISCONNECT_FROM_SYS,
+                        source = snapshot.source,
+                        generation = snapshot.generation,
+                    )
                 }
             } else {
                 connectionAdmissionGate.resume()
@@ -1811,7 +1926,11 @@ class BleManager private constructor() {
             },
             consumeDisconnectingState = { uuid ->
                 // 7. 主动断连/超时断连已带有明确状态，消费后不再上报系统断连。
-                consumeDisconnectingState(uuid)
+                if (consumeOtaRebootDisconnectSuppression(uuid)) {
+                    BleConnectState.DISCONNECT_FROM_SYS
+                } else {
+                    consumeDisconnectingState(uuid)
+                }
             },
             onCharacteristicWriteComplete = { uuid ->
                 // 8. 写回调只推进对应 uuid 的发送队列，左右腿并发写不会互相影响。
@@ -2305,6 +2424,7 @@ class BleManager private constructor() {
         source: BleConnectSource = currentAdmissions[reconnectKey(uuid)]?.source
             ?: BleConnectSource.UNKNOWN,
         generation: Long = currentAdmissions[reconnectKey(uuid)]?.generation ?: 0L,
+        scheduleAutoReconnect: Boolean = true,
     ) {
         //  1、更新连接设备的状态
         connectedDevices.forEach {
@@ -2352,7 +2472,7 @@ class BleManager private constructor() {
         }
         //  5、发送连接状态
         sendConnectState(uuid, name, state, mtu, source, generation)
-        if (state.isDisconnected || state.isError) {
+        if (scheduleAutoReconnect && (state.isDisconnected || state.isError)) {
             autoReconnectSupervisor.schedule(uuid, state)
         }
     }

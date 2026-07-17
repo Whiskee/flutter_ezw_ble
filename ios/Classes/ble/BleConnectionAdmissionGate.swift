@@ -16,6 +16,10 @@ struct BlePeripheralConnectionSession {
     let config: BleConfig
     let deviceName: String
     let afterUpgrade: Bool
+    /// 仅用于识别从未收到 CoreBluetooth 物理回调的陈旧 pending connect。已收到
+    /// didConnect/contactDevice 后，即使业务 GATT 流程仍在进行，也绝不能由手动点击替换。
+    let pendingConnectStartedAt: Date
+    var hasObservedPhysicalContact: Bool = false
 }
 
 /// 非 CoreBluetooth 终态先记录 teardown 债务；只有 didFail/didDisconnect 或 watchdog

@@ -39,10 +39,12 @@ enum class BleMC {
     ARM_AUTO_RECONNECT_TARGETS,
     /** 立即建立/复用所有目标的 native 直连，并保留调用来源。 */
     ACTIVATE_AUTO_RECONNECT_TARGETS,
-    /** 辅助扫描重新看到目标时，唤醒 exact pre-physical passive owner。 */
+    /** 辅助扫描重新看到目标时，接管 exact pre-physical owner 为一次串行真实直连。 */
     NOTIFY_AUTO_RECONNECT_TARGET_VISIBLE,
     /** 断开设备连接，可选移除系统绑定。 */
     DISCONNECT_DEVICE,
+    /** OTA reboot 收尾断开：保留长期回连 owner，禁止立即 schedule。 */
+    DISCONNECT_FOR_OTA_REBOOT,
     /** 中性释放 endpoint runtime，保留持久自动回连 owner。 */
     RELEASE_DEVICE,
     /** 发送普通 GATT 指令。 */
@@ -184,6 +186,14 @@ enum class BleMC {
                 val uuid = jsonMap?.get("uuid") as? String ?: ""
                 val removeBond = jsonMap?.get("removeBond") as Boolean? ?: false
                 BleManager.instance.disconnect(uuid, removeBond)
+            }
+            DISCONNECT_FOR_OTA_REBOOT -> {
+                // OTA 成功后的固件 reboot 不是用户取消；必须保留 owner，由 Dart 在
+                // reboot 窗口后发起 afterUpgrade activation，避免 native 抢跑重连。
+                val jsonMap = arguments as Map<*, *>?
+                val uuid = jsonMap?.get("uuid") as? String ?: ""
+                val name = jsonMap?.get("name") as? String ?: ""
+                BleManager.instance.disconnectForOtaReboot(uuid, name)
             }
             RELEASE_DEVICE -> {
                 // dispose/reset 只释放 runtime；禁止复用 disconnect 的持久 owner 删除语义。

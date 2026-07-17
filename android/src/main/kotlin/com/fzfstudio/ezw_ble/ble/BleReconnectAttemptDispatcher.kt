@@ -31,7 +31,7 @@ internal fun interface BlePassiveGattFactory {
     ): BluetoothGatt?
 }
 
-/** 生产环境 GATT 工厂；所有回连路径固定使用 autoConnect=true。 */
+/** 生产环境长期回连 GATT 工厂；常态保持 `autoConnect=true` 的系统 pending 请求。 */
 internal object AndroidBlePassiveGattFactory : BlePassiveGattFactory {
     override fun connect(
         device: BluetoothDevice,
@@ -47,6 +47,30 @@ internal object AndroidBlePassiveGattFactory : BlePassiveGattFactory {
         )
     } else {
         device.connectGatt(context, true, callback)
+    }
+}
+
+/**
+ * 目标已被辅助扫描确认可见时使用的一次性真实直连。
+ *
+ * 它只由 supervisor 的单槽队列调度，不能替代长期 passive owner；成功或终态后仍由
+ * 原有 autoReconnect 任务继续维持后续回连意图。
+ */
+internal object AndroidBleVisibleDirectGattFactory : BlePassiveGattFactory {
+    override fun connect(
+        device: BluetoothDevice,
+        context: Context?,
+        callback: BleGattSessionCallback,
+    ): BluetoothGatt? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        device.connectGatt(
+            context,
+            false,
+            callback,
+            BluetoothDevice.TRANSPORT_LE,
+            BluetoothDevice.PHY_LE_2M,
+        )
+    } else {
+        device.connectGatt(context, false, callback)
     }
 }
 
