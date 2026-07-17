@@ -1123,11 +1123,10 @@ class BleManager private constructor() {
             return
         }
         val key = reconnectKey(device.uuid)
-        val admission = BleBluetoothOffTerminalMetadataPolicy.resolve(
+        val acceptedAdmission = BleBluetoothOffTerminalMetadataPolicy.resolve(
             currentAdmission = currentAdmissions[key],
             businessConnectedAdmission = businessConnectedGattSessions[key]?.admission,
-        )
-        if (!BleBluetoothOffTerminalMetadataPolicy.isEpochAccepted(admission)) {
+        ) ?: run {
             // 不能把 unknown/0 发给 Dart：它会被 epoch guard 拒绝并留下假连接。OTA
             // 收尾只允许业务已确认 connected 的 endpoint 进入，因此这属于不变量破坏。
             sendLog(BleLoggerTag.e, "OTA reboot disconnect: ${device.uuid}, missing epoch-accepted admission")
@@ -1139,8 +1138,8 @@ class BleManager private constructor() {
             device.uuid,
             device.name,
             BleConnectState.DISCONNECT_FROM_SYS,
-            source = admission.source,
-            generation = admission.generation,
+            source = acceptedAdmission.source,
+            generation = acceptedAdmission.generation,
             scheduleAutoReconnect = false,
         )
         sendLog(BleLoggerTag.d, "OTA reboot disconnect: ${device.uuid}, owner preserved")
