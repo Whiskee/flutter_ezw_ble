@@ -37,7 +37,7 @@ enum BleMC: String {
     case armAutoReconnectTargets
     /// 立即建立/复用所有目标的 CoreBluetooth pending connect。
     case activateAutoReconnectTargets
-    /// Android 扫描唤醒提示；iOS State Restoration/pending connect 不需要处理。
+    /// 辅助扫描可见性提示；iOS 仅对 exact 陈旧 pending owner 做一次受控恢复。
     case notifyAutoReconnectTargetVisible
     /// Send one command and wait for the platform write path.
     case sendCmd
@@ -171,9 +171,13 @@ enum BleMC: String {
             result(acknowledgements.map(\.raw))
             return
         case .notifyAutoReconnectTargetVisible:
-            // CoreBluetooth 的 pending connect 与 State Restoration 自主管理恢复；
-            // 扫描命中不能重复 cancel/connect，因此固定安全 no-op。
-            result(false)
+            let data = arguments as? [String: Any] ?? [:]
+            let uuid = data["uuid"] as? String ?? ""
+            let name = data["name"] as? String ?? ""
+            result(BleManager.shared.reconcileVisibleAutoReconnectTarget(
+                uuid: uuid,
+                name: name
+            ))
             return
         case .disconnectDevice:
             let jsonData = arguments as? [String: Any] ?? [:]

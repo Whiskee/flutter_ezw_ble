@@ -108,6 +108,9 @@ class BleManager: NSObject {
     //  - central.connect 到 didConnect 之间没有 GATT timeout；exact generation/session
     //    watchdog 对自动回连只做观测，普通前台 attempt 才允许有界回收。
     let pendingPhysicalConnectWatchdogs = BlePendingPhysicalConnectWatchdogRegistry()
+    //  - 辅助扫描命中只为 exact 长期 pending owner 提供一次受控恢复机会；
+    //    与 60 秒观测 watchdog 分离，避免重复提示把恢复窗口向后顺延。
+    let visiblePendingRecoveryWatchdogs = BleVisiblePendingRecoveryWatchdogRegistry()
     let deferredPeripheralReconnectRegistry = BleDeferredPeripheralReconnectRegistry()
     var pendingConnectionAdmissionTeardowns: [String: BlePendingConnectionAdmissionTeardown] = [:]
     let reconnectStore = BleReconnectStore()
@@ -270,6 +273,7 @@ extension BleManager {
             pairingRecoveryScanTimers.removeValue(forKey: key)?.timer.invalidate()
         }
         pendingPhysicalConnectWatchdogs.remove(endpointIds: endpointIds).forEach { $0.cancel() }
+        visiblePendingRecoveryWatchdogs.remove(endpointIds: endpointIds).forEach { $0.cancel() }
         deferredPeripheralReconnectRegistry.remove(endpointIds: endpointIds)
         peripheralCancellationBarrierGate.discard(endpointIds: endpointIds)
 

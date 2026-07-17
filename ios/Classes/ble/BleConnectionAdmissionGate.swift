@@ -111,6 +111,69 @@ final class BlePendingPhysicalConnectWatchdogRegistry {
     }
 }
 
+/**
+ * 辅助扫描确认设备重新可见后，为 exact admission 安装一次受控恢复定时器。
+ *
+ * 该定时器不扩展扫描预算，也不周期性重建连接；它只防止 CoreBluetooth 已长期
+ * pending、设备已重新广播却始终没有 didConnect 的单次卡死。所有消费都要求
+ * endpoint/generation/session 完全一致，旧可见性提示不能碰到后续连接代次。
+ */
+final class BleVisiblePendingRecoveryWatchdogRegistry {
+    private struct Entry {
+        let admission: BleConnectionAdmission
+        let workItem: DispatchWorkItem
+    }
+
+    private var entries: [String: Entry] = [:]
+    private let lock = NSLock()
+
+    @discardableResult
+    func replace(
+        admission: BleConnectionAdmission,
+        workItem: DispatchWorkItem
+    ) -> DispatchWorkItem? {
+        let key = endpointKey(admission.endpointId)
+        guard !key.isEmpty else { return workItem }
+        lock.lock()
+        let replaced = entries.updateValue(
+            Entry(admission: admission, workItem: workItem),
+            forKey: key
+        )?.workItem
+        lock.unlock()
+        return replaced
+    }
+
+    func takeIfCurrent(_ admission: BleConnectionAdmission) -> DispatchWorkItem? {
+        let key = endpointKey(admission.endpointId)
+        lock.lock()
+        defer { lock.unlock() }
+        guard let entry = entries[key], entry.admission == admission else {
+            return nil
+        }
+        entries.removeValue(forKey: key)
+        return entry.workItem
+    }
+
+    func remove(endpointIds: Set<String>) -> [DispatchWorkItem] {
+        let keys = Set(endpointIds.map(endpointKey).filter { !$0.isEmpty })
+        lock.lock()
+        defer { lock.unlock() }
+        return keys.compactMap { entries.removeValue(forKey: $0)?.workItem }
+    }
+
+    func removeAll() -> [DispatchWorkItem] {
+        lock.lock()
+        defer { lock.unlock() }
+        let workItems = entries.values.map(\.workItem)
+        entries.removeAll()
+        return workItems
+    }
+
+    private func endpointKey(_ endpointId: String) -> String {
+        endpointId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+}
+
 /// CoreBluetooth cancel 回调不带 attempt id；该 disposition 只消费取消债务，绝不直接
 /// 终止当前 generation。
 enum BlePeripheralCancellationCallbackDisposition: Equatable {

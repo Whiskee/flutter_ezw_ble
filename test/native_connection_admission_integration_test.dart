@@ -217,6 +217,32 @@ void main() {
     expect(connect, contains('replace stale pending autoReconnect attempt'));
   });
 
+  test('iOS visible auto reconnect target repairs only the exact stale owner',
+      () {
+    final method =
+        File('ios/Classes/ble/BleMethodChannel.swift').readAsStringSync();
+    final manager = File('ios/Classes/ble/BleManager.swift').readAsStringSync();
+    final flow = File('ios/Classes/ble/BleConnectionAdmissionFlow.swift')
+        .readAsStringSync();
+    final gate = File('ios/Classes/ble/BleConnectionAdmissionGate.swift')
+        .readAsStringSync();
+    final reconnect = File('ios/Classes/ble/BleAutoReconnectCoordinator.swift')
+        .readAsStringSync();
+
+    expect(method, contains('reconcileVisibleAutoReconnectTarget'));
+    expect(method, isNot(contains('result(false)\n            return')));
+    expect(manager, contains('visiblePendingRecoveryWatchdogs'));
+    expect(gate, contains('BleVisiblePendingRecoveryWatchdogRegistry'));
+    expect(flow, contains('scheduleVisiblePendingRecovery'));
+    expect(flow, contains('currentConnectionAdmission(expectedAdmission)'));
+    expect(flow, contains('!session.hasObservedPhysicalContact'));
+    expect(flow, contains('replaceStalePendingAttemptIfNeeded'));
+    expect(flow, contains('trigger: .visibleAutoReconnect'));
+    expect(flow, contains('enqueuePhysicalConnectionThroughGate(peripheral)'));
+    expect(reconnect, contains('currentIsPendingTeardown'));
+    expect(flow, contains('beginReconnectAttempt(uuid: admission.endpointId)'));
+  });
+
   test(
       'connectFinish keeps the auth watchdog until business connected on both hosts',
       () {

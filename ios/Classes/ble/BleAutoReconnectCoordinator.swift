@@ -730,6 +730,10 @@ extension BleManager {
         let key = reconnectKey(uuid: activeTask.uuid)
         if let current = currentConnectionAdmission(uuid: activeTask.uuid) {
             let pendingTeardown = pendingConnectionAdmissionTeardowns[key]
+            let currentIsPendingTeardown = pendingTeardown.map {
+                $0.admission.generation == current.generation &&
+                    $0.admission.sessionId == current.sessionId
+            } == true
             let isReplacementGeneration = pendingTeardown.map {
                 $0.admission.generation != current.generation ||
                     $0.admission.sessionId != current.sessionId
@@ -742,7 +746,11 @@ extension BleManager {
             }
             let barrierBlocking = hasPeripheralCancellationBarrier(peripheral)
 
-            if activeTask.source == .manualReconnect && barrierBlocking {
+            if currentIsPendingTeardown {
+                // 手动接管或辅助扫描的受控恢复都可能把当前 old admission 放入
+                // teardown。此时必须继续注册下一代；新 connect 会被 barrier 扣住，
+                // 直到旧 CoreBluetooth callback 或 watchdog 明确释放。
+            } else if activeTask.source == .manualReconnect && barrierBlocking {
                 if isReplacementGeneration ||
                     (pendingTeardown == nil && deferredPeripheralReconnectRegistry.contains(endpointId: activeTask.uuid)) {
                     // 重复手动点击复用已经注册的新 generation；registry 的 take 语义保证

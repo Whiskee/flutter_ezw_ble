@@ -62,7 +62,7 @@ void main() {
     );
     expect(androidChannel, contains('NOTIFY_AUTO_RECONNECT_TARGET_VISIBLE'));
     expect(iosChannel, contains('case .notifyAutoReconnectTargetVisible:'));
-    expect(iosChannel, contains('result(false)'));
+    expect(iosChannel, contains('reconcileVisibleAutoReconnectTarget'));
     expect(
       reconnect,
       isNot(

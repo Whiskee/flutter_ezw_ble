@@ -1,6 +1,13 @@
 import CoreBluetooth
 import Foundation
 
+/// 陈旧 pre-didConnect request 的受控替换来源；来源只影响准入边界与日志，
+/// 不改变原 reconnect task 的业务 source/generation 归属。
+enum BleStalePendingReplacementTrigger: String {
+    case manualReconnect
+    case visibleAutoReconnect
+}
+
 /**
  * iOS CoreBluetooth 连接的全局准入流程。
  *
@@ -514,6 +521,7 @@ extension BleManager {
         session.hasObservedPhysicalContact = true
         peripheralConnectionSessions[admission.sessionId] = session
         pendingPhysicalConnectWatchdogs.takeIfCurrent(admission)?.cancel()
+        visiblePendingRecoveryWatchdogs.takeIfCurrent(admission)?.cancel()
         switch connectionAdmissionGate.onPhysicalConnected(admission) {
         case .granted:
             handleConnectState(
@@ -611,6 +619,7 @@ extension BleManager {
     ) -> BleConnectionAdmission? {
         guard let current = currentConnectionAdmission(expected) else { return nil }
         pendingPhysicalConnectWatchdogs.takeIfCurrent(current)?.cancel()
+        visiblePendingRecoveryWatchdogs.takeIfCurrent(current)?.cancel()
         currentConnectionAdmissions.removeValue(forKey: reconnectKey(uuid: current.endpointId))
         peripheralConnectionSessions.removeValue(forKey: current.sessionId)
         return invalidateEndpoint
@@ -667,11 +676,105 @@ extension BleManager {
         return true
     }
 
+    /// 辅助扫描只上报“长期 owner 的目标重新可见”。这里不直接重建连接：先核对
+    /// reconnect task、exact admission 与 peripheral identity；若 CoreBluetooth 已经
+    /// 显示 connected，则补交 Gate，其他情况只安装一次到原 pending 起点 +20 秒的恢复。
+    @discardableResult
+    func reconcileVisibleAutoReconnectTarget(uuid: String, name: String) -> Bool {
+        guard centralManager.state == .poweredOn,
+              let task = reconnectTasks.values.first(where: {
+                  isSameConnectTarget(
+                      storedUuid: $0.uuid,
+                      storedName: $0.name,
+                      uuid: uuid,
+                      name: name
+                  )
+              }),
+              let admission = currentConnectionAdmission(uuid: task.uuid),
+              let session = peripheralConnectionSessions[admission.sessionId],
+              session.peripheral.identifier.uuidString.caseInsensitiveCompare(task.uuid) == .orderedSame,
+              !session.hasObservedPhysicalContact else {
+            return false
+        }
+
+        let peripheral = session.peripheral
+        if peripheral.state == .connected {
+            loggerD(msg: "admission gate: \(admission.endpointId), visible hint observed connected generation=\(admission.generation)")
+            enqueuePhysicalConnectionThroughGate(peripheral)
+            return true
+        }
+        guard !hasPeripheralCancellationBarrier(peripheral) else {
+            return false
+        }
+        scheduleVisiblePendingRecovery(
+            peripheral,
+            expectedAdmission: admission,
+            pendingConnectStartedAt: session.pendingConnectStartedAt
+        )
+        return true
+    }
+
+    /// 同一 admission 始终只保留一个 work item，deadline 基于原 pending 起点计算，
+    /// 因此重复广告不会延后恢复，也不会形成周期性 cancel/connect。
+    private func scheduleVisiblePendingRecovery(
+        _ peripheral: CBPeripheral,
+        expectedAdmission: BleConnectionAdmission,
+        pendingConnectStartedAt: Date
+    ) {
+        let elapsed = Date().timeIntervalSince(pendingConnectStartedAt)
+        let remaining = max(0, manualPendingReplacementThreshold - elapsed)
+        let workItem = DispatchWorkItem { [weak self, weak peripheral] in
+            guard let self = self, let peripheral = peripheral,
+                  self.visiblePendingRecoveryWatchdogs.takeIfCurrent(expectedAdmission) != nil,
+                  let admission = self.currentConnectionAdmission(expectedAdmission),
+                  let session = self.peripheralConnectionSessions[admission.sessionId],
+                  session.peripheral === peripheral,
+                  !session.hasObservedPhysicalContact else {
+                return
+            }
+            if peripheral.state == .connected {
+                self.enqueuePhysicalConnectionThroughGate(peripheral)
+                return
+            }
+            guard self.replaceStalePendingAttemptIfNeeded(
+                peripheral,
+                trigger: .visibleAutoReconnect
+            ) else {
+                return
+            }
+            // replacement 已建立 cancellation barrier；beginReconnectAttempt 会保留
+            // 原 task source，并注册新 generation 等待旧终态/看门狗后再 connect。
+            self.beginReconnectAttempt(uuid: admission.endpointId)
+        }
+        visiblePendingRecoveryWatchdogs
+            .replace(admission: expectedAdmission, workItem: workItem)?
+            .cancel()
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + remaining,
+            execute: workItem
+        )
+        let remainingDescription = String(format: "%.1f", remaining)
+        loggerD(msg: "admission gate: \(expectedAdmission.endpointId), visible pending recovery armed generation=\(expectedAdmission.generation), delay=\(remainingDescription)s")
+    }
+
     /// 手动连接的受控逃逸口：仅替换超过阈值、从未收到物理连接回调且未处于取消
     /// barrier 的 pending owner。正常 autoReconnect 继续长期交给 CoreBluetooth，不能因
     /// 每次点击被重置；这里的 cancel 也必须先建立 barrier，确保旧 callback 不会污染新代。
     @discardableResult
     func replaceStalePendingManualAttemptIfNeeded(_ peripheral: CBPeripheral) -> Bool {
+        replaceStalePendingAttemptIfNeeded(
+            peripheral,
+            trigger: .manualReconnect
+        )
+    }
+
+    /// exact admission 的通用陈旧 pending 替换边界。可见性恢复与手动接管共享同一
+    /// 20 秒/no-contact/barrier 条件，避免两套逻辑分别制造 CoreBluetooth 竞态。
+    @discardableResult
+    func replaceStalePendingAttemptIfNeeded(
+        _ peripheral: CBPeripheral,
+        trigger: BleStalePendingReplacementTrigger
+    ) -> Bool {
         guard let admission = currentConnectionAdmission(uuid: peripheral.identifier.uuidString),
               let session = peripheralConnectionSessions[admission.sessionId],
               session.peripheral === peripheral,
@@ -689,6 +792,7 @@ extension BleManager {
         // completion 的 exact admission guard 会只释放旧 session，deferred registry 则保证
         // 新 central.connect 必须等 didFail/didDisconnect 或 barrier watchdog 后才真正执行。
         pendingPhysicalConnectWatchdogs.takeIfCurrent(admission)?.cancel()
+        visiblePendingRecoveryWatchdogs.takeIfCurrent(admission)?.cancel()
         deferConnectionAdmissionReleaseUntilPeripheralTerminal(
             admission: admission,
             peripheral: peripheral,
@@ -697,7 +801,10 @@ extension BleManager {
         )
         centralManager.cancelPeripheralConnection(peripheral)
         let elapsedDescription = String(format: "%.1f", elapsed)
-        loggerD(msg: "admission gate: \(admission.endpointId), manual stale pending replacement generation=\(admission.generation), elapsed=\(elapsedDescription)s")
+        let replacementDescription = trigger == .manualReconnect
+            ? "manual stale pending replacement"
+            : "visible auto reconnect stale pending replacement"
+        loggerD(msg: "admission gate: \(admission.endpointId), \(replacementDescription) trigger=\(trigger.rawValue), generation=\(admission.generation), elapsed=\(elapsedDescription)s")
         return true
     }
 
@@ -714,6 +821,7 @@ extension BleManager {
         peripheralCancellationWatchdogs.values.forEach { $0.workItem.cancel() }
         peripheralCancellationWatchdogs.removeAll()
         pendingPhysicalConnectWatchdogs.removeAll().forEach { $0.cancel() }
+        visiblePendingRecoveryWatchdogs.removeAll().forEach { $0.cancel() }
         peripheralCancellationBarrierGate.reset()
         deferredPeripheralReconnectRegistry.removeAll()
         pendingConnectionAdmissionTeardowns.removeAll()
