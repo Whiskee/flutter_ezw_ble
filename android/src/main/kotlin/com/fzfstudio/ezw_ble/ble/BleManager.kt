@@ -168,7 +168,8 @@ class BleManager private constructor() {
     //  - 蓝牙管理工具
     private lateinit var bluetoothManager: BluetoothManager
     //  - 系统蓝牙状态监听
-    private lateinit var bleStateListener: BleStateListener
+    // release 后清空引用；再次 release 不能对已经解绑的 receiver 再执行 unregister。
+    private var bleStateListener: BleStateListener? = null
     //  - 蓝牙搜索状态，是否正在搜索中
     private var isScanning = false
     //  - 搜索纯净模式
@@ -216,8 +217,9 @@ class BleManager private constructor() {
         //  主动查询蓝牙工具状态
         bleState = if (bluetoothAdapter.isEnabled) 5 else 4
         //  注册监听：蓝牙状态
-        bleStateListener = BleStateListener(context)
-        bleStateListener.register(createBleStateListener())
+        bleStateListener = BleStateListener(context).also {
+            it.register(createBleStateListener())
+        }
         restorePersistedConfigsIfNeeded()
         checkBluetoothPermission()
         sendLog(BleLoggerTag.d, "Init: success")
@@ -1432,9 +1434,8 @@ class BleManager private constructor() {
         // 1. 调用现有的 reset 逻辑，断开所有连接并清空队列
         reset()
         // 2. 注销蓝牙状态监听器，防止内存泄漏
-        if (this::bleStateListener.isInitialized) {
-            bleStateListener.unregister()
-        }
+        bleStateListener?.unregister()
+        bleStateListener = null
         // 3. 取消所有正在进行的协程任务
         if (this::mainScope.isInitialized) {
             mainScope.cancel()

@@ -23,6 +23,13 @@ class BleStateListener(private val context: Context) {
 
     private var callback: BluetoothStateCallback? = null
 
+    /**
+     * `unregisterReceiver` 会在 receiver 未注册时抛出 IllegalArgumentException。
+     * FlutterEngine 的 detach/recreate 可能让 release 进入不止一次，因此必须由
+     * listener 自己保存注册事实，而不能仅依赖外层对象是否已初始化。
+     */
+    private var isReceiverRegistered = false
+
     // 定义广播接收器
     private val bluetoothReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -58,8 +65,12 @@ class BleStateListener(private val context: Context) {
     /**
      * 注册监听
      */
+    @Synchronized
     fun register(callback: BluetoothStateCallback) {
         this.callback = callback
+        // 同一 listener 已登记时只刷新业务回调，不能重复向 Context 登记同一个 receiver。
+        if (isReceiverRegistered) return
+
         val filter = IntentFilter().apply {
             addAction(BluetoothAdapter.ACTION_STATE_CHANGED) // 监听蓝牙状态变化
             addAction(BluetoothDevice.ACTION_ACL_CONNECTED) // 监听设备连接
@@ -67,8 +78,26 @@ class BleStateListener(private val context: Context) {
             addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED) // 监听设备断开
         }
         context.registerReceiver(bluetoothReceiver, filter)
+        isReceiverRegistered = true
     }
 
-    // 注销监听
-    fun unregister() = context.unregisterReceiver(bluetoothReceiver)
+    /**
+     * 幂等释放 receiver。
+     *
+     * 先检查本 listener 的登记状态；同时兜住系统已提前移除 receiver 的极端生命周期，
+     * 防止 plugin detach 阶段的清理异常升级为 Activity.onDestroy 崩溃。
+     */
+    @Synchronized
+    fun unregister() {
+        if (!isReceiverRegistered) return
+
+        try {
+            context.unregisterReceiver(bluetoothReceiver)
+        } catch (_: IllegalArgumentException) {
+            // Context 已不再持有 receiver；本次释放的目标已达成。
+        } finally {
+            isReceiverRegistered = false
+            callback = null
+        }
+    }
 }
