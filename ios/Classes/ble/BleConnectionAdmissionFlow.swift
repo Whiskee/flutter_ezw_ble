@@ -327,6 +327,14 @@ extension BleManager {
             }
         }
         if !hasReplacementGeneration && !hasDeferredReplacement {
+            // scheduleReconnect 会把 active request 视为仍有连接 owner 并选择 defer。
+            // 旧 admission 已在上面释放，因此必须先清掉同一旧 request；否则 cancel
+            // callback/watchdog 恰好同步到达时会形成 admission/request 都不存在、长期
+            // autoReconnect task 却不再驱动的零 owner 死区。
+            removeActiveConnectRequest(
+                uuid: pending.admission.endpointId,
+                name: pending.deviceName
+            )
             scheduleReconnect(
                 uuid: pending.admission.endpointId,
                 name: pending.deviceName,

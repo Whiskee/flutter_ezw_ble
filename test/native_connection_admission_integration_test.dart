@@ -286,6 +286,27 @@ void main() {
         ),
       ),
     );
+
+    final flow = File('ios/Classes/ble/BleConnectionAdmissionFlow.swift')
+        .readAsStringSync();
+    final teardownStart = flow.indexOf(
+      'func completePendingConnectionAdmissionTeardown(',
+    );
+    final teardownEnd = flow.indexOf(
+      'private func startDeferredPeripheralConnection(',
+      teardownStart,
+    );
+    final teardown = flow.substring(teardownStart, teardownEnd);
+
+    // cancel callback/watchdog 释放旧 pending owner 时也必须遵守同一顺序。
+    // 否则 scheduleReconnect 会看到旧 active request 后选择 defer，而 teardown
+    // 随后又删掉旧 admission，最终形成没有任何 CoreBluetooth owner 的死区。
+    final pendingOwnerCleanup = teardown.indexOf('removeActiveConnectRequest(');
+    expect(teardown, contains('uuid: pending.admission.endpointId'));
+    final pendingReconnectSchedule = teardown.indexOf('scheduleReconnect(');
+    expect(pendingOwnerCleanup, isNonNegative);
+    expect(pendingReconnectSchedule, isNonNegative);
+    expect(pendingOwnerCleanup, lessThan(pendingReconnectSchedule));
   });
 
   test('iOS stale business cache cannot suppress a pending auto reconnect', () {
