@@ -25,13 +25,14 @@ extension BleManager {
      *  但是否 arm 自动回连仍由 Dart 业务认证成功后的 deviceConnected 决定。
      */
     func connect(easyConnect: BleEasyConnect) {
+        // 1、校验蓝牙能力和配置，空身份请求在进入异步流程前失败闭环。
         // 默认功能检查失败时必须显式上报 bleError，不能静默丢弃连接请求。
         guard checkIsFunctionCanBeCalled() else {
             loggerE(msg: "connect-flow: \(easyConnect.uuid) ble error")
             handleConnectState(uuid: easyConnect.uuid, name: easyConnect.name, state: .bleError)
             return
         }
-        // 新连接请求会清理旧预连接标记，避免上一次认证状态污染本次连接。
+        // 2、清理旧预连接/升级标记，避免上一次认证状态污染本次连接。
         preConnectedDevices.remove(easyConnect.uuid)
         if !easyConnect.afterUpgrade {
             // 非 OTA 恢复连接不能继续占用升级态，否则普通指令会被升级保护拒绝。
@@ -53,7 +54,7 @@ extension BleManager {
             return
         }
 
-        // 手动点击复用已存在的 autoReconnect pending session，只提升本轮 source/等待优先级；
+        // 3、手动点击优先复用已存在的 autoReconnect pending session，只提升本轮 source/等待优先级；
         // 不 cancel CoreBluetooth 后重开同一外设，避免旧终态回调与新 generation 交叉。
         if easyConnect.uuid.isNotEmpty,
            let current = currentConnectionAdmission(uuid: easyConnect.uuid) {
@@ -73,7 +74,7 @@ extension BleManager {
             }
         }
 
-        // 空 UUID 无法贯穿异步回调，临时 UUID 只作为本次 session 的请求标识。
+        // 4、空 UUID 使用临时 session 标识，稳定 peripheral identity 仍由后续发现结果补齐。
         let newUuid = easyConnect.uuid.isEmpty ? "temp-\(UUID().uuidString)" : easyConnect.uuid
         var newEasyConnect = BleEasyConnect(
             configName: bleConfig.name,
@@ -84,7 +85,7 @@ extension BleManager {
             time: Date().timeIntervalSince1970,
         )
         newEasyConnect.bleConfig = bleConfig
-        // 是否串行连接由 Dart 业务层决定；原生只保证每个请求可被回调追踪和取消。
+        // 5、提交前台请求；串行顺序由 Dart/Gate 决定，原生只保证回调可追踪和取消。
         upsertActiveConnectRequest(newEasyConnect)
         loggerD(msg: BleConnectRequestLogContext(
             uuid: newEasyConnect.uuid,

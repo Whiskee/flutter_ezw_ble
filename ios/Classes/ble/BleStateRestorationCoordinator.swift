@@ -35,6 +35,7 @@ final class BleStateRestorationCoordinator {
      *  CoreBluetooth 可能多次回放同一个 peripheral，按 identifier 去重可以避免重复 connectFinish。
      */
     func enqueue(_ peripheral: CBPeripheral) {
+        // 1、按 CoreBluetooth identifier 去重，避免同一 restored peripheral 重复 replay。
         if pendingPeripherals.contains(where: { $0.identifier == peripheral.identifier }) {
             return
         }
@@ -47,6 +48,7 @@ final class BleStateRestorationCoordinator {
      *  drain 语义保证每个 restored peripheral 只被 replay 一次，失败时由恢复流程决定是否重新 enqueue。
      */
     func drainPendingPeripherals() -> [CBPeripheral] {
+        // 1、一次性取出并清空缓存；恢复流程决定失败后是否重新入队。
         let peripherals = pendingPeripherals
         pendingPeripherals.removeAll()
         return peripherals
@@ -54,6 +56,7 @@ final class BleStateRestorationCoordinator {
 
     /// reset/clean 会使本次 runtime restoration session 全部失效。
     func clearPendingPeripherals() {
+        // 1、reset/clean 直接丢弃本轮 restoration 债务，不允许旧对象复活连接。
         pendingPeripherals.removeAll()
     }
 }
