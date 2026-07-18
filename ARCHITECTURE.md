@@ -504,7 +504,7 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 
 Android 自动/手动回连统一使用 `connectGatt(autoConnect = true)`；`autoReconnectUseNativePassive` 不再决定是否退回 active/scan-first。pending 阶段的 exact-GATT deadline 只回收未收到物理 callback 的 zombie handle；Gate queued 与业务 pipeline 阶段不会被它关闭。
 
-iOS 回连优先走 restoration / `retrieveConnectedPeripherals` / `retrievePeripherals` / 同时扫描已写入的 cache，自动回连任务来源的 `centralManager.connect` 携带系统 auto reconnect option。找不到 peripheral 时不在插件内启动 scan-by-name，只保留任务等待上层并行扫描补缓存。已知 peripheral 的 pending connect 不能被短扫描 timeout 取消，因为它是 CoreBluetooth State Restoration 后续唤醒进程的系统等待点。若相同稳定 name 对应的 CoreBluetooth UUID 从 A 漂移到 B，任务、持久化 owner 和 Gate identity 原子迁移；每个 canonical target 仅保留“最早 UI owner + 最近旧身份”两个 alias，保证 hard cancel 可达且长期内存有界。
+iOS 回连优先走 restoration / `retrieveConnectedPeripherals` / `retrievePeripherals` / 同时扫描已写入的 cache，自动回连任务来源的 `centralManager.connect` 携带系统 auto reconnect option。卸载重装后业务缓存 UUID 可能已经失效，而 ANCS 系统连接又会让端点停止广播；因此直连路径先按配置私有服务 + ANCS 查询系统连接，只允许旧 UUID 或完整非空端点名精确接管，再在 admission 前迁移 native identity。找不到 peripheral 时不在插件内启动 scan-by-name，只保留任务等待上层并行扫描补缓存。已知 peripheral 的 pending connect 不能被短扫描 timeout 取消，因为它是 CoreBluetooth State Restoration 后续唤醒进程的系统等待点。若相同稳定 name 对应的 CoreBluetooth UUID 从 A 漂移到 B，任务、持久化 owner 和 Gate identity 原子迁移；每个 canonical target 仅保留“最早 UI owner + 最近旧身份”两个 alias，保证 hard cancel 可达且长期内存有界。
 
 完整方案见 `docs/AUTO_RECONNECT_SPEC.md`。iOS State Restoration 专项边界见 `docs/IOS_STATE_RESTORATION_SPEC.md`。
 

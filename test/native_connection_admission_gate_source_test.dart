@@ -39,8 +39,10 @@ void main() {
     expect(gate, contains('current == Int.max ? Int.max : current + 1'));
     expect(gate, contains('activeTokens[key] == token'));
     expect(reconnect, contains('migrateReconnectTaskIdentityIfNeeded'));
+    expect(reconnect, contains('system-connected identity takeover'));
     expect(reconnect, contains('reconnectIdentityAliases'));
     expect(store, contains('func migrate('));
+    expect(store, contains('matchesSystemConnectedPeripheral'));
   });
 
   test('bluetooth reset cannot leak a manual source into a new attempt', () {

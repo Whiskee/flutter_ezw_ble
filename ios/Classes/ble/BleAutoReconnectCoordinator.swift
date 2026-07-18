@@ -701,6 +701,17 @@ extension BleManager {
                })?.1 {
                 return discovered
             }
+            // App 重装会让服务端/业务缓存中的 CoreBluetooth UUID 失效。若目标已被
+            // iOS/ANCS 持有连接，它可能停止广播，必须在旧 UUID retrieve 和扫描缓存前
+            // 通过配置私有服务 + ANCS 接管系统连接，再复用下方同一条 Gate/GATT 流程。
+            if let systemConnected = findPeripheralFromConnected(
+                uuid: task.uuid,
+                name: task.name,
+                serviceUUIDs: config.privateServices.map { $0.serviceUUID }
+            ) {
+                loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), system-connected identity takeover current=\(systemConnected.identifier.uuidString)")
+                return systemConnected
+            }
             if let identifier = UUID(uuidString: task.uuid),
                let retrieved = centralManager.retrievePeripherals(withIdentifiers: [identifier]).first {
                 return retrieved

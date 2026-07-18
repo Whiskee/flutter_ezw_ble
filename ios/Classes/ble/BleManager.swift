@@ -787,7 +787,12 @@ extension BleManager {
         guard !queryServices.isEmpty else { return nil }
         let connectedPeripherals = centralManager.retrieveConnectedPeripherals(withServices: queryServices)
         return connectedPeripherals.first { device in
-            device.name == name || device.identifier.uuidString == uuid
+            BleReconnectIdentityPolicy.matchesSystemConnectedPeripheral(
+                taskUuid: uuid,
+                taskName: name,
+                peripheralUuid: device.identifier.uuidString,
+                peripheralName: device.name ?? ""
+            )
         }
     }
     

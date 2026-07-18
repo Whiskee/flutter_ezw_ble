@@ -1022,3 +1022,36 @@ Owner:
 - Example/even_connect owns cached config readiness and cached-device replay.
 - Native `flutter_ezw_ble` owns returning `initConfigs` promptly, but Dart must
   remain robust when platform work is delayed by restoration or lifecycle order.
+
+## iOS reinstall: stale peripheral UUID plus ANCS system connection
+
+Symptoms:
+
+- The server restores old iOS peripheral UUIDs after reinstall.
+- One G2 leg is rediscovered and migrates to a new UUID, while the ANCS leg never
+  advertises and repeatedly logs `no peripheral cache yet`.
+- iOS Settings reports both legs connected, but the App never reaches private
+  service discovery, CCCD, AUTH, or business `connected` for the missing leg.
+
+Root cause:
+
+- Reinstall invalidates app-scoped CoreBluetooth identifiers.
+- ANCS can keep the peripheral system-connected and stop its advertisement.
+- The reconnect direct path only checked the stale identifier and scan cache; it
+  did not adopt `retrieveConnectedPeripherals(privateServices + ANCS)`.
+
+Fix:
+
+- Query system-connected peripherals before retrieving the stale identifier.
+- Match only a stable UUID or an exact non-empty endpoint name; never use prefix
+  or empty-name fallback for takeover.
+- Migrate reconnect task, aliases, persistent target, and Gate identity before
+  registering admission, then continue through the existing single GATT pipeline.
+- Do not add a scan, a second connect, or a relaxed callback epoch rule.
+
+Owner:
+
+- Native iOS owns system-connected peripheral takeover and canonical UUID migration.
+- even_connect owns persisting the callback UUID into the logical device cache.
+- The App owns initializing auto-connect only when authoritative server binding
+  exists and the current user namespace has never stored an intent.

@@ -111,6 +111,12 @@ retrieveConnectedPeripherals(withServices: privateServices + [ANCS])
 
 命中后应直接进入 `centralManager.connect(peripheral)` / GATT pipeline，不应把扫描不可见映射成 `noDeviceFound`。
 
+卸载重装会清空 App 沙箱并使服务端保存的旧 `CBPeripheral.identifier` 失效，但系统可能仍因
+ANCS 持有同一条腿。自动回连直连路径必须在 `retrievePeripherals(oldUUID)` 前执行上述系统连接
+查询；仅允许旧 UUID 或完整端点名称精确匹配。命中新 UUID 后，在创建 admission 前原子迁移
+task、alias、持久 target 和 Gate identity，随后仍走同一条 GATT/业务鉴权链路，不能新开扫描或
+第二条连接。
+
 ## 7. 全局 Admission Gate 与 GATT Readiness
 
 所有目标可以同时处于 CoreBluetooth pending connect，但 `didConnect`、系统 already-connected 与 State Restoration callback 都必须提交同一个进程级 Admission Gate：

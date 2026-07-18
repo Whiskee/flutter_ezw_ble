@@ -318,6 +318,36 @@ class RunnerTests: XCTestCase {
     XCTAssertEqual(store.target(uuid: newUuid)?.uuid, newUuid)
   }
 
+  func testSystemConnectedIdentityTakeoverRequiresExactStableIdentity() {
+    let staleUuid = "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"
+    let currentUuid = "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"
+
+    XCTAssertTrue(BleReconnectIdentityPolicy.matchesSystemConnectedPeripheral(
+      taskUuid: staleUuid,
+      taskName: "Even G2_32_R_18B77C",
+      peripheralUuid: currentUuid,
+      peripheralName: "Even G2_32_R_18B77C"
+    ))
+    XCTAssertTrue(BleReconnectIdentityPolicy.matchesSystemConnectedPeripheral(
+      taskUuid: staleUuid,
+      taskName: "Even G2_32_R_18B77C",
+      peripheralUuid: staleUuid.lowercased(),
+      peripheralName: "unexpected-name"
+    ))
+    XCTAssertFalse(BleReconnectIdentityPolicy.matchesSystemConnectedPeripheral(
+      taskUuid: staleUuid,
+      taskName: "Even G2_32_R_18B77C",
+      peripheralUuid: currentUuid,
+      peripheralName: "Even G2_32_R_OTHER"
+    ))
+    XCTAssertFalse(BleReconnectIdentityPolicy.matchesSystemConnectedPeripheral(
+      taskUuid: "",
+      taskName: "",
+      peripheralUuid: currentUuid,
+      peripheralName: ""
+    ))
+  }
+
   func testBluetoothResetStartsANewAutomaticSourceAttempt() {
     XCTAssertEqual(BleReconnectSourcePolicy.afterTransportReset(), .autoReconnect)
   }

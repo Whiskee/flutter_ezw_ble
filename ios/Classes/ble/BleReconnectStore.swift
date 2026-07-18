@@ -92,6 +92,26 @@ struct BleTransportOffConnectionSnapshot {
 /// 辅助扫描只有在稳定旧 UUID 与新 peripheral UUID 不同、且非空 name 明确相同时才允许
 /// 迁移 reconnect owner；避免仅凭相同广播名误合并两个真实设备。
 enum BleReconnectIdentityPolicy {
+    /// 系统连接接管只允许稳定 UUID 或完整设备名精确命中。重装后旧 UUID 会失效，
+    /// 此时完整左右腿名称是唯一可用身份；空名称和模糊名称不能抢占其它设备 owner。
+    static func matchesSystemConnectedPeripheral(
+        taskUuid: String,
+        taskName: String,
+        peripheralUuid: String,
+        peripheralName: String
+    ) -> Bool {
+        let oldUuid = taskUuid.trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentUuid = peripheralUuid.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !oldUuid.isEmpty,
+           !currentUuid.isEmpty,
+           oldUuid.caseInsensitiveCompare(currentUuid) == .orderedSame {
+            return true
+        }
+        let expectedName = taskName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentName = peripheralName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !expectedName.isEmpty && expectedName == currentName
+    }
+
     static func shouldMigrate(
         taskUuid: String,
         taskName: String,

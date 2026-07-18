@@ -57,6 +57,20 @@ void main() {
       iosReconnect.indexOf('func preparePeerPairingRecovery'),
     );
     expect(normalReconnect, isNot(contains('startScan()')));
+    // App 重装后 CoreBluetooth UUID 会变化；目标若已被系统/ANCS 连接而停止广播，
+    // 直连必须先接管系统连接并复用既有 Gate，不能退回 scan-first。
+    expect(
+      normalReconnect,
+      contains('findPeripheralFromConnected('),
+    );
+    expect(
+      normalReconnect.indexOf('findPeripheralFromConnected('),
+      lessThan(normalReconnect.indexOf('retrievePeripherals(')),
+    );
+    expect(
+      normalReconnect,
+      contains('migrateReconnectTaskIdentityIfNeeded'),
+    );
     expect(iosReconnect,
         contains('pairingRecoveryDiscoveryTimeout: TimeInterval { 20.0 }'));
     expect(iosReconnect, contains('resumePeerPairingRecoveryIfMatched'));

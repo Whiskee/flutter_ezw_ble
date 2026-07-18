@@ -233,6 +233,12 @@ iOS lookup order:
 4. If no peripheral is known, keep the task armed and wait for the app's
    concurrent scan/cache update or a later retrieve/restoration opportunity.
 
+After reinstall, a server-restored UUID can be stale while the matching endpoint
+is already system-connected and no longer advertising. The first lookup therefore
+matches either the stable UUID or the exact non-empty endpoint name; when it finds
+a new CoreBluetooth UUID, identity migration must finish before admission is
+registered. The migrated peripheral then uses the existing Gate/GATT pipeline.
+
 iOS 17+ may pass `CBConnectPeripheralOptionEnableAutoReconnect` when available. Lower versions still keep a pending `centralManager.connect` for a known peripheral and rely on CoreBluetooth to complete the connection when the device returns. Apps that need background reconnect must configure `UIBackgroundModes = bluetooth-central` and use CoreBluetooth state restoration.
 
 The iOS plugin must not pass `CBCentralManagerOptionRestoreIdentifierKey` unless
