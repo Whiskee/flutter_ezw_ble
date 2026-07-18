@@ -396,6 +396,7 @@ final class BleConnectionAdmissionGate {
 
     /// 注册最新尝试代次，并移除同 endpoint 尚未执行的旧排队节点。
     func registerAttempt(endpointId: String, generation: Int64) {
+        // 1、忽略空身份和低于高水位的旧 generation。
         lock.lock()
         defer { lock.unlock() }
         guard !endpointId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
@@ -403,6 +404,7 @@ final class BleConnectionAdmissionGate {
         if let current = latestGenerations[key], generation < current {
             return
         }
+        // 2、登记当前 generation，并删除同 endpoint 的旧排队节点。
         latestGenerations[key] = generation
         manualQueue.removeAll { endpointKey($0.endpointId) == key && $0.generation < generation }
         automaticQueue.removeAll { endpointKey($0.endpointId) == key && $0.generation < generation }
@@ -410,6 +412,7 @@ final class BleConnectionAdmissionGate {
 
     /// 按真实物理 callback 到达顺序提交；首个节点立即成为 owner。
     func onPhysicalConnected(_ admission: BleConnectionAdmission) -> BleConnectionAdmissionDecision {
+        // 1、按身份、suspended、generation、重复 session 顺序 fail-closed 校验。
         lock.lock()
         defer { lock.unlock() }
         guard !admission.endpointId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -424,6 +427,7 @@ final class BleConnectionAdmissionGate {
             automaticQueue.contains(where: { $0.sameSession(as: admission) }) {
             return .duplicate
         }
+        // 2、没有 active owner 时立即授权；已有 owner 时按 source 排队。
         guard active == nil else {
             if admission.source == .manualReconnect {
                 manualQueue.append(admission)
@@ -438,9 +442,11 @@ final class BleConnectionAdmissionGate {
 
     /// 仅 exact active session 可以完成；返回随后获得准入的节点。
     func complete(_ admission: BleConnectionAdmission) -> BleConnectionAdmission? {
+        // 1、只有 exact active session 才能释放 Gate owner。
         lock.lock()
         defer { lock.unlock() }
         guard active?.sameSession(as: admission) == true else { return nil }
+        // 2、释放当前 owner，随后只从有效队列授予下一 endpoint。
         active = nil
         removeLatestGenerationIfOwned(by: admission)
         return grantNext()
@@ -448,11 +454,13 @@ final class BleConnectionAdmissionGate {
 
     /// 手动点击只提升同一个 pending session，不创建重复 CoreBluetooth connect。
     func promote(endpointId: String, generation: Int64, sessionId: Int64) {
+        // 1、定位同一 endpoint/generation/session 的自动等待节点，不能抢占 active。
         lock.lock()
         defer { lock.unlock() }
         guard let index = automaticQueue.firstIndex(where: {
             $0.matches(endpointId: endpointId, generation: generation, sessionId: sessionId)
         }) else { return }
+        // 2、切换 source 后进入手动优先队列，复用同一个 CoreBluetooth session。
         let current = automaticQueue.remove(at: index)
         manualQueue.append(
             BleConnectionAdmission(
@@ -472,20 +480,24 @@ final class BleConnectionAdmissionGate {
     /// 配置撤销必须一次性移除整批 endpoint，再从仍获授权的队列选下一 owner。
     /// 逐个 cancel 会在批处理中途短暂 grant 同样即将被撤销的 waiter。
     func cancelEndpoints(_ endpointIds: Set<String>) -> BleConnectionAdmission? {
+        // 1、规范化 endpoint 集合；空集合不改变状态。
         lock.lock()
         defer { lock.unlock() }
         let keys = Set(endpointIds.map(endpointKey).filter { !$0.isEmpty })
         guard !keys.isEmpty else { return nil }
+        // 2、移除 generation 高水位，令后续回调不能命中已取消会话。
         keys.forEach { latestGenerations.removeValue(forKey: $0) }
         manualQueue.removeAll { keys.contains(endpointKey($0.endpointId)) }
         automaticQueue.removeAll { keys.contains(endpointKey($0.endpointId)) }
         guard active.map({ keys.contains(endpointKey($0.endpointId)) }) == true else { return nil }
+        // 3、只有 active 被取消才推进下一 owner。
         active = nil
         return grantNext()
     }
 
     /// reset/clean 在蓝牙仍开启时使所有旧 generation 失效，同时保持 Gate 可立即注册新尝试。
     func invalidateAllAndReset() {
+        // 1、失效所有 owner/queue，并保持 Gate 可接受新的显式连接。
         lock.lock()
         latestGenerations.removeAll()
         active = nil
@@ -525,6 +537,7 @@ final class BleConnectionAdmissionGate {
 
     /// 蓝牙关闭会原子失效所有 owner/queue；旧 callback 恢复后也不能再次准入。
     func suspendAndReset() {
+        // 1、蓝牙关闭先暂停 Gate，再原子清除旧 owner、queue 和 generation。
         lock.lock()
         defer { lock.unlock() }
         suspended = true

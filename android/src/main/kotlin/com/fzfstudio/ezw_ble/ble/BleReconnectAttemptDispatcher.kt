@@ -104,10 +104,12 @@ internal class BleReconnectAttemptDispatcher(
         delayMs: Long,
         scheduleGeneration: Long? = null,
     ): BleReconnectScheduleHandle? {
+        // 1、首轮 activation 必须同步创建 passive GATT，保证所有目标在 native 返回前已入系统。
         if (delayMs <= 0L) {
             gattStarter(uuid, scheduleGeneration)
             return null
         }
+        // 2、失败重试才进入可取消 scheduler；回调仍携带 generation 供 supervisor 校验。
         return scheduler.schedule(delayMs) { gattStarter(uuid, scheduleGeneration) }
     }
 }

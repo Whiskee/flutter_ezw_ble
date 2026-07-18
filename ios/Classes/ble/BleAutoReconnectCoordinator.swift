@@ -159,9 +159,11 @@ extension BleManager {
     /// 必须在 poweredOff 清空 admission 之前冻结终态来源与 generation。
     /// connecting 端点取当前 admission；已业务 connected 端点取 task 保存的最后成功代。
     func bluetoothOffConnectionSnapshots() -> [BleTransportOffConnectionSnapshot] {
+        // 1、在 poweredOff 清空 admission 前遍历业务连接和当前 admission 快照。
         var snapshots: [BleTransportOffConnectionSnapshot] = []
         var capturedEndpointKeys = Set<String>()
 
+        // 2、优先使用 admission generation，其次使用业务已连接 task 保存的 generation。
         for device in connectedDevices {
             let uuid = device.peripheral.identifier.uuidString
             let name = device.peripheral.name ?? ""
@@ -182,6 +184,7 @@ extension BleManager {
                 loggerE(msg: "bluetooth off: \(uuid)-\(name), skip terminal without accepted generation")
                 continue
             }
+            // 3、只上报大于 0 的 generation，确保 Dart epoch guard 能接受系统断连终态。
             snapshots.append(BleTransportOffConnectionSnapshot(
                 uuid: uuid,
                 name: name,
@@ -293,7 +296,9 @@ extension BleManager {
         _ targets: [BleReconnectTarget],
         source: BleConnectSource = .autoReconnect
     ) -> [BleReconnectActivationResult] {
+        // 1、逐目标校验配置和身份，保持一次 activation 的目标快照稳定。
         return targets.map { target in
+            // 1.1、关闭 autoReconnect 或缺少稳定 identity 时只返回结果，不创建 GATT。
             guard let config = bleConfigs.first(where: { $0.name == target.belongConfig }),
                   config.autoReconnect else {
                 loggerE(msg: "autoReconnect activation rejected: config=\(target.belongConfig), reason=invalidConfig")
@@ -338,6 +343,7 @@ extension BleManager {
                     reason: "awaitingPeripheralIdentity"
                 )
             }
+            // 2、稳定 UUID 目标先 arm 长期 owner，再进入统一 activation。
             guard let task = armReconnectTarget(target, source: source) else {
                 return BleReconnectActivationResult(
                     target: target,
@@ -345,6 +351,7 @@ extension BleManager {
                     reason: "nativeArmRejected"
                 )
             }
+            // 3、复用已有 pending owner，或创建同一 Gate 管理的新 attempt。
             activateArmedReconnectTask(task, source: source)
             return BleReconnectActivationResult(
                 target: target,
@@ -356,6 +363,7 @@ extension BleManager {
 
     /// 激活一个已经拥有稳定 UUID 的 task；MethodChannel 与扫描身份解析共用此顺序。
     private func activateArmedReconnectTask(_ task: BleReconnectTask, source: BleConnectSource) {
+            // 1、已有 admission 时优先判断是否可安全复用当前 pending session。
             let key = reconnectKey(uuid: task.uuid)
             if let current = currentConnectionAdmission(uuid: task.uuid) {
                 let pendingTeardown = pendingConnectionAdmissionTeardowns[key]
@@ -365,6 +373,7 @@ extension BleManager {
                 } == true
                 if source != .manualReconnect || !currentIsPendingTeardown {
                     if source == .manualReconnect {
+                        // 1.1、手动请求只提升 source；仅超过替换阈值且从未物理接触才允许 barrier 替换。
                         // 默认仅提升同一 pending owner，避免手动点击引入第二条 GATT。
                         // 只有旧 owner 已超过 20 秒且从未收到物理回调，才先走 cancel
                         // barrier 后建立新 generation，给 CoreBluetooth 卡住的 pending 一个
@@ -380,7 +389,7 @@ extension BleManager {
                     return
                 }
             }
-            // cancellation barrier 内的手动请求不能提升即将销毁的旧 session；继续创建
+            // 2、cancellation barrier 内的手动请求不能提升即将销毁的旧 session；继续创建
             // 新 generation，并由旧 didDisconnect/watchdog 释放后原子启动。
             beginReconnectAttempt(uuid: task.uuid)
     }
@@ -578,6 +587,7 @@ extension BleManager {
         state: BleConnectState,
         preserveAttemptSource: Bool = false
     ) {
+        // 1、先确认终态属于可恢复类型，再加载长期 task/config。
         guard shouldScheduleReconnect(state: state) else {
             return
         }
@@ -586,6 +596,7 @@ extension BleManager {
             // 没有 armed task 说明业务尚未确认 connected，原生不能自行接管长期回连。
             return
         }
+        // 2、终态后默认恢复 autoReconnect source；显式提升只保留当前 attempt 来源。
         if !preserveAttemptSource {
             task.source = BleReconnectSourcePolicy.afterTerminalAttempt()
         }
@@ -597,12 +608,14 @@ extension BleManager {
             // OTA/升级态由升级流程控制连接，避免自动回连打断升级状态机。
             return
         }
+        // 3、蓝牙不可用只记录暂停，poweredOn 后继续，不取消长期 intent。
         guard centralManager.state == .poweredOn else {
             task.pausedByBluetoothOff = true
             reconnectTasks[reconnectKey(uuid: task.uuid)] = task
             loggerD(msg: "autoReconnect: \(task.uuid), paused because bluetooth is unavailable")
             return
         }
+        // 4、已有 peripheral 时交给 CoreBluetooth pending connect；无 identity 时才防抖重试。
         if state != .noDeviceFound {
             let key = reconnectKey(uuid: task.uuid)
             // passive pending connect 由系统持有，不需要本地 timer 并行触发。
@@ -653,6 +666,7 @@ extension BleManager {
      *  这里复用 connect(easyConnect:) 是为了让主动连接、自动回连、restoration 最终都进入同一套 GATT pipeline。
      */
     func beginReconnectAttempt(uuid: String) {
+        // 1、校验 task/config/蓝牙状态，旧 timer 或取消后的回调直接失效。
         let key = reconnectKey(uuid: uuid)
         guard var task = reconnectTasks[key] else {
             // 任务可能已被用户 disconnect/remove 取消，忽略旧 timer 回调。
@@ -669,6 +683,7 @@ extension BleManager {
         }
         // attempt 只用于退避和日志，不再作为停止条件。自动回连是业务 connected 后建立的
         // 持续意图，不能因为设备离开较久或多次 timeout 被 native 主动放弃。
+        // 2、递增日志 attempt，不把次数作为长期 autoReconnect 的停止条件。
         task.attempt = nextReconnectAttemptCount(task.attempt)
         task.timer?.invalidate()
         task.timer = nil
@@ -681,12 +696,14 @@ extension BleManager {
 
     /// 构造一条不经扫描前置、不提前起超时的 CoreBluetooth pending connect。
     func beginDirectReconnectAttempt(task: BleReconnectTask, config: BleConfig) {
+        // 1、先以真实物理连接状态短路，避免重复建立 GATT。
         // 不能只看业务缓存 isConnected：断连后 retrieve/restoration 可能保留同 UUID 的
         // 旧 CBPeripheral 实例。只有物理连接仍在时才短路，否则必须重建系统 pending connect。
         if let connected = businessConnectedCacheDevice(uuid: task.uuid) {
             armReconnectTask(device: connected, source: .autoReconnect, businessConnected: true)
             return
         }
+        // 2、Code 14 等场景要求新广播时走配对恢复；否则按缓存/系统连接/扫描身份选择 peripheral。
         if task.requiresFreshAdvertisement {
             startPairingRecoveryDiscoveryIfNeeded(task)
             return

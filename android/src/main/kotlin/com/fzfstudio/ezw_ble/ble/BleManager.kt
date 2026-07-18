@@ -98,6 +98,11 @@ class BleManager private constructor() {
     //    系统稍后断连时据此区分 live session 与旧 callback。
     private val businessConnectedGattSessions: MutableMap<String, BusinessConnectedGattSession> =
         Collections.synchronizedMap(mutableMapOf())
+    // OTA 中间腿 reboot 可能注册过新 attempt、清掉 exact business GATT session，却没有
+    // 再次完成业务 connected。保留最后一次已被 Dart 接受的 epoch metadata，仅用于生成
+    // transport/OTA teardown 终态；绝不能用它恢复物理 GATT 或判定当前已连接。
+    private val lastEpochAcceptedAdmissions: MutableMap<String, BleConnectionAdmission> =
+        Collections.synchronizedMap(mutableMapOf())
     // OTA reboot 主动 close 后仍会收到一条旧 GATT 的 STATE_DISCONNECTED。它已经由
     // disconnectForOtaReboot 上报过同代终态，必须只消费一次，不能再 schedule retry。
     private val otaRebootDisconnectSuppressions: MutableSet<String> =
@@ -309,12 +314,14 @@ class BleManager private constructor() {
      */
     @Synchronized
     fun initConfigs(newConfigs: List<BleConfig>) {
+        // 1、先比较旧/新配置，识别 autoReconnect 撤权边界。
         // 配置删除或 autoReconnect true->false 是授权撤销，必须先终止旧 runtime/persisted owner，
         // 再发布新配置；否则旧 passive callback 可能在配置切换窗口重新进入 Gate。
         val revokedConfigNames = BleReconnectConfigDiff.revokedConfigNames(bleConfigs, newConfigs)
         if (revokedConfigNames.isNotEmpty()) {
             revokeReconnectConfigs(revokedConfigNames)
         }
+        // 2、撤权完成后发布新配置并持久化，避免旧 callback 在切换窗口复活。
         bleConfigs = newConfigs
         persistConfigs(newConfigs)
     }
@@ -324,6 +331,7 @@ class BleManager private constructor() {
      * 同批 endpoint 先全部失效，再 teardown GATT，最后只启动仍获授权的下一 Gate owner。
      */
     private fun revokeReconnectConfigs(configNames: Set<String>) {
+        // 1、收集 runtime、persisted、connected、scan 四类 endpoint，形成一次性撤权集合。
         val taskEndpoints = autoReconnectSupervisor.endpointsForConfigs(configNames)
         val persistedEndpoints = reconnectStore.removeTargetsForConfigs(weakContext?.get(), configNames)
         val revokedDevices = connectedDevices.filter { it.belongConfig.name in configNames }
@@ -335,7 +343,7 @@ class BleManager private constructor() {
             .toSet()
         val endpointKeys = endpointIds.map(::reconnectKey).toSet()
 
-        // 1. 先快照被撤销 session 的 GATT；map/Gate 失效后迟到 callback 只能 fail closed。
+        // 2、先快照并移除被撤销 session；map/Gate 失效后迟到 callback 只能 fail closed。
         val revokedAdmissionSessions = admittedGattSessions.values
             .filter { reconnectKey(it.admission.endpointId) in endpointKeys }
         val revokedBusinessSessions = businessConnectedGattSessions
@@ -345,7 +353,10 @@ class BleManager private constructor() {
             .filter { it in endpointKeys }
             .forEach { currentAdmissions.remove(it) }
         revokedAdmissionSessions.forEach { admittedGattSessions.remove(it.admission.sessionId) }
-        endpointKeys.forEach { businessConnectedGattSessions.remove(it) }
+        endpointKeys.forEach {
+            businessConnectedGattSessions.remove(it)
+            lastEpochAcceptedAdmissions.remove(it)
+        }
         endpointIds.forEach { endpointId ->
             val key = reconnectKey(endpointId)
             connectionAttemptGenerations[key] = nextConnectionGeneration(
@@ -1073,6 +1084,9 @@ class BleManager private constructor() {
             return
         }
         sendLog(BleLoggerTag.d, "Set $uuid connected")
+        // 业务 connected 是唯一可证明 Dart 已接受本 generation 的时刻；后续 OTA reboot
+        // 即使 exact GATT session 被中间 attempt 替换，也可用这份快照上报同代终态。
+        lastEpochAcceptedAdmissions[reconnectKey(uuid)] = acceptedAdmission
         //  移除预连接状态
         preConnectedDevices.remove(uuid)
         handleConnectState(
@@ -1091,7 +1105,9 @@ class BleManager private constructor() {
      */
     fun disconnect(uuid: String, removeBond: Boolean = false) {
         sendLog(BleLoggerTag.d, "Star disconnect: $uuid by user")
-        businessConnectedGattSessions.remove(reconnectKey(uuid))
+        val key = reconnectKey(uuid)
+        businessConnectedGattSessions.remove(key)
+        lastEpochAcceptedAdmissions.remove(key)
         // 用户主动断开就是取消长期回连意图；removeBond 只额外清系统绑定。
         removePersistedReconnectTarget(uuid)
         autoReconnectSupervisor.cancel(uuid, reason = "user disconnect")
@@ -1116,6 +1132,7 @@ class BleManager private constructor() {
      * 在设备尚未 reboot 完成时竞争 GATT。
      */
     fun disconnectForOtaReboot(uuid: String, name: String = "") {
+        // 1、定位业务已连接设备，并解析可被 Dart 接受的 source/generation 元数据。
         val device = connectedDevices.firstOrNull { candidate ->
             candidate.uuid.equals(uuid, ignoreCase = true) ||
                 (name.isNotBlank() && candidate.name == name)
@@ -1128,14 +1145,20 @@ class BleManager private constructor() {
         val acceptedAdmission = BleBluetoothOffTerminalMetadataPolicy.resolve(
             currentAdmission = currentAdmissions[key],
             businessConnectedAdmission = businessConnectedGattSessions[key]?.admission,
+            lastBusinessConnectedAdmission = lastEpochAcceptedAdmissions[key],
         ) ?: run {
             // 不能把 unknown/0 发给 Dart：它会被 epoch guard 拒绝并留下假连接。OTA
             // 收尾只允许业务已确认 connected 的 endpoint 进入，因此这属于不变量破坏。
             sendLog(BleLoggerTag.e, "OTA reboot disconnect: ${device.uuid}, missing epoch-accepted admission")
             return
         }
+        // 2、OTA 只保留逻辑 reconnect owner；旧物理 GATT 必须先从 supervisor 脱钩，
+        // 否则 afterUpgrade/manual activation 会永远复用已经被 releaseAndClear 的句柄。
+        autoReconnectSupervisor.detachPhysicalGattForOtaReboot(device.uuid)
         markOtaRebootDisconnectSuppression(device.uuid)
         preConnectedDevices.remove(device.uuid)
+        businessConnectedGattSessions.remove(key)
+        cancelConnectionAdmission(device.uuid, reason = "OTA reboot disconnect")
         handleConnectState(
             device.uuid,
             device.name,
@@ -1197,7 +1220,10 @@ class BleManager private constructor() {
             .filter { it in endpointKeys }
             .forEach { currentAdmissions.remove(it) }
         admissionSessions.forEach { admittedGattSessions.remove(it.admission.sessionId) }
-        endpointKeys.forEach { businessConnectedGattSessions.remove(it) }
+        endpointKeys.forEach {
+            businessConnectedGattSessions.remove(it)
+            lastEpochAcceptedAdmissions.remove(it)
+        }
         endpointIds.forEach { endpointId ->
             val key = reconnectKey(endpointId)
             connectionAttemptGenerations[key] = nextConnectionGeneration(
@@ -1338,6 +1364,7 @@ class BleManager private constructor() {
         currentAdmissions.clear()
         admittedGattSessions.clear()
         businessConnectedGattSessions.clear()
+        lastEpochAcceptedAdmissions.clear()
         connectionAttemptGenerations.replaceAll { _, generation ->
             nextConnectionGeneration(generation)
         }
@@ -1517,6 +1544,7 @@ class BleManager private constructor() {
                     BleBluetoothOffTerminalMetadataPolicy.resolve(
                         currentAdmission = currentAdmissions[key],
                         businessConnectedAdmission = businessConnectedGattSessions[key]?.admission,
+                        lastBusinessConnectedAdmission = lastEpochAcceptedAdmissions[key],
                     ),
                 ) {
                     "Bluetooth off terminal invariant violated for ${device.uuid}: missing epoch-accepted admission"
@@ -1534,6 +1562,7 @@ class BleManager private constructor() {
      */
     private fun createBleStateListener(): BluetoothStateCallback = object : BluetoothStateCallback {
         override fun onBluetoothStateChanged(state: Int) {
+            // 1、把系统状态映射为插件状态；仅在稳定 OFF/ON 时推进 teardown/resume。
             //  监听获取蓝牙开关
             bleState = when (state) {
                 //  蓝牙关闭
@@ -1548,6 +1577,7 @@ class BleManager private constructor() {
                 else -> return
             }
             if (bleState != 5) {
+                // 2、蓝牙关闭：先快照终态 metadata，再暂停 supervisor 和关闭物理句柄。
                 // transport teardown 会清空 Gate/current/business session；必须先冻结每个
                 // 业务已连接 endpoint 的 source/generation，避免后续终态事件退化为 unknown/0。
                 val transportOffTerminalSnapshots = captureBluetoothOffTerminalSnapshots()
@@ -1566,13 +1596,13 @@ class BleManager private constructor() {
                     .filter { reconnectKey(it.uuid) in admissionEndpoints }
                     .forEach { it.releaseAndClear() }
 
-                // 句柄 teardown 后再原子暂停 Gate 并失效所有 generation/session/callback。
+                // 2.1、句柄 teardown 后再原子暂停 Gate 并失效所有 generation/session/callback。
                 connectionAdmissionGate.suspendAndReset()
                 currentAdmissions.clear()
                 admittedGattSessions.clear()
                 businessConnectedGattSessions.clear()
                 connectionAttemptGenerations.replaceAll { _, generation -> generation + 1L }
-                //  清除所有升级设备数据，避免执行OTA退出时出现状态回连问题
+                // 2.2、清除升级设备数据，避免 OTA 退出时旧状态重新进入回连。
                 upgradeDevices.clear()
                 //  系统级蓝牙关闭：把所有已连接设备标记为 DISCONNECT_FROM_SYS（系统断连），
                 //  让 even_connect 的 EvenDeviceReconnectMixin 能在 BLE 恢复后自动接管重连。
@@ -1598,6 +1628,7 @@ class BleManager private constructor() {
                     )
                 }
             } else {
+                // 3、蓝牙恢复：解除 Gate 暂停并让 supervisor 重建长期 passive owner。
                 connectionAdmissionGate.resume()
                 autoReconnectSupervisor.resumeAfterBluetoothOn()
             }
@@ -2426,7 +2457,7 @@ class BleManager private constructor() {
         generation: Long = currentAdmissions[reconnectKey(uuid)]?.generation ?: 0L,
         scheduleAutoReconnect: Boolean = true,
     ) {
-        //  1、更新连接设备的状态
+        // 1、先把 source/generation 写入对应 endpoint 状态。
         connectedDevices.forEach {
             if (it.uuid == uuid) {
                 it.connectState = state
@@ -2441,7 +2472,7 @@ class BleManager private constructor() {
         if (state == BleConnectState.DISCONNECT_BY_USER) {
             autoReconnectSupervisor.cancel(uuid, reason = "disconnectByUser state")
         }
-        //  2、处理正在连接
+        // 2、flow connecting 只清理断连列表，不结束业务超时会话。
         //  注意：CONNECT_FINISH 只表示 BLE 服务/特征流程完成，真正的业务 connected
         //  仍由上层鉴权后调用 deviceConnected 触发，所以这里不取消超时定时器。
         if (state.isFlowConnecting) {
@@ -2449,11 +2480,11 @@ class BleManager private constructor() {
                 it.first == uuid
             }
         }
-        //  3、处理断连和错误连接
+        // 3、断连/错误状态走统一 teardown，并按 source/generation 调度自动回连。
         else if (state.isDisconnected || state.isError) {
             disconnectDevice(uuid, state, removeBond)
         }
-        //  4、处理连接成功（uuid 用 ignoreCase 比较：connect 与 setConnected 可能来自不同链路，MAC 大小写不一致会导致匹配不到，定时器无法清除）
+        // 4、成功状态清理 timeout，并在业务 connected 后 arm 长期 autoReconnect。
         else if (state.isConnected) {
             // - 4.1、连接成功后清理当前设备上的超时定时器。
             connectedDevices.firstOrNull {

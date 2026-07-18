@@ -39,6 +39,35 @@ class BleBluetoothOffTerminalMetadataPolicyTest {
         )
     }
 
+    @Test
+    fun `last business-connected epoch survives OTA replacement of the exact session`() {
+        val lastConnected = admission(7, BleConnectSource.AUTO_RECONNECT)
+
+        assertEquals(
+            lastConnected,
+            BleBluetoothOffTerminalMetadataPolicy.resolve(
+                currentAdmission = null,
+                businessConnectedAdmission = null,
+                lastBusinessConnectedAdmission = lastConnected,
+            ),
+        )
+    }
+
+    @Test
+    fun `live current admission wins over the historical OTA fallback`() {
+        val current = admission(9, BleConnectSource.MANUAL_RECONNECT)
+        val lastConnected = admission(7, BleConnectSource.AUTO_RECONNECT)
+
+        assertEquals(
+            current,
+            BleBluetoothOffTerminalMetadataPolicy.resolve(
+                currentAdmission = current,
+                businessConnectedAdmission = null,
+                lastBusinessConnectedAdmission = lastConnected,
+            ),
+        )
+    }
+
     private fun admission(
         generation: Long,
         source: BleConnectSource,

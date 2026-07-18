@@ -35,6 +35,10 @@ void main() {
     expect(androidMethod, contains('BleConnectState.DISCONNECT_FROM_SYS'));
     expect(androidMethod, contains('scheduleAutoReconnect = false'));
     expect(androidMethod, contains('markOtaRebootDisconnectSuppression'));
+    expect(androidMethod,
+        contains('autoReconnectSupervisor.detachPhysicalGattForOtaReboot'));
+    expect(androidMethod, contains('lastEpochAcceptedAdmissions[key]'));
+    expect(androidMethod, contains('cancelConnectionAdmission'));
     expect(androidMethod, isNot(contains('autoReconnectSupervisor.cancel')));
     expect(androidMethod, isNot(contains('removePersistedReconnectTarget')));
 
@@ -50,5 +54,23 @@ void main() {
         contains('OTA reboot teardown suppresses native reconnect schedule'));
     expect(android, contains('consumeOtaRebootDisconnectSuppression'));
     expect(iosStore, contains('lastConnectedGeneration'));
+  });
+
+  test('Android OTA reboot preserves owner but drops the closed physical GATT',
+      () {
+    final reconnect = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleAutoReconnectSupervisor.kt',
+    ).readAsStringSync();
+
+    final detachStart = reconnect.indexOf('fun detachPhysicalGattForOtaReboot');
+    final detachEnd = reconnect.indexOf('\n    /**', detachStart + 1);
+    final detachMethod = reconnect.substring(detachStart, detachEnd);
+
+    expect(detachMethod, contains('task.passiveGatt = null'));
+    expect(detachMethod, contains('task.pendingPhysicalDeadline = null'));
+    expect(detachMethod, contains('invalidateRetrySchedule(task)'));
+    expect(detachMethod, contains('owner preserved'));
+    expect(detachMethod, isNot(contains('reconnectTasks.remove')));
+    expect(detachMethod, isNot(contains('persistReconnectTarget')));
   });
 }

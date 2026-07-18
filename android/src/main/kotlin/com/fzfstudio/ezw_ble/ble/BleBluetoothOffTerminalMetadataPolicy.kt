@@ -14,9 +14,11 @@ internal object BleBluetoothOffTerminalMetadataPolicy {
     fun resolve(
         currentAdmission: BleConnectionAdmission?,
         businessConnectedAdmission: BleConnectionAdmission?,
+        lastBusinessConnectedAdmission: BleConnectionAdmission? = null,
     ): BleConnectionAdmission? =
         currentAdmission.takeIf(::isEpochAccepted)
             ?: businessConnectedAdmission.takeIf(::isEpochAccepted)
+            ?: lastBusinessConnectedAdmission.takeIf(::isEpochAccepted)
 
     /** 业务 connected 与系统断连事件共用的最低 epoch 契约。 */
     fun isEpochAccepted(admission: BleConnectionAdmission?): Boolean =

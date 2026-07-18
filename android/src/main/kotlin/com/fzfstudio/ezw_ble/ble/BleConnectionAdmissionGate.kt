@@ -37,14 +37,17 @@ internal class BleConnectionAdmissionGate {
     /** 注册当前 endpoint 的最新尝试代次，并移除尚未执行的旧排队节点。 */
     @Synchronized
     fun registerAttempt(endpointId: String, generation: Long) {
+        // 1、空身份直接忽略，避免污染 latestGenerations。
         if (endpointId.isBlank()) {
             return
         }
+        // 2、只接受不低于当前高水位的新代次。
         val key = endpointKey(endpointId)
         val current = latestGenerations[key]
         if (current != null && generation < current) {
             return
         }
+        // 3、登记新代次，并移除同 endpoint 的旧排队节点。
         latestGenerations[key] = generation
         manualQueue.removeAll { endpointKey(it.endpointId) == key && it.generation < generation }
         automaticQueue.removeAll { endpointKey(it.endpointId) == key && it.generation < generation }
@@ -53,6 +56,7 @@ internal class BleConnectionAdmissionGate {
     /** 按真实物理 callback 到达顺序提交；首个节点立即成为 owner，其余进入优先队列。 */
     @Synchronized
     fun onPhysicalConnected(admission: BleConnectionAdmission): BleConnectionAdmissionDecision {
+        // 1、按 suspended、generation、重复 session 依次做 fail-closed 校验。
         if (admission.endpointId.isBlank()) {
             return BleConnectionAdmissionDecision.INVALID_IDENTITY
         }
@@ -69,6 +73,7 @@ internal class BleConnectionAdmissionGate {
         ) {
             return BleConnectionAdmissionDecision.DUPLICATE
         }
+        // 2、没有 active owner 时立即授权；否则按 source 进入 manual/automatic 队列。
         if (active == null) {
             active = admission
             return BleConnectionAdmissionDecision.GRANTED
@@ -84,10 +89,12 @@ internal class BleConnectionAdmissionGate {
     /** 仅 exact active session 可以完成；返回随后获得准入的节点。 */
     @Synchronized
     fun complete(endpointId: String, generation: Long, sessionId: Long): BleConnectionAdmission? {
+        // 1、只有 exact active token 能释放 owner，迟到终态不得推进队列。
         val owner = active ?: return null
         if (!owner.matches(endpointId, generation, sessionId)) {
             return null
         }
+        // 2、释放当前 owner，并只 grant 下一位等待节点。
         active = null
         return grantNext()
     }
@@ -97,10 +104,12 @@ internal class BleConnectionAdmissionGate {
      */
     @Synchronized
     fun promote(endpointId: String, generation: Long, sessionId: Long) {
+        // 1、查找同一代次的自动等待节点；当前 active 不被抢占。
         val index = automaticQueue.indexOfFirst { it.matches(endpointId, generation, sessionId) }
         if (index < 0) {
             return
         }
+        // 2、移出自动队列后切换 source，保证手动优先级只影响后续 Gate 调度。
         val promoted = automaticQueue.removeAt(index).copy(source = BleConnectSource.MANUAL_RECONNECT)
         manualQueue.add(promoted)
     }
@@ -117,6 +126,7 @@ internal class BleConnectionAdmissionGate {
      */
     @Synchronized
     fun cancelEndpoints(endpointIds: Set<String>): BleConnectionAdmission? {
+        // 1、规范化 endpoint 集合；空集合不改变任何 Gate 状态。
         val keys = endpointIds
             .asSequence()
             .filter { it.isNotBlank() }
@@ -125,14 +135,17 @@ internal class BleConnectionAdmissionGate {
         if (keys.isEmpty()) {
             return null
         }
+        // 2、先推进每个 endpoint 的 generation，阻断所有迟到 callback。
         keys.forEach { key ->
             latestGenerations[key] = nextGeneration(latestGenerations[key] ?: 0L)
         }
+        // 3、原子移除两类等待队列，避免逐个取消期间短暂 grant。
         manualQueue.removeAll { endpointKey(it.endpointId) in keys }
         automaticQueue.removeAll { endpointKey(it.endpointId) in keys }
         if (active?.let { endpointKey(it.endpointId) in keys } != true) {
             return null
         }
+        // 4、active 被取消时才授权下一 owner。
         active = null
         return grantNext()
     }
@@ -160,6 +173,7 @@ internal class BleConnectionAdmissionGate {
     /** 蓝牙关闭会原子失效所有 owner/queue；旧 callback 在恢复后也不能再次准入。 */
     @Synchronized
     fun suspendAndReset() {
+        // 1、标记 suspended，再统一失效 owner、队列和 generation 高水位。
         suspended = true
         invalidateAllLocked()
     }
@@ -170,6 +184,7 @@ internal class BleConnectionAdmissionGate {
      */
     @Synchronized
     fun invalidateAllAndReset() {
+        // 1、配置重置同样失效所有 token，但保持 Gate 可接受新的显式连接。
         invalidateAllLocked()
         suspended = false
     }

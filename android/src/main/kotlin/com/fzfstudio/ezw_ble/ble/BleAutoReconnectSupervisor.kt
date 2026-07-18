@@ -145,14 +145,17 @@ internal class BleAutoReconnectSupervisor(
 
     /** 立即建立或复用长期 pending autoConnect；物理 callback 前不发送 connecting。 */
     fun activate(device: BleDevice, source: BleConnectSource) {
+        // 1、登记/刷新长期目标；这一步不创建第二条 GATT。
         arm(device, source)
         val task = reconnectTasks[reconnectKey(device.uuid)] ?: return
+        // 2、已有 passive owner 时只提升 pending admission，复用当前 GATT。
         if (task.passiveGatt != null || task.timer != null) {
             if (source == BleConnectSource.MANUAL_RECONNECT) {
                 promotePendingAdmission(device.uuid)
             }
             return
         }
+        // 3、首次 activation 同步执行 connectGatt(true)，确保返回前系统已经持有 pending owner。
         // 首轮不能通过 Timer(0) 异步跳出 MethodChannel：调用返回前必须已经同步执行
         // connectGatt(true)，这样上层随后启动扫描时所有有效目标都已进入系统 pending。
         beginInitialAttempt(device.uuid)
@@ -163,12 +166,54 @@ internal class BleAutoReconnectSupervisor(
      * 返回 true 表示 manager 不得继续打开 foreground duplicate GATT。
      */
     fun promotePendingAttempt(uuid: String): Boolean {
+        // 1、只有同一 uuid 已有 pending attempt 才允许提升；没有 owner 交给新 activation。
         val task = reconnectTasks[reconnectKey(uuid)] ?: return false
         if (task.passiveGatt == null && task.timer == null) {
             return false
         }
+        // 2、切换当前 attempt source，并把 admission 节点移入 manual 优先队列。
         task.source = BleConnectSource.MANUAL_RECONNECT
         promotePendingAdmission(uuid)
+        return true
+    }
+
+    /**
+     * OTA reboot 前只剥离当前物理 GATT，保留长期 reconnect task 与持久化 owner。
+     *
+     * 业务 connected 后 [onPassivePhysicalConnected] 会刻意保留 exact GATT，并取消
+     * pre-physical deadline。固件 reboot teardown 随后会由 manager 关闭该 GATT；如果
+     * task 仍保留旧引用，afterUpgrade/manual activation 会误判为仍有 pending attempt，
+     * 永远只提升旧 owner 而不会创建新的 connectGatt。
+     *
+     * 本方法不关闭仍由 BleDevice 持有的 GATT，避免与 manager 的统一 teardown 重复抢占；
+     * 仅当 supervisor 引用已经和 BleDevice 脱钩时，才回收这个孤立句柄。
+     */
+    fun detachPhysicalGattForOtaReboot(uuid: String): Boolean {
+        val detachedGatt = synchronized(this) {
+            val task = reconnectTasks[reconnectKey(uuid)] ?: return false
+            invalidateRetrySchedule(task)
+            task.pendingPhysicalDeadline?.cancel()
+            task.pendingPhysicalDeadline = null
+            task.pendingVisibleDirectConnect = false
+            task.visibleDirectConnectRequested = false
+            val gatt = task.passiveGatt
+            task.passiveGatt = null
+            task.passiveStartedAtMs = 0L
+            gatt
+        }
+
+        val deviceOwnsGatt = connectedDevices.firstOrNull {
+            it.uuid.equals(uuid, ignoreCase = true)
+        }?.myGatt === detachedGatt
+        if (detachedGatt != null && !deviceOwnsGatt) {
+            runCatching { detachedGatt.disconnect() }
+            runCatching { detachedGatt.close() }
+        }
+        releaseVisibleDirectConnectSlot(uuid)
+        sendLog(
+            BleLoggerTag.d,
+            "Auto reconnect: $uuid, OTA reboot detached physical GATT, owner preserved, hadGatt=${detachedGatt != null}",
+        )
         return true
     }
 
@@ -274,12 +319,13 @@ internal class BleAutoReconnectSupervisor(
      * Android 蓝牙关闭会让当前 GATT binder 失效；这里只暂停，等待蓝牙恢复后继续调度。
      */
     fun pauseForBluetoothOff() {
+        // 1、先清空可见直连槽位，避免蓝牙关闭后残留物理 owner。
         // transport reset 不能遗留一个永远占用的直连槽位；所有 task 都会在恢复后回到 passive。
         synchronized(this) {
             visibleDirectConnectQueue.clear()
             activeVisibleDirectConnectUuid = null
         }
-        // 1. 清掉延迟 timer，并标记为蓝牙关闭导致的暂停。
+        // 2、清掉延迟 timer，并标记为蓝牙关闭导致的暂停。
         reconnectTasks.values.forEach { task ->
             task.pausedByBluetoothOff = true
             task.source = BleReconnectSourcePolicy.afterTransportReset()
@@ -290,7 +336,7 @@ internal class BleAutoReconnectSupervisor(
             task.pendingVisibleDirectConnect = false
             task.visibleDirectConnectRequested = false
 
-            // 2. passive GATT 不可复用，必须 close 后等待下一轮重新 connectGatt。
+            // 2.1、passive GATT 不可复用，必须 close 后等待下一轮重新 connectGatt。
             try {
                 task.passiveGatt?.disconnect()
                 task.passiveGatt?.close()
@@ -311,10 +357,11 @@ internal class BleAutoReconnectSupervisor(
      * connected 后建立的持续意图，停止源只能是用户/业务主动取消、配置关闭或 reset/release。
      */
     fun resumeAfterBluetoothOn() {
-        // 1. 只恢复因蓝牙关闭暂停的任务。
+        // 1、只恢复因蓝牙关闭暂停的任务。
         reconnectTasks.values
             .filter { it.pausedByBluetoothOff }
             .forEach { task ->
+                // 1.1、恢复长期 owner；具体 GATT 创建仍由 schedule 串行调度。
                 task.pausedByBluetoothOff = false
                 schedule(
                     task.uuid,

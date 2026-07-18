@@ -97,10 +97,11 @@ extension BleManager {
      *  willRestoreState 可能早于 initConfigs，必须等配置存在后才能知道该走哪套私有服务。
      */
     func flushPendingRestoredPeripherals() {
+        // 1、只有配置初始化完成后才消费暂存 peripheral，避免无 owner 误恢复。
         guard restorationCoordinator.hasPendingPeripherals else {
             return
         }
-        // drain 后逐个 replay；如果仍匹配不到配置，restorePeripheral 会负责重新 enqueue。
+        // 2、逐个 replay；如果仍匹配不到配置，restorePeripheral 会按授权策略重新暂存或拒绝。
         restorationCoordinator.drainPendingPeripherals().forEach { peripheral in
             restorePeripheral(peripheral, source: "pending-after-initConfigs")
         }
@@ -112,10 +113,11 @@ extension BleManager {
      *  restored peripheral 只表示系统恢复了物理对象，不代表私有服务/notify/业务认证已经 ready。
      */
     func restorePeripheral(_ peripheral: CBPeripheral, source: String) {
+        // 1、State Restoration 只恢复系统 peripheral 对象，不代表业务 GATT 已 ready。
         peripheral.delegate = self
         let uuid = peripheral.identifier.uuidString
         let name = peripheral.name ?? ""
-        // 先记录 native 事件，便于 Dart 恢复后补读 State Restoration 发生过什么。
+        // 1.1、先记录 native 事件，便于 Dart 恢复后补读 State Restoration 发生过什么。
         recordAutoReconnectEvent(
             type: "ios_restore_peripheral",
             uuid: uuid,
@@ -123,6 +125,7 @@ extension BleManager {
             detail: source
         )
         loggerD(msg: "stateRestoration: restore peripheral source=\(source), uuid=\(uuid), name=\(name), state=\(peripheral.state.rawValue), services=\(peripheral.services?.count ?? 0)")
+        // 2、按 persisted/runtime owner 授权配置；无授权时延后或 fail-closed。
         guard let bleConfig = findRestoredBleConfig(peripheral: peripheral) else {
             switch BleStateRestorationAuthorization.replayDecision(
                 configsInitialized: hasInitializedBleConfigs,
@@ -148,6 +151,7 @@ extension BleManager {
             }
             return
         }
+        // 3、授权后把 restored peripheral 接入统一 admission/GATT pipeline；旧 UUID 会先迁移。
         // persisted owner 可能仍是旧 UUID A，而 restoration/辅助扫描已给出新 UUID B。
         // 先补建长期 task，再复用同一原子迁移逻辑，保证 B 终态仍能继续自动回连。
         if let target = persistedReconnectTarget(uuid: uuid, name: name) {

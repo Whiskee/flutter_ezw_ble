@@ -447,13 +447,14 @@ extension BleManager {
         afterUpgrade: Bool,
         source: BleConnectSource
     ) -> BleConnectionAdmission? {
+        // 1、校验稳定 peripheral identity；空 UUID 不进入 Gate。
         let endpointId = peripheral.identifier.uuidString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !endpointId.isEmpty else {
             loggerE(msg: "admission gate: reject blank peripheral identity")
             return nil
         }
         let key = reconnectKey(uuid: endpointId)
-        // generation 使用单一饱和序列，不按历史 UUID 建表；Gate 只保留当前在途 endpoint。
+        // 2、递增全局 generation/session；Gate 只保留当前在途 endpoint。
         connectionAttemptGenerationSequence = connectionAttemptGenerationSequence == Int64.max
             ? Int64.max
             : connectionAttemptGenerationSequence + 1
@@ -465,6 +466,7 @@ extension BleManager {
             sessionId: connectionSessionSequence,
             source: source
         )
+        // 3、先登记 Gate，再写 current/session 映射，保证随后物理回调可精确归属。
         connectionAdmissionGate.registerAttempt(endpointId: endpointId, generation: generation)
         currentConnectionAdmissions[key] = admission
         peripheralConnectionSessions[admission.sessionId] = BlePeripheralConnectionSession(
@@ -509,6 +511,7 @@ extension BleManager {
 
     /// 真实物理连接回调的唯一入口；只在此刻发 source-tagged contactDevice。
     func enqueuePhysicalConnectionThroughGate(_ peripheral: CBPeripheral) {
+        // 1、校验 current admission、session 和 CBPeripheral 对象身份，旧 callback 直接关闭。
         guard let admission = currentConnectionAdmission(uuid: peripheral.identifier.uuidString),
               var session = peripheralConnectionSessions[admission.sessionId],
               session.peripheral === peripheral else {
@@ -516,12 +519,13 @@ extension BleManager {
             centralManager.cancelPeripheralConnection(peripheral)
             return
         }
-        // physical callback 一旦到达，之后的手动点击只可以提升 Gate 优先级，不能取消
+        // 2、记录真实物理接触并取消观察 watchdog；之后手动点击只可以提升 Gate 优先级，不能取消
         // 已建立的链路并重开 GATT；这也是区别“陈旧 pending”与正常慢连接的边界。
         session.hasObservedPhysicalContact = true
         peripheralConnectionSessions[admission.sessionId] = session
         pendingPhysicalConnectWatchdogs.takeIfCurrent(admission)?.cancel()
         visiblePendingRecoveryWatchdogs.takeIfCurrent(admission)?.cancel()
+        // 3、把 contact 交给 Gate；只有 granted 才开始 GATT/service pipeline。
         switch connectionAdmissionGate.onPhysicalConnected(admission) {
         case .granted:
             handleConnectState(
@@ -569,6 +573,7 @@ extension BleManager {
 
     /// Gate owner 唯一允许启动 service discovery，此刻才开始连接超时。
     func startGrantedGattPipeline(_ expected: BleConnectionAdmission) {
+        // 1、重新校验 exact admission/session/peripheral，防止旧 owner 获得 pipeline。
         guard let admission = currentConnectionAdmission(expected),
               let session = peripheralConnectionSessions[expected.sessionId] else {
             releaseOrphanedConnectionAdmission(expected, reason: "missing session at grant")
@@ -578,6 +583,7 @@ extension BleManager {
             releaseOrphanedConnectionAdmission(expected, reason: "peripheral identity mismatch at grant")
             return
         }
+        // 2、安装 delegate、替换缓存并从此刻开始业务连接超时。
         let peripheral = session.peripheral
         peripheral.delegate = self
         connectedDevices.removeAll { device in
@@ -605,6 +611,7 @@ extension BleManager {
             session.config.privateServices.contains { $0.serviceUUID == service.uuid }
         }
         loggerD(msg: "admission gate: \(admission.endpointId), start services cached=\(cachedPrivateServices.count)/\(session.config.privateServices.count)")
+        // 3、优先复用完整缓存服务，否则发起 service discovery。
         if cachedPrivateServices.count == session.config.privateServices.count {
             processDiscoveredServices(peripheral: peripheral, error: nil, tag: "admission cached")
         } else {
@@ -617,11 +624,13 @@ extension BleManager {
         _ expected: BleConnectionAdmission,
         invalidateEndpoint: Bool
     ) -> BleConnectionAdmission? {
+        // 1、只释放当前 exact admission，并取消该代次所有 watchdog。
         guard let current = currentConnectionAdmission(expected) else { return nil }
         pendingPhysicalConnectWatchdogs.takeIfCurrent(current)?.cancel()
         visiblePendingRecoveryWatchdogs.takeIfCurrent(current)?.cancel()
         currentConnectionAdmissions.removeValue(forKey: reconnectKey(uuid: current.endpointId))
         peripheralConnectionSessions.removeValue(forKey: current.sessionId)
+        // 2、根据终态是完成还是硬取消，选择 complete 或 cancelEndpoint 推进 Gate。
         return invalidateEndpoint
             ? connectionAdmissionGate.cancelEndpoint(current.endpointId)
             : connectionAdmissionGate.complete(current)
@@ -654,11 +663,13 @@ extension BleManager {
     /// 手动点击只提升已存在的 pending session，不抢占 active，不新建 peripheral connect。
     @discardableResult
     func promotePendingAttempt(uuid: String) -> Bool {
+        // 1、找到同一 pending session；不存在时由 coordinator 创建新 attempt。
         let key = reconnectKey(uuid: uuid)
         guard let current = currentConnectionAdmissions[key],
               var session = peripheralConnectionSessions[current.sessionId] else {
             return false
         }
+        // 2、更新 current/session source，再提升 Gate 等待优先级，不重建 CoreBluetooth connect。
         let promoted = BleConnectionAdmission(
             endpointId: current.endpointId,
             generation: current.generation,
@@ -810,6 +821,7 @@ extension BleManager {
 
     /// 蓝牙关闭必须先取消全部 peripheral handle，再原子失效 Gate/generation。
     func suspendConnectionAdmissionGateForBluetoothOff() {
+        // 1、先取消所有 peripheral handle，再原子失效 Gate、session、watchdog 和 barrier。
         let peripherals = peripheralConnectionSessions.values.map { $0.peripheral }
         var cancelled = Set<ObjectIdentifier>()
         for peripheral in peripherals where cancelled.insert(ObjectIdentifier(peripheral)).inserted {
