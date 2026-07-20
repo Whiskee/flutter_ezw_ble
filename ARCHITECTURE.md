@@ -651,11 +651,16 @@ connect(belongConfig, uuid, name, sn, directConnect=false)
 
 BluetoothGattCallback
   ├─ STATE_CONNECTED → onPhysicalConnected(admission)
-  ├─ 全局 Gate granted（排队时间不计超时）→ startConnectTimeout → discoverServices
+  ├─ 全局 Gate granted（排队时间不计超时）→ startConnectTimeout
+  ├─ initiateBinding=false 或系统已 BOND_BONDED → discoverServices
+  ├─ initiateBinding=true 且 BOND_BONDING → startBinding，持有 Gate 等待 bond 广播
+  ├─ initiateBinding=true 且 BOND_NONE → startBinding → createBond()
+  │    ├─ BOND_BONDED → 同一 Gate/GATT session 恢复 discoverServices
+  │    └─ BOND_BONDING → BOND_NONE → exact BOUND_FAIL teardown，释放 Gate
   ├─ onServicesDiscovered → 找 privateServices
   ├─ 写 CCCD descriptor → 全部 readChars notify enabled
   ├─ requestMtu(config.mtu)
-  └─ connectFinish 或 createBond/startBinding
+  └─ connectFinish
 ```
 
 Android 的防重入重点是 `isWaitingDevice`：scan-then-connect 阶段已经先把设备置为 `CONNECTING`，扫描命中后必须允许二次进入真正 `connectGatt`，否则会被自己设置的 `isConnecting` 挡住。连接状态上报也应尽量使用解析后的稳定 name，而不是回读可能为空的 `BluetoothDevice.name`。
@@ -683,14 +688,16 @@ connectFinish 上报给 Dart
 
 ### 11.4 Android bond 状态映射边界
 
-`onDeviceBondStateChanged(device, isBonded)` 是 `alreadyBound/boundFail` 的主要来源，风险最大。它必须遵守阶段语义：
+`onDeviceBondStateChanged(device, bondState, previousBondState)` 只消费系统 bond 结果，不再直接把布尔值映射为业务终态。它必须遵守阶段语义：
 
-- `isBonded == true` 且 `belongConfig.initiateBinding == true`：可以推进 `CONNECT_FINISH`。
-- 当前处于 `START_BINDING` 或主动绑定流程中失败：可以上报 `BOUND_FAIL`。
+- 只有 `initiateBinding=true`、当前为 `START_BINDING`，并且 endpoint + generation + sessionId + GATT 都属于当前 Gate owner，广播才可推进连接。
+- `BOND_BONDED`：在同一 GATT 上恢复服务发现；不得跳过 CCCD/MTU 直接推进 `CONNECT_FINISH`。
+- 明确的 `BOND_BONDING → BOND_NONE`：走 exact `BOUND_FAIL` teardown，关闭当前 GATT、释放 Gate，再启动下一 endpoint。
+- `BOND_BONDING`、重复 `BOND_NONE`、错误 generation、false-config 与其它迟到广播：全部忽略。
 - 当前已经 `CONNECTED/UPGRADE`：迟到的 bond 失败不应覆盖连接成功态。
 - 当前已经 `TIMEOUT/DISCONNECT_FROM_SYS`：bond 失败通常是后续副作用，应避免再次把语义改成 `BOUND_FAIL`，否则上层会把可重试链路误判成 777 终态。
 
-G2 当前配置 `initiateBinding=false`，它的应用层安全握手由 `even_connect` 发送 `AUTHENTICATION(4)` 完成，不应依赖 Android 系统 bond 成功来判断业务连接成功。
+R1 的 Android 系统 bond 与协议 `pairAuth` 是两个独立阶段：先 bond 只解决受保护 GATT 的可访问性，`connectFinish` 后仍必须完成协议认证。G1/G2 保持 `initiateBinding=false`；即使 Android 因访问受保护属性自行触发配对，也不能视为插件主动调用 `createBond()`。
 
 ### 11.5 `GATT_CONN_LMP_TIMEOUT` 的处理原则
 

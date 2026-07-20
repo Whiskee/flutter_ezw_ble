@@ -139,8 +139,10 @@ Native reconnect is a persistent intent after `deviceConnected(uuid)`. Reaching
 
 Waiting in the global admission queue is not part of `connectTimeout`. The
 business-pipeline timeout starts only after a real
-`STATE_CONNECTED` / `didConnect` callback has been granted the Gate and service
-discovery begins. It remains active through `connectFinish` until final
+`STATE_CONNECTED` / `didConnect` callback has been granted the Gate. On Android,
+an `initiateBinding=true` owner may first hold that same Gate while system bonding
+completes; service discovery starts only after `BOND_BONDED`. The timeout remains
+active through bonding and `connectFinish` until final
 `deviceConnected`, with the existing bounded auth grace.
 
 Android bounds only the pre-physical-callback lifetime of each pending
@@ -167,7 +169,14 @@ discovery, characteristic discovery, CCCD/notify setup, and business auth:
 - queue time is excluded from the timeout;
 - `connectFinish` does not release the owner;
 - business `deviceConnected`, or an acknowledged terminal teardown, releases
-  the owner and starts the next endpoint.
+the owner and starts the next endpoint.
+
+On Android the active Gate also serializes proactive system bonding for configs
+with `initiateBinding=true`. A `BONDING` owner keeps the Gate; `BOND_BONDED`
+resumes service discovery on the exact GATT/session, while an explicit
+`BOND_BONDING -> BOND_NONE` terminates that session before the next owner starts.
+Configs with `initiateBinding=false` skip plugin-owned `createBond()` and enter
+service discovery directly.
 
 Every admission is identified by endpoint + generation + session and, at the
 platform boundary, the exact GATT/peripheral object. Stale callbacks fail

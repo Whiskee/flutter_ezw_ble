@@ -13,8 +13,8 @@ class BleStateListener(private val context: Context) {
     // 定义回调接口
     interface BluetoothStateCallback {
         fun onBluetoothStateChanged(state: Int)
-        //  可选
-        fun onDeviceBondStateChanged(device: BluetoothDevice, isBonded: Boolean) {}
+        /** 透传权威 bond 前后状态；上层必须结合 exact session 决定是否推进连接。 */
+        fun onDeviceBondStateChanged(device: BluetoothDevice, bondState: Int, previousBondState: Int) {}
         //  可选
         fun onDeviceConnected(device: BluetoothDevice) {}
         //  可选
@@ -48,12 +48,16 @@ class BleStateListener(private val context: Context) {
                     device?.let { callback?.onDeviceConnected(it) }
                 }
                 BluetoothDevice.ACTION_BOND_STATE_CHANGED -> {
+                    // 1、BOND_BONDING 也是状态机证据，不能再压缩成 isBonded 或提前丢弃。
                     val bondState = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, -1)
-                    //  避免多次回调
-                    if (bondState == BluetoothDevice.BOND_BONDING) {
-                        return
+                    val previousBondState = intent.getIntExtra(
+                        BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE,
+                        -1,
+                    )
+                    // 2、Manager 使用 current/previous 识别成功与明确的 BONDING -> NONE 拒绝。
+                    device?.let {
+                        callback?.onDeviceBondStateChanged(it, bondState, previousBondState)
                     }
-                    device?.let { callback?.onDeviceBondStateChanged(it, bondState == BluetoothDevice.BOND_BONDED) }
                 }
                 BluetoothDevice.ACTION_ACL_DISCONNECTED -> {
                     device?.let { callback?.onDeviceDisconnected(it) }

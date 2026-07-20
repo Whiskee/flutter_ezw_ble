@@ -75,6 +75,28 @@ void main() {
     expect(reconnect, isNot(contains('BleConnectState.CONNECTING')));
   });
 
+  test('Android R1 bonds inside the gate before GATT readiness', () {
+    final callback = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleGattSessionCallback.kt',
+    ).readAsStringSync();
+    final manager = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleManager.kt',
+    ).readAsStringSync();
+    final listener = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/services/BleStateListener.kt',
+    ).readAsStringSync();
+
+    expect(callback, isNot(contains('createBond()')));
+    expect(manager, contains('startBondBeforeGattReadiness(current, session)'));
+    expect(manager, contains('session.gatt.device.createBond()'));
+    expect(manager, contains('connectionAdmissionGate.isActive(current)'));
+    expect(manager, contains('startGrantedServiceDiscovery'));
+    expect(manager, contains('state = BleConnectState.BOUND_FAIL'));
+    expect(listener, contains('BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE'));
+    expect(
+        listener, isNot(contains('bondState == BluetoothDevice.BOND_BONDING')));
+  });
+
   test(
       'Android business-connected GATT disconnect survives admission release and restarts passive reconnect',
       () {

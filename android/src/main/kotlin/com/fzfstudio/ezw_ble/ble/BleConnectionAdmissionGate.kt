@@ -86,6 +86,10 @@ internal class BleConnectionAdmissionGate {
         return BleConnectionAdmissionDecision.QUEUED
     }
 
+    /** bond/service callback 只有携带 exact 三元 token 时才属于当前 Gate owner。 */
+    @Synchronized
+    fun isActive(admission: BleConnectionAdmission): Boolean = active?.sameSession(admission) == true
+
     /** 仅 exact active session 可以完成；返回随后获得准入的节点。 */
     @Synchronized
     fun complete(endpointId: String, generation: Long, sessionId: Long): BleConnectionAdmission? {

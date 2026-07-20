@@ -3,7 +3,9 @@ package com.fzfstudio.ezw_ble.ble
 import com.fzfstudio.ezw_ble.ble.models.BleConnectSource
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 /** 全局连接 Gate 的纯状态机测试，不依赖 Android BluetoothGatt。 */
 class BleConnectionAdmissionGateTest {
@@ -163,6 +165,23 @@ class BleConnectionAdmissionGateTest {
         val replacement = lost.copy(generation = 2, sessionId = 53)
         assertEquals(BleConnectionAdmissionDecision.QUEUED, gate.onPhysicalConnected(replacement))
         assertEquals(replacement, gate.complete(peer.endpointId, peer.generation, peer.sessionId))
+    }
+
+    @Test
+    fun `only exact active admission owns the granted pipeline`() {
+        val gate = BleConnectionAdmissionGate()
+        val active = admission("ring", 3, 71, BleConnectSource.AUTO_RECONNECT)
+        val queued = admission("g2-left", 4, 72, BleConnectSource.AUTO_RECONNECT)
+        listOf(active, queued).forEach { gate.registerAttempt(it.endpointId, it.generation) }
+
+        gate.onPhysicalConnected(active)
+        gate.onPhysicalConnected(queued)
+
+        assertTrue(gate.isActive(active))
+        assertFalse(gate.isActive(active.copy(sessionId = 73)))
+        assertFalse(gate.isActive(queued))
+        assertEquals(queued, gate.complete(active.endpointId, active.generation, active.sessionId))
+        assertTrue(gate.isActive(queued))
     }
 
     private fun admission(

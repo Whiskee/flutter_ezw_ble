@@ -1,6 +1,5 @@
 package com.fzfstudio.ezw_ble.ble
 
-import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
@@ -404,25 +403,15 @@ internal class BleGattSessionCallback(
     /**
      * 根据 MTU 回调完成连接流程。
      *
-     * 如果配置要求主动绑定，则先触发系统 bond；真正的业务 connected 仍由 Dart 鉴权成功后
-     * 调用 `deviceConnected`，这里最多上报 connectFinish。
+     * 系统 bond 已在 Gate owner 获准后、服务发现前完成；这里仅上报 GATT readiness。
+     * 真正的业务 connected 仍由 Dart 鉴权成功后调用 `deviceConnected`。
      */
     private fun connectingFlowFinish(gatt: BluetoothGatt, mtu: Int) {
         // 1. 再次校验 session，防止旧 MTU 回调错误完成新连接。
         val address = gatt.device.address
         val device = currentExpectedDeviceForGatt(gatt, "connect finish") ?: return
         val name = device.name
-        val config = device.belongConfig
-
-        // 2. 需要系统绑定且尚未绑定时，先进入 START_BINDING，由 bond listener 继续流程。
-        if (config.initiateBinding && gatt.device.bondState != BluetoothDevice.BOND_BONDED) {
-            gatt.device.createBond()
-            sendLog(BleLoggerTag.d, "Connect call back: $address, start create bond")
-            handleConnectState(address, name, BleConnectState.START_BINDING, DEFAULT_MTU)
-            return
-        }
-
-        // 3. GATT readiness 完成后上报 connectFinish，等待 Dart 业务认证后再进入 connected。
+        // 2. GATT readiness 完成后上报 connectFinish，等待 Dart 业务认证后再进入 connected。
         handleConnectState(address, name, BleConnectState.CONNECT_FINISH, mtu)
         sendLog(BleLoggerTag.d, "Connect call back: $address, connect finish")
     }

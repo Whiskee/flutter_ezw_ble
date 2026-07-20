@@ -114,6 +114,8 @@ class BleManager private constructor() {
         val gatt: BluetoothGatt,
         val device: BleDevice,
         val afterUpgrade: Boolean,
+        /** bond 成功与 createBond 返回可能竞速；同一 session 只允许提交一次服务发现。 */
+        var serviceDiscoveryStarted: Boolean = false,
     )
 
     /** 业务 connected 已释放 Gate，但物理 GATT 仍长期存活。 */
@@ -1194,7 +1196,7 @@ class BleManager private constructor() {
             source = BleConnectSource.AUTO_RECONNECT,
         )
         sendLog(
-            BleLoggerTag.w,
+            BleLoggerTag.e,
             "OTA reboot disconnect: $endpointId, synthesized terminal admission " +
                 "generation=$generation, source=${admission.source.flutterValue}",
         )
@@ -1658,46 +1660,66 @@ class BleManager private constructor() {
             checkBluetoothPermission()
         }
 
-        override fun onDeviceBondStateChanged(device: BluetoothDevice, isBonded: Boolean) {
+        override fun onDeviceBondStateChanged(
+            device: BluetoothDevice,
+            bondState: Int,
+            previousBondState: Int,
+        ) {
+            // 1、广播只提供系统状态；先解析 endpoint，找不到当前设备时直接 fail-closed。
             val connectedDevice = findConnectedDevice(device.address)
-            //  1、不处理非连接设备的绑定状态
             if (connectedDevice == null) {
-                sendLog(BleLoggerTag.e, "Ble status listener - bond state: ${device.address} not connected device")
+                sendLog(BleLoggerTag.d, "Bond before GATT: endpoint=${device.address}, ignored missing device")
                 return
             }
-            //  2、如果没有绑定成功就结束
-            if (!isBonded) {
-                //  - 存在已经配对过的设备，蓝牙密钥信息丢失，
-                //  - 发起连接会立马返回断连或则绑定失败，导致执行了断连，此时超时连接定时器已经关闭
-                //  - 但是此时服务搜索又可以执行，会使连接进入连接中，一直无法退出
-                //  - 所以阻断执行boundFail的流程，等待超时关闭连接
-                if (connectedDevice.connectState.isConnecting || connectedDevice.connectState.isDisconnected) {
-                    return
+
+            val currentBondState = systemBondStateOf(bondState)
+            val oldBondState = systemBondStateOf(previousBondState)
+            var exactAdmission: BleConnectionAdmission? = null
+            var action = BondBroadcastAction.IGNORE
+
+            // 2、与 createBond 使用同一 device monitor，防止 false 返回覆盖同步成功广播。
+            synchronized(connectedDevice) {
+                val candidate = currentAdmissions[reconnectKey(connectedDevice.uuid)]
+                val session = candidate?.let { admittedGattSessions[it.sessionId] }
+                val ownsExactGatt = candidate != null &&
+                    session?.gatt === connectedDevice.myGatt &&
+                    session?.device === connectedDevice &&
+                    connectionAdmissionGate.isActive(candidate)
+
+                // 2.1、只有当前 Gate owner、exact GATT、主动配对配置和 START_BINDING 可推进。
+                if (ownsExactGatt) {
+                    val owner = candidate ?: return@synchronized
+                    exactAdmission = owner
+                    action = decideBondBroadcastAction(
+                        initiateBinding = connectedDevice.belongConfig.initiateBinding,
+                        connectState = connectedDevice.connectState,
+                        bondState = currentBondState,
+                        previousBondState = oldBondState,
+                    )
                 }
-                //  - 只有连接成功后才执行搜索，确保再次连接设备时设备能被重新刷新，避免连接旧的连接信息
-                mainScope.launch {
-                    startScan()
+                sendLog(
+                    BleLoggerTag.d,
+                    "Bond before GATT: endpoint=${connectedDevice.uuid}, source=${candidate?.source?.flutterValue}, " +
+                        "generation=${candidate?.generation}, sessionId=${candidate?.sessionId}, " +
+                        "previous=$oldBondState, current=$currentBondState, exactOwner=$ownsExactGatt, action=$action",
+                )
+            }
+
+            // 3、锁外执行 GATT/终态动作；两个出口都会再次校验 exact token 与 GATT identity。
+            when (action) {
+                BondBroadcastAction.DISCOVER_SERVICES -> exactAdmission?.let {
+                    startGrantedServiceDiscovery(it, reason = "bond broadcast success")
                 }
-                sendLog(BleLoggerTag.e, "Ble status listener - bond state: ${device.address} unable to bind")
-                handleConnectState(connectedDevice.uuid, connectedDevice.name, BleConnectState.BOUND_FAIL)
-                return
+                BondBroadcastAction.FAIL_BINDING -> exactAdmission?.let { admission ->
+                    terminateConnectionAdmission(
+                        expectedAdmission = admission,
+                        gatt = connectedDevice.myGatt,
+                        fallbackName = connectedDevice.name,
+                        state = BleConnectState.BOUND_FAIL,
+                    )
+                }
+                BondBroadcastAction.IGNORE -> Unit
             }
-            //  3、如果眼镜已经连接了就不再执行绑定
-            if (connectedDevice.connectState.isConnected) {
-                sendLog(BleLoggerTag.e, "Ble status listener - bond state: ${device.address} bind success")
-                return
-            }
-            //  4、检查当前设备连接状态，如果出现异常就不处理
-            if (connectedDevice.connectState.isError) {
-                sendLog(BleLoggerTag.e, "Ble status listener - bond state: ${device.address} is ${connectedDevice.connectState}, bound failure")
-                handleConnectState(connectedDevice.uuid, connectedDevice.name, BleConnectState.BOUND_FAIL)
-                return
-            }
-            //  5、主动绑定时，需要进入CONNECT_FINISH流程，如果是眼镜主动绑定，则默认进入CONNECT_FINISH
-            if (connectedDevice.belongConfig.initiateBinding) {
-                handleConnectState(connectedDevice.uuid, connectedDevice.name, BleConnectState.CONNECT_FINISH)
-            }
-            sendLog(BleLoggerTag.d, "Ble status listener - bond state: ${device.address} is bonded, state = ${connectedDevice.connectState}, finish connect")
         }
     }
 
@@ -2090,7 +2112,8 @@ class BleManager private constructor() {
         }
     }
 
-    /** Gate owner 唯一允许启动 service discovery；此刻才开始计算 connectTimeout。 */
+    /** Gate owner 获准后启动 timeout，并在同一 owner 内先完成系统 bond 再进入 GATT readiness。 */
+    @Synchronized
     private fun startGrantedGattPipeline(admission: BleConnectionAdmission) {
         val session = admittedGattSessions[admission.sessionId]
         if (session == null) {
@@ -2118,7 +2141,153 @@ class BleManager private constructor() {
             session.afterUpgrade,
             admission = current,
         )
-        val started = session.gatt.discoverServices()
+        startBondBeforeGattReadiness(current, session)
+    }
+
+    /**
+     * 在 Gate 内选择主动配对、等待系统配对或直接服务发现。
+     *
+     * 1、false-config 与已配对设备不改变既有服务发现路径。
+     * 2、等待/发起配对时先上报 START_BINDING，并持续占有 Gate 与连接 timeout。
+     * 3、只有权威成功广播或 createBond 后 framework 已同步进入 BONDED 才恢复服务发现。
+     */
+    private fun startBondBeforeGattReadiness(
+        admission: BleConnectionAdmission,
+        session: GrantedGattSession,
+    ) {
+        val bondState = systemBondStateOf(session.gatt.device.bondState)
+        val action = decideGateGrantedBondAction(
+            initiateBinding = session.device.belongConfig.initiateBinding,
+            bondState = bondState,
+        )
+        sendLog(
+            BleLoggerTag.d,
+            "Bond before GATT: endpoint=${admission.endpointId}, source=${admission.source.flutterValue}, " +
+                "generation=${admission.generation}, sessionId=${admission.sessionId}, " +
+                "bondState=$bondState, action=$action",
+        )
+        when (action) {
+            GateGrantedBondAction.DISCOVER_SERVICES ->
+                startGrantedServiceDiscovery(admission, reason = "gate granted")
+            GateGrantedBondAction.WAIT_FOR_BOND -> {
+                handleConnectState(
+                    session.device.uuid,
+                    session.device.name,
+                    BleConnectState.START_BINDING,
+                    source = admission.source,
+                    generation = admission.generation,
+                )
+            }
+            GateGrantedBondAction.START_BOND -> startGrantedSystemBond(admission, session)
+        }
+    }
+
+    /** 主动配对前先发布 START_BINDING，并复查 framework 状态消除 createBond(false) 竞态。 */
+    @Synchronized
+    private fun startGrantedSystemBond(
+        admission: BleConnectionAdmission,
+        session: GrantedGattSession,
+    ) {
+        var resumeServiceDiscovery = false
+        var failBinding = false
+        synchronized(session.device) {
+            // 1、createBond 前再次确认 exact Gate/GATT；取消、替换或 next owner 均不得继续。
+            val current = currentAdmissionFor(admission)
+            val exactSession = current?.let { admittedGattSessions[it.sessionId] }
+            if (current == null ||
+                exactSession !== session ||
+                session.device.myGatt !== session.gatt ||
+                !connectionAdmissionGate.isActive(current)
+            ) {
+                sendLog(
+                    BleLoggerTag.d,
+                    "Bond before GATT: endpoint=${admission.endpointId}, generation=${admission.generation}, " +
+                        "sessionId=${admission.sessionId}, proactive bond ignored stale owner",
+                )
+                return
+            }
+
+            // 2、状态必须先进入 START_BINDING；快速广播随后才能被 exact guard 接受。
+            handleConnectState(
+                session.device.uuid,
+                session.device.name,
+                BleConnectState.START_BINDING,
+                source = current.source,
+                generation = current.generation,
+            )
+            val beforeBondState = systemBondStateOf(session.gatt.device.bondState)
+            val createBondResult = runCatching { session.gatt.device.createBond() }
+            val createBondStarted = createBondResult.getOrDefault(false)
+            val afterBondState = systemBondStateOf(session.gatt.device.bondState)
+            resumeServiceDiscovery = afterBondState == SystemBondState.BONDED
+            failBinding = shouldFailRejectedCreateBond(
+                createBondStarted = createBondStarted,
+                connectState = session.device.connectState,
+                bondState = afterBondState,
+            )
+            sendLog(
+                if (createBondResult.isFailure || failBinding) BleLoggerTag.e else BleLoggerTag.d,
+                "Bond before GATT: endpoint=${current.endpointId}, source=${current.source.flutterValue}, " +
+                    "generation=${current.generation}, sessionId=${current.sessionId}, " +
+                    "before=$beforeBondState, after=$afterBondState, createBondStarted=$createBondStarted, " +
+                    "error=${createBondResult.exceptionOrNull()?.message}",
+            )
+        }
+
+        // 3、同步成功复用同一服务发现入口；明确拒绝必须 exact teardown 并释放下一 owner。
+        when {
+            resumeServiceDiscovery -> startGrantedServiceDiscovery(
+                admission,
+                reason = "createBond observed bonded",
+            )
+            failBinding -> terminateConnectionAdmission(
+                expectedAdmission = admission,
+                gatt = session.gatt,
+                fallbackName = session.device.name,
+                state = BleConnectState.BOUND_FAIL,
+            )
+        }
+    }
+
+    /** exact Gate owner 在同一 GATT 上只允许提交一次 service discovery。 */
+    @Synchronized
+    private fun startGrantedServiceDiscovery(
+        admission: BleConnectionAdmission,
+        reason: String,
+    ) {
+        val current = currentAdmissionFor(admission) ?: return
+        val session = admittedGattSessions[current.sessionId] ?: run {
+            releaseOrphanedAdmission(current, "missing GATT session before service discovery")
+            return
+        }
+        if (!connectionAdmissionGate.isActive(current) || session.device.myGatt !== session.gatt) {
+            sendLog(
+                BleLoggerTag.d,
+                "Bond before GATT: endpoint=${current.endpointId}, generation=${current.generation}, " +
+                    "sessionId=${current.sessionId}, service discovery ignored stale owner",
+            )
+            return
+        }
+
+        val started = synchronized(session) {
+            // 1、createBond 同步状态与成功广播可能同时到达，session 标志负责去重。
+            if (session.serviceDiscoveryStarted) {
+                sendLog(
+                    BleLoggerTag.d,
+                    "Bond before GATT: endpoint=${current.endpointId}, generation=${current.generation}, " +
+                        "sessionId=${current.sessionId}, duplicate service discovery ignored, reason=$reason",
+                )
+                return
+            }
+            session.serviceDiscoveryStarted = true
+            runCatching { session.gatt.discoverServices() }.getOrDefault(false)
+        }
+        sendLog(
+            if (started) BleLoggerTag.d else BleLoggerTag.e,
+            "Bond before GATT: endpoint=${current.endpointId}, source=${current.source.flutterValue}, " +
+                "generation=${current.generation}, sessionId=${current.sessionId}, " +
+                "discoverServicesStarted=$started, reason=$reason",
+        )
         if (!started) {
             terminateConnectionAdmission(
                 expectedAdmission = current,
