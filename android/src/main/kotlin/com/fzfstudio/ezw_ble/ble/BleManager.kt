@@ -1150,12 +1150,7 @@ class BleManager private constructor() {
             currentAdmission = currentAdmissions[key],
             businessConnectedAdmission = businessConnectedGattSessions[key]?.admission,
             lastBusinessConnectedAdmission = lastEpochAcceptedAdmissions[key],
-        ) ?: run {
-            // 不能把 unknown/0 发给 Dart：它会被 epoch guard 拒绝并留下假连接。OTA
-            // 收尾只允许业务已确认 connected 的 endpoint 进入，因此这属于不变量破坏。
-            sendLog(BleLoggerTag.e, "OTA reboot disconnect: ${device.uuid}, missing epoch-accepted admission")
-            return
-        }
+        ) ?: synthesizeOtaRebootTerminalAdmission(device.uuid, key)
         // 2、OTA 只保留逻辑 reconnect owner；旧物理 GATT 必须先从 supervisor 脱钩，
         // 否则 afterUpgrade/manual activation 会永远复用已经被 releaseAndClear 的句柄。
         autoReconnectSupervisor.detachPhysicalGattForOtaReboot(device.uuid)
@@ -1172,6 +1167,38 @@ class BleManager private constructor() {
             scheduleAutoReconnect = false,
         )
         sendLog(BleLoggerTag.d, "OTA reboot disconnect: ${device.uuid}, owner preserved")
+    }
+
+    /**
+     * OTA reboot 是已知的 transport teardown 边界，即使 Dart 之前没有接受过该腿的
+     * connected admission，也必须先释放物理 GATT，再让 afterUpgrade 覆盖整机双腿。
+     *
+     * 这里生成的 admission 只用于 `disconnectFromSys` 终态，不代表连接成功，也不会
+     * 写入业务 connected session。generation 使用当前 endpoint 的下一个高水位，配合
+     * Dart persistent autoReconnect 的 allowWithoutContact 规则，让这条系统断连能够
+     * 收口旧 connected 状态，同时继续保持旧 autoReconnect owner。
+     */
+    @Synchronized
+    private fun synthesizeOtaRebootTerminalAdmission(
+        endpointId: String,
+        key: String,
+    ): BleConnectionAdmission {
+        val generation = nextConnectionGeneration(
+            connectionAttemptGenerations[key] ?: 0L,
+        )
+        connectionAttemptGenerations[key] = generation
+        val admission = BleConnectionAdmission(
+            endpointId = endpointId,
+            generation = generation,
+            sessionId = connectionSessionSequence.incrementAndGet(),
+            source = BleConnectSource.AUTO_RECONNECT,
+        )
+        sendLog(
+            BleLoggerTag.w,
+            "OTA reboot disconnect: $endpointId, synthesized terminal admission " +
+                "generation=$generation, source=${admission.source.flutterValue}",
+        )
+        return admission
     }
 
     /** 只屏蔽本次主动 close 的迟到 callback；10 秒内没有回调则自动失效，不能污染新会话。 */

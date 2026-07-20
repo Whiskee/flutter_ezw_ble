@@ -39,6 +39,9 @@ void main() {
         contains('autoReconnectSupervisor.detachPhysicalGattForOtaReboot'));
     expect(androidMethod, contains('lastEpochAcceptedAdmissions[key]'));
     expect(androidMethod, contains('cancelConnectionAdmission'));
+    expect(androidMethod, contains('synthesizeOtaRebootTerminalAdmission'));
+    expect(android, contains('BleConnectSource.AUTO_RECONNECT'));
+    expect(androidMethod, isNot(contains('missing epoch-accepted admission')));
     expect(androidMethod, isNot(contains('autoReconnectSupervisor.cancel')));
     expect(androidMethod, isNot(contains('removePersistedReconnectTarget')));
 
