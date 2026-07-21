@@ -86,6 +86,9 @@ class BleManager: NSObject {
     //  - Code 14 配对失配恢复的有界扫描窗口。只在该任务自己启动扫描时才负责停止，
     //    不能抢占发现页或 Dart 身份补全扫描的所有权。
     var pairingRecoveryScanTimers: [String: (timer: Timer, ownsScan: Bool)] = [:]
+    //  - 已因 Code 14 结束的稳定 config+name 身份。它不保留 GATT/owner，也不直接
+    //    触发 720；仅让下一次手动连接绕过旧 peripheral，等待一次新鲜广播。
+    var stoppedPeerPairingRecoveryKeys: Set<String> = []
     //  - iOS 空 UUID 目标先以 config+完整名称持有 owner，扫描只负责补齐 peripheral UUID。
     lazy var pendingReconnectIdentities: [String: BlePendingReconnectIdentity] = [:]
     //  - 每个 canonical target 最多保留常数个 UUID 别名，兼顾旧 UI hard cancel 与长期内存有界。
@@ -225,6 +228,14 @@ extension BleManager {
         pendingReconnectIdentities = pendingReconnectIdentities.filter {
             !configNames.contains($0.value.belongConfig)
         }
+        let normalizedConfigPrefixes = configNames.map {
+            "\($0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())|"
+        }
+        stoppedPeerPairingRecoveryKeys = Set(
+            stoppedPeerPairingRecoveryKeys.filter { key in
+                !normalizedConfigPrefixes.contains(where: key.hasPrefix)
+            }
+        )
         revokedTasks.forEach { task in
             task.timer?.invalidate()
             reconnectIdentityAliases.removeAliases(canonicalUuid: task.uuid)
@@ -266,11 +277,18 @@ extension BleManager {
         upgradeDevices?.removeAll {
             endpointKeys.contains(reconnectKey(uuid: $0))
         }
+        var shouldStopOwnedPairingRecoveryScan = false
         endpointKeys.forEach { key in
             otaWriteQueues.removeValue(forKey: key)?.cancelAll(reason: "initConfigs revoked")
             pendingConnectionAdmissionTeardowns.removeValue(forKey: key)
             peripheralCancellationWatchdogs.removeValue(forKey: key)?.workItem.cancel()
-            pairingRecoveryScanTimers.removeValue(forKey: key)?.timer.invalidate()
+            if let scanEntry = pairingRecoveryScanTimers.removeValue(forKey: key) {
+                scanEntry.timer.invalidate()
+                shouldStopOwnedPairingRecoveryScan = shouldStopOwnedPairingRecoveryScan || scanEntry.ownsScan
+            }
+        }
+        if shouldStopOwnedPairingRecoveryScan {
+            stopScan()
         }
         pendingPhysicalConnectWatchdogs.remove(endpointIds: endpointIds).forEach { $0.cancel() }
         visiblePendingRecoveryWatchdogs.remove(endpointIds: endpointIds).forEach { $0.cancel() }
@@ -1226,15 +1244,20 @@ extension BleManager {
                     name: peripheral.name ?? ""
                 )
             }
+            var pairingFailureAction: BlePeerPairingFailureAction?
             if nsError?.code == 14, hasAutoReconnectTask {
-                // 对端已清除 bond 时，当前 system pending connect 已不可信；先标记为等待
-                // 新广告，再由后续 scheduleReconnect 统一重建，不能中断长期 autoReconnect owner。
-                preparePeerPairingRecovery(
+                // 被动自动回连只允许一次新鲜广播恢复；手动连接或恢复再次失败
+                // 都结束本轮 owner，下一次手动点击才会创建新的真实连接。
+                pairingFailureAction = registerPeerPairingFailure(
                     uuid: peripheral.identifier.uuidString,
-                    name: peripheral.name ?? session.deviceName
+                    name: peripheral.name ?? session.deviceName,
+                    source: admission.source
                 )
             }
-            let state: BleConnectState = (nsError?.code == 14 && !hasAutoReconnectTask)
+            // stopAttempt 表示当前 owner 已删除；统一上报 alreadyBound 终态。
+            // App 只会把 manual source 的本次真实 Code 14 映射成 720，自动来源静默。
+            let stoppedForPairingFailure = pairingFailureAction == .stopAttempt
+            let state: BleConnectState = (nsError?.code == 14 && (!hasAutoReconnectTask || stoppedForPairingFailure))
                 ? .alreadyBound
                 : .disconnectFromSys
             handleConnectState(
@@ -1242,7 +1265,9 @@ extension BleManager {
                 name: peripheral.name ?? session.deviceName,
                 state: state,
                 source: admission.source,
-                generation: admission.generation,
+                // native attempt generation 只用于 exact Gate teardown；Flutter 终态
+                // 必须沿用 recovery batch 的逻辑 session，避免 epoch guard 丢弃真回调。
+                generation: admission.sessionGeneration,
                 peripheralTerminalAcknowledged: true,
                 tag: tag
             )
@@ -1286,7 +1311,7 @@ extension BleManager {
         //  4、错误处理
         //  - 4.1、iOS error 14 表示 pairing 信息失配；autoReconnect 模式下这是可恢复的
         //        系统断连错误，不能进入 alreadyBound 终态，否则会停止持续回连。
-        let hasAutoReconnectTask = reconnectTasks.values.contains { task in
+        let reconnectTask = reconnectTasks.values.first { task in
             isSameConnectTarget(
                 storedUuid: task.uuid,
                 storedName: task.name,
@@ -1294,19 +1319,29 @@ extension BleManager {
                 name: peripheral.name ?? ""
             )
         }
-        if error.code == 14, hasAutoReconnectTask {
-            preparePeerPairingRecovery(
+        if error.code == 14, let reconnectTask {
+            let admission = currentConnectionAdmission(uuid: peripheral.identifier.uuidString)
+            let attemptSource = admission?.source ?? reconnectTask.source
+            let pairingFailureAction = registerPeerPairingFailure(
                 uuid: peripheral.identifier.uuidString,
-                name: peripheral.name ?? ""
+                name: peripheral.name ?? "",
+                source: attemptSource
             )
+            let stoppedForPairingFailure = pairingFailureAction == .stopAttempt
             handleConnectState(
                 uuid: peripheral.identifier.uuidString,
                 name: peripheral.name ?? "",
-                state: .disconnectFromSys,
+                state: stoppedForPairingFailure ? .alreadyBound : .disconnectFromSys,
+                source: attemptSource,
+                generation: admission?.sessionGeneration ?? reconnectTask.sessionGeneration,
                 peripheralTerminalAcknowledged: true,
                 tag: tag
             )
-            loggerE(msg: "\(logHead) \(peripheral.identifier.uuidString), error code = \(error.code), msg = \(error.localizedDescription), mapped to disconnectFromSys for autoReconnect")
+            let pairingRecoveryLabel = pairingFailureAction?.rawValue ?? "none"
+            let mappedStateLabel = stoppedForPairingFailure
+                ? BleConnectState.alreadyBound.rawValue
+                : BleConnectState.disconnectFromSys.rawValue
+            loggerE(msg: "\(logHead) \(peripheral.identifier.uuidString), error code = \(error.code), msg = \(error.localizedDescription), pairingRecovery=\(pairingRecoveryLabel), mapped to \(mappedStateLabel) for autoReconnect")
             return
         }
         if error.code == 14 {

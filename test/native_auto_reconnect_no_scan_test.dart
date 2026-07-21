@@ -54,7 +54,7 @@ void main() {
     // 精确 owner 的例外扫描窗口，不能回退为所有 autoReconnect scan-first。
     final normalReconnect = iosReconnect.substring(
       iosReconnect.indexOf('func beginDirectReconnectAttempt'),
-      iosReconnect.indexOf('func preparePeerPairingRecovery'),
+      iosReconnect.indexOf('func registerPeerPairingFailure'),
     );
     expect(normalReconnect, isNot(contains('startScan()')));
     // App 重装后 CoreBluetooth UUID 会变化；目标若已被系统/ANCS 连接而停止广播，

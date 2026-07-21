@@ -4,7 +4,10 @@ import Foundation
 /// 一次真实物理连接回调等待进入全局 GATT pipeline 的身份。
 struct BleConnectionAdmission: Equatable {
     let endpointId: String
+    /// Native Gate attempt 代次，只用于 exact teardown/callback ownership。
     let generation: Int64
+    /// Dart recovery batch 逻辑代次，用于所有上报 Flutter 的状态。
+    let sessionGeneration: Int64
     let sessionId: Int64
     let source: BleConnectSource
 }
@@ -466,6 +469,7 @@ final class BleConnectionAdmissionGate {
             BleConnectionAdmission(
                 endpointId: current.endpointId,
                 generation: current.generation,
+                sessionGeneration: current.sessionGeneration,
                 sessionId: current.sessionId,
                 source: .manualReconnect
             )

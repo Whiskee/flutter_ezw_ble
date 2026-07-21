@@ -446,6 +446,7 @@ class BleManager private constructor() {
     internal fun activateAutoReconnectTargets(
         targets: List<BleReconnectSeed>,
         source: BleConnectSource,
+        sessionGeneration: Long = 0L,
     ): List<BleReconnectActivationResult> {
         if (targets.isEmpty()) {
             return emptyList()
@@ -462,6 +463,8 @@ class BleManager private constructor() {
                     target = target,
                     state = BleReconnectActivationState.REJECTED,
                     reason = if (target.uuid.isBlank()) "emptyIdentity" else "invalidConfig",
+                    source = source,
+                    sessionGeneration = sessionGeneration,
                 )
             }
             val seedDevice = BleDevice(
@@ -477,6 +480,8 @@ class BleManager private constructor() {
                 target = target,
                 state = BleReconnectActivationState.RESOLVED,
                 reason = "",
+                source = source,
+                sessionGeneration = sessionGeneration,
             )
         }
     }

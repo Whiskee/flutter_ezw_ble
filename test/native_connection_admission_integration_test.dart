@@ -393,7 +393,7 @@ void main() {
     expect(
       reconnectCoordinator,
       contains(
-        'let generation = admission?.generation ?? task?.lastConnectedGeneration',
+        'let generation = admission?.sessionGeneration ?? task?.lastConnectedGeneration',
       ),
     );
     expect(reconnectCoordinator, contains('capturedEndpointKeys.insert(key)'));

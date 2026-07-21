@@ -106,10 +106,40 @@ void main() {
     await platform.activateAutoReconnectTargets(
       [BleDevice('ring', '11:22', 'Even R1', 'R1-1', -42)],
       source: BleConnectSource.manualReconnect,
+      sessionGeneration: 37,
     );
 
     final arguments = captured?.arguments as Map<Object?, Object?>;
     expect(arguments['source'], 'manualReconnect');
+    expect(arguments['sessionGeneration'], 37);
+  });
+
+  test('removed userRepairRequired acknowledgement fails closed', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (_) async {
+      return [
+        {
+          'belongConfig': 'ring_bcl_1',
+          'uuid': 'ring-uuid',
+          'name': 'EVEN R1_2639B0',
+          'state': 'userRepairRequired',
+          'reason': 'peerPairingInformationRemoved',
+          'source': 'manualReconnect',
+          'sessionGeneration': 37,
+        },
+      ];
+    });
+
+    final results = await platform.activateAutoReconnectTargets(
+      [BleDevice('ring_bcl_1', 'ring-uuid', 'EVEN R1_2639B0', 'R1', -50)],
+      source: BleConnectSource.manualReconnect,
+      sessionGeneration: 37,
+    );
+
+    expect(results.single.state, BleReconnectActivationState.rejected);
+    expect(results.single.isAccepted, isFalse);
+    expect(results.single.source, BleConnectSource.manualReconnect);
+    expect(results.single.sessionGeneration, 37);
   });
 
   test('target visible hint uses named uuid and name arguments', () async {

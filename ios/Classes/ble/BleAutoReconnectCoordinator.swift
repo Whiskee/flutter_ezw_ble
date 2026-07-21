@@ -84,6 +84,13 @@ extension BleManager {
      *  用户主动断开时必须同时取消内存任务和磁盘目标，避免后续系统断连回调重新唤起回连。
      */
     func removePersistedReconnectTarget(uuid: String, name: String = "") {
+        let persistedTarget = reconnectStore.target(uuid: uuid, name: name)
+        if let persistedTarget {
+            clearStoppedPeerPairingRecovery(
+                belongConfig: persistedTarget.belongConfig,
+                name: name.isEmpty ? persistedTarget.name : name
+            )
+        }
         reconnectStore.remove(uuid: uuid, name: name)
         if let canonicalUuid = reconnectIdentityAliases.resolvedCanonical(uuid: uuid),
            canonicalUuid.caseInsensitiveCompare(uuid) != .orderedSame {
@@ -101,6 +108,7 @@ extension BleManager {
      */
     func clearPersistedReconnectTargets() {
         reconnectStore.clearTargets()
+        stoppedPeerPairingRecoveryKeys.removeAll()
     }
 
     /**
@@ -141,14 +149,19 @@ extension BleManager {
             // connected 释放 admission 后仍需保留最后一次被 Dart 接受的 epoch，
             // poweredOff 或普通 didDisconnect 才能发送同代终态，而不是 unknown/0。
             task.lastConnectedGeneration = generation
+            task.sessionGeneration = generation
         }
         task.attempt = 0
         task.pausedByBluetoothOff = false
         // 业务已重新认证后，前一轮 Code 14 的一次性恢复约束可以安全清除；之后继续使用
         // 系统长期 pending connect，保持正常自动回连的低功耗语义。
         if businessConnected {
-            task.requiresFreshAdvertisement = false
-            task.requiresForegroundPairingRecovery = false
+            task.pairingRecoveryState = .normal
+            task.hasAttemptedPairingRecovery = false
+            clearStoppedPeerPairingRecovery(
+                belongConfig: config.name,
+                name: device.peripheral.name ?? task.name
+            )
         }
         task.timer?.invalidate()
         task.timer = nil
@@ -179,7 +192,7 @@ extension BleManager {
                     name: name
                 )
             })
-            guard let generation = admission?.generation ?? task?.lastConnectedGeneration,
+            guard let generation = admission?.sessionGeneration ?? task?.lastConnectedGeneration,
                   generation > 0 else {
                 loggerE(msg: "bluetooth off: \(uuid)-\(name), skip terminal without accepted generation")
                 continue
@@ -203,7 +216,7 @@ extension BleManager {
                 uuid: admission.endpointId,
                 name: session?.deviceName ?? "",
                 source: admission.source,
-                generation: admission.generation
+                generation: admission.sessionGeneration
             ))
             capturedEndpointKeys.insert(key)
         }
@@ -214,7 +227,8 @@ extension BleManager {
     @discardableResult
     func armReconnectTarget(
         _ target: BleReconnectTarget,
-        source: BleConnectSource
+        source: BleConnectSource,
+        sessionGeneration: Int64 = 0
     ) -> BleReconnectTask? {
         let persistedCanonical = reconnectStore.target(uuid: "", name: target.name)
         let canonicalUuid = BleReconnectTargetIdentityPolicy.canonicalUuid(
@@ -225,7 +239,8 @@ extension BleManager {
         let effectiveTarget = BleReconnectTarget(
             belongConfig: target.belongConfig,
             uuid: canonicalUuid,
-            name: target.name
+            name: target.name,
+            expectedMacSuffix: target.expectedMacSuffix
         )
         guard let config = bleConfigs.first(where: { $0.name == effectiveTarget.belongConfig }),
               config.autoReconnect,
@@ -277,6 +292,9 @@ extension BleManager {
             incoming: source,
             businessConnected: false
         )
+        if sessionGeneration > 0 {
+            task.sessionGeneration = sessionGeneration
+        }
         task.attempt = 0
         task.pausedByBluetoothOff = false
         task.timer?.invalidate()
@@ -284,6 +302,50 @@ extension BleManager {
         reconnectTasks[key] = task
         reconnectStore.upsert(target: effectiveTarget)
         return task
+    }
+
+    /// Code 14 停止标记只使用稳定 config+完整名称，不使用可能被 CoreBluetooth
+    /// 重新分配的 UUID。空身份不能进入集合，避免多个未知设备互相覆盖。
+    private func peerPairingRecoveryKey(belongConfig: String, name: String) -> String? {
+        let config = belongConfig.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let deviceName = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !config.isEmpty, !deviceName.isEmpty else { return nil }
+        return "\(config)|\(deviceName)"
+    }
+
+    private func hasStoppedPeerPairingRecovery(_ target: BleReconnectTarget) -> Bool {
+        guard let key = peerPairingRecoveryKey(
+            belongConfig: target.belongConfig,
+            name: target.name
+        ) else {
+            return false
+        }
+        return stoppedPeerPairingRecoveryKeys.contains(key)
+    }
+
+    private func clearStoppedPeerPairingRecovery(belongConfig: String, name: String) {
+        guard let key = peerPairingRecoveryKey(belongConfig: belongConfig, name: name) else {
+            return
+        }
+        stoppedPeerPairingRecoveryKeys.remove(key)
+    }
+
+    /// 结束当前 Code 14 恢复 owner，但保留一个无资源的身份标记。后续自动 activation
+    /// 会被拒绝；下一次手动 activation 会消费该事实去等待新广告，而不是直接弹 720。
+    private func stopPeerPairingRecoveryTask(_ task: BleReconnectTask, reason: String) {
+        let key = reconnectKey(uuid: task.uuid)
+        task.timer?.invalidate()
+        cancelPairingRecoveryDiscovery(key: key)
+        reconnectTasks.removeValue(forKey: key)
+        if let identityKey = peerPairingRecoveryKey(
+            belongConfig: task.belongConfig,
+            name: task.name
+        ) {
+            stoppedPeerPairingRecoveryKeys.insert(identityKey)
+        }
+        purgeStaleScanCache(uuid: task.uuid, name: task.name)
+        connectionAdmissionGate.retireInactiveEndpoint(task.uuid)
+        loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), peer pairing attempt stopped reason=\(reason)")
     }
 
     /// 旧入口仅 arm 长期意图，不打开 CoreBluetooth connect。
@@ -294,7 +356,8 @@ extension BleManager {
     /// 所有目标立即建立/复用 pending 直连；物理 callback 前不发 connecting。
     func activateAutoReconnectTargets(
         _ targets: [BleReconnectTarget],
-        source: BleConnectSource = .autoReconnect
+        source: BleConnectSource = .autoReconnect,
+        sessionGeneration: Int64 = 0
     ) -> [BleReconnectActivationResult] {
         // 1、逐目标校验配置和身份，保持一次 activation 的目标快照稳定。
         return targets.map { target in
@@ -305,25 +368,42 @@ extension BleManager {
                 return BleReconnectActivationResult(
                     target: target,
                     state: .rejected,
-                    reason: "invalidConfig"
+                    reason: "invalidConfig",
+                    source: source,
+                    sessionGeneration: sessionGeneration
                 )
             }
             let trimmedUuid = target.uuid.trimmingCharacters(in: .whitespacesAndNewlines)
             let trimmedName = target.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            // 1.2、一次性自动恢复已经结束后不再后台重建 owner。只有下一次手动
+            // 点击可以开始新 attempt；这里返回 rejected 只结束当前 batch，不触发 UI。
+            if source != .manualReconnect, hasStoppedPeerPairingRecovery(target) {
+                loggerD(msg: "autoReconnect activation rejected: config=\(target.belongConfig), name=\(trimmedName), reason=peerPairingRecoveryStopped")
+                return BleReconnectActivationResult(
+                    target: target,
+                    state: .rejected,
+                    reason: "peerPairingRecoveryStopped",
+                    source: source,
+                    sessionGeneration: sessionGeneration
+                )
+            }
             if trimmedUuid.isEmpty {
                 guard !trimmedName.isEmpty else {
                     loggerE(msg: "autoReconnect activation rejected: config=\(target.belongConfig), reason=emptyIdentity")
                     return BleReconnectActivationResult(
                         target: target,
                         state: .rejected,
-                        reason: "emptyIdentity"
+                        reason: "emptyIdentity",
+                        source: source,
+                        sessionGeneration: sessionGeneration
                     )
                 }
                 let pendingKey = BlePendingReconnectIdentity(
                     belongConfig: target.belongConfig,
                     name: trimmedName,
                     expectedMacSuffix: target.expectedMacSuffix,
-                    source: source
+                    source: source,
+                    sessionGeneration: sessionGeneration
                 ).key
                 let pending = BlePendingReconnectIdentity(
                     belongConfig: target.belongConfig,
@@ -333,22 +413,51 @@ extension BleManager {
                         current: pendingReconnectIdentities[pendingKey]?.source ?? source,
                         incoming: source,
                         businessConnected: false
-                    )
+                    ),
+                    sessionGeneration: sessionGeneration > 0
+                        ? sessionGeneration
+                        : pendingReconnectIdentities[pendingKey]?.sessionGeneration ?? 0
                 )
                 pendingReconnectIdentities[pending.key] = pending
                 loggerD(msg: "autoReconnect identityPending: config=\(target.belongConfig), name=\(trimmedName), macSuffix=\(target.expectedMacSuffix)")
                 return BleReconnectActivationResult(
                     target: target,
                     state: .identityPending,
-                    reason: "awaitingPeripheralIdentity"
+                    reason: "awaitingPeripheralIdentity",
+                    source: source,
+                    sessionGeneration: sessionGeneration
                 )
             }
             // 2、稳定 UUID 目标先 arm 长期 owner，再进入统一 activation。
-            guard let task = armReconnectTarget(target, source: source) else {
+            guard let task = armReconnectTarget(
+                target,
+                source: source,
+                sessionGeneration: sessionGeneration
+            ) else {
                 return BleReconnectActivationResult(
                     target: target,
                     state: .rejected,
-                    reason: "nativeArmRejected"
+                    reason: "nativeArmRejected",
+                    source: source,
+                    sessionGeneration: sessionGeneration
+                )
+            }
+            // 2.1、历史 Code 14 只改变下一次手动连接的取 peripheral 方式：先等
+            // 新广告，再在 Gate 内真正连接。不能依据历史失败直接返回 720。
+            if source == .manualReconnect, hasStoppedPeerPairingRecovery(target) {
+                var freshTask = task
+                freshTask.hasAttemptedPairingRecovery = true
+                freshTask.pairingRecoveryState = .awaitingFreshAdvertisement
+                reconnectTasks[reconnectKey(uuid: freshTask.uuid)] = freshTask
+                purgeStaleScanCache(uuid: freshTask.uuid, name: freshTask.name)
+                startPairingRecoveryDiscoveryIfNeeded(freshTask)
+                loggerD(msg: "autoReconnect: \(freshTask.uuid)-\(freshTask.name), manual attempt waits for fresh advertisement sessionGeneration=\(freshTask.sessionGeneration)")
+                return BleReconnectActivationResult(
+                    target: target,
+                    state: .resolved,
+                    reason: "freshPairingRecoveryStarted",
+                    source: source,
+                    sessionGeneration: freshTask.sessionGeneration
                 )
             }
             // 3、复用已有 pending owner，或创建同一 Gate 管理的新 attempt。
@@ -356,7 +465,9 @@ extension BleManager {
             return BleReconnectActivationResult(
                 target: target,
                 state: .resolved,
-                reason: ""
+                reason: "",
+                source: source,
+                sessionGeneration: task.sessionGeneration
             )
         }
     }
@@ -416,7 +527,11 @@ extension BleManager {
             name: advertisedName,
             expectedMacSuffix: pending.expectedMacSuffix
         )
-        guard let task = armReconnectTarget(target, source: pending.source) else {
+        guard let task = armReconnectTarget(
+            target,
+            source: pending.source,
+            sessionGeneration: pending.sessionGeneration
+        ) else {
             loggerE(msg: "autoReconnect identity resolve rejected: config=\(belongConfig), name=\(advertisedName), uuid=\(uuid)")
             return true
         }
@@ -445,6 +560,20 @@ extension BleManager {
      *  disconnect/remove 会调用这里；任务取消后，后续 stale callback 只能打日志，不能恢复连接。
      */
     func cancelReconnectTask(uuid: String, name: String = "") {
+        // 用户硬取消/移除设备要同时清理无资源的 Code 14 身份标记；否则再次绑定
+        // 同一设备时会被错误当成旧配对恢复。
+        let persistedTarget = reconnectStore.target(uuid: uuid, name: name)
+        if let persistedTarget {
+            clearStoppedPeerPairingRecovery(
+                belongConfig: persistedTarget.belongConfig,
+                name: name.isEmpty ? persistedTarget.name : name
+            )
+        } else if !name.isEmpty {
+            let suffix = "|\(name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())"
+            stoppedPeerPairingRecoveryKeys = Set(
+                stoppedPeerPairingRecoveryKeys.filter { !$0.hasSuffix(suffix) }
+            )
+        }
         if !name.isEmpty {
             pendingReconnectIdentities = pendingReconnectIdentities.filter {
                 $0.value.name != name
@@ -458,7 +587,9 @@ extension BleManager {
         for (key, task) in matches {
             // timer 必须先 invalidate，否则取消后仍可能触发一次 beginReconnectAttempt。
             task.timer?.invalidate()
-            pairingRecoveryScanTimers.removeValue(forKey: key)?.timer.invalidate()
+            // Code 14 恢复扫描属于该 owner；硬取消必须同时停止它实际拥有的
+            // central scan，不能只丢 timer 后让扫描无限运行。
+            cancelPairingRecoveryDiscovery(key: key)
             reconnectTasks.removeValue(forKey: key)
             loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), task cancelled")
         }
@@ -472,9 +603,13 @@ extension BleManager {
     func cancelAllReconnectTasks() {
         reconnectTasks.values.forEach { $0.timer?.invalidate() }
         pairingRecoveryScanTimers.values.forEach { $0.timer.invalidate() }
+        if pairingRecoveryScanTimers.values.contains(where: { $0.ownsScan }) {
+            stopScan()
+        }
         pairingRecoveryScanTimers.removeAll()
         reconnectTasks.removeAll()
         pendingReconnectIdentities.removeAll()
+        stoppedPeerPairingRecoveryKeys.removeAll()
         reconnectIdentityAliases.reset()
     }
 
@@ -703,15 +838,15 @@ extension BleManager {
             armReconnectTask(device: connected, source: .autoReconnect, businessConnected: true)
             return
         }
-        // 2、Code 14 等场景要求新广播时走配对恢复；否则按缓存/系统连接/扫描身份选择 peripheral。
-        if task.requiresFreshAdvertisement {
+        // 2、Code 14 后等待新广播阶段禁止 retrieve 旧 peripheral。
+        if task.pairingRecoveryState == .awaitingFreshAdvertisement {
             startPairingRecoveryDiscoveryIfNeeded(task)
             return
         }
         let cachedPeripheral: CBPeripheral? = {
             // Code 14 后必须优先消费本轮 didDiscover 写入的 peripheral，而不是先从
             // retrievePeripherals 取回刚被 iOS 拒绝的旧缓存对象。
-            if task.requiresForegroundPairingRecovery,
+            if task.pairingRecoveryState == .foregroundRecoveryConnecting,
                let discovered = scanResultTemp.first(where: {
                    $0.0.uuid.caseInsensitiveCompare(task.uuid) == .orderedSame ||
                        (!task.name.isEmpty && ($0.0.name == task.name || $0.1.name == task.name))
@@ -817,21 +952,27 @@ extension BleManager {
             config: config,
             deviceName: activeTask.name,
             afterUpgrade: false,
-            source: activeTask.source
+            source: activeTask.source,
+            sessionGeneration: activeTask.sessionGeneration
         ) != nil else {
             return
         }
-        let usesSystemAutoReconnect = !activeTask.requiresForegroundPairingRecovery
+        let usesSystemAutoReconnect = activeTask.pairingRecoveryState != .foregroundRecoveryConnecting
         connectPeripheralAfterCancellationBarrier(
             peripheral,
             autoReconnect: usesSystemAutoReconnect
         )
-        loggerD(msg: "autoReconnect: \(activeTask.uuid)-\(activeTask.name), native pending connect activated source=\(activeTask.source.rawValue), pairingRecovery=\(activeTask.requiresForegroundPairingRecovery)")
+        loggerD(msg: "autoReconnect: \(activeTask.uuid)-\(activeTask.name), native pending connect activated source=\(activeTask.source.rawValue), pairingRecovery=\(activeTask.pairingRecoveryState.rawValue), sessionGeneration=\(activeTask.sessionGeneration)")
     }
 
-    /// Code 14 后只保留长期回连意图，不复用已失败的 pending connect。扫描窗口最多 20 秒；
-    /// 超时后回退系统 pending connect，保证设备离开范围时自动回连不会被此恢复分支关闭。
-    func preparePeerPairingRecovery(uuid: String, name: String) {
+    /// 记录一次 Code 14。只有被动自动回连的首次失败允许一次新鲜广播恢复；
+    /// 手动连接或恢复 attempt 再次失败都立即结束 owner，由下一次手动点击重建。
+    @discardableResult
+    func registerPeerPairingFailure(
+        uuid: String,
+        name: String,
+        source: BleConnectSource
+    ) -> BlePeerPairingFailureAction? {
         guard let key = reconnectTasks.first(where: { _, task in
             isSameConnectTarget(
                 storedUuid: task.uuid,
@@ -841,14 +982,34 @@ extension BleManager {
             )
         })?.key,
         var task = reconnectTasks[key] else {
-            return
+            return nil
         }
-        task.requiresFreshAdvertisement = true
-        task.requiresForegroundPairingRecovery = true
+        if source == .manualReconnect || task.hasAttemptedPairingRecovery {
+            stopPeerPairingRecoveryTask(
+                task,
+                reason: source == .manualReconnect
+                    ? "manualCode14"
+                    : "automaticRecoveryCode14"
+            )
+            return .stopAttempt
+        }
+        task.hasAttemptedPairingRecovery = true
+        task.pairingRecoveryState = .awaitingFreshAdvertisement
         reconnectTasks[key] = task
         // 删除本轮命中的广告缓存，确保恢复连接确实等待 error 之后的新广告。
         purgeStaleScanCache(uuid: task.uuid, name: task.name)
         loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), peer pairing reset; wait fresh advertisement before recovery")
+        return .retryFreshAdvertisement
+    }
+
+    /// 取消某个 owner 的配对恢复扫描。只有该 owner 自己启动的扫描才允许停止，
+    /// 避免抢占 Discovery/其它恢复批次共享的 central scan。
+    func cancelPairingRecoveryDiscovery(key: String) {
+        guard let entry = pairingRecoveryScanTimers.removeValue(forKey: key) else { return }
+        entry.timer.invalidate()
+        if entry.ownsScan {
+            stopScan()
+        }
     }
 
     /// 在已有扫描上共享窗口；只有本任务主动开的扫描，超时才允许停止，避免抢占其他业务扫描。
@@ -862,20 +1023,28 @@ extension BleManager {
         let timer = Timer.scheduledTimer(withTimeInterval: pairingRecoveryDiscoveryTimeout, repeats: false) { [weak self] _ in
             guard let self = self,
                   let entry = self.pairingRecoveryScanTimers.removeValue(forKey: key),
-                  var current = self.reconnectTasks[key],
-                  current.requiresFreshAdvertisement else {
+                  let current = self.reconnectTasks[key],
+                  current.pairingRecoveryState == .awaitingFreshAdvertisement else {
                 return
             }
-            current.requiresFreshAdvertisement = false
-            // 没有拿到失败后的新广告时不能伪装成“已刷新”。回退为系统长期 pending
-            // 让 State Restoration 继续拥有 rendezvous，下一次 Code 14 才会再次开启窗口。
-            current.requiresForegroundPairingRecovery = false
-            self.reconnectTasks[key] = current
             if entry.ownsScan {
                 self.stopScan()
             }
-            self.loggerD(msg: "autoReconnect: \(current.uuid)-\(current.name), peer pairing recovery scan timed out; resume system pending connect")
-            self.beginReconnectAttempt(uuid: current.uuid)
+            // 自动首次 Code 14 的恢复窗口耗尽后静默结束；历史 Code 14 后的手动
+            // 新连接若仍无广告，则按扫描失败结束，不能伪造新的 Code 14/720。
+            let terminalState: BleConnectState = current.source == .manualReconnect
+                ? .noDeviceFound
+                : .alreadyBound
+            self.stopPeerPairingRecoveryTask(current, reason: "freshAdvertisementTimeout")
+            self.handleConnectState(
+                uuid: current.uuid,
+                name: current.name,
+                state: terminalState,
+                source: current.source,
+                generation: current.sessionGeneration,
+                suppressReconnectSchedule: true,
+                tag: "peer pairing recovery scan timeout"
+            )
         }
         pairingRecoveryScanTimers[key] = (timer, ownsScan)
         loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), start peer pairing recovery scan ownsScan=\(ownsScan)")
@@ -887,17 +1056,39 @@ extension BleManager {
         peripheral: CBPeripheral,
         advertisedName: String,
         belongConfig: String,
+        advertisedMac: String,
         rssi: Int
     ) -> Bool {
         guard let entry = reconnectTasks.first(where: { _, task in
-            task.requiresFreshAdvertisement &&
+            task.pairingRecoveryState == .awaitingFreshAdvertisement &&
                 task.belongConfig == belongConfig &&
                 !task.name.isEmpty &&
                 task.name == advertisedName
         }), var task = reconnectTasks[entry.key] else {
             return false
         }
-        pairingRecoveryScanTimers.removeValue(forKey: entry.key)?.timer.invalidate()
+        // 完整广播名是主身份；当持久 target 和本次广告都能提供 MAC 时，再用
+        // 后缀做附加校验。任一侧缺失时不伪造约束，保持历史 R1 广播兼容。
+        let expectedMacSuffix = reconnectStore
+            .target(uuid: task.uuid, name: task.name)?
+            .expectedMacSuffix
+            .filter(\.isHexDigit)
+            .uppercased() ?? ""
+        let normalizedAdvertisedMac = advertisedMac
+            .filter(\.isHexDigit)
+            .uppercased()
+        if !expectedMacSuffix.isEmpty,
+           !normalizedAdvertisedMac.isEmpty,
+           !normalizedAdvertisedMac.hasSuffix(expectedMacSuffix) {
+            loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), ignore fresh advertisement with mismatched mac suffix")
+            return false
+        }
+        if let scanEntry = pairingRecoveryScanTimers.removeValue(forKey: entry.key) {
+            scanEntry.timer.invalidate()
+            if scanEntry.ownsScan {
+                stopScan()
+            }
+        }
         scanResultTemp.removeAll { info in
             info.0.uuid.caseInsensitiveCompare(peripheral.identifier.uuidString) == .orderedSame
         }
@@ -913,7 +1104,7 @@ extension BleManager {
             peripheral
         ))
         task = migrateReconnectTaskIdentityIfNeeded(task, to: peripheral)
-        task.requiresFreshAdvertisement = false
+        task.pairingRecoveryState = .foregroundRecoveryConnecting
         reconnectTasks[reconnectKey(uuid: task.uuid)] = task
         loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), peer pairing recovery discovered fresh peripheral; rebuild normal connect")
         beginReconnectAttempt(uuid: task.uuid)
@@ -981,7 +1172,8 @@ extension BleManager {
             config: config,
             deviceName: request.name,
             afterUpgrade: false,
-            source: .autoReconnect
+            source: .autoReconnect,
+            sessionGeneration: task.sessionGeneration
         ) else {
             return
         }
@@ -1023,7 +1215,10 @@ extension BleManager {
             to: BleReconnectTarget(
                 belongConfig: task.belongConfig,
                 uuid: peripheralUuid,
-                name: peripheralName
+                name: peripheralName,
+                expectedMacSuffix: reconnectStore
+                    .target(uuid: task.uuid, name: task.name)?
+                    .expectedMacSuffix ?? ""
             )
         )
         loggerD(msg: "autoReconnect: migrate peripheral identity \(task.uuid) -> \(peripheralUuid), name=\(peripheralName)")

@@ -445,7 +445,8 @@ extension BleManager {
         config: BleConfig,
         deviceName: String,
         afterUpgrade: Bool,
-        source: BleConnectSource
+        source: BleConnectSource,
+        sessionGeneration: Int64 = 0
     ) -> BleConnectionAdmission? {
         // 1、校验稳定 peripheral identity；空 UUID 不进入 Gate。
         let endpointId = peripheral.identifier.uuidString.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -463,6 +464,7 @@ extension BleManager {
         let admission = BleConnectionAdmission(
             endpointId: endpointId,
             generation: generation,
+            sessionGeneration: sessionGeneration > 0 ? sessionGeneration : generation,
             sessionId: connectionSessionSequence,
             source: source
         )
@@ -673,6 +675,7 @@ extension BleManager {
         let promoted = BleConnectionAdmission(
             endpointId: current.endpointId,
             generation: current.generation,
+            sessionGeneration: current.sessionGeneration,
             sessionId: current.sessionId,
             source: .manualReconnect
         )

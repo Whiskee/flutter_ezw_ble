@@ -103,13 +103,17 @@ internal data class BleReconnectActivationResult(
     val target: BleReconnectSeed,
     val state: BleReconnectActivationState,
     val reason: String,
+    val source: BleConnectSource,
+    val sessionGeneration: Long,
 ) {
-    fun toFlutterMap(): Map<String, String> = mapOf(
+    fun toFlutterMap(): Map<String, Any> = mapOf(
         "belongConfig" to target.belongConfig,
         "uuid" to target.uuid,
         "name" to target.name,
         "state" to state.flutterValue,
         "reason" to reason,
+        "source" to source.flutterValue,
+        "sessionGeneration" to sessionGeneration,
     )
 }
 

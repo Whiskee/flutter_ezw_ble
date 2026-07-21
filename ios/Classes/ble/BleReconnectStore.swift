@@ -10,6 +10,24 @@
 import CoreBluetooth
 import Foundation
 
+/// iOS 单次连接 attempt 内的 Code 14 恢复阶段。
+///
+/// 这里只描述“首次失败后的有界恢复”，不表示 App 正在等待用户处理。恢复扫描或
+/// 恢复连接一旦再次失败，native 会结束该 owner；下一次手动点击再创建全新 attempt。
+enum BlePeerPairingRecoveryState: String {
+    case normal
+    case awaitingFreshAdvertisement
+    case foregroundRecoveryConnecting
+}
+
+/// 当前 Code 14 回调对本次 attempt 的处置动作。
+enum BlePeerPairingFailureAction: String {
+    /// 被动自动回连首次失败：允许一次新鲜广播恢复。
+    case retryFreshAdvertisement
+    /// 手动连接失败或自动恢复已经消耗：结束本轮，不保留物理连接 owner。
+    case stopAttempt
+}
+
 /**
  *  运行时自动回连任务。
  *
@@ -32,12 +50,13 @@ struct BleReconnectTask {
     var source: BleConnectSource = .autoReconnect
     /// 最近一次业务 connected 对应的 generation；Gate 释放后的系统断连复用它发送同代终态。
     var lastConnectedGeneration: Int64?
-    /// iOS Code 14 表示对端已清除配对信息。此标记要求下一次尝试先等待一条新的目标广播，
-    /// 禁止立即复用刚被系统拒绝的 CoreBluetooth peripheral cache。
-    var requiresFreshAdvertisement: Bool = false
-    /// 配对信息失配后的首轮恢复使用普通 connect，而非 iOS 17 的 system auto-reconnect
-    /// option；长期 autoReconnect owner 仍保留，业务 connected 后再恢复系统 pending 策略。
-    var requiresForegroundPairingRecovery: Bool = false
+    /// Dart recovery batch 的逻辑代次。native Gate attempt 可多次变化，但 Flutter
+    /// 状态必须始终回到同一逻辑 session，防止 epoch guard 把真实终态当成旧回调。
+    var sessionGeneration: Int64 = 0
+    /// Code 14 恢复状态；只在当前 attempt 内有效，不承担长期等待用户语义。
+    var pairingRecoveryState: BlePeerPairingRecoveryState = .normal
+    /// 同一 attempt 最多自动执行一轮配对恢复；再次失败立即结束本轮。
+    var hasAttemptedPairingRecovery: Bool = false
 }
 
 /// 发送系统终态时使用的连接来源与代次，二者必须作为同一快照一起继承。
@@ -57,7 +76,7 @@ enum BleTerminalConnectionMetadataPolicy {
         if let admission = currentAdmission, admission.generation > 0 {
             return BleTerminalConnectionMetadata(
                 source: admission.source,
-                generation: admission.generation
+                generation: admission.sessionGeneration
             )
         }
         // Gate 在业务 connected 后会释放；此后的真实系统断连只能继承最后一次
@@ -325,7 +344,7 @@ struct BleReconnectTarget {
         self.belongConfig = belongConfig
         self.uuid = uuid
         self.name = raw["name"] ?? ""
-        self.expectedMacSuffix = ""
+        self.expectedMacSuffix = raw["expectedMacSuffix"] ?? ""
     }
 
     /**
@@ -335,7 +354,8 @@ struct BleReconnectTarget {
         [
             "belongConfig": belongConfig,
             "uuid": uuid,
-            "name": name
+            "name": name,
+            "expectedMacSuffix": expectedMacSuffix
         ]
     }
 }
@@ -346,6 +366,7 @@ struct BlePendingReconnectIdentity {
     let name: String
     let expectedMacSuffix: String
     let source: BleConnectSource
+    let sessionGeneration: Int64
 
     /// 配置名与完整广播名共同组成唯一 owner，避免仅凭 R1 前缀误连附近设备。
     var key: String {
@@ -375,14 +396,18 @@ struct BleReconnectActivationResult {
     let target: BleReconnectTarget
     let state: BleReconnectActivationState
     let reason: String
+    let source: BleConnectSource
+    let sessionGeneration: Int64
 
-    var raw: [String: String] {
+    var raw: [String: Any] {
         [
             "belongConfig": target.belongConfig,
             "uuid": target.uuid,
             "name": target.name,
             "state": state.rawValue,
-            "reason": reason
+            "reason": reason,
+            "source": source.rawValue,
+            "sessionGeneration": sessionGeneration
         ]
     }
 }
@@ -461,7 +486,14 @@ final class BleReconnectStore {
             return
         }
         let name = device.peripheral.name ?? ""
-        let next = targets()
+        let existingTargets = targets()
+        // live CBPeripheral 不携带广播 MAC；业务 connected 回写 UUID 时必须保留
+        // Dart 绑定缓存曾提供的 suffix，供日后 Code 14 新鲜广播做附加身份校验。
+        let expectedMacSuffix = existingTargets.first { target in
+            target.uuid.caseInsensitiveCompare(uuid) == .orderedSame ||
+                (!name.isEmpty && target.name == name)
+        }?.expectedMacSuffix ?? ""
+        let next = existingTargets
             .filter { target in
                 target.uuid.caseInsensitiveCompare(uuid) != .orderedSame &&
                     target.name != name
@@ -469,7 +501,8 @@ final class BleReconnectStore {
                 BleReconnectTarget(
                     belongConfig: device.belongConfig.name,
                     uuid: uuid,
-                    name: name
+                    name: name,
+                    expectedMacSuffix: expectedMacSuffix
                 )
             ]
         saveTargets(next)

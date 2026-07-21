@@ -1,3 +1,5 @@
+import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
+
 /// Native 接受自动回连目标后的 owner 状态。
 ///
 /// `resolved` 表示目标已有稳定平台身份并已交给长期回连；`identityPending`
@@ -25,6 +27,8 @@ class BleReconnectActivationResult {
     required this.name,
     required this.state,
     required this.reason,
+    this.source = BleConnectSource.unknown,
+    this.sessionGeneration = 0,
   });
 
   final String belongConfig;
@@ -32,8 +36,12 @@ class BleReconnectActivationResult {
   final String name;
   final BleReconnectActivationState state;
   final String reason;
+  final BleConnectSource source;
 
-  /// 只有 resolved / identityPending 才代表 native 真正持有长期回连 owner。
+  /// even_connect recovery batch 的逻辑代次；不得与 native Gate attempt 混用。
+  final int sessionGeneration;
+
+  /// 除 rejected 外都表示 native 已保留当前连接 owner。
   bool get isAccepted => state != BleReconnectActivationState.rejected;
 
   /// 宽松解析 MethodChannel map，同时对缺失/未来状态采取 fail-closed。
@@ -45,6 +53,15 @@ class BleReconnectActivationResult {
       name: map['name'] as String? ?? '',
       state: BleReconnectActivationState.fromNative(map['state']),
       reason: map['reason'] as String? ?? 'invalidNativeAck',
+      source: BleConnectSource.values.firstWhere(
+        (source) => source.name == map['source'],
+        orElse: () => BleConnectSource.unknown,
+      ),
+      sessionGeneration: switch (map['sessionGeneration']) {
+        final int value => value,
+        final num value => value.toInt(),
+        _ => 0,
+      },
     );
   }
 }

@@ -107,6 +107,10 @@ extension BleManager {
             peripheral: peripheral,
             advertisedName: advertisedName,
             belongConfig: bleConfig.name,
+            advertisedMac: parseDataToMac(
+                manufactureData: manufactureData,
+                macRule: bleConfig.scan.macRule
+            ),
             rssi: rssi.intValue
         ) {
             return
