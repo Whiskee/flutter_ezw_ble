@@ -1135,6 +1135,55 @@ class BleManager private constructor() {
     }
 
     /**
+     * 原子撤销一台逻辑设备的所有自动回连端点。
+     *
+     * 设备切换时 G2 双腿必须先同时从 Gate 中失效，再逐端点释放 runtime；如果复用
+     * [disconnect] 逐个取消，第一条腿释放时可能短暂 grant 第二条旧腿。方法返回时，
+     * 持久 owner、supervisor、扫描任务、Gate generation 和 GATT 均已失效。
+     */
+    @Synchronized
+    internal fun cancelAutoReconnectTargets(
+        targets: List<BleReconnectSeed>,
+        removeBond: Boolean = false,
+        reason: String = "",
+    ) {
+        // 1、先按 uuid/name 扩展 supervisor 中的真实 endpoint，覆盖身份迁移后的旧 owner。
+        val endpointIds = targets.flatMap { target ->
+            autoReconnectSupervisor.endpointsMatching(target.uuid, target.name) + target.uuid
+        }.filter { it.isNotBlank() }.toSet()
+        if (endpointIds.isEmpty()) {
+            return
+        }
+
+        // 2、整批从 Gate 移除；返回的 next 先保留到全部旧 GATT 关闭后再启动。
+        val next = connectionAdmissionGate.cancelEndpoints(endpointIds)
+
+        // 3、逐端点删除持久意图和所有 future runtime；releaseDevice 此时不会再放行旧腿。
+        targets.forEach { target ->
+            val resolved = (autoReconnectSupervisor.endpointsMatching(target.uuid, target.name) +
+                target.uuid).filter { it.isNotBlank() }.toSet()
+            resolved.forEach { endpointId ->
+                removePersistedReconnectTarget(endpointId)
+                autoReconnectSupervisor.cancel(endpointId, reason = "batch cancel: $reason")
+                cancelScanRefresh(endpointId)
+                cancelPendingScanConnect(endpointId)
+                releaseDevice(endpointId, target.name)
+                if (removeBond) {
+                    removeBond(endpointId)
+                }
+            }
+        }
+
+        // 4、旧逻辑设备完全退出后，才允许仍获授权的其它逻辑设备进入 GATT pipeline。
+        next?.let { startGrantedGattPipeline(it) }
+        sendLog(
+            BleLoggerTag.d,
+            "Cancel auto reconnect targets: endpoints=$endpointIds, " +
+                "removeBond=$removeBond, reason=$reason",
+        )
+    }
+
+    /**
      * OTA 成功后 firmware reboot 的专用断开。
      *
      * 它与 [disconnect] 的唯一关键差异是：不撤销 persisted/native autoReconnect owner。

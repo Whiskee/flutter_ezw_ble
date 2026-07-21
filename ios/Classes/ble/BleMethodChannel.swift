@@ -27,6 +27,8 @@ enum BleMC: String {
     case connectDevice
     /// Disconnect or cancel an in-flight connect request.
     case disconnectDevice
+    /// Atomically revoke an exact logical device's reconnect owners and runtime.
+    case cancelAutoReconnectTargets
     /// OTA reboot teardown: disconnect physical transport without revoking reconnect intent.
     case disconnectForOtaReboot
     /// Mark business-layer auth as about to complete.
@@ -187,6 +189,21 @@ enum BleMC: String {
             let name: String = jsonData["name"] as? String ?? ""
             BleManager.shared.disconnect(uuid: uuid, name: name)
             break
+        case .cancelAutoReconnectTargets:
+            let data = arguments as? [String: Any] ?? [:]
+            let targets = (data["devices"] as? [[String: Any]] ?? []).map { item in
+                BleReconnectTarget(
+                    belongConfig: item["belongConfig"] as? String ?? "",
+                    uuid: item["uuid"] as? String ?? "",
+                    name: item["name"] as? String ?? ""
+                )
+            }
+            let reason = data["reason"] as? String ?? ""
+            // iOS cannot remove a system bond programmatically; removeBond is intentionally
+            // accepted by the shared Dart contract but only Android consumes it.
+            BleManager.shared.cancelAutoReconnectTargets(targets, reason: reason)
+            result(nil)
+            return
         case .disconnectForOtaReboot:
             let jsonData = arguments as? [String: Any] ?? [:]
             let uuid: String = jsonData["uuid"] as? String ?? ""

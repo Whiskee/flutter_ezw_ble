@@ -116,6 +116,20 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
         'disconnectDevice(uuid: $uuid, name: $name, removeBond: $removeBond) has not been implemented.');
   }
 
+  /// 原子撤销一组自动回连目标，并在返回前完成 native owner/Gate/runtime 失效。
+  ///
+  /// 设备切换和移除必须使用该批量边界，不能逐个调用 [disconnectDevice]：双腿逐个
+  /// 取消会在中间短暂放行同批另一条腿，重新制造旧设备与新设备的 HCI/GATT 竞争。
+  Future<void> cancelAutoReconnectTargets(
+    List<BleDevice> devices, {
+    bool removeBond = false,
+    String reason = '',
+  }) {
+    throw UnimplementedError(
+      'cancelAutoReconnectTargets(devices: $devices, removeBond: $removeBond, reason: $reason) has not been implemented.',
+    );
+  }
+
   /// OTA 成功后设备重启前的专用物理断开。
   ///
   /// 这不是用户取消：必须保留 native autoReconnect owner 和持久化目标，同时用当前

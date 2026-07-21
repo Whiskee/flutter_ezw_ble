@@ -519,6 +519,45 @@ extension BleManager {
     }
 
     /**
+     * Atomically revoke all reconnect endpoints that belong to one logical device.
+     *
+     * The Gate is invalidated for the complete target set before any CoreBluetooth cancel is
+     * submitted. This prevents the first cancelled G2 leg from granting the second stale leg
+     * while a replacement device is waiting to become current.
+     */
+    func cancelAutoReconnectTargets(_ targets: [BleReconnectTarget], reason: String) {
+        // 1. Resolve aliases and name-only owners before mutating reconnectTasks.
+        let endpointIds = Set(targets.flatMap { target -> [String] in
+            let taskUuids = reconnectTasks.values.filter { task in
+                isSameConnectTarget(
+                    storedUuid: task.uuid,
+                    storedName: task.name,
+                    uuid: target.uuid,
+                    name: target.name
+                )
+            }.map(\.uuid)
+            let canonical = reconnectIdentityAliases.resolvedCanonical(uuid: target.uuid)
+            return taskUuids + [target.uuid, canonical ?? ""]
+        }.filter { !$0.isEmpty })
+        guard !targets.isEmpty else { return }
+
+        // 2. Remove every stale endpoint from the Gate as one operation and delay the next owner.
+        let next = connectionAdmissionGate.cancelEndpoints(endpointIds)
+
+        // 3. Existing disconnect owns task/store/request/peripheral cleanup and installs a
+        // cancellation barrier before CoreBluetooth can deliver a late terminal callback.
+        targets.forEach { target in
+            disconnect(uuid: target.uuid, name: target.name)
+        }
+
+        // 4. Only after all old targets have been revoked may a surviving owner enter GATT.
+        if let next {
+            startGrantedGattPipeline(next)
+        }
+        loggerD(msg: "cancel auto reconnect targets: endpoints=\(endpointIds), reason=\(reason)")
+    }
+
+    /**
      * OTA 成功后的固件 reboot 专用断开。
      *
      * 不能复用 [disconnect]：那条路径代表用户取消，会删除 reconnect task 与持久 owner。

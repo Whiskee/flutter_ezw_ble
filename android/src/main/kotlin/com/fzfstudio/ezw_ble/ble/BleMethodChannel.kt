@@ -43,6 +43,8 @@ enum class BleMC {
     NOTIFY_AUTO_RECONNECT_TARGET_VISIBLE,
     /** 断开设备连接，可选移除系统绑定。 */
     DISCONNECT_DEVICE,
+    /** 原子撤销一组 exact 自动回连目标及其 Gate/GATT runtime。 */
+    CANCEL_AUTO_RECONNECT_TARGETS,
     /** OTA reboot 收尾断开：保留长期回连 owner，禁止立即 schedule。 */
     DISCONNECT_FOR_OTA_REBOOT,
     /** 中性释放 endpoint runtime，保留持久自动回连 owner。 */
@@ -187,6 +189,17 @@ enum class BleMC {
                 val uuid = jsonMap?.get("uuid") as? String ?: ""
                 val removeBond = jsonMap?.get("removeBond") as Boolean? ?: false
                 BleManager.instance.disconnect(uuid, removeBond)
+            }
+            CANCEL_AUTO_RECONNECT_TARGETS -> {
+                // 1、设备切换/移除按整台逻辑设备提交，manager 先批量失效 Gate 再关闭 GATT。
+                val jsonMap = arguments as? Map<*, *>
+                val targets = (jsonMap?.get("devices") as? List<*>)
+                    ?.mapNotNull { (it as? Map<*, *>)?.toReconnectSeed() }
+                    ?: emptyList()
+                val removeBond = jsonMap?.get("removeBond") as? Boolean ?: false
+                val reason = jsonMap?.get("reason") as? String ?: ""
+                BleManager.instance.cancelAutoReconnectTargets(targets, removeBond, reason)
+                return result.success(null)
             }
             DISCONNECT_FOR_OTA_REBOOT -> {
                 // OTA 成功后的固件 reboot 不是用户取消；必须保留 owner，由 Dart 在

@@ -85,6 +85,18 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       });
 
   @override
+  Future<void> cancelAutoReconnectTargets(
+    List<BleDevice> devices, {
+    bool removeBond = false,
+    String reason = '',
+  }) async =>
+      methodChannel.invokeMethod("cancelAutoReconnectTargets", {
+        "devices": devices.map((device) => device.toJson()).toList(),
+        "removeBond": removeBond,
+        "reason": reason,
+      });
+
+  @override
   Future<void> disconnectForOtaReboot(String uuid, String name) async =>
       methodChannel.invokeMethod("disconnectForOtaReboot", {
         "uuid": uuid,

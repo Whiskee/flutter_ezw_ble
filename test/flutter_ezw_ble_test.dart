@@ -66,6 +66,15 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
+  Future<void> cancelAutoReconnectTargets(
+    List<BleDevice> devices, {
+    bool removeBond = false,
+    String reason = '',
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
   Future<void> disconnectForOtaReboot(String uuid, String name) {
     throw UnimplementedError();
   }

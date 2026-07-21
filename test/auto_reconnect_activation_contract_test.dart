@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/services.dart';
 import 'package:flutter_ezw_ble/core/models/ble_connect_model.dart';
 import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
@@ -163,6 +165,59 @@ void main() {
     });
   });
 
+  test('batch cancellation preserves exact targets and removal intent',
+      () async {
+    MethodCall? captured;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      captured = call;
+      return null;
+    });
+
+    await platform.cancelAutoReconnectTargets(
+      [
+        BleDevice('g2', 'AA:01', 'Even G2_L', 'G2-1', -50),
+        BleDevice('g2', 'AA:02', 'Even G2_R', 'G2-1', -50),
+      ],
+      removeBond: true,
+      reason: 'remove device G2-1',
+    );
+
+    expect(captured?.method, 'cancelAutoReconnectTargets');
+    final arguments = captured?.arguments as Map<Object?, Object?>;
+    expect(arguments['removeBond'], isTrue);
+    expect(arguments['reason'], 'remove device G2-1');
+    expect(arguments['devices'], hasLength(2));
+  });
+
+  test('native batch cancellation invalidates Gate before endpoint teardown',
+      () {
+    final android = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleManager.kt',
+    ).readAsStringSync();
+    final ios = File('ios/Classes/ble/BleManager.swift').readAsStringSync();
+
+    final androidMethod = _methodBody(
+      android,
+      'fun cancelAutoReconnectTargets(',
+      'fun disconnectForOtaReboot(',
+    );
+    expect(
+      androidMethod.indexOf('connectionAdmissionGate.cancelEndpoints'),
+      lessThan(androidMethod.indexOf('releaseDevice(endpointId')),
+    );
+
+    final iosMethod = _methodBody(
+      ios,
+      'func cancelAutoReconnectTargets(',
+      'func disconnectForOtaReboot(',
+    );
+    expect(
+      iosMethod.indexOf('connectionAdmissionGate.cancelEndpoints'),
+      lessThan(iosMethod.indexOf('disconnect(uuid: target.uuid')),
+    );
+  });
+
   test('name-only iOS target is preserved and parses identityPending ack',
       () async {
     MethodCall? captured;
@@ -223,4 +278,12 @@ void main() {
     expect(results.single.isAccepted, isFalse);
     expect(results.single.reason, 'emptyIdentity');
   });
+}
+
+String _methodBody(String source, String start, String end) {
+  final startIndex = source.indexOf(start);
+  final endIndex = source.indexOf(end, startIndex + start.length);
+  expect(startIndex, isNonNegative, reason: 'missing $start');
+  expect(endIndex, greaterThan(startIndex), reason: 'missing boundary $end');
+  return source.substring(startIndex, endIndex);
 }
