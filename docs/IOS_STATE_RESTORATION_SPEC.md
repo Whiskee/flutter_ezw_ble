@@ -166,7 +166,7 @@ service/char/timeout 等非 CoreBluetooth 终态要先调用 cancel，并保持 
 - `charsFail`；
 - 蓝牙关闭。
 
-蓝牙关闭只能暂停任务。恢复到 poweredOn 后，原生层应重新 replay reconnect target，继续 pending connect 或 GATT pipeline。
+蓝牙关闭只能暂停任务。恢复到 poweredOn 后，iOS 原生层应重新 replay reconnect target，继续 pending connect 或 GATT pipeline；Android 同样恢复长期 passive owner，上层最多 20 秒的扫描只并行刷新身份，不能成为直连前置条件。
 
 任何界面上的“取消”都必须调用真取消入口：清 task、持久化 target、`identityPending` owner、pending peripheral/session、timer 与迟到 callback 的复活入口；此后只有再次明确手动点击连接才能重新 activate。自动/手动连接 UI 的 1 分钟超时只停止展示（手动可提示超时），不能隐式调用取消。蓝牙关闭则 teardown Gate/session 并把下一 attempt source 重置为 `autoReconnect`，旧 manual source 不跨 transport reset。
 

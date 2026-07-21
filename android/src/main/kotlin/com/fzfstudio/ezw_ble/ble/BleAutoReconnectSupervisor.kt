@@ -316,7 +316,8 @@ internal class BleAutoReconnectSupervisor(
     /**
      * 蓝牙关闭时暂停所有回连任务。
      *
-     * Android 蓝牙关闭会让当前 GATT binder 失效；这里只暂停，等待蓝牙恢复后继续调度。
+     * Android 蓝牙关闭会让当前 GATT binder 失效；这里只暂停并关闭失效句柄，
+     * 等待 powered-on 后按统一直连契约重建长期 passive owner。
      */
     fun pauseForBluetoothOff() {
         // 1、先清空可见直连槽位，避免蓝牙关闭后残留物理 owner。
@@ -351,10 +352,10 @@ internal class BleAutoReconnectSupervisor(
     }
 
     /**
-     * 蓝牙恢复后重启被暂停的回连任务。
+     * 蓝牙 powered-on 后恢复此前暂停的长期回连。
      *
-     * 所有任务都回到 passive `connectGatt(true)`，不再使用指数退避；自动回连是业务
-     * connected 后建立的持续意图，停止源只能是用户/业务主动取消、配置关闭或 reset/release。
+     * 回连 owner 先直接进入 passive `connectGatt(true)`，Dart 最多 20 秒的辅助扫描
+     * 与之并行，只负责刷新可见身份，不能成为恢复 owner 的前置条件。
      */
     fun resumeAfterBluetoothOn() {
         // 1、只恢复因蓝牙关闭暂停的任务。
