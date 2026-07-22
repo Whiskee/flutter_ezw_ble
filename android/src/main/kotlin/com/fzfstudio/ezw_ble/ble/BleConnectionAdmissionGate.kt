@@ -56,6 +56,21 @@ internal class BleConnectionAdmissionGate {
         automaticQueue.removeAll { endpointKey(it.endpointId) == key && it.generation < generation }
     }
 
+    /**
+     * 返回 Gate 已记录的 endpoint generation 高水位。
+     *
+     * Manager 在批量撤销和新 attempt 注册时必须与这个值取最大值；否则两个状态机
+     * 独立递增后会出现 Manager 生成的新 token 仍低于 Gate，高概率在真实物理回调时
+     * 被错误判为 STALE。
+     */
+    @Synchronized
+    fun latestGeneration(endpointId: String): Long? {
+        if (endpointId.isBlank()) {
+            return null
+        }
+        return latestGenerations[endpointKey(endpointId)]
+    }
+
     /** 按真实物理 callback 到达顺序提交；首个节点立即成为 owner，其余进入优先队列。 */
     @Synchronized
     fun onPhysicalConnected(admission: BleConnectionAdmission): BleConnectionAdmissionDecision {

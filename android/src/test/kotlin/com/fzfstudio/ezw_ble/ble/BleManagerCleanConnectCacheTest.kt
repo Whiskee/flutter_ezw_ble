@@ -142,14 +142,46 @@ class BleManagerCleanConnectCacheTest {
         store.clearTargets(context)
     }
 
+    @Test
+    fun `repeated batch cancellation keeps manager and gate generations converged`() {
+        val manager = BleManager.instance
+        manager.cleanConnectCache()
+        managerField<MutableList<BleDevice>>(manager, "connectedDevices").clear()
+        val endpoint = "AA:BB:CC:DD:EE:10"
+        val seed = BleReconnectSeed(
+            belongConfig = "ring_bcl_1",
+            uuid = endpoint,
+            name = "EVEN R1_EE10",
+            sn = "ring-sn",
+            rssi = -40,
+        )
+        val gate = managerField<BleConnectionAdmissionGate>(manager, "connectionAdmissionGate")
+
+        // 1、模拟 OTA/移除流程连续撤销同一 endpoint；每轮只能推进一个 generation。
+        Mockito.mockStatic(Log::class.java).use {
+            repeat(3) { index ->
+                manager.cancelAutoReconnectTargets(
+                    listOf(seed),
+                    reason = "repeated cancellation ${index + 1}",
+                )
+            }
+        }
+
+        // 2、下一次真实连接必须能注册到 Gate 当前高水位，而不是在物理回调时被判 STALE。
+        val fresh = registerAttempt(manager, endpoint)
+        assertEquals(fresh.generation, gate.latestGeneration(endpoint))
+        assertEquals(BleConnectionAdmissionDecision.GRANTED, gate.onPhysicalConnected(fresh))
+    }
+
     private fun registerAttempt(manager: BleManager, endpoint: String): BleConnectionAdmission {
         val method = BleManager::class.java.getDeclaredMethod(
             "registerConnectionAttempt",
             String::class.java,
             BleConnectSource::class.java,
+            Long::class.javaPrimitiveType,
         )
         method.isAccessible = true
-        return method.invoke(manager, endpoint, BleConnectSource.AUTO_RECONNECT) as BleConnectionAdmission
+        return method.invoke(manager, endpoint, BleConnectSource.AUTO_RECONNECT, 0L) as BleConnectionAdmission
     }
 
     @Suppress("UNCHECKED_CAST")

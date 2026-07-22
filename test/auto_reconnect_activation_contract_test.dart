@@ -221,10 +221,14 @@ void main() {
       'fun cancelAutoReconnectTargets(',
       'fun disconnectForOtaReboot(',
     );
+    // 1、批量取消必须先让 Manager/Gate 共同推进一次 generation。
     expect(
-      androidMethod.indexOf('connectionAdmissionGate.cancelEndpoints'),
-      lessThan(androidMethod.indexOf('releaseDevice(endpointId')),
+      androidMethod.indexOf('invalidateConnectionAttempts(endpointIds)'),
+      lessThan(androidMethod.indexOf('releaseDeviceRuntime(')),
     );
+    // 2、逐 endpoint teardown 只能释放 runtime，不得再次推进 Gate generation。
+    expect(androidMethod, contains('admissionAlreadyInvalidated = true'));
+    expect(androidMethod, isNot(contains('releaseDevice(endpointId')));
 
     final iosMethod = _methodBody(
       ios,

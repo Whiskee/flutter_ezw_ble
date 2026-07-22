@@ -190,6 +190,13 @@ the platform boundary, the exact GATT/peripheral object. Status events expose
 the Dart sessionGeneration separately so a reconnect batch can remain stable
 while native retries advance attempt ownership. Stale callbacks fail closed.
 
+Android Manager and Gate maintain the same per-endpoint attempt-generation
+high-water mark. A batch cancellation advances that mark exactly once before
+tearing down its endpoint runtimes; the per-endpoint release step must not
+advance it again. A later attempt is allocated from the maximum high-water mark
+observed by either side. This keeps a valid post-cancellation physical callback
+from being rejected as stale after OTA, device switching, or repeated cleanup.
+
 ## GATT Restoration Readiness
 
 Native reconnect is successful only after every configured private service is restored:

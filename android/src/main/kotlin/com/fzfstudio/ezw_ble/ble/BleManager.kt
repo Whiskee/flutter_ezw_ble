@@ -364,13 +364,7 @@ class BleManager private constructor() {
             businessConnectedGattSessions.remove(it)
             lastEpochAcceptedAdmissions.remove(it)
         }
-        endpointIds.forEach { endpointId ->
-            val key = reconnectKey(endpointId)
-            connectionAttemptGenerations[key] = nextConnectionGeneration(
-                connectionAttemptGenerations[key] ?: 0L,
-            )
-        }
-        val next = connectionAdmissionGate.cancelEndpoints(endpointIds)
+        val next = invalidateConnectionAttempts(endpointIds)
 
         // 2. 清除尚未物理连接的扫描/命令/鉴权上下文，避免延迟任务重新打开 GATT。
         pendingScanConnects.removeAll { it.belongConfig in configNames }
@@ -1161,8 +1155,9 @@ class BleManager private constructor() {
             return
         }
 
-        // 2、整批从 Gate 移除；返回的 next 先保留到全部旧 GATT 关闭后再启动。
-        val next = connectionAdmissionGate.cancelEndpoints(endpointIds)
+        // 2、Manager 与 Gate 以同一高水位原子失效一次；返回的 next 先保留到全部
+        // 旧 GATT 关闭后再启动。不能在 release runtime 时再次推进 generation。
+        val next = invalidateConnectionAttempts(endpointIds)
 
         // 3、逐端点删除持久意图和所有 future runtime；releaseDevice 此时不会再放行旧腿。
         targets.forEach { target ->
@@ -1173,7 +1168,11 @@ class BleManager private constructor() {
                 autoReconnectSupervisor.cancel(endpointId, reason = "batch cancel: $reason")
                 cancelScanRefresh(endpointId)
                 cancelPendingScanConnect(endpointId)
-                releaseDevice(endpointId, target.name)
+                releaseDeviceRuntime(
+                    endpointId,
+                    target.name,
+                    admissionAlreadyInvalidated = true,
+                )
                 if (removeBond) {
                     removeBond(endpointId)
                 }
@@ -1286,6 +1285,21 @@ class BleManager private constructor() {
      */
     @Synchronized
     fun releaseDevice(uuid: String, name: String = "") {
+        releaseDeviceRuntime(uuid, name, admissionAlreadyInvalidated = false)
+    }
+
+    /**
+     * 释放单个 endpoint 的 runtime 资源。
+     *
+     * 1、普通 release 在此同步失效 Manager/Gate generation。
+     * 2、批量取消已经对整组 endpoint 完成原子失效，只执行 runtime teardown；若再次
+     *    cancel Gate，会让 Gate 比 Manager 多推进一代，后续真实连接永远被判 STALE。
+     */
+    private fun releaseDeviceRuntime(
+        uuid: String,
+        name: String,
+        admissionAlreadyInvalidated: Boolean,
+    ) {
         val taskEndpoints = autoReconnectSupervisor.endpointsMatching(uuid, name)
         val matchingDevices = connectedDevices.filter { device ->
             (uuid.isNotBlank() && device.uuid.equals(uuid, ignoreCase = true)) ||
@@ -1319,13 +1333,11 @@ class BleManager private constructor() {
             businessConnectedGattSessions.remove(it)
             lastEpochAcceptedAdmissions.remove(it)
         }
-        endpointIds.forEach { endpointId ->
-            val key = reconnectKey(endpointId)
-            connectionAttemptGenerations[key] = nextConnectionGeneration(
-                connectionAttemptGenerations[key] ?: 0L,
-            )
+        val next = if (admissionAlreadyInvalidated) {
+            null
+        } else {
+            invalidateConnectionAttempts(endpointIds)
         }
-        val next = connectionAdmissionGate.cancelEndpoints(endpointIds)
 
         // 2. 取消该 endpoint 所有未来 runtime 入口，但刻意不调用 removePersistedReconnectTarget。
         taskEndpoints.forEach { autoReconnectSupervisor.cancel(it, reason = "neutral releaseDevice") }
@@ -2102,7 +2114,15 @@ class BleManager private constructor() {
         // 新 session 一旦注册，旧业务 GATT metadata 立即失效；旧 callback 必须同时
         // 匹配 GATT 对象和 admission sessionId，不能误杀新 attempt。
         businessConnectedGattSessions.remove(key)
-        val generation = nextConnectionGeneration(connectionAttemptGenerations[key] ?: 0L)
+        // Manager/Gate 都保存 endpoint generation。任何历史取消或版本升级造成两侧
+        // 高水位不一致时，新 attempt 必须从较大者继续，才能在物理 callback 到达时
+        // 被 Gate 接受；只参考 Manager 会让有效 GATT 永久落入 STALE 分支。
+        val generation = nextConnectionGeneration(
+            maxOf(
+                connectionAttemptGenerations[key] ?: 0L,
+                connectionAdmissionGate.latestGeneration(endpointId) ?: 0L,
+            ),
+        )
         connectionAttemptGenerations[key] = generation
         val admission = BleConnectionAdmission(
             endpointId = endpointId,
@@ -2114,6 +2134,35 @@ class BleManager private constructor() {
         connectionAdmissionGate.registerAttempt(endpointId, generation)
         currentAdmissions[key] = admission
         return admission
+    }
+
+    /**
+     * 让 Manager 与 Gate 对一组 endpoint 只推进一次 generation。
+     *
+     * 1、先以两侧最大高水位对齐 Gate 的 floor，兼容旧版本已产生的 generation 漂移。
+     * 2、Manager 记录下一代，Gate 的批量 cancel 同样只推进到下一代。
+     * 3、调用方必须复用返回的 next owner，完成旧 GATT teardown 后再启动它。
+     */
+    @Synchronized
+    private fun invalidateConnectionAttempts(
+        endpointIds: Set<String>,
+    ): BleConnectionAdmission? {
+        val normalized = endpointIds.filter { it.isNotBlank() }.toSet()
+        if (normalized.isEmpty()) {
+            return null
+        }
+        normalized.forEach { endpointId ->
+            val key = reconnectKey(endpointId)
+            val highWater = maxOf(
+                connectionAttemptGenerations[key] ?: 0L,
+                connectionAdmissionGate.latestGeneration(endpointId) ?: 0L,
+            )
+            // 1、先把较低一侧抬到共同 floor；registerAttempt 不会降低 Gate 高水位。
+            connectionAdmissionGate.registerAttempt(endpointId, highWater)
+            // 2、Manager 与随后的 Gate.cancelEndpoints 同步进入同一个 next generation。
+            connectionAttemptGenerations[key] = nextConnectionGeneration(highWater)
+        }
+        return connectionAdmissionGate.cancelEndpoints(normalized)
     }
 
     /** 返回 exact 当前 admission；source 可被手动点击提升，但三元 identity 必须不变。 */
@@ -2136,7 +2185,21 @@ class BleManager private constructor() {
     ) {
         val admission = currentAdmissionFor(expectedAdmission)
         if (admission == null || device.uuid.isBlank() || device.myGatt !== gatt) {
-            sendLog(BleLoggerTag.d, "Admission gate: ${device.uuid}, stale/invalid physical callback ignored")
+            val endpointId = device.uuid.ifBlank { expectedAdmission.endpointId }
+            val key = reconnectKey(endpointId)
+            val current = currentAdmissions[key]
+            sendLog(
+                BleLoggerTag.d,
+                "Admission gate decision: endpoint=$endpointId, decision=PRECHECK_REJECTED, " +
+                    "expectedAttemptGeneration=${expectedAdmission.generation}, " +
+                    "expectedSessionGeneration=${expectedAdmission.sessionGeneration}, " +
+                    "expectedSessionId=${expectedAdmission.sessionId}, " +
+                    "currentAttemptGeneration=${current?.generation}, " +
+                    "managerGeneration=${connectionAttemptGenerations[key]}, " +
+                    "gateGeneration=${connectionAdmissionGate.latestGeneration(endpointId)}, " +
+                    "source=${expectedAdmission.source.flutterValue}, " +
+                    "blankIdentity=${device.uuid.isBlank()}, exactGatt=${device.myGatt === gatt}",
+            )
             runCatching { gatt.close() }
             return
         }
@@ -2149,7 +2212,18 @@ class BleManager private constructor() {
             device = device,
             afterUpgrade = afterUpgrade,
         )
-        when (connectionAdmissionGate.onPhysicalConnected(admission)) {
+        val decision = connectionAdmissionGate.onPhysicalConnected(admission)
+        sendLog(
+            BleLoggerTag.d,
+            "Admission gate decision: endpoint=${admission.endpointId}, decision=$decision, " +
+                "attemptGeneration=${admission.generation}, " +
+                "sessionGeneration=${admission.sessionGeneration}, " +
+                "sessionId=${admission.sessionId}, " +
+                "managerGeneration=${connectionAttemptGenerations[reconnectKey(admission.endpointId)]}, " +
+                "gateGeneration=${connectionAdmissionGate.latestGeneration(admission.endpointId)}, " +
+                "source=${admission.source.flutterValue}",
+        )
+        when (decision) {
             BleConnectionAdmissionDecision.GRANTED -> {
                 handleConnectState(
                     device.uuid,
@@ -2178,6 +2252,10 @@ class BleManager private constructor() {
                 admittedGattSessions.remove(admission.sessionId)
                 runCatching { gatt.disconnect() }
                 runCatching { gatt.close() }
+                sendLog(
+                    BleLoggerTag.d,
+                    "Admission gate: ${device.uuid}, physical callback closed after decision=$decision",
+                )
             }
         }
     }
@@ -2406,7 +2484,7 @@ class BleManager private constructor() {
         currentAdmissions.remove(reconnectKey(current.endpointId))
         admittedGattSessions.remove(current.sessionId)
         return if (invalidateEndpoint) {
-            connectionAdmissionGate.cancelEndpoint(current.endpointId)
+            invalidateConnectionAttempts(setOf(current.endpointId))
         } else {
             connectionAdmissionGate.complete(
                 current.endpointId,
@@ -2570,10 +2648,7 @@ class BleManager private constructor() {
         }
         val key = reconnectKey(uuid)
         currentAdmissions.remove(key)?.let { admittedGattSessions.remove(it.sessionId) }
-        connectionAttemptGenerations[key] = nextConnectionGeneration(
-            connectionAttemptGenerations[key] ?: 0L,
-        )
-        connectionAdmissionGate.cancelEndpoint(uuid)?.let { startGrantedGattPipeline(it) }
+        invalidateConnectionAttempts(setOf(uuid))?.let { startGrantedGattPipeline(it) }
         sendLog(BleLoggerTag.d, "Admission gate: $uuid cancelled, reason=$reason")
     }
 
@@ -2597,10 +2672,7 @@ class BleManager private constructor() {
         }
 
         currentAdmissions.remove(key)
-        connectionAttemptGenerations[key] = nextConnectionGeneration(
-            connectionAttemptGenerations[key] ?: 0L,
-        )
-        connectionAdmissionGate.cancelEndpoint(uuid)?.let { startGrantedGattPipeline(it) }
+        invalidateConnectionAttempts(setOf(uuid))?.let { startGrantedGattPipeline(it) }
         sendCmdQueues.remove(key)
         device.releaseAndClear()
         sendLog(

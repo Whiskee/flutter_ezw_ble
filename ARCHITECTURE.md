@@ -471,6 +471,7 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 4. service/char/timeout 等非系统终态必须先完成 GATT/peripheral teardown，再释放 Gate；普通 CoreBluetooth 终态也必须先移除旧 active request，之后才能调度下一代，避免调度被旧 owner 永久 defer。iOS 使用 exact cancellation token + 2s watchdog；超时债务按 endpoint 用饱和 counter 常数内存保存，迟到 callback 不能误杀新 generation。Android 在业务 connected 后保留 exact `(sessionId, GATT)` metadata，稍后的系统断连仍会清理并重建 passive GATT，旧 GATT 不能命中新 attempt。
 5. UI 的 1 分钟展示超时属于上层展示策略，不会停止 native 长期回连；只有用户点击取消/断开才是真取消，同时清 task、持久化 owner、pending session 与定时器，直到下一次明确手动连接才可重新 arm/activate。
 6. 蓝牙关闭会先快照 active admission 的 generation，并由已业务连接 task 保留最后成功 generation；随后才 teardown 全部 session、清空 Gate 并暂停任务。发给 Dart 的 `disconnectFromSys` 必须复用该可接受 generation，不能退化为 `unknown/0`。恢复后 source 重置为 `autoReconnect`，旧 manual source 不跨 transport generation 泄漏。
+7. Android Manager 与 Gate 的 endpoint attempt generation 必须共享同一高水位：批量取消先统一推进一次 generation，再逐 endpoint 释放 GATT/runtime；release 阶段不得重复推进。新 attempt 从两侧高水位最大值继续，防止 OTA、设备切换或重复清理后真实物理 callback 被误判为 `STALE`。
 
 触发回连：
 
