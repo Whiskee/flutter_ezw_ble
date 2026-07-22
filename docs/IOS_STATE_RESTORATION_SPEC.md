@@ -91,6 +91,15 @@ iOS 自动回连的关键不是扫描，而是把已知 `CBPeripheral` 尽快交
 
 Pending connect 阶段不能使用短连接超时主动取消。设备离开几分钟、几十分钟甚至更久，都应该让 CoreBluetooth 持有这个系统级等待点；短 timeout 只能用于 `didConnect` 之后的 GATT 准备阶段，或前台用户主动连接的可见性反馈。
 
+### 配对信息被设备清除
+
+设备恢复出厂后会清除自身的 bond。iOS 随后可能以
+`CBErrorDomain Code=14 (Peer removed pairing information)` 回调旧的 pending
+connect；这不等价于普通离线或 State Restoration 重连。插件必须移除旧
+`CBPeripheral` 缓存并等待新广播接管，期间禁止 passive reconnect 再次连接旧对象。
+
+该流程与用户在系统设置中“忽略此设备”互补：忽略操作仍是产品流程的必要步骤，但插件不能假设系统记录已经同步完成，也不能在等待期间制造旧安全上下文的重连循环。
+
 ## 6. ANCS / 系统已连接场景
 
 部分外设会因为 ANCS 或系统蓝牙设置页连接而停止广播。此时 `scanForPeripherals` 扫不到目标并不代表设备不存在。

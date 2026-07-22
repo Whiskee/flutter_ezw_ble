@@ -64,6 +64,15 @@ extension BleManager {
             time: Date().timeIntervalSince1970,
         )
         newEasyConnect.bleConfig = bleConfig
+        // Code=14 recovery owns exactly one scan request. A repeated user tap should reuse that
+        // request while it is waiting, but can start a new foreground attempt after its scan
+        // timeout has ended and the stale-peripheral gate is no longer useful.
+        guard prepareExplicitConnectAfterPeerPairingRecovery(
+            uuid: newEasyConnect.uuid,
+            name: newEasyConnect.name
+        ) else {
+            return
+        }
         // 是否串行连接由 Dart 业务层决定；原生只保证每个请求可被回调追踪和取消。
         upsertActiveConnectRequest(newEasyConnect)
         loggerD(msg: BleConnectRequestLogContext(

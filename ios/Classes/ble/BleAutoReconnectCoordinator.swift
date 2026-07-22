@@ -259,6 +259,13 @@ extension BleManager {
             // 没有 armed task 说明业务尚未确认 connected，原生不能自行接管长期回连。
             return
         }
+        // Code=14 表示旧 pairing security context 已被 iOS 丢弃。此时只能等待一次
+        // didDiscover 提供的新广播/peripheral；若继续立即 beginReconnectAttempt，会复用
+        // 已失效对象并把 didFailToConnect -> disconnectFromSys 递归成高频重连循环。
+        guard !isPeerPairingRecoveryActive(uuid: uuid, name: name) else {
+            loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), defer passive reconnect until fresh advertisement after pairing reset")
+            return
+        }
         guard let config = bleConfigs.first(where: { $0.name == task.belongConfig }), config.autoReconnect else {
             // 配置被移除或关闭后，旧任务只保留日志，不再调度。
             return

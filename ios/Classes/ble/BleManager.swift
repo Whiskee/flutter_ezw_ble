@@ -83,6 +83,9 @@ class BleManager: NSObject {
     private lazy var otaWriteQueues: [String: OtaWriteQueue] = [:]
     //  - 原生自动回连任务，只有业务 connected 后才会加入
     lazy var reconnectTasks: [String: BleReconnectTask] = [:]
+    //  - iOS 报 Code=14 后等待新广播的恢复请求。旧 CBPeripheral 的配对安全上下文
+    //    已失效，必须在 scan 命中新广播前阻止 passive reconnect 继续复用旧对象。
+    lazy var peerPairingRecoveryRequests: [String: BleEasyConnect] = [:]
     let reconnectStore = BleReconnectStore()
     let restorationCoordinator = BleStateRestorationCoordinator()
     //  - 最近一次已输出的扫描配置签名，用于避免每次 startScan 都重复刷配置详情。
@@ -479,6 +482,7 @@ extension BleManager {
         //  1、清理当前连接请求和搜索连接信息。
         activeConnectRequests.removeAll()
         startConnectInfos.removeAll()
+        peerPairingRecoveryRequests.removeAll()
         cancelAllReconnectTasks()
         clearPersistedReconnectTargets()
         //  2、取消连接超时计时器。
@@ -504,6 +508,7 @@ extension BleManager {
         connectedDevices.removeAll()
         activeConnectRequests.removeAll()
         startConnectInfos.removeAll()
+        peerPairingRecoveryRequests.removeAll()
         connectingTimeoutTimers.forEach { (uuid, name, timer) in
             timer.invalidate()
         }
@@ -668,14 +673,25 @@ extension BleManager {
      */
     func updateActiveConnectRequestUuid(uuid: String, name: String) {
         // 1. 通过 active owner 找到同一目标的活动请求。
-        guard let index = activeConnectRequests.firstIndex(where: { request in
+        var requestIndex = activeConnectRequests.firstIndex(where: { request in
             isSameActiveConnectTarget(
                 storedUuid: request.uuid,
                 storedName: request.name,
                 uuid: uuid,
                 name: name
             )
-        }) else {
+        })
+        // Code=14 后 CoreBluetooth 可能为同一物理设备分配新的 identifier。两个 UUID
+        // 都是稳定值时，通用 owner 规则不会按名称回退；仅在 pairing-recovery gate 内
+        // 允许用非空名称接管旧请求，避免普通同名设备互相覆盖。
+        if requestIndex == nil,
+           let recoveryIndex = activeConnectRequests.firstIndex(where: { request in
+               !name.isEmpty && request.name == name &&
+                   isPeerPairingRecoveryActive(uuid: request.uuid, name: request.name)
+           }) {
+            requestIndex = recoveryIndex
+        }
+        guard let index = requestIndex else {
             return
         }
 
@@ -1035,6 +1051,127 @@ extension BleManager {
         }
         passiveReconnectWatchdogTimers.removeAll()
     }
+
+    /**
+     *  判断目标是否正在等待配对信息清除后的新广播。
+     *
+     *  iOS Code=14 不是普通链路断连：旧 CBPeripheral 的安全上下文已经失效。
+     *  在 fresh advertisement 到来前禁止 auto reconnect 复用它，才能避免一次失败
+     *  回调触发下一次 connect/cancel 的高频重入循环。
+     */
+    func isPeerPairingRecoveryActive(uuid: String, name: String) -> Bool {
+        return peerPairingRecoveryRequests.values.contains { request in
+            request.uuid == uuid || (!name.isEmpty && request.name == name)
+        }
+    }
+
+    /**
+     *  配对信息重置后的唯一恢复入口。
+     *
+     *  顺序必须是：先让旧 session 按系统断连收尾，再移除旧 peripheral 缓存，最后
+     *  创建 scan-then-connect 请求。继续对旧对象发起 passive connect 只会反复得到
+     *  Code=14，也不会给 iOS 重新发起系统配对的机会。
+     */
+    private func startPeerPairingResetRecovery(
+        peripheral: CBPeripheral,
+        device: BleConnectedDevice,
+        tag: String
+    ) {
+        let uuid = peripheral.identifier.uuidString
+        // 断连回调里的 name 可能暂时为空；优先使用已确认的 reconnect task 名称，确保
+        // 新广播可以稳定匹配到这次 scan-first 恢复。
+        let peripheralName = peripheral.name ?? ""
+        let taskName = reconnectTasks[reconnectKey(uuid: uuid)]?.name ?? ""
+        let name = peripheralName.isNotEmpty ? peripheralName : taskName
+        guard !isPeerPairingRecoveryActive(uuid: uuid, name: name) else {
+            loggerD(msg: "peer pairing reset: \(uuid)-\(name), fresh advertisement recovery already pending")
+            return
+        }
+
+        var request = BleEasyConnect(
+            configName: device.belongConfig.name,
+            uuid: uuid,
+            name: name,
+            afterUpgrade: false,
+            directConnect: false,
+            time: Date().timeIntervalSince1970
+        )
+        request.bleConfig = device.belongConfig
+        // 先写 gate，再发送 disconnect 状态；scheduleReconnect 会识别该 gate，不能在
+        // 本次清理期间再次复用即将被移除的 peripheral。
+        peerPairingRecoveryRequests[reconnectKey(uuid: uuid)] = request
+        handleConnectState(uuid: uuid, name: name, state: .disconnectFromSys, tag: tag)
+
+        // retrievePeripherals 仍可能返回携带旧 LTK 的对象，恢复连接只能由本轮
+        // didDiscover 提供的新广播接管。
+        connectedDevices.removeAll { cached in
+            cached.peripheral.identifier.uuidString == uuid ||
+                (!name.isEmpty && cached.peripheral.name == name)
+        }
+        startConnectInfos.removeAll { info in
+            isSameActiveConnectTarget(
+                storedUuid: info.uuid,
+                storedName: info.name,
+                uuid: uuid,
+                name: name
+            )
+        }
+        cancelScanConnectTimeout(uuid: uuid, name: name)
+
+        // 保留原 UUID，并以 name 匹配新的广告；新 identifier 出现后由 scan pipeline
+        // 回写 active request，保证后续 GATT 回调能查回正确 BleConfig。
+        upsertActiveConnectRequest(request)
+        startConnectInfos.append(request)
+        startScanConnectTimeout(
+            currentConfig: device.belongConfig,
+            uuid: request.uuid,
+            name: request.name,
+            afterUpgrade: false
+        )
+        startScan()
+        loggerD(msg: "peer pairing reset: \(uuid)-\(name), wait fresh advertisement before recovery")
+    }
+
+    /**
+     *  只有 scan 命中后的新广播才允许解除 Code=14 恢复 gate。
+     *
+     *  扫描超时仍保留 gate，阻止旧 peripheral 的被动回连；后续显式连接会按自己的
+     *  超时状态解除 gate 并创建新的前台尝试。
+     */
+    func finishPeerPairingResetRecovery(uuid: String, name: String) {
+        let removed = peerPairingRecoveryRequests.removeValue(
+            forKey: reconnectKey(uuid: uuid)
+        ) != nil
+        if !removed, !name.isEmpty,
+           let key = peerPairingRecoveryRequests.first(where: { $0.value.name == name })?.key {
+            peerPairingRecoveryRequests.removeValue(forKey: key)
+        }
+        loggerD(msg: "peer pairing reset: \(uuid)-\(name), fresh advertisement accepted")
+    }
+
+    /**
+     *  协调用户显式连接与正在等待新广播的 Code=14 恢复。
+     *
+     *  扫描尚未结束时重复点击复用已有请求；扫描结束后才允许新的前台请求撤销旧 gate，
+     *  避免一次用户操作创建两个竞争同一 peripheral 的 connect owner。
+     */
+    func prepareExplicitConnectAfterPeerPairingRecovery(uuid: String, name: String) -> Bool {
+        guard isPeerPairingRecoveryActive(uuid: uuid, name: name) else {
+            return true
+        }
+        let recoveryScanPending = startConnectInfos.contains { request in
+            request.uuid == uuid || (!name.isEmpty && request.name == name)
+        }
+        guard !recoveryScanPending else {
+            loggerD(msg: "peer pairing reset: \(uuid)-\(name), explicit connect reuses pending fresh-advertisement scan")
+            return false
+        }
+        peerPairingRecoveryRequests = peerPairingRecoveryRequests.filter { _, request in
+            request.uuid != uuid && (name.isEmpty || request.name != name)
+        }
+        loggerD(msg: "peer pairing reset: \(uuid)-\(name), previous recovery expired, allow explicit reconnect")
+        return true
+    }
     
     /**
      *  处理连接失败
@@ -1083,8 +1220,8 @@ extension BleManager {
             )
         }
         if error.code == 14, hasAutoReconnectTask {
-            handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .disconnectFromSys, tag: tag)
-            loggerE(msg: "\(logHead) \(peripheral.identifier.uuidString), error code = \(error.code), msg = \(error.localizedDescription), mapped to disconnectFromSys for autoReconnect")
+            startPeerPairingResetRecovery(peripheral: peripheral, device: myDevice, tag: tag)
+            loggerE(msg: "\(logHead) \(peripheral.identifier.uuidString), error code = \(error.code), msg = \(error.localizedDescription), start fresh-advertisement recovery")
             return
         }
         if error.code == 14 {

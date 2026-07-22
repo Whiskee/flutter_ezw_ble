@@ -1,5 +1,29 @@
 # BLE Issue Playbook
 
+## iOS reconnect loops after a factory reset / Forget This Device
+
+Symptoms:
+
+- The device was factory-reset and the user follows the iOS Settings "Forget This Device" prompt.
+- App logs contain `CBErrorDomain Code=14 "Peer removed pairing information"`.
+- The peripheral logs repeated security failures and fast advertising, while the app repeatedly starts native pending connects for the same UUID.
+- The UI never reaches a fresh pairing prompt or discards the repeated system-disconnect statuses as stale.
+
+Root cause:
+
+- The factory reset clears the peripheral bond, while iOS/CoreBluetooth can still hold a cached peripheral with the old security context.
+- Treating Code=14 as an ordinary system disconnect lets the passive reconnect scheduler reuse that cached object before a new advertisement has been accepted.
+
+Fix:
+
+- Treat Code=14 as a scan-first pairing recovery: clean up the old session, evict the cached peripheral, and wait for a fresh advertisement.
+- Suppress passive reconnect for that target until the scan result has taken ownership of the new connection attempt.
+- Keep the product Settings prompt; it is necessary to remove the phone-side bond but does not replace the plugin-side stale-peripheral recovery.
+
+Owner:
+
+- `flutter_ezw_ble` iOS native reconnect coordinator.
+
 ## iOS State Restoration crashes without bluetooth-central background mode
 
 Symptoms:

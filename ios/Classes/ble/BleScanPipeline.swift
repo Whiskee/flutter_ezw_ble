@@ -591,6 +591,12 @@ extension BleManager {
         // 4. 原请求可能没有 UUID，扫描命中后必须补全，后续 didConnect/服务发现才能匹配。
         updateActiveConnectRequestUuid(uuid: peripheral.identifier.uuidString, name: peripheralName)
 
+        // Code=14 recovery 只能由新的 didDiscover 接管。不能在错误回调里清 gate，
+        // 否则 CoreBluetooth 还没给出 fresh peripheral 时旧缓存就会再次被 passive reconnect 使用。
+        if isPeerPairingRecoveryActive(uuid: peripheral.identifier.uuidString, name: peripheralName) {
+            finishPeerPairingResetRecovery(uuid: peripheral.identifier.uuidString, name: peripheralName)
+        }
+
         // 5. 统一进入连接中状态，并复用 connectPeripheral 处理 auto reconnect options。
         handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheralName, state: .connecting, tag: "from search device")
         connectPeripheral(

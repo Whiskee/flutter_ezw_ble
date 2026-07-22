@@ -489,6 +489,8 @@ Android 回连优先复用现有 `connect(...)` active 路径；当设备不可�
 
 iOS 回连优先走 `retrieveConnectedPeripherals` / `retrievePeripherals`，自动回连任务来源的 `centralManager.connect` 会携带系统 auto reconnect option；找不到 peripheral 但有稳定 name 时仍回退到 scan-by-name。已知 peripheral 的 pending connect 不能被短扫描 timeout 取消，因为它是 CoreBluetooth State Restoration 后续唤醒进程的系统等待点。
 
+当 iOS 回调 `CBErrorDomain Code=14 (Peer removed pairing information)` 时，不得把它作为普通 `disconnectFromSys` 后立刻重用 cached `CBPeripheral`。这说明外设已清除 pairing record（例如恢复出厂）；原生应完成旧 session 清理、移除旧 peripheral 缓存、等待一次新广播，然后由 scan-then-connect 建立新连接。新广播接管前，auto reconnect 必须被 gate 抑制，否则会形成 `didFailToConnect → disconnectFromSys → passive connect` 的高频循环，且 Dart 可能丢弃交错的旧连接状态。
+
 完整方案见 `docs/AUTO_RECONNECT_SPEC.md`。iOS State Restoration 专项边界见 `docs/IOS_STATE_RESTORATION_SPEC.md`。
 
 ---

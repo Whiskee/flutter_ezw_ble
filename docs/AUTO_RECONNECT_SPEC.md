@@ -208,6 +208,26 @@ CoreBluetooth pending connect is the iOS long-wait mechanism. App timers may
 update diagnostics, but must not cancel the pending connect or emit a Dart/UI
 timeout just because the peripheral stayed away for minutes or hours.
 
+### iOS pairing-reset recovery
+
+`CBErrorDomain Code=14` (`Peer removed pairing information`) is a distinct
+case from an ordinary unexpected disconnect: the peer has erased its pairing
+record, so the cached `CBPeripheral` can no longer establish a secure link.
+This is expected after a device factory reset, even if the phone has already
+been instructed to forget the device in Settings.
+
+When a business-connected target receives Code=14, iOS must:
+
+1. report the old session as `disconnectFromSys` and complete its normal cleanup;
+2. remove the stale peripheral cache;
+3. suppress passive reconnect for that target;
+4. wait for a fresh scan advertisement, then create one scan-then-connect attempt;
+5. only release the suppression gate when that scan result has taken ownership.
+
+Do not immediately call `centralManager.connect` on the old peripheral. That
+creates a `didFailToConnect -> disconnectFromSys` loop, prevents a clean system
+pairing request, and can flood Dart with stale connection generations.
+
 ## even_connect Integration
 
 1. Enable `autoReconnect` on the desired `BleConfig`.
