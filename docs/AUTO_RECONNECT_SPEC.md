@@ -51,8 +51,13 @@ Public methods:
   `false` because CoreBluetooth pending connect and State Restoration remain
   authoritative.
 
-Every reconnect status event carries `source` and `generation`. Old payloads
-decode as `source=unknown` and `generation=0`.
+Every reconnect status event carries `source`, `generation`,
+`sessionGeneration`, and `attemptGeneration`. `generation` is retained as the
+serialized compatibility key and always equals the Dart session generation.
+`attemptGeneration` is the platform Gate/callback ownership generation. For
+legacy or non-session callers, native falls back `sessionGeneration` to the
+attempt generation. Old payloads decode as `source=unknown`,
+`sessionGeneration=0`, and `attemptGeneration=0`.
 
 ## State Flow
 
@@ -85,7 +90,9 @@ sn or mac
 attempt
 pending native connection handle owned by the OS
 pausedByBluetoothOff
-attempt source and generation
+attempt source
+sessionGeneration
+attemptGeneration
 ```
 
 The task is normally armed after `deviceConnected(uuid)`. On a later cold start,
@@ -178,9 +185,10 @@ resumes service discovery on the exact GATT/session, while an explicit
 Configs with `initiateBinding=false` skip plugin-owned `createBond()` and enter
 service discovery directly.
 
-Every admission is identified by endpoint + generation + session and, at the
-platform boundary, the exact GATT/peripheral object. Stale callbacks fail
-closed.
+Every admission is identified by endpoint + attemptGeneration + session and, at
+the platform boundary, the exact GATT/peripheral object. Status events expose
+the Dart sessionGeneration separately so a reconnect batch can remain stable
+while native retries advance attempt ownership. Stale callbacks fail closed.
 
 ## GATT Restoration Readiness
 
@@ -286,10 +294,12 @@ active request before scheduling the next generation. Barrier completion owns
 this ordering for deferred teardown; the ordinary terminal path must use the
 same cleanup-before-schedule rule and must not schedule a second time.
 
-Before Bluetooth-off teardown clears admission, iOS snapshots the active
-generation for connecting endpoints. A business-connected reconnect task keeps
-its last successful generation. The emitted `disconnectFromSys` reuses that
-accepted generation instead of falling back to `source=unknown, generation=0`.
+Before Bluetooth-off teardown clears admission, each platform snapshots the
+active sessionGeneration for connecting endpoints. A business-connected
+reconnect task keeps its last successful sessionGeneration. The emitted
+`disconnectFromSys` reuses that accepted sessionGeneration through the
+compatibility `generation` key instead of falling back to
+`source=unknown, generation=0`.
 
 If a concurrent scan finds the same stable device name under a new
 CoreBluetooth UUID, task, persistence owner, and Gate identity migrate

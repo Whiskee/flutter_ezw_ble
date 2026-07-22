@@ -9,5 +9,8 @@ data class BleConnectModel(
     val connectState: BleConnectState,
     val mtu: Int = 247,
     val source: BleConnectSource = BleConnectSource.UNKNOWN,
-    val generation: Long = 0L,
+    val sessionGeneration: Long = 0L,
+    val attemptGeneration: Long = 0L,
+    /** Serialized as the legacy session-generation field for old Dart consumers. */
+    val generation: Long = sessionGeneration,
 ): GsonSerializable()

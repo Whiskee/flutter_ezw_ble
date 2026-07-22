@@ -11,6 +11,24 @@ import XCTest
 
 class RunnerTests: XCTestCase {
 
+  func testBleConnectModelEncodesSessionAndAttemptGenerations() throws {
+    let model = BleConnectModel(
+      uuid: "g2-left",
+      name: "Even G2",
+      connectState: .contactDevice,
+      source: .autoReconnect,
+      generation: 42,
+      attemptGeneration: 7
+    )
+
+    let data = try JSONEncoder().encode(model)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+
+    XCTAssertEqual(json["generation"] as? Int, 42)
+    XCTAssertEqual(json["sessionGeneration"] as? Int, 42)
+    XCTAssertEqual(json["attemptGeneration"] as? Int, 7)
+  }
+
   func testPendingReconnectIdentityRequiresExactConfigNameAndMacSuffix() {
     let pending = BlePendingReconnectIdentity(
       belongConfig: "ring_bcl_1",

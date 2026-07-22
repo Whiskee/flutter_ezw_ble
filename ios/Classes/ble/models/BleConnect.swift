@@ -15,7 +15,66 @@ struct BleConnectModel: Codable {
     var connectState: BleConnectState
     var mtu: Int = 247
     var source: BleConnectSource = .unknown
-    var generation: Int64 = 0
+    var sessionGeneration: Int64 = 0
+    var attemptGeneration: Int64 = 0
+
+    /// Backward-compatible alias for older Dart consumers.
+    var generation: Int64 { sessionGeneration }
+
+    init(
+        uuid: String,
+        name: String,
+        connectState: BleConnectState,
+        mtu: Int = 247,
+        source: BleConnectSource = .unknown,
+        generation: Int64 = 0,
+        sessionGeneration: Int64? = nil,
+        attemptGeneration: Int64 = 0
+    ) {
+        self.uuid = uuid
+        self.name = name
+        self.connectState = connectState
+        self.mtu = mtu
+        self.source = source
+        self.sessionGeneration = sessionGeneration ?? generation
+        self.attemptGeneration = attemptGeneration
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case uuid
+        case name
+        case connectState
+        case mtu
+        case source
+        case generation
+        case sessionGeneration
+        case attemptGeneration
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        uuid = try container.decode(String.self, forKey: .uuid)
+        name = try container.decode(String.self, forKey: .name)
+        connectState = try container.decode(BleConnectState.self, forKey: .connectState)
+        mtu = try container.decodeIfPresent(Int.self, forKey: .mtu) ?? 247
+        source = try container.decodeIfPresent(BleConnectSource.self, forKey: .source) ?? .unknown
+        sessionGeneration = try container.decodeIfPresent(Int64.self, forKey: .sessionGeneration)
+            ?? container.decodeIfPresent(Int64.self, forKey: .generation)
+            ?? 0
+        attemptGeneration = try container.decodeIfPresent(Int64.self, forKey: .attemptGeneration) ?? 0
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(uuid, forKey: .uuid)
+        try container.encode(name, forKey: .name)
+        try container.encode(connectState, forKey: .connectState)
+        try container.encode(mtu, forKey: .mtu)
+        try container.encode(source, forKey: .source)
+        try container.encode(sessionGeneration, forKey: .generation)
+        try container.encode(sessionGeneration, forKey: .sessionGeneration)
+        try container.encode(attemptGeneration, forKey: .attemptGeneration)
+    }
 }
 
 /// 与 Dart `BleConnectSource` raw value 一致；未知未来值解码时回退 unknown。

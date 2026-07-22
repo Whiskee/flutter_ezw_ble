@@ -39,7 +39,7 @@ internal class BleAutoReconnectSupervisor(
     /** 判断设备是否处于 OTA，OTA 中不做普通自动回连。 */
     private val isUpgradeDevice: (String) -> Boolean,
     /** 创建一条绑定目标 UUID 的 GATT callback。 */
-    private val createConnectCallback: (String, BleConnectSource) -> BleGattSessionCallback,
+    private val createConnectCallback: (String, BleConnectSource, Long) -> BleGattSessionCallback,
     /** 提升已经进入 Gate waiting queue 的同一 session，不抢占 active。 */
     private val promotePendingAdmission: (String) -> Unit,
     /** 持久化业务确认 connected 的回连目标。 */
@@ -95,6 +95,7 @@ internal class BleAutoReconnectSupervisor(
     fun arm(
         device: BleDevice,
         source: BleConnectSource = BleConnectSource.AUTO_RECONNECT,
+        sessionGeneration: Long = 0L,
     ) {
         // 1. 未启用自动回连或 uuid 缺失时保持无副作用。
         val config = device.belongConfig
@@ -112,9 +113,13 @@ internal class BleAutoReconnectSupervisor(
                 name = device.name,
                 sn = device.sn,
                 source = source,
+                sessionGeneration = sessionGeneration,
             )
         } else {
             task.name = device.name
+            if (sessionGeneration > 0L) {
+                task.sessionGeneration = sessionGeneration
+            }
             // source 只属于当前 attempt：manual 提升后，lifecycle/重入 activate(auto)
             // 不能在物理 callback 前把它降级；但业务 connected 后的重新 arm 必须
             // 将下一次系统断线回连复位为 autoReconnect。
@@ -144,9 +149,9 @@ internal class BleAutoReconnectSupervisor(
     }
 
     /** 立即建立或复用长期 pending autoConnect；物理 callback 前不发送 connecting。 */
-    fun activate(device: BleDevice, source: BleConnectSource) {
+    fun activate(device: BleDevice, source: BleConnectSource, sessionGeneration: Long = 0L) {
         // 1、登记/刷新长期目标；这一步不创建第二条 GATT。
-        arm(device, source)
+        arm(device, source, sessionGeneration)
         val task = reconnectTasks[reconnectKey(device.uuid)] ?: return
         // 2、已有 passive owner 时只提升 pending admission，复用当前 GATT。
         if (task.passiveGatt != null || task.timer != null) {
@@ -598,7 +603,7 @@ internal class BleAutoReconnectSupervisor(
         }
 
         // 4. 自动路径在真实 STATE_CONNECTED callback 前不发用户可见 connecting。
-        val callback = createConnectCallback(task.uuid, task.source)
+        val callback = createConnectCallback(task.uuid, task.source, task.sessionGeneration)
 
         // 5. 常态由 autoConnect=true 保留长期意图；可见目标只在单槽位中直连一次。
         val gatt = gattFactory.connect(remoteDevice, context(), callback)

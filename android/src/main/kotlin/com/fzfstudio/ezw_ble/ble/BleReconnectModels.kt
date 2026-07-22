@@ -59,6 +59,8 @@ internal data class BleReconnectTask(
     var pausedByBluetoothOff: Boolean = false,
     /** 当前 pending session 的来源；手动点击可提升但不会新建重复 GATT。 */
     var source: BleConnectSource = BleConnectSource.AUTO_RECONNECT,
+    /** Dart reconnect batch generation forwarded unchanged on status callbacks. */
+    var sessionGeneration: Long = 0L,
 )
 
 /** Android passive GATT 长离线退避策略；不改变 `connectGatt(autoConnect=true)` 的 owner。 */

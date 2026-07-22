@@ -10,6 +10,20 @@ struct BleConnectionAdmission: Equatable {
     let sessionGeneration: Int64
     let sessionId: Int64
     let source: BleConnectSource
+
+    init(
+        endpointId: String,
+        generation: Int64,
+        sessionId: Int64,
+        source: BleConnectSource,
+        sessionGeneration: Int64? = nil
+    ) {
+        self.endpointId = endpointId
+        self.generation = generation
+        self.sessionGeneration = sessionGeneration ?? generation
+        self.sessionId = sessionId
+        self.source = source
+    }
 }
 
 /// Gate 排队期间保留的 CoreBluetooth session context。
@@ -469,9 +483,9 @@ final class BleConnectionAdmissionGate {
             BleConnectionAdmission(
                 endpointId: current.endpointId,
                 generation: current.generation,
-                sessionGeneration: current.sessionGeneration,
                 sessionId: current.sessionId,
-                source: .manualReconnect
+                source: .manualReconnect,
+                sessionGeneration: current.sessionGeneration
             )
         )
     }

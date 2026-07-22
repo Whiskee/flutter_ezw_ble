@@ -5,9 +5,12 @@ import com.fzfstudio.ezw_ble.ble.models.BleConnectSource
 /** 一次真实物理连接回调等待进入全局 GATT pipeline 的身份。 */
 internal data class BleConnectionAdmission(
     val endpointId: String,
+    /** Native Gate attempt generation; only owns exact callback/teardown identity. */
     val generation: Long,
     val sessionId: Long,
     val source: BleConnectSource,
+    /** Dart reconnect batch generation; all Flutter status events serialize this as `generation`. */
+    val sessionGeneration: Long = generation,
 )
 
 /** 物理连接回调提交给 Gate 后的同步判定。 */

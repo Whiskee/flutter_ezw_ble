@@ -129,7 +129,8 @@ class BleManager private constructor() {
         val uuid: String,
         val name: String,
         val source: BleConnectSource,
-        val generation: Long,
+        val sessionGeneration: Long,
+        val attemptGeneration: Long,
     )
 
     //  - 扫描命中后再连接的待处理请求（非 directConnect 且目标未出现在 scanResultTemp 时入队）
@@ -158,8 +159,12 @@ class BleManager private constructor() {
             bleState = { bleState },
             isBluetoothEnabled = { isBluetoothEnabled() },
             isUpgradeDevice = { uuid -> upgradeDevices.contains(uuid) },
-            createConnectCallback = { expectedUuid, source ->
-                createConnectCallBack(expectedUuid, source = source)
+            createConnectCallback = { expectedUuid, source, sessionGeneration ->
+                createConnectCallBack(
+                    expectedUuid,
+                    source = source,
+                    sessionGeneration = sessionGeneration,
+                )
             },
             promotePendingAdmission = { uuid -> promotePendingAttempt(uuid) },
             persistReconnectTarget = { device -> persistReconnectTarget(device) },
@@ -475,7 +480,7 @@ class BleManager private constructor() {
                 rssi = target.rssi,
                 connectState = BleConnectState.NONE,
             )
-            autoReconnectSupervisor.activate(seedDevice, source)
+            autoReconnectSupervisor.activate(seedDevice, source, sessionGeneration)
             BleReconnectActivationResult(
                 target = target,
                 state = BleReconnectActivationState.RESOLVED,
@@ -1104,7 +1109,8 @@ class BleManager private constructor() {
             connectedDevice?.name ?: "",
             BleConnectState.CONNECTED,
             source = acceptedAdmission.source,
-            generation = acceptedAdmission.generation,
+            generation = acceptedAdmission.sessionGeneration,
+            attemptGeneration = acceptedAdmission.generation,
         )
         // 4、业务确认 connected 后释放当前 Gate owner，允许下一 endpoint 开始 pipeline。
         completeBusinessConnectionAdmission(uuid)
@@ -1219,7 +1225,8 @@ class BleManager private constructor() {
             device.name,
             BleConnectState.DISCONNECT_FROM_SYS,
             source = acceptedAdmission.source,
-            generation = acceptedAdmission.generation,
+            generation = acceptedAdmission.sessionGeneration,
+            attemptGeneration = acceptedAdmission.generation,
             scheduleAutoReconnect = false,
         )
         sendLog(BleLoggerTag.d, "OTA reboot disconnect: ${device.uuid}, owner preserved")
@@ -1248,6 +1255,7 @@ class BleManager private constructor() {
             generation = generation,
             sessionId = connectionSessionSequence.incrementAndGet(),
             source = BleConnectSource.AUTO_RECONNECT,
+            sessionGeneration = generation,
         )
         sendLog(
             BleLoggerTag.e,
@@ -1640,7 +1648,8 @@ class BleManager private constructor() {
                     uuid = device.uuid,
                     name = device.name,
                     source = admission.source,
-                    generation = admission.generation,
+                    sessionGeneration = admission.sessionGeneration,
+                    attemptGeneration = admission.generation,
                 )
             }
 
@@ -1701,7 +1710,8 @@ class BleManager private constructor() {
                         snapshot.name,
                         BleConnectState.DISCONNECT_FROM_SYS,
                         source = snapshot.source,
-                        generation = snapshot.generation,
+                        generation = snapshot.sessionGeneration,
+                        attemptGeneration = snapshot.attemptGeneration,
                     )
                 }
             } else {
@@ -2007,8 +2017,9 @@ class BleManager private constructor() {
         expectedUuid: String,
         source: BleConnectSource,
         afterUpgrade: Boolean = false,
+        sessionGeneration: Long = 0L,
     ): BleGattSessionCallback {
-        val admission = registerConnectionAttempt(expectedUuid, source)
+        val admission = registerConnectionAttempt(expectedUuid, source, sessionGeneration)
         return BleGattSessionCallback(
             expectedUuid = expectedUuid,
             currentDeviceForGatt = { gatt, stage ->
@@ -2033,7 +2044,8 @@ class BleManager private constructor() {
                     state,
                     mtu = mtu,
                     source = effectiveAdmission.source,
-                    generation = effectiveAdmission.generation,
+                    generation = effectiveAdmission.sessionGeneration,
+                    attemptGeneration = effectiveAdmission.generation,
                 )
             },
             onPhysicalConnected = { gatt, device ->
@@ -2084,6 +2096,7 @@ class BleManager private constructor() {
     private fun registerConnectionAttempt(
         endpointId: String,
         source: BleConnectSource,
+        sessionGeneration: Long = 0L,
     ): BleConnectionAdmission {
         val key = reconnectKey(endpointId)
         // 新 session 一旦注册，旧业务 GATT metadata 立即失效；旧 callback 必须同时
@@ -2094,6 +2107,7 @@ class BleManager private constructor() {
         val admission = BleConnectionAdmission(
             endpointId = endpointId,
             generation = generation,
+            sessionGeneration = if (sessionGeneration > 0L) sessionGeneration else generation,
             sessionId = connectionSessionSequence.incrementAndGet(),
             source = source,
         )
@@ -2142,7 +2156,8 @@ class BleManager private constructor() {
                     device.name,
                     BleConnectState.CONTACT_DEVICE,
                     source = admission.source,
-                    generation = admission.generation,
+                    generation = admission.sessionGeneration,
+                    attemptGeneration = admission.generation,
                 )
                 startGrantedGattPipeline(admission)
             }
@@ -2152,7 +2167,8 @@ class BleManager private constructor() {
                     device.name,
                     BleConnectState.CONTACT_DEVICE,
                     source = admission.source,
-                    generation = admission.generation,
+                    generation = admission.sessionGeneration,
+                    attemptGeneration = admission.generation,
                 )
                 sendLog(BleLoggerTag.d, "Admission gate: ${device.uuid}, queued generation=${admission.generation}")
             }
@@ -2229,7 +2245,8 @@ class BleManager private constructor() {
                     session.device.name,
                     BleConnectState.START_BINDING,
                     source = admission.source,
-                    generation = admission.generation,
+                    generation = admission.sessionGeneration,
+                    attemptGeneration = admission.generation,
                 )
             }
             GateGrantedBondAction.START_BOND -> startGrantedSystemBond(admission, session)
@@ -2267,7 +2284,8 @@ class BleManager private constructor() {
                 session.device.name,
                 BleConnectState.START_BINDING,
                 source = current.source,
-                generation = current.generation,
+                generation = current.sessionGeneration,
+                attemptGeneration = current.generation,
             )
             val beforeBondState = systemBondStateOf(session.gatt.device.bondState)
             val createBondResult = runCatching { session.gatt.device.createBond() }
@@ -2356,7 +2374,8 @@ class BleManager private constructor() {
             session.device.name,
             BleConnectState.SEARCH_SERVICE,
             source = current.source,
-            generation = current.generation,
+            generation = current.sessionGeneration,
+            attemptGeneration = current.generation,
         )
     }
 
@@ -2456,7 +2475,8 @@ class BleManager private constructor() {
                     state,
                     mtu = mtu,
                     source = expectedAdmission.source,
-                    generation = expectedAdmission.generation,
+                    generation = expectedAdmission.sessionGeneration,
+                    attemptGeneration = expectedAdmission.generation,
                 )
                 return
             }
@@ -2491,7 +2511,8 @@ class BleManager private constructor() {
             state,
             mtu = mtu,
             source = current.source,
-            generation = current.generation,
+            generation = current.sessionGeneration,
+            attemptGeneration = current.generation,
         )
     }
 
@@ -2638,8 +2659,10 @@ class BleManager private constructor() {
         state: BleConnectState,
         mtu: Int = 247,
         source: BleConnectSource = BleConnectSource.UNKNOWN,
-        generation: Long = 0L,
+        sessionGeneration: Long = 0L,
+        attemptGeneration: Long = 0L,
     ) {
+        val legacyGeneration = sessionGeneration.takeIf { it > 0L } ?: attemptGeneration
         mainScope.launch {
             val json = JSONObject()
                 .put("uuid", uuid)
@@ -2647,7 +2670,9 @@ class BleManager private constructor() {
                 .put("connectState", state.toFlutterJsonValue())
                 .put("mtu", mtu)
                 .put("source", source.flutterValue)
-                .put("generation", generation)
+                .put("generation", legacyGeneration)
+                .put("sessionGeneration", legacyGeneration)
+                .put("attemptGeneration", attemptGeneration)
                 .toString()
             BleEC.CONNECT_STATUS.event?.success(json)
         }
@@ -2698,9 +2723,11 @@ class BleManager private constructor() {
         mtu: Int = 247,
         source: BleConnectSource = currentAdmissions[reconnectKey(uuid)]?.source
             ?: BleConnectSource.UNKNOWN,
-        generation: Long = currentAdmissions[reconnectKey(uuid)]?.generation ?: 0L,
+        generation: Long = currentAdmissions[reconnectKey(uuid)]?.sessionGeneration ?: 0L,
+        attemptGeneration: Long = currentAdmissions[reconnectKey(uuid)]?.generation ?: 0L,
         scheduleAutoReconnect: Boolean = true,
     ) {
+        val eventSessionGeneration = generation.takeIf { it > 0L } ?: attemptGeneration
         // 1、先把 source/generation 写入 endpoint 状态，保证终态能关联到当前 session。
         connectedDevices.forEach {
             if (it.uuid == uuid) {
@@ -2745,7 +2772,7 @@ class BleManager private constructor() {
             }
         }
         // 5、向 Dart 发送带 source/generation 的连接状态，再按策略安排 native 回连。
-        sendConnectState(uuid, name, state, mtu, source, generation)
+        sendConnectState(uuid, name, state, mtu, source, eventSessionGeneration, attemptGeneration)
         if (scheduleAutoReconnect && (state.isDisconnected || state.isError)) {
             autoReconnectSupervisor.schedule(uuid, state)
         }

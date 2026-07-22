@@ -1541,6 +1541,7 @@ extension BleManager {
         )
         let eventSource = source ?? terminalMetadata?.source ?? .unknown
         let eventGeneration = generation ?? terminalMetadata?.generation ?? 0
+        let eventAttemptGeneration = currentAdmission?.generation ?? 0
         if currentAdmission == nil,
            source == nil,
            generation == nil,
@@ -1636,7 +1637,8 @@ extension BleManager {
             state: state,
             mtu: mtu,
             source: eventSource,
-            generation: eventGeneration
+            generation: eventGeneration,
+            attemptGeneration: eventAttemptGeneration
         )
         if state == .connected, let device = connectedDevices.first(where: {
             $0.peripheral.identifier.uuidString == uuid || $0.peripheral.name == name
@@ -1702,7 +1704,8 @@ extension BleManager {
         state: BleConnectState,
         mtu: Int,
         source: BleConnectSource,
-        generation: Int64
+        generation: Int64,
+        attemptGeneration: Int64
     ) {
         let connectModel = BleConnectModel(
             uuid: uuid,
@@ -1710,10 +1713,11 @@ extension BleManager {
             connectState: state,
             mtu: mtu,
             source: source,
-            generation: generation
+            generation: generation,
+            attemptGeneration: attemptGeneration
         )
         let jsonString = try? connectModel.toJsonString() ?? ""
-        loggerD(msg: "connectStatus -> Flutter: \(uuid)-\(name), state=\(state.rawValue), mtu=\(mtu), source=\(source.rawValue), generation=\(generation)")
+        loggerD(msg: "connectStatus -> Flutter: \(uuid)-\(name), state=\(state.rawValue), mtu=\(mtu), source=\(source.rawValue), generation=\(generation), attemptGeneration=\(attemptGeneration)")
         BleEC.connectStatus.emit(jsonString)
     }
     

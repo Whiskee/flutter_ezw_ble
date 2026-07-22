@@ -61,16 +61,35 @@ void main() {
     }
   });
 
-  test('BleConnectModel round-trips the native connection generation', () {
+  test('BleConnectModel round-trips session and attempt generations', () {
     final model = BleConnectModel(
       'device-1',
       'Even G2',
       BleConnectState.contactDevice,
-      generation: 42,
+      sessionGeneration: 42,
+      attemptGeneration: 7,
     );
 
     expect(model.toJson()['generation'], 42);
-    expect(BleConnectModel.fromJson(model.toJson()).generation, 42);
+    expect(model.toJson()['attemptGeneration'], 7);
+    final decoded = BleConnectModel.fromJson(model.toJson());
+    expect(decoded.generation, 42);
+    expect(decoded.sessionGeneration, 42);
+    expect(decoded.attemptGeneration, 7);
+  });
+
+  test('BleConnectModel treats legacy generation as session generation', () {
+    final model = BleConnectModel.fromJson({
+      'uuid': 'device-1',
+      'name': 'Even G2',
+      'connectState': 'contactDevice',
+      'generation': 42,
+      'attemptGeneration': 7,
+    });
+
+    expect(model.generation, 42);
+    expect(model.sessionGeneration, 42);
+    expect(model.attemptGeneration, 7);
   });
 
   test('activateAutoReconnectTargets sends targets and defaults source',

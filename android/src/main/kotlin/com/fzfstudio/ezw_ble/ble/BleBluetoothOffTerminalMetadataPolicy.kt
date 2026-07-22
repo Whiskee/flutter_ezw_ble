@@ -7,7 +7,7 @@ import com.fzfstudio.ezw_ble.ble.models.BleConnectSource
  *
  * 终态必须沿用本次物理会话已被 Dart epoch guard 接受过的 metadata：连接仍在
  * Gate 内时取 current admission；业务已 connected、Gate 已释放时取长期 GATT
- * session 的 admission。未知来源或 0 generation 不能作为终态事件的兜底值，
+ * session 的 admission。未知来源或 0 sessionGeneration 不能作为终态事件的兜底值，
  * 否则 Dart 会拒绝它并保留过期的已连接状态。
  */
 internal object BleBluetoothOffTerminalMetadataPolicy {
@@ -22,7 +22,7 @@ internal object BleBluetoothOffTerminalMetadataPolicy {
 
     /** 业务 connected 与系统断连事件共用的最低 epoch 契约。 */
     fun isEpochAccepted(admission: BleConnectionAdmission?): Boolean =
-        admission != null &&
+            admission != null &&
             admission.source != BleConnectSource.UNKNOWN &&
-            admission.generation > 0L
+            admission.sessionGeneration > 0L
 }

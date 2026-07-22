@@ -37,7 +37,8 @@ void main() {
     );
     expect(
       reconnectSource,
-      contains('createConnectCallback(task.uuid, task.source)'),
+      contains(
+          'createConnectCallback(task.uuid, task.source, task.sessionGeneration)'),
     );
   });
 
@@ -80,8 +81,10 @@ void main() {
     expect(activateSource, contains('promotePendingAdmission(device.uuid)'));
     expect(activateSource, isNot(contains('passiveGatt?.close()')));
     expect(activateSource, isNot(contains('passiveGatt?.disconnect()')));
-    expect(managerSource,
-        contains('autoReconnectSupervisor.activate(seedDevice, source)'));
+    expect(
+        managerSource,
+        contains(
+            'autoReconnectSupervisor.activate(seedDevice, source, sessionGeneration)'));
   });
 
   test('Android plugin unregisters Activity lifecycle callbacks on detach', () {

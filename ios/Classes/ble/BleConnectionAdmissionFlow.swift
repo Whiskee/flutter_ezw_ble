@@ -464,9 +464,9 @@ extension BleManager {
         let admission = BleConnectionAdmission(
             endpointId: endpointId,
             generation: generation,
-            sessionGeneration: sessionGeneration > 0 ? sessionGeneration : generation,
             sessionId: connectionSessionSequence,
-            source: source
+            source: source,
+            sessionGeneration: sessionGeneration > 0 ? sessionGeneration : generation
         )
         // 3、先登记 Gate，再写 current/session 映射，保证随后物理回调可精确归属。
         connectionAdmissionGate.registerAttempt(endpointId: endpointId, generation: generation)
@@ -675,9 +675,9 @@ extension BleManager {
         let promoted = BleConnectionAdmission(
             endpointId: current.endpointId,
             generation: current.generation,
-            sessionGeneration: current.sessionGeneration,
             sessionId: current.sessionId,
-            source: .manualReconnect
+            source: .manualReconnect,
+            sessionGeneration: current.sessionGeneration
         )
         currentConnectionAdmissions[key] = promoted
         session.admission = promoted

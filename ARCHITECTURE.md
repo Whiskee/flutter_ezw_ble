@@ -213,7 +213,7 @@ enum BleEventChannel {
 | --- | --- | --- | --- |
 | `bleState` | `int`（iOS CoreBluetooth state 值，扩展 `6 = noLocation` 给 Android） | `BleState` | 蓝牙开关、定位权限变化；启动时也会主动 push 一次。 |
 | `scanResult` | JSON 字符串 | `BleMatchDevice.fromJson` | 一次扫描命中（按 `BleScan.matchCount` 已聚合好的"组合设备"）。 |
-| `connectStatus` | JSON 字符串 | `BleConnectModel.fromJson` | 连接流程的每一步推进（见 §8）；携带 `source` 与 `generation`，旧 payload 分别回退为 `unknown` / `0`。 |
+| `connectStatus` | JSON 字符串 | `BleConnectModel.fromJson` | 连接流程的每一步推进（见 §8）；携带 `source`、兼容键 `generation`、`sessionGeneration` 与 `attemptGeneration`。`generation` 始终序列化为 Dart session generation；旧 payload 分别回退为 `unknown` / `0`。 |
 | `receiveData` | Map：`{uuid, psType, data:Base64, isSuccess}` | `BleCmd.receiveMap` | 来自原生的特征值数据。**注意 `data` 字段是 Base64**，业务侧拿到的 `BleCmd.data` 已经是 `Uint8List`，背后由 `flutter_ezw_utils.encodeBase64()` 解码。 |
 | `logger` | String，含 `[d]-` / `[e]-` 前缀 | `String` | 仅 iOS 主动 push；业务侧自行根据前缀分级。 |
 
@@ -327,6 +327,10 @@ class BleConnectModel {
   @ConnectStateListConverter()
   final BleConnectState connectState;
   final int mtu;                     // 默认 512，Android 协商后实际值通过此字段回传
+  final BleConnectSource source;      // autoReconnect / manualReconnect / stateRestoration / foreground
+  final int sessionGeneration;        // Dart reconnect batch epoch；JSON 兼容键 generation 也写这个值
+  final int attemptGeneration;        // 原生 Gate attempt epoch；只用于诊断与迟到 callback 归属
+  int get generation => sessionGeneration; // 旧调用方兼容别名
 }
 ```
 

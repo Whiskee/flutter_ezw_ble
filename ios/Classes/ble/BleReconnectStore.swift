@@ -366,7 +366,22 @@ struct BlePendingReconnectIdentity {
     let name: String
     let expectedMacSuffix: String
     let source: BleConnectSource
+    /// Dart session generation for name-only owners; legacy callers fall back to 0.
     let sessionGeneration: Int64
+
+    init(
+        belongConfig: String,
+        name: String,
+        expectedMacSuffix: String,
+        source: BleConnectSource,
+        sessionGeneration: Int64 = 0
+    ) {
+        self.belongConfig = belongConfig
+        self.name = name
+        self.expectedMacSuffix = expectedMacSuffix
+        self.source = source
+        self.sessionGeneration = sessionGeneration
+    }
 
     /// 配置名与完整广播名共同组成唯一 owner，避免仅凭 R1 前缀误连附近设备。
     var key: String {

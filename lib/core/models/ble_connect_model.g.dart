@@ -16,7 +16,8 @@ BleConnectModel _$BleConnectModelFromJson(Map<String, dynamic> json) =>
       source: $enumDecodeNullable(_$BleConnectSourceEnumMap, json['source'],
               unknownValue: BleConnectSource.unknown) ??
           BleConnectSource.unknown,
-      generation: (json['generation'] as num?)?.toInt() ?? 0,
+      sessionGeneration: (json['generation'] as num?)?.toInt() ?? 0,
+      attemptGeneration: (json['attemptGeneration'] as num?)?.toInt() ?? 0,
     );
 
 Map<String, dynamic> _$BleConnectModelToJson(BleConnectModel instance) =>
@@ -27,7 +28,8 @@ Map<String, dynamic> _$BleConnectModelToJson(BleConnectModel instance) =>
           const ConnectStateListConverter().toJson(instance.connectState),
       'mtu': instance.mtu,
       'source': _$BleConnectSourceEnumMap[instance.source]!,
-      'generation': instance.generation,
+      'generation': instance.sessionGeneration,
+      'attemptGeneration': instance.attemptGeneration,
     };
 
 const _$BleConnectSourceEnumMap = {

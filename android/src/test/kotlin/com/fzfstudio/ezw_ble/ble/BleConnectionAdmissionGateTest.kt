@@ -11,6 +11,20 @@ import kotlin.test.assertTrue
 class BleConnectionAdmissionGateTest {
 
     @Test
+    fun `admission keeps native attempt generation separate from Dart session generation`() {
+        val admission = BleConnectionAdmission(
+            endpointId = "g2-left",
+            generation = 7,
+            sessionId = 11,
+            source = BleConnectSource.AUTO_RECONNECT,
+            sessionGeneration = 42,
+        )
+
+        assertEquals(7, admission.generation)
+        assertEquals(42, admission.sessionGeneration)
+    }
+
+    @Test
     fun `automatic callbacks keep fifo while manual waiting nodes jump the queue`() {
         val gate = BleConnectionAdmissionGate()
         val first = admission("auto-1", 1, 11, BleConnectSource.AUTO_RECONNECT)

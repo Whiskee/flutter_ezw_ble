@@ -125,7 +125,7 @@ task、alias、持久 target 和 Gate identity，随后仍走同一条 GATT/业�
 - waiting manual 优先于 automatic，但不能抢占 active owner；
 - 只有 owner 能运行 service discovery、characteristic、notify / CCCD 与业务鉴权；
 - `connectFinish` 不释放 owner，只有业务 `deviceConnected` 或已确认 teardown 的终态释放；
-- 事件携带 `source` 与 `generation`，并通过 endpoint + generation + session + `CBPeripheral` 对象身份拒绝迟到 callback。
+- 事件携带 `source`、兼容键 `generation`、`sessionGeneration` 与 `attemptGeneration`。`generation` 序列化为 Dart session generation；`attemptGeneration` 使用 admission.generation，并通过 endpoint + attemptGeneration + session + `CBPeripheral` 对象身份拒绝迟到 callback。
 
 `CBPeripheral` 对象身份只用于拒绝迟到 callback，不能用于 `connectedDevices` 缓存判重。恢复、retrieve 或蓝牙开关后，系统可为同一稳定 UUID 返回不同对象实例；缓存必须按 UUID 单例化。业务缓存显示已连接时，还必须同时确认该实例的 `peripheral.state == .connected` 才能跳过新 pending connect。收到终态要失效全部同 UUID 缓存项，随后由新一代连接替换为当前实例，避免陈旧 `isConnected=true` 把自动回连静默短路。
 
@@ -143,7 +143,7 @@ readCharsNotify == bleConfig.privateServices.count
 
 service/char/timeout 等非 CoreBluetooth 终态要先调用 cancel，并保持 Gate owner，直到 `didFailToConnect` / `didDisconnect` 确认 teardown；CoreBluetooth 永不回调时由 2 秒 exact-token watchdog 放行。watchdog 超时债务必须使用每 endpoint 一个饱和 counter，不能保存无限 token 数组。迟到 callback 先消费债务；若新代仍在途则 exact redrive，若新代已业务 connected 且 peripheral 实际断开，则仍继续正常 `disconnectFromSys` 清理与回连，不能把真实断连吞掉。收到终态后必须先释放 exact admission、移除旧 active request，再调度下一 generation；barrier completion 与普通终态只能有一个调度 owner。
 
-蓝牙关闭会清空当前 Gate，因此必须在 teardown 前冻结连接元数据：connecting 端点使用 active admission generation，已业务 connected 端点使用 runtime task 保存的 last connected generation。随后发送的 `disconnectFromSys` 必须携带该 generation，禁止回退为 `unknown/0`，否则 Dart epoch guard 会拒绝终态并保留陈旧已连接状态。
+蓝牙关闭会清空当前 Gate，因此必须在 teardown 前冻结连接元数据：connecting 端点使用 active admission 的 sessionGeneration，已业务 connected 端点使用 runtime task 保存的 last connected sessionGeneration。随后发送的 `disconnectFromSys` 必须通过兼容键 `generation` 携带该 sessionGeneration，禁止回退为 `unknown/0`，否则 Dart epoch guard 会拒绝终态并保留陈旧已连接状态。
 
 同名扫描结果导致 UUID A→B→C 漂移时，task、持久化 target 与 Gate identity 必须在 admission 前原子迁移。每个 canonical target 最多保留两个 direct alias（最早 UI owner + 最近旧身份）；hard cancel 仍能从原 UI UUID 命中，同时历史 UUID/Gate generation 不线性增长。
 

@@ -25,12 +25,47 @@ void main() {
     expect(androidMethod, contains('BleConnectSource.fromFlutterValue'));
     expect(androidManager, contains('activateAutoReconnectTargets'));
     expect(androidManager, contains('.put("source", source.flutterValue)'));
-    expect(androidManager, contains('.put("generation", generation)'));
+    expect(androidManager, contains('.put("generation", legacyGeneration)'));
+    expect(androidManager,
+        contains('.put("sessionGeneration", legacyGeneration)'));
+    expect(androidManager,
+        contains('.put("attemptGeneration", attemptGeneration)'));
     expect(iosMethod, contains('activateAutoReconnectTargets'));
     expect(iosMethod, contains('BleConnectSource(rawValue:'));
     expect(iosReconnect, contains('activateAutoReconnectTargets'));
     expect(iosFlow, contains('source: source'));
     expect(iosManager, contains('generation: eventGeneration'));
+    expect(iosManager, contains('attemptGeneration: eventAttemptGeneration'));
+  });
+
+  test('native reconnect status separates session and attempt generations', () {
+    final androidManager = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleManager.kt',
+    ).readAsStringSync();
+    final androidSupervisor = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleAutoReconnectSupervisor.kt',
+    ).readAsStringSync();
+    final iosConnect =
+        File('ios/Classes/ble/models/BleConnect.swift').readAsStringSync();
+
+    expect(
+        androidManager,
+        contains(
+            'autoReconnectSupervisor.activate(seedDevice, source, sessionGeneration)'));
+    expect(
+        androidManager,
+        contains(
+            'sessionGeneration = if (sessionGeneration > 0L) sessionGeneration else generation'));
+    expect(
+        androidSupervisor,
+        contains(
+            'createConnectCallback(task.uuid, task.source, task.sessionGeneration)'));
+    expect(iosConnect, contains('case sessionGeneration'));
+    expect(
+        iosConnect,
+        contains(
+            'try container.encode(sessionGeneration, forKey: .generation)'));
+    expect(iosConnect, contains('case attemptGeneration'));
   });
 
   test('iOS name-only activation owns identity before normal MAC filtering',
@@ -127,7 +162,10 @@ void main() {
           'BlePostAdmissionTerminalDisposition.BUSINESS_CONNECTED_SESSION'),
     );
     expect(manager, contains('source = expectedAdmission.source'));
-    expect(manager, contains('generation = expectedAdmission.generation'));
+    expect(
+        manager, contains('generation = expectedAdmission.sessionGeneration'));
+    expect(
+        manager, contains('attemptGeneration = expectedAdmission.generation'));
     expect(manager, contains('autoReconnectSupervisor.schedule(uuid, state)'));
     expect(reconnect, contains('task.passiveGatt = null'));
     expect(
@@ -426,11 +464,14 @@ void main() {
     expect(policy,
         contains('businessConnectedAdmission.takeIf(::isEpochAccepted)'));
     expect(policy, contains('admission.source != BleConnectSource.UNKNOWN'));
-    expect(policy, contains('admission.generation > 0L'));
+    expect(policy, contains('admission.sessionGeneration > 0L'));
     // Kotlin 明确绑定通过校验的非空 admission，避免依赖 policy 调用后的 smart-cast。
     expect(setConnected, contains('isEpochAccepted(acceptedAdmission)'));
     expect(setConnected, contains('source = acceptedAdmission.source'));
-    expect(setConnected, contains('generation = acceptedAdmission.generation'));
+    expect(setConnected,
+        contains('generation = acceptedAdmission.sessionGeneration'));
+    expect(setConnected,
+        contains('attemptGeneration = acceptedAdmission.generation'));
     expect(setConnected, isNot(contains('BleConnectSource.UNKNOWN')));
 
     expect(manager, contains('val transportOffTerminalSnapshots ='));
@@ -443,7 +484,8 @@ void main() {
         contains(
             'businessConnectedAdmission = businessConnectedGattSessions[key]?.admission'));
     expect(manager, contains('source = snapshot.source'));
-    expect(manager, contains('generation = snapshot.generation'));
+    expect(manager, contains('generation = snapshot.sessionGeneration'));
+    expect(manager, contains('attemptGeneration = snapshot.attemptGeneration'));
   });
 
   test('iOS live system disconnect reuses the business-connected epoch', () {
