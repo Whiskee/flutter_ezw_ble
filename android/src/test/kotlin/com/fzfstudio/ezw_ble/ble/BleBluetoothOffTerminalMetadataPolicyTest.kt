@@ -68,6 +68,61 @@ class BleBluetoothOffTerminalMetadataPolicyTest {
         )
     }
 
+    @Test
+    fun `system disconnect restores the exact manual business session metadata`() {
+        val manualSession = admission(19, BleConnectSource.MANUAL_RECONNECT)
+
+        assertEquals(
+            BleTerminalMetadata(
+                source = BleConnectSource.MANUAL_RECONNECT,
+                sessionGeneration = manualSession.sessionGeneration,
+                attemptGeneration = manualSession.generation,
+            ),
+            BleBluetoothOffTerminalMetadataPolicy.resolveTerminalMetadata(
+                explicitSource = BleConnectSource.UNKNOWN,
+                explicitSessionGeneration = 0L,
+                explicitAttemptGeneration = 0L,
+                fallbackAdmission = manualSession,
+            ),
+        )
+    }
+
+    @Test
+    fun `explicit callback metadata wins over historical connected admission`() {
+        val historical = admission(19, BleConnectSource.MANUAL_RECONNECT)
+
+        assertEquals(
+            BleTerminalMetadata(
+                source = BleConnectSource.AUTO_RECONNECT,
+                sessionGeneration = 21L,
+                attemptGeneration = 24L,
+            ),
+            BleBluetoothOffTerminalMetadataPolicy.resolveTerminalMetadata(
+                explicitSource = BleConnectSource.AUTO_RECONNECT,
+                explicitSessionGeneration = 21L,
+                explicitAttemptGeneration = 24L,
+                fallbackAdmission = historical,
+            ),
+        )
+    }
+
+    @Test
+    fun `missing business session never synthesizes an old terminal identity`() {
+        assertEquals(
+            BleTerminalMetadata(
+                source = BleConnectSource.UNKNOWN,
+                sessionGeneration = 0L,
+                attemptGeneration = 7L,
+            ),
+            BleBluetoothOffTerminalMetadataPolicy.resolveTerminalMetadata(
+                explicitSource = BleConnectSource.UNKNOWN,
+                explicitSessionGeneration = 0L,
+                explicitAttemptGeneration = 7L,
+                fallbackAdmission = null,
+            ),
+        )
+    }
+
     private fun admission(
         generation: Long,
         source: BleConnectSource,

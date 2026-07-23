@@ -2,6 +2,13 @@ package com.fzfstudio.ezw_ble.ble
 
 import com.fzfstudio.ezw_ble.ble.models.BleConnectSource
 
+/** 一条发往 Dart 的连接终态身份；session 与 attempt 代次不可互相替代。 */
+internal data class BleTerminalMetadata(
+    val source: BleConnectSource,
+    val sessionGeneration: Long,
+    val attemptGeneration: Long,
+)
+
 /**
  * 蓝牙 transport 关闭会先清空 Gate/runtime 表，再向 Dart 上报系统断连。
  *
@@ -25,4 +32,42 @@ internal object BleBluetoothOffTerminalMetadataPolicy {
             admission != null &&
             admission.source != BleConnectSource.UNKNOWN &&
             admission.sessionGeneration > 0L
+
+    /**
+     * 1、显式携带有效 session 的 exact callback 永远优先。
+     * 2、业务已经 connected 后，某些 Android 系统断连出口只保留 uuid/GATT；此时从
+     * 最后已接受 admission 补齐 source/session/attempt，避免 Dart 拒绝真实断连。
+     * 3、没有有效 fallback 时保持原值，不能为尚未业务 connected 的失败 attempt
+     * 伪造旧会话身份。
+     */
+    fun resolveTerminalMetadata(
+        explicitSource: BleConnectSource,
+        explicitSessionGeneration: Long,
+        explicitAttemptGeneration: Long,
+        fallbackAdmission: BleConnectionAdmission?,
+    ): BleTerminalMetadata {
+        if (explicitSource != BleConnectSource.UNKNOWN &&
+            explicitSessionGeneration > 0L
+        ) {
+            return BleTerminalMetadata(
+                source = explicitSource,
+                sessionGeneration = explicitSessionGeneration,
+                attemptGeneration = explicitAttemptGeneration,
+            )
+        }
+        val acceptedFallback = fallbackAdmission.takeIf(::isEpochAccepted)
+        return if (acceptedFallback != null) {
+            BleTerminalMetadata(
+                source = acceptedFallback.source,
+                sessionGeneration = acceptedFallback.sessionGeneration,
+                attemptGeneration = acceptedFallback.generation,
+            )
+        } else {
+            BleTerminalMetadata(
+                source = explicitSource,
+                sessionGeneration = explicitSessionGeneration,
+                attemptGeneration = explicitAttemptGeneration,
+            )
+        }
+    }
 }

@@ -2799,13 +2799,53 @@ class BleManager private constructor() {
         attemptGeneration: Long = currentAdmissions[reconnectKey(uuid)]?.generation ?: 0L,
         scheduleAutoReconnect: Boolean = true,
     ) {
-        val eventSessionGeneration = generation.takeIf { it > 0L } ?: attemptGeneration
-        // 1、先把 source/generation 写入 endpoint 状态，保证终态能关联到当前 session。
+        val key = reconnectKey(uuid)
+        val connectedDeviceBeforeState = connectedDevices.firstOrNull {
+            it.uuid.equals(uuid, ignoreCase = true)
+        }
+        // 1、业务 connected 后 Gate 已释放。若 Android 的系统断连出口没有显式带回
+        // admission，必须从该 GATT 的长期业务 session/最后接受快照恢复身份；否则 Dart
+        // epoch guard 会拒绝 unknown/0，首页继续保留旧 connected。
+        val fallbackAdmission = if (
+            state == BleConnectState.DISCONNECT_FROM_SYS &&
+            connectedDeviceBeforeState?.connectState?.isConnected == true
+        ) {
+            BleBluetoothOffTerminalMetadataPolicy.resolve(
+                currentAdmission = currentAdmissions[key],
+                businessConnectedAdmission = businessConnectedGattSessions[key]?.admission,
+                lastBusinessConnectedAdmission = lastEpochAcceptedAdmissions[key],
+            )
+        } else {
+            null
+        }
+        val terminalMetadata =
+            BleBluetoothOffTerminalMetadataPolicy.resolveTerminalMetadata(
+                explicitSource = source,
+                explicitSessionGeneration = generation,
+                explicitAttemptGeneration = attemptGeneration,
+                fallbackAdmission = fallbackAdmission,
+            )
+        val effectiveSource = terminalMetadata.source
+        val effectiveAttemptGeneration = terminalMetadata.attemptGeneration
+        val eventSessionGeneration = terminalMetadata.sessionGeneration
+            .takeIf { it > 0L }
+            ?: effectiveAttemptGeneration
+        if (fallbackAdmission != null &&
+            (source == BleConnectSource.UNKNOWN || generation <= 0L)
+        ) {
+            sendLog(
+                BleLoggerTag.d,
+                "Connection terminal metadata restored: uuid=$uuid, state=${state.toFlutterJsonValue()}, " +
+                    "source=${effectiveSource.flutterValue}, sessionGeneration=$eventSessionGeneration, " +
+                    "attemptGeneration=$effectiveAttemptGeneration",
+            )
+        }
+        // 2、先把终态写入 endpoint 状态，保证业务缓存与发送给 Dart 的状态同步。
         connectedDevices.forEach {
             if (it.uuid == uuid) {
                 it.connectState = state
-                // 1.1、系统断连或 timeout 标记为需刷新缓存的 endpoint。
-                // 1.2、系统断连可能丢失地址类型元数据；timeout 可能表示缓存失效。
+                // 2.1、系统断连或 timeout 标记为需刷新缓存的 endpoint。
+                // 2.2、系统断连可能丢失地址类型元数据；timeout 可能表示缓存失效。
                 if (state == BleConnectState.DISCONNECT_FROM_SYS || state == BleConnectState.TIMEOUT) {
                     it.needsScanBeforeConnect = true
                 }
@@ -2814,7 +2854,7 @@ class BleManager private constructor() {
         if (state == BleConnectState.DISCONNECT_BY_USER) {
             autoReconnectSupervisor.cancel(uuid, reason = "disconnectByUser state")
         }
-        // 2、flow connecting 只清理断连列表，不结束业务超时会话。
+        // 3、flow connecting 只清理断连列表，不结束业务超时会话。
         //  注意：CONNECT_FINISH 只表示 BLE 服务/特征流程完成，真正的业务 connected
         //  仍由上层鉴权后调用 deviceConnected 触发，所以这里不取消超时定时器。
         if (state.isFlowConnecting) {
@@ -2822,13 +2862,16 @@ class BleManager private constructor() {
                 it.first == uuid
             }
         }
-        // 3、断连/错误状态走统一 teardown，并按 source/generation 调度自动回连。
+        // 4、断连/错误状态走统一 teardown，并按 source/generation 调度自动回连。
         else if (state.isDisconnected || state.isError) {
+            // 4.1、exact callback 通常已移除业务 session；无 metadata 的系统出口则
+            // 在上方完成快照后于此收口，不能让旧 GATT admission 污染下一次回连。
+            businessConnectedGattSessions.remove(key)
             disconnectDevice(uuid, state, removeBond)
         }
-        // 4、成功状态清理 timeout，并在业务 connected 后 arm 长期 autoReconnect。
+        // 5、成功状态清理 timeout，并在业务 connected 后 arm 长期 autoReconnect。
         else if (state.isConnected) {
-            // 4.1、连接成功后清理当前设备上的超时定时器。
+            // 5.1、连接成功后清理当前设备上的超时定时器。
             connectedDevices.firstOrNull {
                 it.uuid.equals(uuid, ignoreCase = true)
             }?.let {
@@ -2838,13 +2881,21 @@ class BleManager private constructor() {
                     autoReconnectSupervisor.arm(it)
                 }
             }
-            // 4.2、从断连中设备列表中移除当前设备。
+            // 5.2、从断连中设备列表中移除当前设备。
             disconnectingDevices.removeAll {
                 it.first == uuid
             }
         }
-        // 5、向 Dart 发送带 source/generation 的连接状态，再按策略安排 native 回连。
-        sendConnectState(uuid, name, state, mtu, source, eventSessionGeneration, attemptGeneration)
+        // 6、向 Dart 发送带 source/session/attempt 的连接状态，再安排 native 回连。
+        sendConnectState(
+            uuid,
+            name,
+            state,
+            mtu,
+            effectiveSource,
+            eventSessionGeneration,
+            effectiveAttemptGeneration,
+        )
         if (scheduleAutoReconnect && (state.isDisconnected || state.isError)) {
             autoReconnectSupervisor.schedule(uuid, state)
         }
