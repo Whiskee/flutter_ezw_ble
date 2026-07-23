@@ -185,13 +185,11 @@ extension BleManager {
         }
         self.bleConfigs = configs
         self.hasInitializedBleConfigs = true
-        // MethodChannel 调用必须尽快返回 Flutter。State Restoration / auto reconnect
-        // 可能同步进入 GATT pipeline，放到下一轮主队列避免阻塞首帧和 Dart await。
+        // MethodChannel 调用必须尽快返回 Flutter。State Restoration 只在当前设备的
+        // autoReconnect activation 到来后才允许认领，不能在这里只凭 config 类型
+        // 恢复账号历史设备。auto reconnect 补偿仍放到下一轮主队列。
         DispatchQueue.main.async { [weak self] in
-            // 配置已可用后再重放 restored peripherals；此时才能根据 belongConfig
-            // 找到私有服务和 notify 初始化规则。
-            self?.flushPendingRestoredPeripherals()
-            // 蓝牙已恢复但任务被 poweredOff 暂停时，在配置就绪后补偿恢复。
+            // 1、蓝牙已恢复但任务被 poweredOff 暂停时，在配置就绪后补偿恢复。
             self?.resumeReconnectTasksIfBluetoothOn(reason: "initConfigs")
         }
     }
@@ -748,7 +746,7 @@ extension BleManager {
     /**
      * 重置
      */
-    func reset() {
+    func reset(preserveStateRestoration: Bool = false) {
         stopScan()
         cancelAllConnectionAdmissions(reason: "reset")
         connectedDevices.forEach { device in
@@ -767,14 +765,19 @@ extension BleManager {
         scanConnectTimeoutTimers.removeAll()
         upgradeDevices?.removeAll()
         preConnectedDevices.removeAll()
-        restorationCoordinator.clearPendingPeripherals()
+        // 1、冷启动中性 reset 发生在 willRestoreState 与当前设备加载之间。此时只清理
+        // 旧 runtime session，必须保留系统交还的 peripheral，等待当前 target activation
+        // 精确认领；登出、移除设备等 hard reset 仍立即清除 restoration 债务。
+        if !preserveStateRestoration {
+            restorationCoordinator.clearPendingPeripherals()
+        }
         cancelAllReconnectTasks()
         // resetBle 是中性 runtime teardown：持久 owner/autoReconnect 配置必须保留，
         // 由 Dart 下一次 activate 或 State Restoration 重新建立全新 generation。
         //  清空所有 OTA 写队列, 通知 Dart 端 await 立即返回
         otaWriteQueues.values.forEach { $0.cancelAll(reason: "reset") }
         otaWriteQueues.removeAll()
-        loggerD(msg: "Reset: success")
+        loggerD(msg: "Reset: success, preserveStateRestoration=\(preserveStateRestoration)")
     }
     
 }
@@ -836,14 +839,19 @@ extension BleManager {
      *  用配置全部私有服务 + ANCS 服务一起查询：ANCS-only 连接时私有服务可能尚未被
      *  CoreBluetooth 缓存，只查单个私有服务会漏掉，导致目标掉进扫描而报 630。
      */
-    func findPeripheralFromConnected(uuid: String, name: String, serviceUUIDs: [CBUUID])-> CBPeripheral? {
+    func findPeripheralFromConnected(
+        uuid: String,
+        name: String,
+        serviceUUIDs: [CBUUID],
+        requireUniqueMatch: Bool = false
+    )-> CBPeripheral? {
         var queryServices = serviceUUIDs
         if !queryServices.contains(BleManager.ancsServiceUUID) {
             queryServices.append(BleManager.ancsServiceUUID)
         }
         guard !queryServices.isEmpty else { return nil }
         let connectedPeripherals = centralManager.retrieveConnectedPeripherals(withServices: queryServices)
-        return connectedPeripherals.first { device in
+        let matches = connectedPeripherals.filter { device in
             BleReconnectIdentityPolicy.matchesSystemConnectedPeripheral(
                 taskUuid: uuid,
                 taskName: name,
@@ -851,6 +859,12 @@ extension BleManager {
                 peripheralName: device.name ?? ""
             )
         }
+        // 1、冷启动 name-only 恢复不得从同名历史设备中任取一个；UUID 已知或普通
+        // 调用保持原行为，只有明确要求唯一候选时才 fail-closed。
+        if requireUniqueMatch && matches.count != 1 {
+            return nil
+        }
+        return matches.first
     }
     
     

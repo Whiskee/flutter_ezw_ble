@@ -155,7 +155,12 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
-  Future<void> resetBle() {
+  Future<void> resetBle({bool preserveStateRestoration = false}) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> finalizeStateRestorationClaims() {
     throw UnimplementedError();
   }
 

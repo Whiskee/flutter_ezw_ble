@@ -54,6 +54,33 @@ final class BleStateRestorationCoordinator {
         return peripherals
     }
 
+    /**
+     *  为当前 Dart recovery target 精确认领一个 restored peripheral。
+     *
+     *  1、优先使用非空 CoreBluetooth UUID；UUID 为空时只允许完整设备名唯一匹配。
+     *  2、唯一匹配后立即从 pending 集合移除，保证同一 peripheral 只能被一个 owner 消费。
+     *  3、同名多候选时 fail-closed，交回常规扫描解析，避免误连历史设备。
+     */
+    func claimPendingPeripheral(uuid: String, name: String) -> CBPeripheral? {
+        // 1、规范化输入，避免空格导致已知 UUID 或完整名称无法匹配。
+        let normalizedUuid = uuid.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 2、UUID 是 iOS peripheral 的最强身份；为空时才退化为完整名称匹配。
+        let matches = pendingPeripherals.enumerated().filter { _, peripheral in
+            if !normalizedUuid.isEmpty {
+                return peripheral.identifier.uuidString.caseInsensitiveCompare(normalizedUuid) == .orderedSame
+            }
+            guard !normalizedName.isEmpty else { return false }
+            return peripheral.name?.trimmingCharacters(in: .whitespacesAndNewlines) == normalizedName
+        }
+        // 3、只有唯一候选才能认领；歧义时不得猜测设备身份。
+        guard matches.count == 1, let match = matches.first else {
+            return nil
+        }
+        pendingPeripherals.remove(at: match.offset)
+        return match.element
+    }
+
     /// reset/clean 会使本次 runtime restoration session 全部失效。
     func clearPendingPeripherals() {
         // 1、reset/clean 直接丢弃本轮 restoration 债务，不允许旧对象复活连接。

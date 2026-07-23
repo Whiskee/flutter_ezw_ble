@@ -45,6 +45,33 @@ enum BleStateRestorationAuthorization {
  */
 extension BleManager {
     /**
+     *  结束本次冷启动 restoration 认领窗口。
+     *
+     *  当前设备的 activation 已先从 pending 集合移除匹配对象；剩余对象只能属于
+     *  历史设备或歧义身份，必须 fail-closed 并取消系统物理连接。
+     */
+    func finalizeStateRestorationClaims() {
+        // 1、一次性 drain，保证重复收尾幂等且不会取消稍后进入的新 restoration 回调。
+        let unclaimedPeripherals = restorationCoordinator.drainPendingPeripherals()
+        // 2、未认领对象不得进入业务 Gate；若系统仍连接或正在连接，显式取消物理链路。
+        unclaimedPeripherals.forEach { peripheral in
+            let uuid = peripheral.identifier.uuidString
+            let name = peripheral.name ?? ""
+            if peripheral.state != .disconnected {
+                centralManager.cancelPeripheralConnection(peripheral)
+            }
+            recordAutoReconnectEvent(
+                type: "ios_restore_unclaimed",
+                uuid: uuid,
+                name: name,
+                detail: "startup current targets did not claim peripheral"
+            )
+            loggerD(msg: "stateRestoration: finalize unclaimed uuid=\(uuid), name=\(name), state=\(peripheral.state.rawValue)")
+        }
+        loggerD(msg: "stateRestoration: claim window finalized, unclaimed=\(unclaimedPeripherals.count)")
+    }
+
+    /**
      *  为 restored peripheral 找回 BleConfig。
      *
      *  只有明确 persisted/runtime owner 且其配置仍启用 autoReconnect 才允许恢复。

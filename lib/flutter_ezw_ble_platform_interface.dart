@@ -251,9 +251,23 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     throw UnimplementedError('openAppSettings() has not been implemented.');
   }
 
-  /// 重置蓝牙
-  Future<void> resetBle() {
-    throw UnimplementedError('resetBle() has not been implemented.');
+  /// 重置蓝牙。
+  ///
+  /// 冷启动使用 [preserveStateRestoration] 保留 iOS 已交还、但尚未被当前设备
+  /// activation 认领的 peripheral；登出/移除/用户真取消保持默认 hard reset。
+  Future<void> resetBle({bool preserveStateRestoration = false}) {
+    throw UnimplementedError(
+      'resetBle(preserveStateRestoration: $preserveStateRestoration) has not been implemented.',
+    );
+  }
+
+  /// 结束冷启动 State Restoration 认领窗口。
+  ///
+  /// iOS 会取消未被当前业务设备认领的历史 peripheral；Android 为 no-op。
+  Future<void> finalizeStateRestorationClaims() {
+    throw UnimplementedError(
+      'finalizeStateRestorationClaims() has not been implemented.',
+    );
   }
 
   /// 清除连接缓存

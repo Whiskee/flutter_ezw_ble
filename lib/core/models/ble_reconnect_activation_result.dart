@@ -29,6 +29,8 @@ class BleReconnectActivationResult {
     required this.reason,
     this.source = BleConnectSource.unknown,
     this.sessionGeneration = 0,
+    this.resolvedUuid = '',
+    this.resolutionSource = '',
   });
 
   final String belongConfig;
@@ -40,6 +42,15 @@ class BleReconnectActivationResult {
 
   /// even_connect recovery batch 的逻辑代次；不得与 native Gate attempt 混用。
   final int sessionGeneration;
+
+  /// Native 在 activation 期间通过 State Restoration/系统连接找回的平台 UUID。
+  ///
+  /// [uuid] 必须继续保留 Dart 请求身份供 recovery batch 对账；因此平台身份迁移
+  /// 使用独立字段返回，不能在 MethodChannel 回执中直接覆盖 [uuid]。
+  final String resolvedUuid;
+
+  /// 平台身份的解析来源，例如 `stateRestoration` 或 `systemConnected`。
+  final String resolutionSource;
 
   /// 除 rejected 外都表示 native 已保留当前连接 owner。
   bool get isAccepted => state != BleReconnectActivationState.rejected;
@@ -62,6 +73,8 @@ class BleReconnectActivationResult {
         final num value => value.toInt(),
         _ => 0,
       },
+      resolvedUuid: map['resolvedUuid'] as String? ?? '',
+      resolutionSource: map['resolutionSource'] as String? ?? '',
     );
   }
 }

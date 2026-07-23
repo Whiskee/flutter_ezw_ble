@@ -279,6 +279,48 @@ void main() {
     expect(results.single.isAccepted, isTrue);
   });
 
+  test('restoration activation keeps request key and exposes resolved UUID',
+      () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (_) async {
+      return [
+        {
+          'belongConfig': 'ring_bcl_1',
+          // uuid 保留请求身份，防止 recovery batch 在回执期改 key。
+          'uuid': '',
+          'name': 'EVEN R1_F9B658',
+          'state': 'resolved',
+          'reason': 'restoredPeripheralClaimed',
+          'source': 'autoReconnect',
+          'sessionGeneration': 7,
+          'resolvedUuid': '5FB51C30-E13C-A3B7-F542-796E2CE78830',
+          'resolutionSource': 'stateRestoration',
+        },
+      ];
+    });
+
+    final results = await platform.activateAutoReconnectTargets([
+      BleDevice(
+        'ring_bcl_1',
+        '',
+        'EVEN R1_F9B658',
+        'EVEN R1_F9B658',
+        -50,
+        mac: 'DA:93:14:F9:B6:58',
+      ),
+    ], sessionGeneration: 7);
+
+    final result = results.single;
+    expect(result.uuid, '');
+    expect(
+      result.resolvedUuid,
+      '5FB51C30-E13C-A3B7-F542-796E2CE78830',
+    );
+    expect(result.resolutionSource, 'stateRestoration');
+    expect(result.sessionGeneration, 7);
+    expect(result.state, BleReconnectActivationState.resolved);
+  });
+
   test('activation ack keeps native rejection observable', () async {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (_) async {

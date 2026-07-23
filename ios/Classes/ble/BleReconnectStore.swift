@@ -413,6 +413,26 @@ struct BleReconnectActivationResult {
     let reason: String
     let source: BleConnectSource
     let sessionGeneration: Int64
+    let resolvedUuid: String
+    let resolutionSource: String
+
+    init(
+        target: BleReconnectTarget,
+        state: BleReconnectActivationState,
+        reason: String,
+        source: BleConnectSource,
+        sessionGeneration: Int64,
+        resolvedUuid: String = "",
+        resolutionSource: String = ""
+    ) {
+        self.target = target
+        self.state = state
+        self.reason = reason
+        self.source = source
+        self.sessionGeneration = sessionGeneration
+        self.resolvedUuid = resolvedUuid
+        self.resolutionSource = resolutionSource
+    }
 
     var raw: [String: Any] {
         [
@@ -422,7 +442,9 @@ struct BleReconnectActivationResult {
             "state": state.rawValue,
             "reason": reason,
             "source": source.rawValue,
-            "sessionGeneration": sessionGeneration
+            "sessionGeneration": sessionGeneration,
+            "resolvedUuid": resolvedUuid,
+            "resolutionSource": resolutionSource
         ]
     }
 }

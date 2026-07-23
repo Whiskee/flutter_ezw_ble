@@ -387,6 +387,87 @@ extension BleManager {
                     sessionGeneration: sessionGeneration
                 )
             }
+            // 1.2、覆盖安装/系统唤醒时，willRestoreState 可能早于 Dart 当前设备加载。
+            // 先从暂存 restoration 精确认领；如果 startup reset 发生在 restoration 之后，
+            // 再以配置服务查询系统已连接对象。两条路径都必须完整名称唯一匹配，不能
+            // 凭 R1/G2 前缀恢复账号中的历史设备。
+            let claimedRestoredPeripheral = restorationCoordinator.claimPendingPeripheral(
+                uuid: trimmedUuid,
+                name: trimmedName
+            )
+            let systemConnectedPeripheral: CBPeripheral? = {
+                guard claimedRestoredPeripheral == nil, trimmedUuid.isEmpty else {
+                    return nil
+                }
+                return findPeripheralFromConnected(
+                    uuid: trimmedUuid,
+                    name: trimmedName,
+                    serviceUUIDs: config.privateServices.map { $0.serviceUUID },
+                    requireUniqueMatch: true
+                )
+            }()
+            if let resolvedPeripheral = claimedRestoredPeripheral ?? systemConnectedPeripheral {
+                let resolvedUuid = resolvedPeripheral.identifier.uuidString
+                let resolvedName = trimmedName.isEmpty
+                    ? (resolvedPeripheral.name ?? "")
+                    : trimmedName
+                let resolvedTarget = BleReconnectTarget(
+                    belongConfig: target.belongConfig,
+                    uuid: resolvedUuid,
+                    name: resolvedName,
+                    expectedMacSuffix: target.expectedMacSuffix
+                )
+                guard let task = armReconnectTarget(
+                    resolvedTarget,
+                    source: source,
+                    sessionGeneration: sessionGeneration
+                ) else {
+                    // 认领后若配置在同一时刻被撤销，把 restoration 对象重新放回暂存区；
+                    // hard reset/config revoke 会在统一清理边界处理，不能静默丢失系统对象。
+                    if claimedRestoredPeripheral != nil {
+                        restorationCoordinator.enqueue(resolvedPeripheral)
+                    }
+                    return BleReconnectActivationResult(
+                        target: target,
+                        state: .rejected,
+                        reason: "nativeArmRejectedAfterRestorationClaim",
+                        source: source,
+                        sessionGeneration: sessionGeneration
+                    )
+                }
+                // 将精确认领的 peripheral 放入内部缓存，后续 beginDirectReconnectAttempt
+                // 无论当前是 connected/connecting/disconnected 都复用同一 Gate/GATT 流程。
+                scanResultTemp.removeAll {
+                    $0.0.uuid.caseInsensitiveCompare(resolvedUuid) == .orderedSame
+                }
+                scanResultTemp.append((
+                    BleDevice(
+                        belongConfig: target.belongConfig,
+                        name: resolvedName,
+                        uuid: resolvedUuid,
+                        sn: resolvedName,
+                        mac: "",
+                        rssi: 0
+                    ),
+                    resolvedPeripheral
+                ))
+                let resolutionSource = claimedRestoredPeripheral != nil
+                    ? "stateRestoration"
+                    : "systemConnected"
+                loggerD(msg: "autoReconnect restoration claim: config=\(target.belongConfig), requestedUuid=\(trimmedUuid), resolvedUuid=\(resolvedUuid), name=\(resolvedName), state=\(resolvedPeripheral.state.rawValue), source=\(resolutionSource), sessionGeneration=\(task.sessionGeneration)")
+                activateArmedReconnectTask(task, source: source)
+                return BleReconnectActivationResult(
+                    // ack 保留 Dart 原始 target identity，避免 batch 在回执期把 name-key
+                    // 突然切成 uuid-key；resolvedUuid 作为独立字段供上层记录和回填。
+                    target: target,
+                    state: .resolved,
+                    reason: "restoredPeripheralClaimed",
+                    source: source,
+                    sessionGeneration: task.sessionGeneration,
+                    resolvedUuid: resolvedUuid,
+                    resolutionSource: resolutionSource
+                )
+            }
             if trimmedUuid.isEmpty {
                 guard !trimmedName.isEmpty else {
                     loggerE(msg: "autoReconnect activation rejected: config=\(target.belongConfig), reason=emptyIdentity")

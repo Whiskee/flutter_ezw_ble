@@ -197,7 +197,17 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       methodChannel.invokeMethod("openAppSettings");
 
   @override
-  Future<void> resetBle() async => methodChannel.invokeMethod("resetBle");
+  Future<void> resetBle({bool preserveStateRestoration = false}) async =>
+      methodChannel.invokeMethod(
+        "resetBle",
+        <String, Object?>{
+          "preserveStateRestoration": preserveStateRestoration,
+        },
+      );
+
+  @override
+  Future<void> finalizeStateRestorationClaims() async =>
+      methodChannel.invokeMethod("finalizeStateRestorationClaims");
 
   @override
   Future<void> cleanConnectCache() async =>

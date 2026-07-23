@@ -57,6 +57,8 @@ enum BleMC: String {
     case cleanConnectCache
     /// Drain native reconnect/restoration events buffered before Dart listeners.
     case drainAutoReconnectEvents
+    /// Cancel restored peripherals not claimed by the current startup targets.
+    case finalizeStateRestorationClaims
     /// Reset native BLE state.
     case resetBle
     /// Unknown method fallback.
@@ -245,8 +247,19 @@ enum BleMC: String {
         case .drainAutoReconnectEvents:
             result(BleManager.shared.drainAutoReconnectEvents())
             return
+        case .finalizeStateRestorationClaims:
+            // 1、当前设备 activation 已逐端点认领完毕；其余 restored peripheral
+            // 属于历史设备，必须显式取消，不能继续占用系统连接或留在内存。
+            BleManager.shared.finalizeStateRestorationClaims()
+            break
         case .resetBle:
-            BleManager.shared.reset()
+            // 1、冷启动 reset 只清理旧 runtime，不得丢弃 willRestoreState 已交还、
+            // 尚待当前设备 activation 认领的 peripheral；旧 Dart 调用默认仍是 hard reset。
+            let data = arguments as? [String: Any] ?? [:]
+            let preserveStateRestoration = data["preserveStateRestoration"] as? Bool ?? false
+            BleManager.shared.reset(
+                preserveStateRestoration: preserveStateRestoration
+            )
             break
         case .openBleSettings:
             if let url = URL(string: "App-Prefs:root=Bluetooth"), UIApplication.shared.canOpenURL(url) {
