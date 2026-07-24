@@ -68,6 +68,65 @@ void main() {
     expect(iosConnect, contains('case attemptGeneration'));
   });
 
+  test(
+      'higher reconnect session rebuilds the exact physical owner on both hosts',
+      () {
+    final androidModels = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleReconnectModels.kt',
+    ).readAsStringSync();
+    final androidSupervisor = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleAutoReconnectSupervisor.kt',
+    ).readAsStringSync();
+    final androidManager = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleManager.kt',
+    ).readAsStringSync();
+    final iosReconnect =
+        File('ios/Classes/ble/BleAutoReconnectCoordinator.swift')
+            .readAsStringSync();
+
+    // Android 不能把旧 GATT callback 动态重标成新 session；更高 session
+    // 必须走 exact teardown，并且 activation ack 只能回报实际安装值。
+    expect(
+      androidModels,
+      contains('REBUILD_PHYSICAL_OWNER'),
+    );
+    expect(
+      androidSupervisor,
+      contains(
+        'invalidatePassiveGattForSessionRebind(device.uuid, exactGatt)',
+      ),
+    );
+    expect(
+      androidSupervisor,
+      contains(
+        'createConnectCallback(task.uuid, task.source, task.sessionGeneration)',
+      ),
+    );
+    expect(androidManager, contains('reason = if (requestedSessionInstalled)'));
+    expect(androidManager, contains('"sessionNotInstalled"'));
+    expect(
+      androidManager,
+      contains('sessionGeneration = installedSessionGeneration'),
+    );
+
+    // iOS 同样先登记 cancellation barrier，再让 replacement admission
+    // 携带新 session；同 session 的 manual promotion 不进入这条路径。
+    expect(
+      iosReconnect,
+      contains(
+        'if task.sessionGeneration > current.sessionGeneration',
+      ),
+    );
+    expect(
+      iosReconnect,
+      contains('deferConnectionAdmissionReleaseUntilPeripheralTerminal'),
+    );
+    expect(
+      iosReconnect,
+      contains('beginReconnectAttempt(uuid: task.uuid)'),
+    );
+  });
+
   test('iOS name-only activation owns identity before normal MAC filtering',
       () {
     final method =

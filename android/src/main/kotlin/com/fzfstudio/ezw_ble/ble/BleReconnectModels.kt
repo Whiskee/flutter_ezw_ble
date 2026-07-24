@@ -63,6 +63,34 @@ internal data class BleReconnectTask(
     var sessionGeneration: Long = 0L,
 )
 
+/**
+ * 已存在 native reconnect task 收到新 Dart session 时的唯一决策。
+ *
+ * task 字段和 GATT callback 必须始终属于同一个 session：没有物理 owner 时可以直接
+ * 提升 task 高水位；已经创建 GATT 后则必须先精确撤销旧 owner，再用新 session 创建
+ * callback。旧值或同值只能复用当前 owner，不能让迟到请求把 session 倒退。
+ */
+internal enum class BleReconnectSessionUpdateAction {
+    KEEP_CURRENT,
+    UPDATE_TASK,
+    REBUILD_PHYSICAL_OWNER,
+}
+
+/** 将 session 单调性判断收口，供 supervisor 和纯 JVM 回归测试共用。 */
+internal object BleReconnectSessionUpdatePolicy {
+    fun resolve(
+        currentSessionGeneration: Long,
+        incomingSessionGeneration: Long,
+        hasPhysicalOwner: Boolean,
+    ): BleReconnectSessionUpdateAction = when {
+        incomingSessionGeneration <= 0L -> BleReconnectSessionUpdateAction.KEEP_CURRENT
+        incomingSessionGeneration <= currentSessionGeneration ->
+            BleReconnectSessionUpdateAction.KEEP_CURRENT
+        hasPhysicalOwner -> BleReconnectSessionUpdateAction.REBUILD_PHYSICAL_OWNER
+        else -> BleReconnectSessionUpdateAction.UPDATE_TASK
+    }
+}
+
 /** Android passive GATT 长离线退避策略；不改变 `connectGatt(autoConnect=true)` 的 owner。 */
 internal object BlePassiveReconnectDelayPolicy {
     /** 目标重新可见后的短防抖，避免扫描 burst 触发连续 register/unregister。 */

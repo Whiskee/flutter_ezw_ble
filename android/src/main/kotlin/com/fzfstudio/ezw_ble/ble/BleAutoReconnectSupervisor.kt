@@ -55,6 +55,13 @@ internal class BleAutoReconnectSupervisor(
      * session 返回 false，避免把 queued GATT 当作 zombie 关闭。
      */
     private val invalidatePendingPassiveGatt: (String, BluetoothGatt) -> Boolean,
+    /**
+     * 更高 Dart session 接管时精确撤销旧物理 owner。
+     *
+     * 与 pre-physical deadline 不同，这里允许撤销已经进入 Gate 的 exact admission；
+     * manager 必须先失效旧 attempt、释放 GATT/Gate，再返回允许 supervisor 创建唯一新 owner。
+     */
+    private val invalidatePassiveGattForSessionRebind: (String, BluetoothGatt) -> Boolean,
     /** 创建长期 passive GATT 的平台边界；测试可注入 fake 验证 autoConnect pending 次序。 */
     private val passiveGattFactory: BlePassiveGattFactory = AndroidBlePassiveGattFactory,
     /** 扫描确认目标可见后的单次 `autoConnect=false` 直连平台边界。 */
@@ -117,7 +124,9 @@ internal class BleAutoReconnectSupervisor(
             )
         } else {
             task.name = device.name
-            if (sessionGeneration > 0L) {
+            // 2.1、没有 live GATT 时可以直接推进 task session；一旦 callback 已创建，
+            // session 必须由 activate() 走 exact cancellation barrier 后再切换。
+            if (sessionGeneration > task.sessionGeneration && task.passiveGatt == null) {
                 task.sessionGeneration = sessionGeneration
             }
             // source 只属于当前 attempt：manual 提升后，lifecycle/重入 activate(auto)
@@ -149,21 +158,81 @@ internal class BleAutoReconnectSupervisor(
     }
 
     /** 立即建立或复用长期 pending autoConnect；物理 callback 前不发送 connecting。 */
-    fun activate(device: BleDevice, source: BleConnectSource, sessionGeneration: Long = 0L) {
+    fun activate(
+        device: BleDevice,
+        source: BleConnectSource,
+        sessionGeneration: Long = 0L,
+    ): Long {
         // 1、登记/刷新长期目标；这一步不创建第二条 GATT。
         arm(device, source, sessionGeneration)
-        val task = reconnectTasks[reconnectKey(device.uuid)] ?: return
-        // 2、已有 passive owner 时只提升 pending admission，复用当前 GATT。
+        val task = reconnectTasks[reconnectKey(device.uuid)] ?: return 0L
+
+        // 2、session 未变化时复用当前 owner；更高 session 必须重建 callback 归属，
+        // 不能只改 task 字段后让旧 GATT 冒充新会话。
+        val sessionAction = BleReconnectSessionUpdatePolicy.resolve(
+            currentSessionGeneration = task.sessionGeneration,
+            incomingSessionGeneration = sessionGeneration,
+            hasPhysicalOwner = task.passiveGatt != null,
+        )
+        if (sessionAction == BleReconnectSessionUpdateAction.REBUILD_PHYSICAL_OWNER) {
+            val exactGatt = task.passiveGatt
+            val previousSessionGeneration = task.sessionGeneration
+            if (exactGatt != null && invalidatePassiveGattForSessionRebind(device.uuid, exactGatt)) {
+                val rebound = synchronized(this) {
+                    val current = reconnectTasks[reconnectKey(device.uuid)] ?: return@synchronized false
+                    if (current.passiveGatt !== exactGatt) {
+                        return@synchronized false
+                    }
+                    // 2.1、manager 已完成旧 admission/GATT 的 exact teardown；这里再清
+                    // supervisor 引用并安装新 session，随后创建的 callback 才能携带新值。
+                    current.pendingPhysicalDeadline?.cancel()
+                    current.pendingPhysicalDeadline = null
+                    invalidateRetrySchedule(current)
+                    current.passiveGatt = null
+                    current.passiveStartedAtMs = 0L
+                    current.pendingVisibleDirectConnect = false
+                    current.visibleDirectConnectRequested = false
+                    current.sessionGeneration = sessionGeneration
+                    true
+                }
+                if (rebound) {
+                    releaseVisibleDirectConnectSlot(device.uuid)
+                    sendLog(
+                        BleLoggerTag.d,
+                        "Auto reconnect: ${device.uuid}, session owner rebuilt " +
+                            "old=$previousSessionGeneration, incoming=$sessionGeneration",
+                    )
+                    beginInitialAttempt(device.uuid)
+                }
+            }
+            val actualSession = reconnectTasks[reconnectKey(device.uuid)]?.sessionGeneration ?: 0L
+            if (actualSession != sessionGeneration) {
+                sendLog(
+                    BleLoggerTag.e,
+                    "Auto reconnect: ${device.uuid}, session rebind not installed " +
+                        "requested=$sessionGeneration actual=$actualSession",
+                )
+            }
+            return actualSession
+        }
+
+        // 3、没有 live GATT 的 task 可以安全安装更高 session；旧/同 session 不倒退。
+        if (sessionAction == BleReconnectSessionUpdateAction.UPDATE_TASK) {
+            task.sessionGeneration = sessionGeneration
+        }
+
+        // 4、已有 passive owner 时只提升 pending admission，复用当前 GATT。
         if (task.passiveGatt != null || task.timer != null) {
             if (source == BleConnectSource.MANUAL_RECONNECT) {
                 promotePendingAdmission(device.uuid)
             }
-            return
+            return task.sessionGeneration
         }
-        // 3、首次 activation 同步执行 connectGatt(true)，确保返回前系统已经持有 pending owner。
+        // 5、首次 activation 同步执行 connectGatt(true)，确保返回前系统已经持有 pending owner。
         // 首轮不能通过 Timer(0) 异步跳出 MethodChannel：调用返回前必须已经同步执行
         // connectGatt(true)，这样上层随后启动扫描时所有有效目标都已进入系统 pending。
         beginInitialAttempt(device.uuid)
+        return reconnectTasks[reconnectKey(device.uuid)]?.sessionGeneration ?: 0L
     }
 
     /**

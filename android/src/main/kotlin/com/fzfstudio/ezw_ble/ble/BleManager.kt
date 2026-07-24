@@ -171,6 +171,9 @@ class BleManager private constructor() {
             handleConnectState = { uuid, name, state -> handleConnectState(uuid, name, state) },
             sendLog = { tag, message -> sendLog(tag, message) },
             invalidatePendingPassiveGatt = { uuid, gatt -> invalidatePendingPassiveGatt(uuid, gatt) },
+            invalidatePassiveGattForSessionRebind = { uuid, gatt ->
+                invalidatePassiveGattForSessionRebind(uuid, gatt)
+            },
         )
     }
 
@@ -474,13 +477,20 @@ class BleManager private constructor() {
                 rssi = target.rssi,
                 connectState = BleConnectState.NONE,
             )
-            autoReconnectSupervisor.activate(seedDevice, source, sessionGeneration)
+            val installedSessionGeneration =
+                autoReconnectSupervisor.activate(seedDevice, source, sessionGeneration)
+            val requestedSessionInstalled =
+                sessionGeneration <= 0L || installedSessionGeneration == sessionGeneration
             BleReconnectActivationResult(
                 target = target,
-                state = BleReconnectActivationState.RESOLVED,
-                reason = "",
+                state = if (requestedSessionInstalled) {
+                    BleReconnectActivationState.RESOLVED
+                } else {
+                    BleReconnectActivationState.REJECTED
+                },
+                reason = if (requestedSessionInstalled) "" else "sessionNotInstalled",
                 source = source,
-                sessionGeneration = sessionGeneration,
+                sessionGeneration = installedSessionGeneration,
             )
         }
     }
@@ -2678,6 +2688,69 @@ class BleManager private constructor() {
         sendLog(
             BleLoggerTag.d,
             "Admission gate: $uuid, invalidated exact pending passive GATT before physical callback",
+        )
+        return true
+    }
+
+    /**
+     * 更高 Dart session 接管时撤销 exact native owner。
+     *
+     * 1、只处理仍由相同 UUID/GATT/admission 持有的 session。
+     * 2、先清理 manager/Gate 身份并推进 attempt 高水位，再关闭旧 GATT。
+     * 3、返回后 supervisor 才能安装新 session 并创建新 callback，因此任意时刻同一
+     * endpoint 至多存在一个有效 owner，旧 callback 也只能命中 stale guard。
+     */
+    @Synchronized
+    private fun invalidatePassiveGattForSessionRebind(
+        uuid: String,
+        gatt: BluetoothGatt,
+    ): Boolean {
+        val key = reconnectKey(uuid)
+        val device = findConnectedDevice(uuid) ?: return false
+        if (device.myGatt !== gatt) {
+            return false
+        }
+        val admission = currentAdmissions[key]
+        val businessSession = businessConnectedGattSessions[key]
+        if (businessSession?.gatt === gatt) {
+            // 1、业务已连接的长期 GATT 不属于“在途 owner”。Dart 正常不会为已连接
+            // endpoint 提交新 session；若迟到 activation 到达，拒绝重建，避免主动打断
+            // 可用命令通道。
+            return false
+        }
+        if (admission == null) {
+            // 2、STATE_CONNECTED 前还没有 Gate admission，但 passive autoConnect GATT
+            // 已经持有旧 callback/session。精确关闭该句柄后，supervisor 才能创建携带
+            // incoming session 的唯一 replacement。
+            sendCmdQueues.remove(key)
+            device.releaseAndClear()
+            sendLog(
+                BleLoggerTag.d,
+                "Admission gate: $uuid, session rebind invalidated pre-physical owner",
+            )
+            return true
+        }
+        val admittedGatt = admittedGattSessions[admission.sessionId]?.gatt
+        if (admittedGatt != null && admittedGatt !== gatt) {
+            return false
+        }
+
+        // 3、先撤销 exact callback 归属；Gate 返回的其它 endpoint 可以在旧句柄关闭后继续。
+        currentAdmissions.remove(key)
+        admittedGattSessions.remove(admission.sessionId)
+        businessConnectedGattSessions.remove(key)
+        val next = invalidateConnectionAttempts(setOf(uuid))
+
+        // 4、清空设备和命令队列会同步 disconnect/close exact GATT；迟到 callback
+        // 因 admission/sessionId 已失效，不可能被投影成 incoming session。
+        sendCmdQueues.remove(key)
+        device.releaseAndClear()
+        next?.let { startGrantedGattPipeline(it) }
+        sendLog(
+            BleLoggerTag.d,
+            "Admission gate: $uuid, session rebind invalidated exact owner " +
+                "attemptGeneration=${admission.generation}, " +
+                "sessionGeneration=${admission.sessionGeneration}, sessionId=${admission.sessionId}",
         )
         return true
     }

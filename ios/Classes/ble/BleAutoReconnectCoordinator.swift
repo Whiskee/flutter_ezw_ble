@@ -292,7 +292,9 @@ extension BleManager {
             incoming: source,
             businessConnected: false
         )
-        if sessionGeneration > 0 {
+        // Session 只能向前推进。旧 Dart batch 的迟到 activation 不能把已安装 owner
+        // 降回更小代次，否则 CoreBluetooth 成功回调会再次被上层 epoch guard 拒绝。
+        if sessionGeneration > task.sessionGeneration {
             task.sessionGeneration = sessionGeneration
         }
         task.attempt = 0
@@ -563,9 +565,27 @@ extension BleManager {
                     $0.admission.generation == current.generation &&
                         $0.admission.sessionId == current.sessionId
                 } == true
+                if task.sessionGeneration > current.sessionGeneration {
+                    // 1.1、更高 Dart session 不能只覆盖 task 元数据：当前 CoreBluetooth
+                    // admission 和后续回调仍封装旧 session。先建立 exact cancellation
+                    // barrier，再注册唯一 replacement；真正 connect 会等待旧终态释放。
+                    if !currentIsPendingTeardown,
+                       let session = peripheralConnectionSessions[current.sessionId] {
+                        deferConnectionAdmissionReleaseUntilPeripheralTerminal(
+                            admission: current,
+                            peripheral: session.peripheral,
+                            deviceName: session.deviceName,
+                            terminalState: .disconnectFromSys
+                        )
+                        centralManager.cancelPeripheralConnection(session.peripheral)
+                    }
+                    loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), session owner replacement old=\(current.sessionGeneration), incoming=\(task.sessionGeneration), pendingTeardown=\(currentIsPendingTeardown)")
+                    beginReconnectAttempt(uuid: task.uuid)
+                    return
+                }
                 if source != .manualReconnect || !currentIsPendingTeardown {
                     if source == .manualReconnect {
-                        // 1.1、手动请求只提升 source；仅超过替换阈值且从未物理接触才允许 barrier 替换。
+                        // 1.2、手动请求只提升 source；仅超过替换阈值且从未物理接触才允许 barrier 替换。
                         // 默认仅提升同一 pending owner，避免手动点击引入第二条 GATT。
                         // 只有旧 owner 已超过 20 秒且从未收到物理回调，才先走 cancel
                         // barrier 后建立新 generation，给 CoreBluetooth 卡住的 pending 一个
