@@ -49,12 +49,21 @@ internal class BleAutoReconnectSupervisor(
     /** 统一日志出口。 */
     private val sendLog: (BleLoggerTag, String) -> Unit,
     /**
+     * 查询 Supervisor 保存的 GATT 是否仍由 Manager/Gate 精确持有。
+     *
+     * 手动提升必须先做健康检查；假的 `passiveGatt != null` 不能被当成可复用 owner。
+     */
+    private val classifyPendingPassiveGattOwner:
+        (String, BluetoothGatt) -> BlePendingOwnerHealth,
+    /**
      * 精确撤销尚未收到物理 callback 的 admission。
      *
      * deadline 只能撤销仍由相同 GATT 持有的 pre-physical session；已经进入 Gate 的
-     * session 返回 false，避免把 queued GATT 当作 zombie 关闭。
+     * 返回明确 disposition，调用方必须处理 stale、已 admission 和业务 connected，
+     * 禁止再次通过布尔值静默退出。
      */
-    private val invalidatePendingPassiveGatt: (String, BluetoothGatt) -> Boolean,
+    private val invalidatePendingPassiveGatt:
+        (String, BluetoothGatt) -> BlePendingOwnerDisposition,
     /**
      * 更高 Dart session 接管时精确撤销旧物理 owner。
      *
@@ -137,7 +146,9 @@ internal class BleAutoReconnectSupervisor(
                 incoming = source,
                 businessConnected = device.connectState.isConnected,
             )
-            task.pausedByBluetoothOff = false
+            // 2.2、普通 arm 只刷新持久 owner，不能越过 Bluetooth On 恢复屏障。
+            // 蓝牙恢复后的旧 session 必须等 activate() 携带 Dart 最终合并 session
+            // 才能解锁；否则 seed/arm 会提前复活旧 callback，再次制造代次竞态。
             // activate() 会重复进入 arm()。只有业务已确认 connected 时才算一次完整恢复，
             // disconnected 重入不得清空长离线退避或取消正在等待的 passive retry。
             if (device.connectState.isConnected) {
@@ -166,6 +177,10 @@ internal class BleAutoReconnectSupervisor(
         // 1、登记/刷新长期目标；这一步不创建第二条 GATT。
         arm(device, source, sessionGeneration)
         val task = reconnectTasks[reconnectKey(device.uuid)] ?: return 0L
+        // 1.1、只有显式 activation 才能消费 Bluetooth On 恢复屏障。
+        // 此时 sessionAction 会在任何新 GATT 创建前完成 session 安装或 exact rebind。
+        task.pausedByBluetoothOff = false
+        task.awaitingRecoveryActivation = false
 
         // 2、session 未变化时复用当前 owner；更高 session 必须重建 callback 归属，
         // 不能只改 task 字段后让旧 GATT 冒充新会话。
@@ -221,14 +236,38 @@ internal class BleAutoReconnectSupervisor(
             task.sessionGeneration = sessionGeneration
         }
 
-        // 4、已有 passive owner 时只提升 pending admission，复用当前 GATT。
+        // 4、手动接管前校验 Supervisor/Manager/Gate 是否仍指向同一个 owner。
+        // 4.1、若旧 deadline/Gate 清理只完成了一半，先精确修复 orphan，再创建唯一
+        // replacement；不能继续把 `passiveGatt != null` 当作健康 owner。
+        if (source == BleConnectSource.MANUAL_RECONNECT && task.passiveGatt != null) {
+            val exactGatt = task.passiveGatt ?: return task.sessionGeneration
+            if (
+                classifyPendingPassiveGattOwner(device.uuid, exactGatt) ==
+                BlePendingOwnerHealth.STALE
+            ) {
+                val disposition = repairStalePendingOwner(device.uuid, exactGatt)
+                if (
+                    disposition == BlePendingOwnerDisposition.INVALIDATED ||
+                    disposition == BlePendingOwnerDisposition.REPAIRED_STALE_OWNER
+                ) {
+                    clearRecycledPendingOwner(device.uuid, exactGatt)
+                    beginInitialAttempt(device.uuid)
+                } else if (disposition == BlePendingOwnerDisposition.STALE_OWNER_DROPPED) {
+                    // Manager 已有另一条健康 owner；只清 Supervisor 旧引用，不得重复建链。
+                    clearRecycledPendingOwner(device.uuid, exactGatt)
+                }
+                return reconnectTasks[reconnectKey(device.uuid)]?.sessionGeneration ?: 0L
+            }
+        }
+
+        // 5、已有健康 passive owner 时只提升 pending admission，复用当前 GATT。
         if (task.passiveGatt != null || task.timer != null) {
             if (source == BleConnectSource.MANUAL_RECONNECT) {
                 promotePendingAdmission(device.uuid)
             }
             return task.sessionGeneration
         }
-        // 5、首次 activation 同步执行 connectGatt(true)，确保返回前系统已经持有 pending owner。
+        // 6、首次 activation 同步执行 connectGatt(true)，确保返回前系统已经持有 pending owner。
         // 首轮不能通过 Timer(0) 异步跳出 MethodChannel：调用返回前必须已经同步执行
         // connectGatt(true)，这样上层随后启动扫描时所有有效目标都已进入系统 pending。
         beginInitialAttempt(device.uuid)
@@ -245,7 +284,32 @@ internal class BleAutoReconnectSupervisor(
         if (task.passiveGatt == null && task.timer == null) {
             return false
         }
-        // 2、切换当前 attempt source，并把 admission 节点移入 manual 优先队列。
+        // 2、前台兼容入口也必须执行 owner 健康检查，不能绕过 activate() 的 stale 修复。
+        task.passiveGatt?.let { exactGatt ->
+            if (
+                classifyPendingPassiveGattOwner(uuid, exactGatt) ==
+                BlePendingOwnerHealth.STALE
+            ) {
+                val disposition = repairStalePendingOwner(uuid, exactGatt)
+                task.source = BleConnectSource.MANUAL_RECONNECT
+                when (disposition) {
+                    BlePendingOwnerDisposition.INVALIDATED,
+                    BlePendingOwnerDisposition.REPAIRED_STALE_OWNER -> {
+                        clearRecycledPendingOwner(uuid, exactGatt)
+                        beginInitialAttempt(uuid)
+                    }
+                    BlePendingOwnerDisposition.STALE_OWNER_DROPPED -> {
+                        clearRecycledPendingOwner(uuid, exactGatt)
+                        promotePendingAdmission(uuid)
+                    }
+                    BlePendingOwnerDisposition.ALREADY_ADMITTED,
+                    BlePendingOwnerDisposition.BUSINESS_CONNECTED ->
+                        promotePendingAdmission(uuid)
+                }
+                return true
+            }
+        }
+        // 3、切换当前 attempt source，并把 admission 节点移入 manual 优先队列。
         task.source = BleConnectSource.MANUAL_RECONNECT
         promotePendingAdmission(uuid)
         return true
@@ -403,6 +467,7 @@ internal class BleAutoReconnectSupervisor(
         // 2、清掉延迟 timer，并标记为蓝牙关闭导致的暂停。
         reconnectTasks.values.forEach { task ->
             task.pausedByBluetoothOff = true
+            task.awaitingRecoveryActivation = false
             task.source = BleReconnectSourcePolicy.afterTransportReset()
             invalidateRetrySchedule(task)
             task.consecutivePrePhysicalTimeouts = 0
@@ -428,20 +493,21 @@ internal class BleAutoReconnectSupervisor(
     /**
      * 蓝牙 powered-on 后恢复此前暂停的长期回连。
      *
-     * 回连 owner 先直接进入 passive `connectGatt(true)`，Dart 最多 20 秒的辅助扫描
-     * 与之并行，只负责刷新可见身份，不能成为恢复 owner 的前置条件。
+     * 这里只解除 transport 层冻结，不直接用旧 session 创建 GATT。Dart 收到 BLE available
+     * 后会为眼镜与戒指建立一个最终 recovery session，并通过 `activate()` 原子解除屏障。
      */
     fun resumeAfterBluetoothOn() {
-        // 1、只恢复因蓝牙关闭暂停的任务。
+        // 1、只标记因蓝牙关闭暂停的任务等待 Dart activation。
+        // 1.1、保持 paused=true 可以阻止 BT-off 迟到终态或旧 timer 抢先 schedule。
         reconnectTasks.values
             .filter { it.pausedByBluetoothOff }
             .forEach { task ->
-                // 1.1、恢复长期 owner；具体 GATT 创建仍由 schedule 串行调度。
-                task.pausedByBluetoothOff = false
-                schedule(
-                    task.uuid,
-                    BleConnectState.DISCONNECT_FROM_SYS,
-                    preserveAttemptSource = false,
+                task.awaitingRecoveryActivation = true
+                task.source = BleReconnectSourcePolicy.afterTransportReset()
+                sendLog(
+                    BleLoggerTag.d,
+                    "Auto reconnect: ${task.uuid}, bluetooth on, " +
+                        "awaiting Dart recovery activation for final session",
                 )
             }
     }
@@ -476,6 +542,16 @@ internal class BleAutoReconnectSupervisor(
         // 2. 只有已经 arm 的设备才允许自动回连。
         val task = reconnectTasks[reconnectKey(uuid)] ?: return
         val config = bleConfigs().firstOrNull { it.name == task.belongConfig } ?: return
+
+        // 2.1、蓝牙刚恢复时必须等 Dart 用一个最终 session 提交全部端点；旧终态不得
+        // 在 EventChannel available 处理前抢跑旧 GATT。
+        if (task.awaitingRecoveryActivation) {
+            sendLog(
+                BleLoggerTag.d,
+                "Auto reconnect: $uuid, schedule deferred while awaiting recovery activation",
+            )
+            return
+        }
 
         // 3. 手动来源只覆盖当前被提升的 attempt。终态后的长期重试恢复
         //    autoReconnect；只有 activate 初始调度需要保留调用方显式 source。
@@ -729,9 +805,32 @@ internal class BleAutoReconnectSupervisor(
         }
 
         // manager 会检查 exact device/GATT/admission；若物理 callback 已经进入 Gate，
-        // 此处返回 false，deadline 只失效自身，绝不触碰 queued session。manager 调用必须
+        // 此处返回明确 disposition，deadline 只失效自身，绝不触碰 queued session。manager 调用必须
         // 在 supervisor monitor 外执行，避免 physical callback 的 manager→supervisor 反向锁序。
-        if (!invalidatePendingPassiveGatt(uuid, expectedGatt)) {
+        val disposition = invalidatePendingPassiveGatt(uuid, expectedGatt)
+        if (
+            disposition == BlePendingOwnerDisposition.ALREADY_ADMITTED ||
+            disposition == BlePendingOwnerDisposition.BUSINESS_CONNECTED
+        ) {
+            synchronized(this) {
+                val task = reconnectTasks[reconnectKey(uuid)] ?: return
+                if (task.passiveGatt === expectedGatt) {
+                    task.pendingPhysicalDeadline?.cancel()
+                    task.pendingPhysicalDeadline = null
+                }
+            }
+            sendLog(
+                BleLoggerTag.d,
+                "Auto reconnect: $uuid, physical deadline ignored, owner=$disposition",
+            )
+            return
+        }
+        if (disposition == BlePendingOwnerDisposition.STALE_OWNER_DROPPED) {
+            clearRecycledPendingOwner(uuid, expectedGatt)
+            sendLog(
+                BleLoggerTag.d,
+                "Auto reconnect: $uuid, stale deadline owner dropped; manager owner preserved",
+            )
             return
         }
 
@@ -825,8 +924,31 @@ internal class BleAutoReconnectSupervisor(
         val exactGatt = expectedGatt ?: return false
         // manager 调用期间不持有 supervisor monitor，避免与 physical callback 的
         // manager→supervisor 顺序形成锁反转；manager 仍会拒绝已进入 Gate 的 exact GATT。
-        if (!invalidatePendingPassiveGatt(uuid, exactGatt)) {
-            return false
+        val disposition = invalidatePendingPassiveGatt(uuid, exactGatt)
+        if (
+            disposition == BlePendingOwnerDisposition.ALREADY_ADMITTED ||
+            disposition == BlePendingOwnerDisposition.BUSINESS_CONNECTED
+        ) {
+            synchronized(this) {
+                val task = reconnectTasks[reconnectKey(uuid)] ?: return false
+                if (task.passiveGatt === exactGatt) {
+                    task.pendingPhysicalDeadline?.cancel()
+                    task.pendingPhysicalDeadline = null
+                }
+            }
+            sendLog(
+                BleLoggerTag.d,
+                "Auto reconnect: $uuid, visibility already consumed by owner=$disposition",
+            )
+            return true
+        }
+        if (disposition == BlePendingOwnerDisposition.STALE_OWNER_DROPPED) {
+            clearRecycledPendingOwner(uuid, exactGatt)
+            sendLog(
+                BleLoggerTag.d,
+                "Auto reconnect: $uuid, stale visibility owner dropped; manager owner preserved",
+            )
+            return true
         }
 
         val clearedExactGatt = synchronized(this) {
@@ -847,6 +969,35 @@ internal class BleAutoReconnectSupervisor(
         // 与 deadline 路径一致，schedule 不持 supervisor monitor，保持单向锁序。
         scheduleTargetVisibleDirectConnect(uuid)
         return true
+    }
+
+    /**
+     * 手动提升发现 stale owner 时复用 Manager 的 exact 修复入口。
+     *
+     * 该方法只在健康分类为 STALE 后调用；健康 pre-physical owner 仍由普通 promotion
+     * 复用，避免手动点击制造多余 GATT。
+     */
+    private fun repairStalePendingOwner(
+        uuid: String,
+        exactGatt: BluetoothGatt,
+    ): BlePendingOwnerDisposition = invalidatePendingPassiveGatt(uuid, exactGatt)
+
+    /** Manager 已回收 exact owner 后，清除 Supervisor 对旧 GATT/deadline/timer 的全部引用。 */
+    private fun clearRecycledPendingOwner(uuid: String, exactGatt: BluetoothGatt) {
+        synchronized(this) {
+            val task = reconnectTasks[reconnectKey(uuid)] ?: return
+            if (task.passiveGatt !== exactGatt) {
+                return
+            }
+            task.pendingPhysicalDeadline?.cancel()
+            task.pendingPhysicalDeadline = null
+            invalidateRetrySchedule(task)
+            task.passiveGatt = null
+            task.passiveStartedAtMs = 0L
+            task.pendingVisibleDirectConnect = false
+            task.visibleDirectConnectRequested = false
+        }
+        releaseVisibleDirectConnectSlot(uuid)
     }
 
     /** 在 supervisor 锁内重置可见目标的长离线计数，并标记一次真实直连。 */

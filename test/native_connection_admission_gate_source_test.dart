@@ -56,7 +56,11 @@ void main() {
       expect(source, contains('afterTransportReset()'));
       expect(source, contains('preserveAttemptSource'));
     }
-    expect(android, contains('preserveAttemptSource = false'));
+    expect(
+      android,
+      contains('awaiting Dart recovery activation for final session'),
+      reason: 'Android must reset source without replaying the old session',
+    );
     expect(ios, contains('preserveAttemptSource: false'));
   });
 }

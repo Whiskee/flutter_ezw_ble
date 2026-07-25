@@ -57,6 +57,13 @@ internal data class BleReconnectTask(
     var passiveStartedAtMs: Long = 0L,
     /** Bluetooth adapter is off; keep task but pause attempts until powered on. */
     var pausedByBluetoothOff: Boolean = false,
+    /**
+     * Bluetooth 已恢复，但仍在等待 Dart 用本轮最终 session 一次提交全部端点。
+     *
+     * 该屏障阻止 native 用 transport-off 前的旧 session 抢先创建 GATT，随后又被
+     * `even_connect` 的新 recovery batch 关闭重建。
+     */
+    var awaitingRecoveryActivation: Boolean = false,
     /** 当前 pending session 的来源；手动点击可提升但不会新建重复 GATT。 */
     var source: BleConnectSource = BleConnectSource.AUTO_RECONNECT,
     /** Dart reconnect batch generation forwarded unchanged on status callbacks. */
@@ -89,6 +96,45 @@ internal object BleReconnectSessionUpdatePolicy {
         hasPhysicalOwner -> BleReconnectSessionUpdateAction.REBUILD_PHYSICAL_OWNER
         else -> BleReconnectSessionUpdateAction.UPDATE_TASK
     }
+}
+
+/**
+ * Supervisor 保存的 GATT 与 Manager/Gate 当前身份之间的健康状态。
+ *
+ * deadline、扫描可见性和手动提升必须先分类，不能再把所有 `false` 都当成“已有健康
+ * owner”。否则 Manager 已丢失 admission 时，Supervisor 会永久保留一个假的 GATT 引用。
+ */
+internal enum class BlePendingOwnerHealth {
+    PRE_PHYSICAL,
+    ADMITTED,
+    BUSINESS_CONNECTED,
+    STALE,
+}
+
+/** pending owner 健康分类的纯决策，供 Manager 与 JVM 回归测试共用。 */
+internal object BlePendingOwnerPolicy {
+    fun classify(
+        exactDeviceGatt: Boolean,
+        hasAdmission: Boolean,
+        exactAdmittedGatt: Boolean,
+        hasBusinessGatt: Boolean,
+    ): BlePendingOwnerHealth = when {
+        hasBusinessGatt -> BlePendingOwnerHealth.BUSINESS_CONNECTED
+        exactDeviceGatt && hasAdmission && exactAdmittedGatt ->
+            BlePendingOwnerHealth.ADMITTED
+        exactDeviceGatt && hasAdmission -> BlePendingOwnerHealth.PRE_PHYSICAL
+        else -> BlePendingOwnerHealth.STALE
+    }
+}
+
+/** Manager 处理 pending owner 后返回明确结果，Supervisor 每个分支都必须收敛。 */
+internal enum class BlePendingOwnerDisposition {
+    INVALIDATED,
+    ALREADY_ADMITTED,
+    BUSINESS_CONNECTED,
+    REPAIRED_STALE_OWNER,
+    /** Supervisor 的旧引用已丢弃，但 Manager 已有另一条健康 owner，不能再建 GATT。 */
+    STALE_OWNER_DROPPED,
 }
 
 /** Android passive GATT 长离线退避策略；不改变 `connectGatt(autoConnect=true)` 的 owner。 */

@@ -170,7 +170,12 @@ class BleManager private constructor() {
             persistReconnectTarget = { device -> persistReconnectTarget(device) },
             handleConnectState = { uuid, name, state -> handleConnectState(uuid, name, state) },
             sendLog = { tag, message -> sendLog(tag, message) },
-            invalidatePendingPassiveGatt = { uuid, gatt -> invalidatePendingPassiveGatt(uuid, gatt) },
+            classifyPendingPassiveGattOwner = { uuid, gatt ->
+                classifyPendingPassiveGattOwner(uuid, gatt)
+            },
+            invalidatePendingPassiveGatt = { uuid, gatt ->
+                invalidatePendingPassiveGatt(uuid, gatt)
+            },
             invalidatePassiveGattForSessionRebind = { uuid, gatt ->
                 invalidatePassiveGattForSessionRebind(uuid, gatt)
             },
@@ -1737,7 +1742,9 @@ class BleManager private constructor() {
                     )
                 }
             } else {
-                // 3、蓝牙恢复：解除 Gate 暂停并让 supervisor 重建长期 passive owner。
+                // 3、蓝牙恢复：只解除全局 Gate 暂停并登记恢复屏障。
+                // supervisor 不得按 Bluetooth Off 前的旧 session 立即重建 GATT；
+                // 等 Dart 汇总眼镜/戒指后提交一次最终 recovery activation。
                 connectionAdmissionGate.resume()
                 autoReconnectSupervisor.resumeAfterBluetoothOn()
             }
@@ -2670,26 +2677,114 @@ class BleManager private constructor() {
      * admission/generation 再释放 GATT，迟到 callback 就只能被 stale guard 丢弃。
      */
     @Synchronized
-    private fun invalidatePendingPassiveGatt(uuid: String, gatt: BluetoothGatt): Boolean {
+    private fun classifyPendingPassiveGattOwner(
+        uuid: String,
+        gatt: BluetoothGatt,
+    ): BlePendingOwnerHealth {
         val key = reconnectKey(uuid)
-        val device = findConnectedDevice(uuid) ?: return false
-        if (device.myGatt !== gatt) {
-            return false
+        val device = findConnectedDevice(uuid)
+        val admission = currentAdmissions[key]
+        val businessGatt = businessConnectedGattSessions[key]?.gatt
+        return BlePendingOwnerPolicy.classify(
+            exactDeviceGatt = device?.myGatt === gatt,
+            hasAdmission = admission != null,
+            exactAdmittedGatt =
+                admission != null && admittedGattSessions[admission.sessionId]?.gatt === gatt,
+            hasBusinessGatt = businessGatt === gatt && device?.myGatt === gatt,
+        )
+    }
+
+    /**
+     * 处理 deadline/visibility 对 pending GATT 的回收请求。
+     *
+     * 1、exact pre-physical owner 正常失效并释放。
+     * 2、已经进入 Gate 或业务 connected 的 owner 明确返回，不允许 watchdog 关闭。
+     * 3、Manager 与 Supervisor 身份不一致时执行 endpoint 级修复，清掉 orphan
+     * admission/GATT 后让 Supervisor 只重建一个 owner。
+     */
+    @Synchronized
+    private fun invalidatePendingPassiveGatt(
+        uuid: String,
+        gatt: BluetoothGatt,
+    ): BlePendingOwnerDisposition {
+        return when (classifyPendingPassiveGattOwner(uuid, gatt)) {
+            BlePendingOwnerHealth.ADMITTED ->
+                BlePendingOwnerDisposition.ALREADY_ADMITTED
+            BlePendingOwnerHealth.BUSINESS_CONNECTED ->
+                BlePendingOwnerDisposition.BUSINESS_CONNECTED
+            BlePendingOwnerHealth.STALE -> repairStalePendingOwner(uuid, gatt)
+            BlePendingOwnerHealth.PRE_PHYSICAL -> {
+                val key = reconnectKey(uuid)
+                val device = findConnectedDevice(uuid)
+                currentAdmissions.remove(key)
+                invalidateConnectionAttempts(setOf(uuid))?.let { startGrantedGattPipeline(it) }
+                sendCmdQueues.remove(key)
+                device?.releaseAndClear() ?: runCatching { gatt.close() }
+                sendLog(
+                    BleLoggerTag.d,
+                    "Admission gate: $uuid, invalidated exact pending passive GATT before physical callback",
+                )
+                BlePendingOwnerDisposition.INVALIDATED
+            }
         }
-        val admission = currentAdmissions[key] ?: return false
-        if (admittedGattSessions[admission.sessionId]?.gatt === gatt) {
-            return false
+    }
+
+    /**
+     * 修复 Supervisor/Manager/Gate 三方不一致的 orphan owner。
+     *
+     * 修复只作用于尚未业务 connected 的 endpoint；先失效 attempt/Gate，再关闭 Manager
+     * 当前 GATT 与 Supervisor 传入的旧 GATT，避免下一轮和 orphan 并存。
+     */
+    private fun repairStalePendingOwner(
+        uuid: String,
+        staleGatt: BluetoothGatt,
+    ): BlePendingOwnerDisposition {
+        val key = reconnectKey(uuid)
+        val device = findConnectedDevice(uuid)
+        val managerGatt = device?.myGatt
+        val currentAdmission = currentAdmissions[key]
+        val admittedManagerGatt =
+            currentAdmission?.let { admittedGattSessions[it.sessionId]?.gatt }
+        val businessGatt = businessConnectedGattSessions[key]?.gatt
+        // 1、Supervisor 可能只残留旧引用，而 Manager 已经持有同 endpoint 的新健康
+        // owner。这里只认可 exact admitted/business GATT；单有 admission 而没有 exact
+        // GATT 证据仍按 orphan 全量修复，避免保留另一条假 owner。
+        if (
+            managerGatt != null &&
+            managerGatt !== staleGatt &&
+            (admittedManagerGatt === managerGatt || businessGatt === managerGatt)
+        ) {
+            runCatching {
+                staleGatt.disconnect()
+                staleGatt.close()
+            }
+            sendLog(
+                BleLoggerTag.e,
+                "Admission gate: $uuid, dropped stale supervisor owner, " +
+                    "preservedManagerOwner=true, businessConnected=${businessGatt === managerGatt}",
+            )
+            return BlePendingOwnerDisposition.STALE_OWNER_DROPPED
         }
 
-        currentAdmissions.remove(key)
-        invalidateConnectionAttempts(setOf(uuid))?.let { startGrantedGattPipeline(it) }
+        // 2、没有另一条健康 Manager owner 时，清理这个 endpoint 的全部 orphan 状态。
+        val staleAdmission = currentAdmissions.remove(key)
+        staleAdmission?.let { admittedGattSessions.remove(it.sessionId) }
+        val next = invalidateConnectionAttempts(setOf(uuid))
         sendCmdQueues.remove(key)
-        device.releaseAndClear()
+        device?.releaseAndClear()
+        if (managerGatt !== staleGatt) {
+            runCatching {
+                staleGatt.disconnect()
+                staleGatt.close()
+            }
+        }
+        next?.let { startGrantedGattPipeline(it) }
         sendLog(
-            BleLoggerTag.d,
-            "Admission gate: $uuid, invalidated exact pending passive GATT before physical callback",
+            BleLoggerTag.e,
+            "Admission gate: $uuid, repaired stale pending owner, " +
+                "hadAdmission=${staleAdmission != null}, exactManagerGatt=${managerGatt === staleGatt}",
         )
-        return true
+        return BlePendingOwnerDisposition.REPAIRED_STALE_OWNER
     }
 
     /**

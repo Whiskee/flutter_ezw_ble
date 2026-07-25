@@ -470,7 +470,7 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 3. 自动回连在物理 callback 前不发送用户可见 `connecting`。第一条回连状态从 `contactDevice` 开始，并携带 `source` 与 `generation`。手动点击若已有 pending session，只把 source/队列优先级提升为 `manualReconnect`。
 4. service/char/timeout 等非系统终态必须先完成 GATT/peripheral teardown，再释放 Gate；普通 CoreBluetooth 终态也必须先移除旧 active request，之后才能调度下一代，避免调度被旧 owner 永久 defer。iOS 使用 exact cancellation token + 2s watchdog；超时债务按 endpoint 用饱和 counter 常数内存保存，迟到 callback 不能误杀新 generation。Android 在业务 connected 后保留 exact `(sessionId, GATT)` metadata，稍后的系统断连仍会清理并重建 passive GATT，旧 GATT 不能命中新 attempt。
 5. UI 的 1 分钟展示超时属于上层展示策略，不会停止 native 长期回连；只有用户点击取消/断开才是真取消，同时清 task、持久化 owner、pending session 与定时器，直到下一次明确手动连接才可重新 arm/activate。
-6. 蓝牙关闭会先快照 active admission 的 generation，并由已业务连接 task 保留最后成功 generation；随后才 teardown 全部 session、清空 Gate 并暂停任务。发给 Dart 的 `disconnectFromSys` 必须复用该可接受 generation，不能退化为 `unknown/0`。恢复后 source 重置为 `autoReconnect`，旧 manual source 不跨 transport generation 泄漏。
+6. 蓝牙关闭会先快照 active admission 的 generation，并由已业务连接 task 保留最后成功 generation；随后才 teardown 全部 session、清空 Gate 并暂停任务。发给 Dart 的 `disconnectFromSys` 必须复用该可接受 generation，不能退化为 `unknown/0`。恢复后 source 重置为 `autoReconnect`，旧 manual source 不跨 transport generation 泄漏。Android powered-on 只设置 `awaitingRecoveryActivation`，不按关闭前的旧 session 抢先重建 GATT；必须等待 Dart 汇总全部允许目标并以最终 session 调用一次 activation 后才解除屏障。
 7. Android Manager 与 Gate 的 endpoint attempt generation 必须共享同一高水位：批量取消先统一推进一次 generation，再逐 endpoint 释放 GATT/runtime；release 阶段不得重复推进。新 attempt 从两侧高水位最大值继续，防止 OTA、设备切换或重复清理后真实物理 callback 被误判为 `STALE`。
 
 触发回连：
@@ -498,7 +498,7 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 - 单次 `charsFail`
 - 蓝牙关闭
 
-蓝牙关闭只暂停任务；蓝牙重新开启后恢复任务。Android 每轮 pending `connectGatt(true)` 在未收到 `STATE_CONNECTED` 前受 `connectTimeout`（至少1秒）deadline 保护；连续 pre-physical deadline 失败按 `1–3 次 1.5s / 4–10 次 5s / 11 次起 30s` 重建，降低长离线耗电和协议栈 register/unregister 压力。上层并行扫描重新看到 exact UUID 时会清零该计数，并以 250ms 防抖重建；已物理连接、已进入 Gate、已取消或蓝牙关闭时提示无效。所有刷新都不上报 Dart/UI timeout，也不停止长期 intent。收到物理 callback 后 deadline 立即取消，获得 Gate 后的 GATT readiness / 业务鉴权仍受独立 `connectTimeout` 保护。iOS 保留系统 pending connect，不使用该 Android deadline。`autoReconnectMaxAttempts` 仅保留兼容和日志意义，**不再作为停止条件**。也就是说，设备离开 30 分钟再回来，只要用户/业务没有主动取消，原生层仍应继续持有或重建回连任务。
+蓝牙关闭只暂停任务；蓝牙重新开启后由 Dart 最终 recovery activation 一次恢复任务。Android 每轮 pending `connectGatt(true)` 在未收到 `STATE_CONNECTED` 前受 `connectTimeout`（至少1秒）deadline 保护；deadline、扫描可见性接管和手动提升都必须先把 owner 分类为 pre-physical、Gate admitted、business connected 或 stale。只有 exact pre-physical owner 可正常回收；admitted/business GATT 保留，stale 的 Supervisor/Manager/Gate 引用会精确修复，若 Manager 已有另一条健康 owner 则只丢弃旧引用，禁止重复 GATT。连续 pre-physical deadline 失败按 `1–3 次 1.5s / 4–10 次 5s / 11 次起 30s` 重建，降低长离线耗电和协议栈 register/unregister 压力。上层并行扫描重新看到 exact UUID 时会清零该计数，并以 250ms 防抖重建；已物理连接、已进入 Gate、已取消或蓝牙关闭时提示无效。所有刷新都不上报 Dart/UI timeout，也不停止长期 intent。收到物理 callback 后 deadline 立即取消，获得 Gate 后的 GATT readiness / 业务鉴权仍受独立 `connectTimeout` 保护。iOS 保留系统 pending connect，不使用该 Android deadline。`autoReconnectMaxAttempts` 仅保留兼容和日志意义，**不再作为停止条件**。也就是说，设备离开 30 分钟再回来，只要用户/业务没有主动取消，原生层仍应继续持有或重建回连任务。
 
 回连成功的门槛不是 GATT 物理连接成功，而是全部 `BleConfig.privateServices` 都重新恢复：
 

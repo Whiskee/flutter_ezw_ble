@@ -90,6 +90,7 @@ sn or mac
 attempt
 pending native connection handle owned by the OS
 pausedByBluetoothOff
+awaitingRecoveryActivation
 attempt source
 sessionGeneration
 attemptGeneration
@@ -113,9 +114,13 @@ Cancel the task only on:
 - config removed or `autoReconnect=false`
 - plugin release
 
-Pause the task on Bluetooth off. Resume paused tasks when Bluetooth returns to
-powered on, with source reset to `autoReconnect` so an old manual click cannot
-leak across a transport reset.
+Pause the task on Bluetooth off. When Bluetooth returns to powered on, native
+sets `awaitingRecoveryActivation` and resets the source to `autoReconnect`, but
+does not open a GATT with the pre-reset session. Dart first combines every
+eligible glasses/ring endpoint into one final recovery session, then
+`activateAutoReconnectTargets` consumes the barrier and creates the only
+physical owner. This prevents an old-session callback from racing the combined
+batch and being closed immediately by an exact session rebind.
 
 ## Trigger Rules
 
@@ -154,7 +159,13 @@ active through bonding and `connectFinish` until final
 
 Android bounds only the pre-physical-callback lifetime of each pending
 `connectGatt(autoConnect=true)` by `BleConfig.connectTimeout` (minimum 1s). On
-expiry it atomically invalidates that exact GATT/admission and closes it. Consecutive
+expiry it first classifies the exact owner as pre-physical, Gate-admitted,
+business-connected, or stale. Only an exact pre-physical owner is normally
+recycled. Gate-admitted and business-connected owners keep their GATT. A stale
+Supervisor/Manager/Gate identity is repaired explicitly: the orphan is removed,
+and a replacement is created only when Manager does not already own another
+healthy GATT. No boolean failure path may silently preserve a fake owner.
+Consecutive
 pre-physical deadline failures rebuild after 1.5s for failures 1–3, 5s for
 failures 4–10, and 30s from failure 11 onward. A matching scan-visible hint
 resets the streak and rebuilds after a 250ms debounce. This refresh is
@@ -242,6 +253,12 @@ A later `STATE_DISCONNECTED` from that exact `(sessionId, GATT)` must still emit
 handle. A callback from any older GATT/session must not change the newer
 attempt.
 
+On Bluetooth-on, Android does not replay paused tasks by itself. It waits for
+the Dart recovery activation carrying the final `sessionGeneration`; ordinary
+`arm` calls cannot consume this barrier. Manual promotion also classifies the
+native owner first. A stale `passiveGatt` is repaired or dropped instead of
+being reported as reusable, while a real Gate/business owner is never closed.
+
 ## iOS Strategy
 
 iOS uses CoreBluetooth pending connects without an internal scan-first phase.
@@ -322,6 +339,10 @@ hard cancel reachability without linear memory growth.
    `manualReconnect` only for a user click; otherwise use `autoReconnect`.
    Keep desired, activation-in-flight, and native-accepted targets separate so
    a rejected or lost acknowledgement cannot leave a phantom active batch.
+   While Bluetooth is unavailable, system-disconnect callbacks may update
+   business state but must not create per-endpoint activation sessions.
+   Bluetooth available consumes that recovery debt once and submits the
+   combined endpoint set.
 3. Start the app-level scan concurrently, never before direct activation. Stop
    it when all devices connect or at 20 seconds, whichever comes first. A later
    Bluetooth-on recovery trigger may reopen only this scan window for the same
@@ -352,7 +373,8 @@ hard cancel reachability without linear memory growth.
   after one minute without stopping native reconnect.
 - Device power loss then power restore reconnects to `connectFinish`.
 - All private services are writable and notify-capable after reconnect.
-- Bluetooth off pauses tasks; Bluetooth on resumes them.
+- Bluetooth off pauses tasks; Bluetooth on waits for one final combined Dart
+  activation before native opens replacement GATT handles.
 - Bluetooth-off terminals preserve the active or last business-connected
   generation, so Dart can accept the disconnect before reconnect resumes.
 - iOS ANCS/system-connected devices do not fall into scan timeout.
