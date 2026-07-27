@@ -21,7 +21,8 @@ void main() {
       stateUpdate,
     );
     final stateEvent = update.indexOf(
-      'handleConnectState(uuid: uuid, name: name, state: reportedState)',
+      'handleConnectState(',
+      commitBeforeEvent,
     );
 
     expect(stateUpdate, greaterThanOrEqualTo(0));

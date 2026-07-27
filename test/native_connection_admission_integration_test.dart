@@ -577,6 +577,46 @@ void main() {
     );
   });
 
+  test('iOS explicit cancellation freezes metadata before removing owners', () {
+    final manager = File('ios/Classes/ble/BleManager.swift').readAsStringSync();
+    final reconnectStore =
+        File('ios/Classes/ble/BleReconnectStore.swift').readAsStringSync();
+    final cancelMethodStart =
+        manager.indexOf('func cancelAutoReconnectTargets(');
+    final cancelMethodEnd =
+        manager.indexOf('func disconnectForOtaReboot(', cancelMethodStart);
+    final cancelMethod = manager.substring(cancelMethodStart, cancelMethodEnd);
+
+    expect(
+      reconnectStore,
+      contains('enum BleExplicitCancellationMetadataPolicy'),
+    );
+    expect(
+      reconnectStore,
+      contains('attemptGeneration: admission.generation'),
+    );
+    expect(
+      cancelMethod,
+      contains('let cancellationTargets = targets.map'),
+    );
+    expect(
+      cancelMethod.indexOf('let cancellationTargets = targets.map'),
+      lessThan(cancelMethod.indexOf(
+        'let next = connectionAdmissionGate.cancelEndpoints(endpointIds)',
+      )),
+    );
+    expect(
+      manager,
+      contains('attemptGeneration: cancellationMetadata?.attemptGeneration'),
+    );
+    expect(
+      manager,
+      contains(
+        'let eventAttemptGeneration = attemptGeneration ?? currentAdmission?.generation ?? 0',
+      ),
+    );
+  });
+
   test('iOS timed-out cancellation debt cannot hide a live system disconnect',
       () {
     final flow = File('ios/Classes/ble/BleConnectionAdmissionFlow.swift')

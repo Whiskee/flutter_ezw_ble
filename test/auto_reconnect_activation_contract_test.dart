@@ -237,7 +237,7 @@ void main() {
     );
     expect(
       iosMethod.indexOf('connectionAdmissionGate.cancelEndpoints'),
-      lessThan(iosMethod.indexOf('disconnect(uuid: target.uuid')),
+      lessThan(iosMethod.indexOf('disconnect(\n')),
     );
   });
 

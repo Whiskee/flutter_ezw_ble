@@ -413,6 +413,73 @@ class RunnerTests: XCTestCase {
     ))
   }
 
+  func testExplicitCancellationPrefersCurrentAdmissionIdentity() {
+    var task = BleReconnectTask(
+      belongConfig: "g2_glasses",
+      uuid: "left",
+      name: "Even G2_32_L_123456",
+      source: .autoReconnect
+    )
+    task.sessionGeneration = 9
+    task.lastConnectedGeneration = 8
+    let admission = BleConnectionAdmission(
+      endpointId: "left",
+      generation: 17,
+      sessionId: 100,
+      source: .manualReconnect,
+      sessionGeneration: 12
+    )
+
+    XCTAssertEqual(
+      BleExplicitCancellationMetadataPolicy.resolve(
+        currentAdmission: admission,
+        reconnectTask: task
+      ),
+      BleExplicitCancellationMetadata(
+        source: .manualReconnect,
+        sessionGeneration: 12,
+        attemptGeneration: 17
+      )
+    )
+  }
+
+  func testExplicitCancellationReusesOwnerSessionAfterGateRelease() {
+    var task = BleReconnectTask(
+      belongConfig: "g2_glasses",
+      uuid: "right",
+      name: "Even G2_32_R_654321",
+      source: .autoReconnect
+    )
+    task.sessionGeneration = 13
+    task.lastConnectedGeneration = 13
+
+    XCTAssertEqual(
+      BleExplicitCancellationMetadataPolicy.resolve(
+        currentAdmission: nil,
+        reconnectTask: task
+      ),
+      BleExplicitCancellationMetadata(
+        source: .autoReconnect,
+        sessionGeneration: 13,
+        attemptGeneration: 0
+      )
+    )
+  }
+
+  func testExplicitCancellationRejectsMissingAcceptedSession() {
+    let task = BleReconnectTask(
+      belongConfig: "g2_glasses",
+      uuid: "right",
+      name: "Even G2_32_R_654321",
+      source: .autoReconnect
+    )
+
+    XCTAssertNil(BleExplicitCancellationMetadataPolicy.resolve(
+      currentAdmission: nil,
+      reconnectTask: task
+    ))
+  }
+
   func testCurrentAdmissionPrecedesHistoricalConnectedGeneration() {
     var task = BleReconnectTask(
       belongConfig: "ring_bcl_1",

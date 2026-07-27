@@ -65,6 +65,49 @@ struct BleTerminalConnectionMetadata: Equatable {
     let generation: Int64
 }
 
+/// 用户显式取消前冻结的连接身份。
+///
+/// 显式取消会先删除 reconnect owner 和 Gate admission；如果不在删除前冻结，
+/// 随后的 `disconnectByUser` 只能退化成 `unknown/0`，失去本次真实会话的取证能力。
+struct BleExplicitCancellationMetadata: Equatable {
+    let source: BleConnectSource
+    let sessionGeneration: Int64
+    let attemptGeneration: Int64
+}
+
+/// 解析用户显式取消应继承的当前连接身份。
+enum BleExplicitCancellationMetadataPolicy {
+    static func resolve(
+        currentAdmission: BleConnectionAdmission?,
+        reconnectTask: BleReconnectTask?
+    ) -> BleExplicitCancellationMetadata? {
+        // 1、正在 Gate 中的物理 attempt 是最高优先级权威来源。
+        if let admission = currentAdmission, admission.sessionGeneration > 0 {
+            return BleExplicitCancellationMetadata(
+                source: admission.source,
+                sessionGeneration: admission.sessionGeneration,
+                attemptGeneration: admission.generation
+            )
+        }
+
+        // 2、Gate 已释放或尚未进入 Gate 时，复用长期 owner 当前 session。
+        guard let task = reconnectTask else {
+            return nil
+        }
+        let generation = task.sessionGeneration > 0
+            ? task.sessionGeneration
+            : (task.lastConnectedGeneration ?? 0)
+        guard generation > 0 else {
+            return nil
+        }
+        return BleExplicitCancellationMetadata(
+            source: task.source,
+            sessionGeneration: generation,
+            attemptGeneration: 0
+        )
+    }
+}
+
 /// 解析无 attempt token 的 CoreBluetooth 终态应该归属的已接受连接代次。
 enum BleTerminalConnectionMetadataPolicy {
     static func resolve(

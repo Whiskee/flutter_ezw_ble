@@ -441,7 +441,57 @@ extension BleManager {
      *    b) connectedDevices 中已发起 centralManager.connect 但未 connectFinish 的 peripheral
      *    c) 已完成连接流程的 peripheral
      */
+    private func explicitCancellationMetadata(
+        uuid: String,
+        name: String
+    ) -> BleExplicitCancellationMetadata? {
+        // 1、先通过 alias/name 找到长期 owner；UUID 漂移后不能只查调用方传入的旧 UUID。
+        let effectiveUuid = reconnectIdentityAliases.resolvedCanonical(uuid: uuid) ?? uuid
+        let reconnectTask = reconnectTasks.values.first { task in
+            isSameConnectTarget(
+                storedUuid: task.uuid,
+                storedName: task.name,
+                uuid: effectiveUuid,
+                name: name
+            )
+        }
+
+        // 2、Gate admission 优先；否则使用 owner 保存的当前 Dart session。
+        let admission = currentConnectionAdmission(uuid: effectiveUuid)
+            ?? reconnectTask.flatMap { currentConnectionAdmission(uuid: $0.uuid) }
+        let metadata = BleExplicitCancellationMetadataPolicy.resolve(
+            currentAdmission: admission,
+            reconnectTask: reconnectTask
+        )
+        loggerD(
+            msg: "disconnect metadata snapshot: \(uuid)->\(effectiveUuid)-\(name), " +
+                "source=\(metadata?.source.rawValue ?? "unknown"), " +
+                "sessionGeneration=\(metadata?.sessionGeneration ?? 0), " +
+                "attemptGeneration=\(metadata?.attemptGeneration ?? 0)"
+        )
+        return metadata
+    }
+
     func disconnect(uuid: String, name: String) {
+        disconnect(
+            uuid: uuid,
+            name: name,
+            cancellationMetadata: explicitCancellationMetadata(
+                uuid: uuid,
+                name: name
+            )
+        )
+    }
+
+    /// 使用删除 owner 前冻结的身份执行显式取消。
+    ///
+    /// `cancelAutoReconnectTargets` 会先原子撤销整台逻辑设备的 Gate owner，因此
+    /// 必须把 admission/task 元数据从批量入口传入，不能在 Gate 清理后重新查询。
+    private func disconnect(
+        uuid: String,
+        name: String,
+        cancellationMetadata: BleExplicitCancellationMetadata?
+    ) {
         let effectiveUuid = reconnectIdentityAliases.resolvedCanonical(uuid: uuid) ?? uuid
         cancelReconnectTask(uuid: uuid, name: name)
         removePersistedReconnectTarget(uuid: uuid, name: name)
@@ -471,7 +521,15 @@ extension BleManager {
             //         sendConnectStateToFlutter 发回 Dart；Dart 层按 (uuid OR name) 匹配，
             //         name 命中即可正确落到对应 device，触发 UI 切换到已断开态
             for info in inFlightInfos {
-                handleConnectState(uuid: info.uuid, name: info.name, state: .disconnectByUser, tag: "cancel in-flight by user")
+                handleConnectState(
+                    uuid: info.uuid,
+                    name: info.name,
+                    state: .disconnectByUser,
+                    source: cancellationMetadata?.source,
+                    generation: cancellationMetadata?.sessionGeneration,
+                    attemptGeneration: cancellationMetadata?.attemptGeneration,
+                    tag: "cancel in-flight by user"
+                )
             }
             loggerD(msg: "disconnect: cancelled in-flight scan/connect for \(uuid.isEmpty ? "(no-uuid)" : uuid)-\(name), removed \(inFlightInfos.count) item(s)")
             return
@@ -487,7 +545,15 @@ extension BleManager {
                 }) {
                     centralManager.cancelPeripheralConnection(match.1)
                 }
-                handleConnectState(uuid: request.uuid, name: request.name, state: .disconnectByUser, tag: "cancel active connect by user")
+                handleConnectState(
+                    uuid: request.uuid,
+                    name: request.name,
+                    state: .disconnectByUser,
+                    source: cancellationMetadata?.source,
+                    generation: cancellationMetadata?.sessionGeneration,
+                    attemptGeneration: cancellationMetadata?.attemptGeneration,
+                    tag: "cancel active connect by user"
+                )
                 loggerD(msg: "disconnect: cancelled active connect for \(request.uuid)-\(request.name), by user")
                 return
             }
@@ -502,7 +568,15 @@ extension BleManager {
             let p = inProgressDevice.peripheral
             let realUuid = p.identifier.uuidString
             let realName = p.name ?? name
-            handleConnectState(uuid: realUuid, name: realName, state: .disconnectByUser, tag: "cancel connecting by user")
+            handleConnectState(
+                uuid: realUuid,
+                name: realName,
+                state: .disconnectByUser,
+                source: cancellationMetadata?.source,
+                generation: cancellationMetadata?.sessionGeneration,
+                attemptGeneration: cancellationMetadata?.attemptGeneration,
+                tag: "cancel connecting by user"
+            )
             loggerD(msg: "disconnect: cancelled connecting peripheral \(realUuid)-\(realName), by user")
             return
         }
@@ -512,8 +586,21 @@ extension BleManager {
         let connectedDevice = connectedDevices.first { device in
             device.peripheral.identifier.uuidString == effectiveUuid || device.peripheral.name == name
         }
-        updateConnectedDevice(uuid: effectiveUuid, name: connectedDevice?.peripheral.name ?? "", isConnected: false, updateByUser: true)
-        loggerD(msg: "disconnect:\(uuid)->\(effectiveUuid)-\(name), disconnect by user")
+        updateConnectedDevice(
+            uuid: effectiveUuid,
+            name: connectedDevice?.peripheral.name ?? name,
+            isConnected: false,
+            updateByUser: true,
+            source: cancellationMetadata?.source,
+            generation: cancellationMetadata?.sessionGeneration,
+            attemptGeneration: cancellationMetadata?.attemptGeneration
+        )
+        loggerD(
+            msg: "disconnect:\(uuid)->\(effectiveUuid)-\(name), disconnect by user, " +
+                "source=\(cancellationMetadata?.source.rawValue ?? "unknown"), " +
+                "sessionGeneration=\(cancellationMetadata?.sessionGeneration ?? 0), " +
+                "attemptGeneration=\(cancellationMetadata?.attemptGeneration ?? 0)"
+        )
     }
 
     /**
@@ -539,16 +626,28 @@ extension BleManager {
         }.filter { !$0.isEmpty })
         guard !targets.isEmpty else { return }
 
-        // 2. Remove every stale endpoint from the Gate as one operation and delay the next owner.
-        let next = connectionAdmissionGate.cancelEndpoints(endpointIds)
-
-        // 3. Existing disconnect owns task/store/request/peripheral cleanup and installs a
-        // cancellation barrier before CoreBluetooth can deliver a late terminal callback.
-        targets.forEach { target in
-            disconnect(uuid: target.uuid, name: target.name)
+        // 2. Freeze every endpoint's accepted identity before Gate/task removal.
+        let cancellationTargets = targets.map { target in
+            (
+                target,
+                explicitCancellationMetadata(uuid: target.uuid, name: target.name)
+            )
         }
 
-        // 4. Only after all old targets have been revoked may a surviving owner enter GATT.
+        // 3. Remove every stale endpoint from the Gate as one operation and delay the next owner.
+        let next = connectionAdmissionGate.cancelEndpoints(endpointIds)
+
+        // 4. Existing disconnect owns task/store/request/peripheral cleanup and installs a
+        // cancellation barrier before CoreBluetooth can deliver a late terminal callback.
+        for (target, metadata) in cancellationTargets {
+            disconnect(
+                uuid: target.uuid,
+                name: target.name,
+                cancellationMetadata: metadata
+            )
+        }
+
+        // 5. Only after all old targets have been revoked may a surviving owner enter GATT.
         if let next {
             startGrantedGattPipeline(next)
         }
@@ -1426,7 +1525,10 @@ extension BleManager {
                                        readChars: CBCharacteristic? = nil,
                                        psType: Int = 0,
                                        isConnected: Bool? = nil,
-                                       updateByUser: Bool = false) {
+                                       updateByUser: Bool = false,
+                                       source: BleConnectSource? = nil,
+                                       generation: Int64? = nil,
+                                       attemptGeneration: Int64? = nil) {
         //  1、没有缓存就不更新
         guard uuid.isNotEmpty else {
             loggerE(msg: "updateConnectedDevice: \(uuid), empty uuid")
@@ -1434,7 +1536,15 @@ extension BleManager {
         }
         guard connectedDevices.isNotEmpty else {
             if updateByUser {
-                handleConnectState(uuid: uuid, name: name, state: .disconnectByUser, tag: "cancel with empty connectedDevices cache")
+                handleConnectState(
+                    uuid: uuid,
+                    name: name,
+                    state: .disconnectByUser,
+                    source: source,
+                    generation: generation,
+                    attemptGeneration: attemptGeneration,
+                    tag: "cancel with empty connectedDevices cache"
+                )
             }
             loggerE(msg: "updateConnectedDevice: \(uuid), not found device")
             return
@@ -1444,7 +1554,14 @@ extension BleManager {
         guard  let index = connectedDevices.firstIndex(where: { device in
             device.peripheral.identifier.uuidString == uuid || device.peripheral.name == name
         }) else {
-            handleConnectState(uuid: uuid, name: name, state: updateByUser ? .disconnectByUser : .disconnectFromSys)
+            handleConnectState(
+                uuid: uuid,
+                name: name,
+                state: updateByUser ? .disconnectByUser : .disconnectFromSys,
+                source: source,
+                generation: generation,
+                attemptGeneration: attemptGeneration
+            )
             loggerE(msg: "updateConnectedDevice: \(uuid), no cache device object")
             return
         }
@@ -1482,7 +1599,14 @@ extension BleManager {
         // connectedDevices，因此不能跨状态上报继续持有本次查到的数组 index。
         connectedDevices[index] = connectedDevice
         if let reportedState = reportedState {
-            handleConnectState(uuid: uuid, name: name, state: reportedState)
+            handleConnectState(
+                uuid: uuid,
+                name: name,
+                state: reportedState,
+                source: source,
+                generation: generation,
+                attemptGeneration: attemptGeneration
+            )
         }
         loggerD(msg: "updateConnectedDevice: \(uuid), state = \(connectedDevice.peripheral.state), device = \(connectedDevice.toString())")
         if shouldCheckBleFlow {
@@ -1524,6 +1648,7 @@ extension BleManager {
         mtu: Int = 247,
         source: BleConnectSource? = nil,
         generation: Int64? = nil,
+        attemptGeneration: Int64? = nil,
         peripheralTerminalAcknowledged: Bool = false,
         systemAutoReconnectInProgress: Bool = false,
         suppressReconnectSchedule: Bool = false,
@@ -1555,7 +1680,7 @@ extension BleManager {
         )
         let eventSource = source ?? terminalMetadata?.source ?? .unknown
         let eventGeneration = generation ?? terminalMetadata?.generation ?? 0
-        let eventAttemptGeneration = currentAdmission?.generation ?? 0
+        let eventAttemptGeneration = attemptGeneration ?? currentAdmission?.generation ?? 0
         if currentAdmission == nil,
            source == nil,
            generation == nil,
