@@ -45,6 +45,8 @@ enum class BleMC {
     DISCONNECT_DEVICE,
     /** 原子撤销一组 exact 自动回连目标及其 Gate/GATT runtime。 */
     CANCEL_AUTO_RECONNECT_TARGETS,
+    /** 对账 Dart 业务 connected 与 Android GATT/runtime，补发丢失的系统断连终态。 */
+    RECONCILE_BUSINESS_CONNECTIONS,
     /** OTA reboot 收尾断开：保留长期回连 owner，禁止立即 schedule。 */
     DISCONNECT_FOR_OTA_REBOOT,
     /** 中性释放 endpoint runtime，保留持久自动回连 owner。 */
@@ -201,6 +203,18 @@ enum class BleMC {
                 val removeBond = jsonMap?.get("removeBond") as? Boolean ?: false
                 val reason = jsonMap?.get("reason") as? String ?: ""
                 BleManager.instance.cancelAutoReconnectTargets(targets, removeBond, reason)
+                return result.success(null)
+            }
+            RECONCILE_BUSINESS_CONNECTIONS -> {
+                // 1. Dart 只提交当前正式业务 connected 端点；manager 独立校验 owner/epoch。
+                val targets = (arguments as? List<*>)
+                    ?.mapNotNull { (it as? Map<*, *>)?.toReconnectSeed() }
+                    ?: emptyList()
+                // 2. 对账是同步快照操作；终态仍通过现有 EventChannel 返回。
+                BleManager.instance.reconcileBusinessConnections(
+                    targets,
+                    trigger = "appForeground",
+                )
                 return result.success(null)
             }
             DISCONNECT_FOR_OTA_REBOOT -> {

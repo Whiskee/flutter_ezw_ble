@@ -107,6 +107,10 @@ class BleManager private constructor() {
     // disconnectForOtaReboot 上报过同代终态，必须只消费一次，不能再 schedule retry。
     private val otaRebootDisconnectSuppressions: MutableSet<String> =
         Collections.synchronizedSet(mutableSetOf())
+    // 同一 endpoint/session 的存活纠偏只允许上报一次，避免 write failure 与 resumed
+    // 同时到达时重复发送 disconnectFromSys。
+    private val reconciledBusinessSessions: MutableSet<String> =
+        Collections.synchronizedSet(mutableSetOf())
 
     /** Gate 排队期间保留真实 GATT；只有获得准入后才启动 timeout 和 service discovery。 */
     private data class GrantedGattSession(
@@ -128,6 +132,13 @@ class BleManager private constructor() {
     private data class BluetoothOffTerminalSnapshot(
         val uuid: String,
         val name: String,
+        val source: BleConnectSource,
+        val sessionGeneration: Long,
+        val attemptGeneration: Long,
+    )
+
+    /** 一次业务存活对账使用的、可被 Dart epoch guard 接受的终态元数据。 */
+    private data class BusinessLivenessMetadata(
         val source: BleConnectSource,
         val sessionGeneration: Long,
         val attemptGeneration: Long,
@@ -314,6 +325,33 @@ class BleManager private constructor() {
             val started = device?.writeCharacteristic(cmd.data, cmd.psType) == true
             if (started) {
                 return
+            }
+            // 写入入口找不到可用 GATT/characteristic 时，先让原生权威对账连接存活。
+            // 系统仍连接或状态未知时策略会 no-op，因此不会把瞬时 write busy 误判为断连。
+            val reconcileTarget = device?.let { staleDevice ->
+                BleReconnectSeed(
+                    belongConfig = staleDevice.belongConfig.name,
+                    uuid = staleDevice.uuid,
+                    name = staleDevice.name,
+                    sn = staleDevice.sn,
+                    rssi = staleDevice.rssi,
+                )
+            } ?: autoReconnectSupervisor.ownerSnapshot(cmd.uuid)?.let { owner ->
+                // native 已经移除 connectedDevices 时，命令仍来自 Dart 的旧 connected 投影。
+                // 使用只读 owner 身份触发对账，不能因为缺少 BleDevice 而等到下次 resumed。
+                BleReconnectSeed(
+                    belongConfig = owner.belongConfig,
+                    uuid = owner.uuid,
+                    name = owner.name,
+                    sn = owner.sn,
+                    rssi = 0,
+                )
+            }
+            reconcileTarget?.let { target ->
+                reconcileBusinessConnections(
+                    listOf(target),
+                    trigger = "writeStartFailed",
+                )
             }
             queue.poll()
             sendLog(BleLoggerTag.e, "Send cmd: ${cmd.uuid}, write start failed, drop queued command")
@@ -713,12 +751,211 @@ class BleManager private constructor() {
      *
      * 该判断用于 ANCS/系统自动回连类场景：设备已经在系统连接列表里，但因为不再广播而扫不到。
      */
-    private fun isSystemGattConnected(uuid: String): Boolean {
-        // 1. 系统查询可能因权限/状态异常抛错，失败时按未连接处理，保持旧路径兜底。
+    private fun isSystemGattConnected(uuid: String): Boolean =
+        querySystemGattConnectionState(uuid) == BleSystemGattConnectionState.CONNECTED
+
+    /**
+     * 权威查询 Android GATT 连接状态，并保留 UNKNOWN。
+     *
+     * 连接规划仍可把 UNKNOWN 当未连接走旧路径；存活对账必须 fail-closed，不能因为权限或
+     * BluetoothManager 异常主动拆除一条可能仍健康的 GATT。
+     */
+    private fun querySystemGattConnectionState(uuid: String): BleSystemGattConnectionState {
+        if (!this::bluetoothManager.isInitialized || uuid.isBlank()) {
+            return BleSystemGattConnectionState.UNKNOWN
+        }
         return runCatching {
             bluetoothManager.getConnectedDevices(BluetoothProfile.GATT)
                 .any { it.address.equals(uuid, ignoreCase = true) }
-        }.getOrDefault(false)
+        }.fold(
+            onSuccess = { connected ->
+                if (connected) {
+                    BleSystemGattConnectionState.CONNECTED
+                } else {
+                    BleSystemGattConnectionState.DISCONNECTED
+                }
+            },
+            onFailure = { error ->
+                sendLog(
+                    BleLoggerTag.e,
+                    "Liveness reconcile: system GATT query failed, uuid=$uuid, " +
+                        "error=${error.message}",
+                )
+                BleSystemGattConnectionState.UNKNOWN
+            },
+        )
+    }
+
+    /**
+     * 对账 Dart 业务 connected 与 Android 当前 runtime。
+     *
+     * 1. 只处理仍有 autoReconnect owner、合法 epoch 且不处于 OTA/蓝牙关闭保护期的端点。
+     * 2. native 已经断连并回连时只补发终态，不重复 teardown 或重排重试。
+     * 3. native 假 connected 时仅在 exact GATT 丢失或系统明确断连后走标准 teardown。
+     */
+    @Synchronized
+    internal fun reconcileBusinessConnections(
+        targets: List<BleReconnectSeed>,
+        trigger: String,
+    ) {
+        targets
+            .filter { it.uuid.isNotBlank() }
+            .distinctBy { reconnectKey(it.uuid) }
+            .forEach { target ->
+                reconcileBusinessConnection(target, trigger)
+            }
+    }
+
+    /** 对账单个 endpoint；所有动作都必须经过纯策略和 session 去重。 */
+    private fun reconcileBusinessConnection(
+        target: BleReconnectSeed,
+        trigger: String,
+    ) {
+        val key = reconnectKey(target.uuid)
+        val device = findConnectedDevice(target.uuid)
+        val owner = autoReconnectSupervisor.ownerSnapshot(target.uuid)
+        val acceptedAdmission = BleBluetoothOffTerminalMetadataPolicy.resolve(
+            currentAdmission = currentAdmissions[key],
+            businessConnectedAdmission = businessConnectedGattSessions[key]?.admission,
+            lastBusinessConnectedAdmission = lastEpochAcceptedAdmissions[key],
+        )
+        val metadata = resolveBusinessLivenessMetadata(owner, acceptedAdmission)
+        val config = bleConfigs.firstOrNull { it.name == target.belongConfig }
+        val identityMismatch =
+            device != null &&
+                target.sn.isNotBlank() &&
+                device.sn.isNotBlank() &&
+                !device.sn.equals(target.sn, ignoreCase = true)
+        val protectedByLifecycle =
+            !isBluetoothEnabled() ||
+                config?.autoReconnect != true ||
+                upgradeDevices.any { it.equals(target.uuid, ignoreCase = true) } ||
+                identityMismatch
+        val nativeBusinessConnected = device?.connectState?.isConnected == true
+        val exactBusinessSession = businessConnectedGattSessions[key]
+        val hasExactGatt =
+            device?.myGatt != null &&
+                exactBusinessSession?.gatt === device.myGatt
+        val systemState = if (nativeBusinessConnected && device?.myGatt != null) {
+            querySystemGattConnectionState(target.uuid)
+        } else {
+            BleSystemGattConnectionState.UNKNOWN
+        }
+        val dedupKey = metadata?.let {
+            livenessReconcileKey(target.uuid, it.sessionGeneration)
+        }
+        val action = BleConnectionLivenessPolicy.decide(
+            BleConnectionLivenessInput(
+                dartClaimsConnected = true,
+                nativeBusinessConnected = nativeBusinessConnected,
+                hasExactGatt = hasExactGatt,
+                systemGattState = systemState,
+                hasEpochAcceptedAdmission = metadata != null,
+                hasPersistentReconnectOwner = owner != null,
+                protectedByLifecycle = protectedByLifecycle,
+                sessionAlreadyReconciled =
+                    dedupKey != null && reconciledBusinessSessions.contains(dedupKey),
+            ),
+        )
+
+        sendLog(
+            BleLoggerTag.d,
+            "Liveness reconcile: trigger=$trigger, endpoint=${target.uuid}, " +
+                "nativeState=${device?.connectState}, osState=$systemState, action=$action, " +
+                "source=${metadata?.source?.flutterValue}, " +
+                "sessionGeneration=${metadata?.sessionGeneration ?: 0L}, " +
+                "attemptGeneration=${metadata?.attemptGeneration ?: 0L}",
+        )
+        if (action == BleConnectionLivenessAction.NO_OP || metadata == null || dedupKey == null) {
+            return
+        }
+
+        // 动作前再次校验 owner/session 和 device/GATT 身份；查询系统状态期间若 runtime 已
+        // 切代，则本轮 fail-closed，下一次 write/resumed 会用新 session 再对账。
+        val latestOwner = autoReconnectSupervisor.ownerSnapshot(target.uuid)
+        if (latestOwner == null ||
+            latestOwner.sessionGeneration != owner?.sessionGeneration ||
+            findConnectedDevice(target.uuid) !== device
+        ) {
+            sendLog(
+                BleLoggerTag.d,
+                "Liveness reconcile: endpoint=${target.uuid}, stale snapshot ignored",
+            )
+            return
+        }
+        if (action == BleConnectionLivenessAction.TERMINATE_STALE_CONNECTED &&
+            businessConnectedGattSessions[key]?.gatt !== exactBusinessSession?.gatt
+        ) {
+            return
+        }
+
+        reconciledBusinessSessions.add(dedupKey)
+        when (action) {
+            BleConnectionLivenessAction.REPLAY_TERMINAL -> {
+                // native 已经在自动回连：只补 Dart 遗失的终态，不关闭 GATT、不 schedule。
+                sendConnectState(
+                    target.uuid,
+                    device?.name ?: owner.name,
+                    BleConnectState.DISCONNECT_FROM_SYS,
+                    source = metadata.source,
+                    sessionGeneration = metadata.sessionGeneration,
+                    attemptGeneration = metadata.attemptGeneration,
+                )
+            }
+            BleConnectionLivenessAction.TERMINATE_STALE_CONNECTED -> {
+                // native 自身仍假 connected：复用标准 teardown，释放旧 GATT 后继续原 owner。
+                handleConnectState(
+                    target.uuid,
+                    device?.name ?: owner.name,
+                    BleConnectState.DISCONNECT_FROM_SYS,
+                    source = metadata.source,
+                    generation = metadata.sessionGeneration,
+                    attemptGeneration = metadata.attemptGeneration,
+                )
+            }
+            BleConnectionLivenessAction.NO_OP -> Unit
+        }
+    }
+
+    /**
+     * 合并最后一次业务 admission 与当前长期 owner。
+     *
+     * owner session 可能已经因被动重试前进；事件必须使用不低于 owner 的 session，
+     * attemptGeneration 仍来自最后一次真实 GATT admission，不能伪造新物理 attempt。
+     */
+    private fun resolveBusinessLivenessMetadata(
+        owner: BleReconnectOwnerSnapshot?,
+        admission: BleConnectionAdmission?,
+    ): BusinessLivenessMetadata? {
+        if (owner == null || admission == null) {
+            return null
+        }
+        val source = owner.source.takeIf { it != BleConnectSource.UNKNOWN }
+            ?: admission.source
+        val sessionGeneration = maxOf(
+            owner.sessionGeneration,
+            admission.sessionGeneration,
+        )
+        if (source == BleConnectSource.UNKNOWN ||
+            sessionGeneration <= 0L ||
+            admission.generation <= 0L
+        ) {
+            return null
+        }
+        return BusinessLivenessMetadata(
+            source = source,
+            sessionGeneration = sessionGeneration,
+            attemptGeneration = admission.generation,
+        )
+    }
+
+    private fun livenessReconcileKey(uuid: String, sessionGeneration: Long): String =
+        "${reconnectKey(uuid)}#$sessionGeneration"
+
+    /** 新业务 connected 或显式资源清理后，旧 session 去重标记不再参与后续连接。 */
+    private fun clearLivenessReconcileMarkers(uuid: String) {
+        val prefix = "${reconnectKey(uuid)}#"
+        reconciledBusinessSessions.removeAll { it.startsWith(prefix) }
     }
 
     /**
@@ -1107,6 +1344,8 @@ class BleManager private constructor() {
             return
         }
         sendLog(BleLoggerTag.d, "Set $uuid connected")
+        // 新业务 session 已经完成鉴权；清除旧对账去重标记，后续真实断连可再次纠偏。
+        clearLivenessReconcileMarkers(uuid)
         // 2、记录最后一次被 Dart 接受的 admission，供 OTA/蓝牙关闭上报同代终态。
         // 业务 connected 是唯一可证明 Dart 已接受本 generation 的时刻；后续 OTA reboot
         // 即使 exact GATT session 被中间 attempt 替换，也可用这份快照上报同代终态。
@@ -1132,6 +1371,7 @@ class BleManager private constructor() {
         // 1、撤销持久回连目标和当前 endpoint 的所有 pending/scan 任务。
         sendLog(BleLoggerTag.d, "Star disconnect: $uuid by user")
         val key = reconnectKey(uuid)
+        clearLivenessReconcileMarkers(uuid)
         businessConnectedGattSessions.remove(key)
         lastEpochAcceptedAdmissions.remove(key)
         // 1.1、用户主动断开取消长期回连意图；removeBond 只额外清系统绑定。
@@ -1179,6 +1419,7 @@ class BleManager private constructor() {
             val resolved = (autoReconnectSupervisor.endpointsMatching(target.uuid, target.name) +
                 target.uuid).filter { it.isNotBlank() }.toSet()
             resolved.forEach { endpointId ->
+                clearLivenessReconcileMarkers(endpointId)
                 removePersistedReconnectTarget(endpointId)
                 autoReconnectSupervisor.cancel(endpointId, reason = "batch cancel: $reason")
                 cancelScanRefresh(endpointId)
@@ -1357,6 +1598,7 @@ class BleManager private constructor() {
         // 2. 取消该 endpoint 所有未来 runtime 入口，但刻意不调用 removePersistedReconnectTarget。
         taskEndpoints.forEach { autoReconnectSupervisor.cancel(it, reason = "neutral releaseDevice") }
         endpointIds.forEach { endpointId ->
+            clearLivenessReconcileMarkers(endpointId)
             cancelScanRefresh(endpointId)
             preConnectedDevices.remove(endpointId)
             upgradeDevices.remove(endpointId)
@@ -1487,6 +1729,7 @@ class BleManager private constructor() {
         admittedGattSessions.clear()
         businessConnectedGattSessions.clear()
         lastEpochAcceptedAdmissions.clear()
+        reconciledBusinessSessions.clear()
         connectionAttemptGenerations.replaceAll { _, generation ->
             nextConnectionGeneration(generation)
         }
@@ -1528,6 +1771,7 @@ class BleManager private constructor() {
         sendCmdQueues.clear()
         disconnectingDevices.clear()
         preConnectedDevices.clear()
+        reconciledBusinessSessions.clear()
         sendLog(BleLoggerTag.d, "Reset: success")
     }
 

@@ -71,6 +71,20 @@ internal data class BleReconnectTask(
 )
 
 /**
+ * 对外只读的长期回连 owner 快照。
+ *
+ * 存活对账只能读取 owner 的身份和 epoch，不能直接持有可变 task 或被动 GATT。
+ */
+internal data class BleReconnectOwnerSnapshot(
+    val belongConfig: String,
+    val uuid: String,
+    val name: String,
+    val sn: String,
+    val source: BleConnectSource,
+    val sessionGeneration: Long,
+)
+
+/**
  * 已存在 native reconnect task 收到新 Dart session 时的唯一决策。
  *
  * task 字段和 GATT callback 必须始终属于同一个 session：没有物理 owner 时可以直接

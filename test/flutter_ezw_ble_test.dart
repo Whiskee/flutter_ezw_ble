@@ -60,8 +60,11 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
-  Future<void> disconnectDevice(String uuid, String name,
-      {bool removeBond = false}) {
+  Future<void> disconnectDevice(
+    String uuid,
+    String name, {
+    bool removeBond = false,
+  }) {
     throw UnimplementedError();
   }
 
@@ -71,6 +74,11 @@ class MockFlutterEzwBlePlatform
     bool removeBond = false,
     String reason = '',
   }) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> reconcileBusinessConnections(List<BleDevice> devices) {
     throw UnimplementedError();
   }
 
@@ -112,20 +120,12 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
-  Future<void> sendCmd(
-    String uuid,
-    Uint8List data, {
-    int psType = 0,
-  }) {
+  Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0}) {
     throw UnimplementedError();
   }
 
   @override
-  Future<void> sendCmdNoWait(
-    String uuid,
-    Uint8List data, {
-    int psType = 0,
-  }) {
+  Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0}) {
     throw UnimplementedError();
   }
 
@@ -191,15 +191,17 @@ void main() {
     expect(cmd.isSuccess, isTrue);
   });
 
-  test('BleCmd.receiveMap does not throw on malformed receiveData payloads',
-      () {
-    final cmd = BleCmd.receiveMap({'unexpected': null});
+  test(
+    'BleCmd.receiveMap does not throw on malformed receiveData payloads',
+    () {
+      final cmd = BleCmd.receiveMap({'unexpected': null});
 
-    expect(cmd.uuid, isEmpty);
-    expect(cmd.psType, 0);
-    expect(cmd.data, isNull);
-    expect(cmd.isSuccess, isFalse);
-  });
+      expect(cmd.uuid, isEmpty);
+      expect(cmd.psType, 0);
+      expect(cmd.data, isNull);
+      expect(cmd.isSuccess, isFalse);
+    },
+  );
 
   // test('getPlatformVersion', () async {
   //   EzwBle ezwBlePlugin = EzwBle();

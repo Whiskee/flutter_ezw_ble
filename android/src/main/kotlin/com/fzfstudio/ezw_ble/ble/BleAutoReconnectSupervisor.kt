@@ -522,6 +522,25 @@ internal class BleAutoReconnectSupervisor(
     }
 
     /**
+     * 冻结指定 endpoint 的长期回连 owner 元数据。
+     *
+     * 1. 对账层只能依赖这份不可变快照判断 owner 是否仍存在。
+     * 2. 不暴露 task/GATT，避免 App foreground 查询意外改变重连计时或物理 owner。
+     */
+    @Synchronized
+    fun ownerSnapshot(uuid: String): BleReconnectOwnerSnapshot? {
+        val task = reconnectTasks[reconnectKey(uuid)] ?: return null
+        return BleReconnectOwnerSnapshot(
+            belongConfig = task.belongConfig,
+            uuid = task.uuid,
+            name = task.name,
+            sn = task.sn,
+            source = task.source,
+            sessionGeneration = task.sessionGeneration,
+        )
+    }
+
+    /**
      * 根据连接失败状态调度下一次自动回连。
      *
      * 非系统/链路/GATT readiness 失败不会触发回连，避免用户主动断开后又被 native 拉起。

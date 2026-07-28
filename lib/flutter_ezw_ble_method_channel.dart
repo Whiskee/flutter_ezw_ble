@@ -23,16 +23,14 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
 
   @override
   Future<void> initConfigs(List<BleConfig> configs) async =>
-      methodChannel.invokeMethod("initConfigs",
-          configs.map((config) => config.customToJson()).toList());
+      methodChannel.invokeMethod(
+        "initConfigs",
+        configs.map((config) => config.customToJson()).toList(),
+      );
 
   @override
-  Future<void> startScan({
-    bool turnOnPureModel = false,
-  }) async =>
-      methodChannel.invokeMethod("startScan", {
-        "turnOnPureModel": turnOnPureModel,
-      });
+  Future<void> startScan({bool turnOnPureModel = false}) async => methodChannel
+      .invokeMethod("startScan", {"turnOnPureModel": turnOnPureModel});
 
   @override
   Future<void> stopScan() async => methodChannel.invokeMethod("stopScan");
@@ -97,6 +95,16 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       });
 
   @override
+  Future<void> reconcileBusinessConnections(List<BleDevice> devices) async {
+    // 1. 只传递 Dart 当前正式业务 connected 的 endpoint 快照。
+    // 2. 原生负责权威判断并补发终态，Dart bridge 不直接修改任何连接状态。
+    await methodChannel.invokeMethod<void>(
+      'reconcileBusinessConnections',
+      devices.map((device) => device.toJson()).toList(growable: false),
+    );
+  }
+
+  @override
   Future<void> disconnectForOtaReboot(String uuid, String name) async =>
       methodChannel.invokeMethod("disconnectForOtaReboot", {
         "uuid": uuid,
@@ -124,14 +132,12 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
     BleConnectSource source = BleConnectSource.autoReconnect,
     int sessionGeneration = 0,
   }) async {
-    final raw = await methodChannel.invokeListMethod<Object?>(
-      "activateAutoReconnectTargets",
-      {
-        "devices": devices.map((device) => device.toJson()).toList(),
-        "source": source.name,
-        "sessionGeneration": sessionGeneration,
-      },
-    );
+    final raw = await methodChannel
+        .invokeListMethod<Object?>("activateAutoReconnectTargets", {
+      "devices": devices.map((device) => device.toJson()).toList(),
+      "source": source.name,
+      "sessionGeneration": sessionGeneration,
+    });
     return (raw ?? const <Object?>[])
         .map(BleReconnectActivationResult.fromNative)
         .toList(growable: false);
@@ -144,19 +150,12 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
   }) async =>
       await methodChannel.invokeMethod<bool>(
         'notifyAutoReconnectTargetVisible',
-        {
-          'uuid': uuid,
-          'name': name,
-        },
+        {'uuid': uuid, 'name': name},
       ) ??
       false;
 
   @override
-  Future<void> sendCmd(
-    String uuid,
-    Uint8List data, {
-    int psType = 0,
-  }) async =>
+  Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0}) async =>
       methodChannel.invokeMethod<void>("sendCmd", {
         "uuid": uuid,
         "data": data,
@@ -198,12 +197,9 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
 
   @override
   Future<void> resetBle({bool preserveStateRestoration = false}) async =>
-      methodChannel.invokeMethod(
-        "resetBle",
-        <String, Object?>{
-          "preserveStateRestoration": preserveStateRestoration,
-        },
-      );
+      methodChannel.invokeMethod("resetBle", <String, Object?>{
+        "preserveStateRestoration": preserveStateRestoration,
+      });
 
   @override
   Future<void> finalizeStateRestorationClaims() async =>
@@ -215,13 +211,14 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
 
   @override
   Future<List<Map<String, dynamic>>> drainAutoReconnectEvents() async {
-    final result = await methodChannel
-        .invokeListMethod<Object?>("drainAutoReconnectEvents");
+    final result = await methodChannel.invokeListMethod<Object?>(
+      "drainAutoReconnectEvents",
+    );
     return (result ?? const <Object?>[])
         .whereType<Map<Object?, Object?>>()
-        .map((item) => item.map(
-              (key, value) => MapEntry(key.toString(), value),
-            ))
+        .map(
+          (item) => item.map((key, value) => MapEntry(key.toString(), value)),
+        )
         .toList();
   }
 }

@@ -57,11 +57,10 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   ///
   /// - param turnOnPureModel 是否开启纯模式
   ///
-  Future<void> startScan({
-    bool turnOnPureModel = false,
-  }) {
+  Future<void> startScan({bool turnOnPureModel = false}) {
     throw UnimplementedError(
-        'startScan(turnOnPureModel: $turnOnPureModel) has not been implemented.');
+      'startScan(turnOnPureModel: $turnOnPureModel) has not been implemented.',
+    );
   }
 
   /// 停止扫描设备
@@ -79,7 +78,8 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     String name,
   ) {
     throw UnimplementedError(
-        'isSystemConnectedPeripheral() has not been implemented.');
+      'isSystemConnectedPeripheral() has not been implemented.',
+    );
   }
 
   /// 连接设备
@@ -113,7 +113,8 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     bool removeBond = false,
   }) {
     throw UnimplementedError(
-        'disconnectDevice(uuid: $uuid, name: $name, removeBond: $removeBond) has not been implemented.');
+      'disconnectDevice(uuid: $uuid, name: $name, removeBond: $removeBond) has not been implemented.',
+    );
   }
 
   /// 原子撤销一组自动回连目标，并在返回前完成 native owner/Gate/runtime 失效。
@@ -127,6 +128,16 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   }) {
     throw UnimplementedError(
       'cancelAutoReconnectTargets(devices: $devices, removeBond: $removeBond, reason: $reason) has not been implemented.',
+    );
+  }
+
+  /// 对账 Dart 业务 connected 与 Android 当前 GATT/runtime 状态。
+  ///
+  /// Android 仅在有长期 autoReconnect owner 和合法 epoch 元数据时补发丢失的系统断连
+  /// 终态；iOS 保持 no-op。该接口不会创建连接、停止回连或修改扫描节奏。
+  Future<void> reconcileBusinessConnections(List<BleDevice> devices) {
+    throw UnimplementedError(
+      'reconcileBusinessConnections(devices: $devices) has not been implemented.',
     );
   }
 
@@ -147,7 +158,8 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   ///
   Future<void> devicePreConnected(String uuid) {
     throw UnimplementedError(
-        'devicePreConnected(uuid: $uuid) has not been implemented.');
+      'devicePreConnected(uuid: $uuid) has not been implemented.',
+    );
   }
 
   /// 设备连接成功
@@ -156,7 +168,8 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   ///
   Future<void> deviceConnected(String uuid) {
     throw UnimplementedError(
-        'deviceConnected(uuid: $uuid) has not been implemented.');
+      'deviceConnected(uuid: $uuid) has not been implemented.',
+    );
   }
 
   /// 只补种 native 自动回连目标，不发起前台连接。
@@ -165,7 +178,8 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// 当前进程尚未经历 `deviceConnected`，需要先建立长期回连 owner。
   Future<void> armAutoReconnectTargets(List<BleDevice> devices) {
     throw UnimplementedError(
-        'armAutoReconnectTargets(devices: $devices) has not been implemented.');
+      'armAutoReconnectTargets(devices: $devices) has not been implemented.',
+    );
   }
 
   /// 建立并立即激活长期自动回连目标。
@@ -203,11 +217,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// - param data 指令数据
   /// - param psType 指令类型
   ///
-  Future<void> sendCmd(
-    String uuid,
-    Uint8List data, {
-    int psType = 0,
-  }) {
+  Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0}) {
     throw UnimplementedError('sendCmd() has not been implemented.');
   }
 
@@ -217,11 +227,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// - param data 指令数据
   /// - param psType 指令类型
   ///
-  Future<void> sendCmdNoWait(
-    String uuid,
-    Uint8List data, {
-    int psType = 0,
-  }) {
+  Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0}) {
     throw UnimplementedError('sendCmdNoWait() has not been implemented.');
   }
 
@@ -281,6 +287,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// 让业务层在启动后补齐 native 侧证据并决定是否继续业务鉴权流程。
   Future<List<Map<String, dynamic>>> drainAutoReconnectEvents() {
     throw UnimplementedError(
-        'drainAutoReconnectEvents() has not been implemented.');
+      'drainAutoReconnectEvents() has not been implemented.',
+    );
   }
 }

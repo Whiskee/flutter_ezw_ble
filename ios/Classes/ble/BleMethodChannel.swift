@@ -29,6 +29,8 @@ enum BleMC: String {
     case disconnectDevice
     /// Atomically revoke an exact logical device's reconnect owners and runtime.
     case cancelAutoReconnectTargets
+    /// Android-only business connection liveness reconciliation; iOS is an explicit no-op.
+    case reconcileBusinessConnections
     /// OTA reboot teardown: disconnect physical transport without revoking reconnect intent.
     case disconnectForOtaReboot
     /// Mark business-layer auth as about to complete.
@@ -204,6 +206,11 @@ enum BleMC: String {
             // iOS cannot remove a system bond programmatically; removeBond is intentionally
             // accepted by the shared Dart contract but only Android consumes it.
             BleManager.shared.cancelAutoReconnectTargets(targets, reason: reason)
+            result(nil)
+            return
+        case .reconcileBusinessConnections:
+            // iOS 的 CoreBluetooth pending/state-restoration 由现有 coordinator 管理。
+            // 保留显式 no-op 让跨平台 API 对称，不能在此重建 peripheral 或发送假终态。
             result(nil)
             return
         case .disconnectForOtaReboot:
