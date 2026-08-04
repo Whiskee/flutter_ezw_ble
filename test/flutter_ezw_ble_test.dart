@@ -120,7 +120,12 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
-  Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0}) {
+  Future<void> sendCmd(
+    String uuid,
+    Uint8List data, {
+    int psType = 0,
+    bool allowDuringUpgrade = false,
+  }) {
     throw UnimplementedError();
   }
 

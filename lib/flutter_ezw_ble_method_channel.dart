@@ -155,11 +155,17 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       false;
 
   @override
-  Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0}) async =>
+  Future<void> sendCmd(
+    String uuid,
+    Uint8List data, {
+    int psType = 0,
+    bool allowDuringUpgrade = false,
+  }) async =>
       methodChannel.invokeMethod<void>("sendCmd", {
         "uuid": uuid,
         "data": data,
         "psType": psType,
+        "allowDuringUpgrade": allowDuringUpgrade,
       });
 
   /// 发送数据 - 原始数据 - 不等待响应
