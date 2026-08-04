@@ -216,8 +216,14 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// - param uuid 设备唯一标识
   /// - param data 指令数据
   /// - param psType 指令类型
+  /// - param allowDuringUpgrade 业务协议已确认该控制指令可在升级态发送
   ///
-  Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0}) {
+  Future<void> sendCmd(
+    String uuid,
+    Uint8List data, {
+    int psType = 0,
+    bool allowDuringUpgrade = false,
+  }) {
     throw UnimplementedError('sendCmd() has not been implemented.');
   }
 

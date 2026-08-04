@@ -233,12 +233,15 @@ enum class BleMC {
                 BleManager.instance.releaseDevice(uuid, name)
             }
             SEND_CMD -> {
-                // 1. GATT 写入由 BleManager 按 uuid 队列化，channel 层只传递 payload。
+                // 1. allowDuringUpgrade 只能由上层协议白名单设置；插件默认 false，
+                //    避免普通业务指令借 OTA 重连窗口绕过 Native 保护。
                 val jsonMap = arguments as Map<*, *>?
                 val uuid = jsonMap?.get("uuid") as? String ?: ""
                 val data = jsonMap?.get("data") as ByteArray? ?: byteArrayOf()
                 val psType = jsonMap?.get("psType") as Int? ?: 0
-                BleManager.instance.sendCmd(uuid, data, psType)
+                val allowDuringUpgrade =
+                    jsonMap?.get("allowDuringUpgrade") as? Boolean ?: false
+                BleManager.instance.sendCmd(uuid, data, psType, allowDuringUpgrade)
             }
             SEND_CMD_NO_WAIT -> {
                 // 1. OTA no-wait 写入仍由 BleManager 根据 psType 选择发送策略。

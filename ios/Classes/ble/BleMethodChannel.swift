@@ -223,8 +223,15 @@ enum BleMC: String {
             let jsonData: [String: Any] = arguments as? [String: Any] ?? [:]
             let uuid: String = jsonData["uuid"] as? String ?? ""
             let psType: Int = jsonData["psType"] as? Int ?? 0
+            // 默认 false；只有上层协议白名单可以显式放行 OTA 恢复控制指令。
+            let allowDuringUpgrade: Bool = jsonData["allowDuringUpgrade"] as? Bool ?? false
             if let data = jsonData["data"] as? FlutterStandardTypedData {
-                BleManager.shared.sendCmd(uuid: uuid, data: data.data, psType: psType)
+                BleManager.shared.sendCmd(
+                    uuid: uuid,
+                    data: data.data,
+                    psType: psType,
+                    allowDuringUpgrade: allowDuringUpgrade
+                )
             }
             // CoreBluetooth does not expose a reliable per-packet success callback here;
             // return after enqueueing to preserve the historical Dart contract.

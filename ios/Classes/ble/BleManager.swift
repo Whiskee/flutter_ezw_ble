@@ -714,15 +714,21 @@ extension BleManager {
      *
      *  发送数据
      *
-     *  - 升级中不允许发送cmd
+     *  - 升级中仅允许 OTA 通道和上层协议白名单确认的恢复控制指令
      *
      */
-    func sendCmd(uuid: String, data: Data, psType: Int = 0) {
+    func sendCmd(
+        uuid: String,
+        data: Data,
+        psType: Int = 0,
+        allowDuringUpgrade: Bool = false
+    ) {
         guard checkIsFunctionCanBeCalled() else {
             return
         }
-        // 如果设备在升级中且不是OTA指令，则不允许发送
-        guard upgradeDevices?.contains(where: {$0 == uuid}) != true || psType == 1 else {
+        // OTA 数据通道天然放行；common 只有 AUTH/时间同步等由业务协议显式标记后
+        // 才能越过升级态，普通业务写入仍保持阻断。
+        guard upgradeDevices?.contains(where: {$0 == uuid}) != true || psType == 1 || allowDuringUpgrade else {
             loggerE(msg: "sendCmd: \(uuid), type=\(psType), cannot send non-OTA commands during upgrade")
             return
         }

@@ -1646,13 +1646,21 @@ class BleManager private constructor() {
      *  @param uuid 发送指令设备
      *  @param data 指令数据
      *  @param psType 私有服务类型
+     *  @param allowDuringUpgrade 上层协议已确认可与 OTA 共存的恢复控制指令
      *
      */
-    fun sendCmd(uuid: String, data: ByteArray, psType: Int = 0) {
+    fun sendCmd(
+        uuid: String,
+        data: ByteArray,
+        psType: Int = 0,
+        allowDuringUpgrade: Boolean = false,
+    ) {
         if (!checkIsFunctionCanBeCalled() || uuid.isEmpty()) {
             return
         }
-        if (upgradeDevices.contains(uuid) && psType != 1) {
+        // OTA 数据通道天然放行；common 只接受业务协议显式标记的 AUTH/时间同步等
+        // 恢复控制指令，其余写入继续阻断，避免升级过程中产生通道竞争。
+        if (upgradeDevices.contains(uuid) && psType != 1 && !allowDuringUpgrade) {
             sendLog(BleLoggerTag.e, "Send cmd: $uuid, Cannot send commands during upgrade")
             return
         }
