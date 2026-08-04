@@ -323,7 +323,17 @@ active sessionGeneration for connecting endpoints. A business-connected
 reconnect task keeps its last successful sessionGeneration. The emitted
 `disconnectFromSys` reuses that accepted sessionGeneration through the
 compatibility `generation` key instead of falling back to
-`source=unknown, generation=0`.
+`source=unknown, generation=0`. Android serializes this transport barrier with
+admission, upgrade-state, and runtime teardown mutations. If a legacy race has
+already removed admission, only a live reconnect owner with an accepted epoch
+may restore terminal metadata; a cache with no owner is quarantined and its
+physical resources are released without crashing the broadcast receiver.
+
+OTA upgrade state is a projection of an existing business-connected epoch, not
+a connection owner. Entering upgrade requires a live connected endpoint and an
+accepted epoch. Exiting upgrade may emit `connected` only while that same
+physical connection remains live; a late OTA cleanup after disconnect consumes
+the marker without resurrecting cached connection state.
 
 If a concurrent scan finds the same stable device name under a new
 CoreBluetooth UUID, task, persistence owner, and Gate identity migrate
@@ -377,6 +387,10 @@ hard cancel reachability without linear memory growth.
   activation before native opens replacement GATT handles.
 - Bluetooth-off terminals preserve the active or last business-connected
   generation, so Dart can accept the disconnect before reconnect resumes.
+- Bluetooth-off teardown cannot crash on a missing admission; it recovers only
+  from a valid reconnect owner or quarantines the ownerless cache.
+- A late OTA exit after transport loss never changes the endpoint back to
+  `connected` on either platform.
 - iOS ANCS/system-connected devices do not fall into scan timeout.
 - Android out-of-range devices recover through the mandatory passive reconnect path.
 - Android business-connected system disconnect rebuilds `passiveGatt`; an old

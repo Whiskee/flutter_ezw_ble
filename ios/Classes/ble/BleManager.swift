@@ -801,9 +801,36 @@ extension BleManager {
         guard upgradeDevices?.contains(where: {$0 == uuid}) != true else {
             return
         }
-        upgradeDevices?.append(uuid)
         let connectedDevice = connectedDevices.first(where: { $0.peripheral.identifier.uuidString == uuid })
-        handleConnectState(uuid: uuid, name: connectedDevice?.peripheral.name ?? "", state: .upgrade)
+        let reconnectTask = reconnectTasks.values.first(where: { task in
+            isSameConnectTarget(
+                storedUuid: task.uuid,
+                storedName: task.name,
+                uuid: uuid,
+                name: connectedDevice?.peripheral.name ?? ""
+            )
+        })
+        let metadata = BleExplicitCancellationMetadataPolicy.resolve(
+            currentAdmission: currentConnectionAdmission(uuid: uuid),
+            reconnectTask: reconnectTask
+        )
+        // upgrade 只能投影真实业务连接；缓存、peripheral 或 epoch 任一失效都不得制造假连接态。
+        guard let connectedDevice = connectedDevice,
+              connectedDevice.isConnected,
+              connectedDevice.peripheral.state == .connected,
+              let metadata = metadata else {
+            loggerE(msg: "enterUpgradeState rejected: \(uuid), missing live connected epoch")
+            return
+        }
+        upgradeDevices?.append(uuid)
+        handleConnectState(
+            uuid: uuid,
+            name: connectedDevice.peripheral.name ?? "",
+            state: .upgrade,
+            source: metadata.source,
+            generation: metadata.sessionGeneration,
+            attemptGeneration: metadata.attemptGeneration
+        )
         loggerD(msg: "enterUpgradeState: \(uuid), enter upgrade state")
     }
     
@@ -814,9 +841,36 @@ extension BleManager {
         guard upgradeDevices?.contains(where: {$0 == uuid}) == true else {
             return
         }
+        // 先消费 marker；后续校验失败时保留真实断连态，不能再次被旧 OTA 回调复活。
         upgradeDevices?.removeAll(where: { $0 == uuid })
         let connectedDevice = connectedDevices.first(where: { $0.peripheral.identifier.uuidString == uuid })
-        handleConnectState(uuid: uuid, name: connectedDevice?.peripheral.name ?? "", state: .connected)
+        let reconnectTask = reconnectTasks.values.first(where: { task in
+            isSameConnectTarget(
+                storedUuid: task.uuid,
+                storedName: task.name,
+                uuid: uuid,
+                name: connectedDevice?.peripheral.name ?? ""
+            )
+        })
+        let metadata = BleExplicitCancellationMetadataPolicy.resolve(
+            currentAdmission: currentConnectionAdmission(uuid: uuid),
+            reconnectTask: reconnectTask
+        )
+        guard let connectedDevice = connectedDevice,
+              connectedDevice.isConnected,
+              connectedDevice.peripheral.state == .connected,
+              let metadata = metadata else {
+            loggerE(msg: "quiteUpgradeState rejected: \(uuid), connection already invalid")
+            return
+        }
+        handleConnectState(
+            uuid: uuid,
+            name: connectedDevice.peripheral.name ?? "",
+            state: .connected,
+            source: metadata.source,
+            generation: metadata.sessionGeneration,
+            attemptGeneration: metadata.attemptGeneration
+        )
         loggerD(msg: "quiteUpgradeState(\(uuid)): Had Quite upgrade state")
     }
     

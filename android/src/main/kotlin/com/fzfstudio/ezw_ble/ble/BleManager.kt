@@ -137,6 +137,12 @@ class BleManager private constructor() {
         val attemptGeneration: Long,
     )
 
+    /** powered-off 快照同时携带可上报终态与必须隔离的无 owner 脏缓存。 */
+    private data class BluetoothOffTerminalCapture(
+        val snapshots: List<BluetoothOffTerminalSnapshot>,
+        val quarantinedDevices: List<BleDevice>,
+    )
+
     /** 一次业务存活对账使用的、可被 Dart epoch guard 接受的终态元数据。 */
     private data class BusinessLivenessMetadata(
         val source: BleConnectSource,
@@ -1320,6 +1326,7 @@ class BleManager private constructor() {
     /**
      *  主动设置连接成功
      */
+    @Synchronized
     fun setConnected(uuid: String) {
         // 1、校验请求、pre-connected 标记和当前 admission，确保业务 connected 有合法代次。
         if (!checkIsFunctionCanBeCalled() || uuid.isEmpty()) {
@@ -1367,6 +1374,7 @@ class BleManager private constructor() {
     /**
      * 断连设备
      */
+    @Synchronized
     fun disconnect(uuid: String, removeBond: Boolean = false) {
         // 1、撤销持久回连目标和当前 endpoint 的所有 pending/scan 任务。
         sendLog(BleLoggerTag.d, "Star disconnect: $uuid by user")
@@ -1452,6 +1460,7 @@ class BleManager private constructor() {
      * 的系统断连；本次 terminal 不调度 native retry，避免与上层 afterUpgrade activation
      * 在设备尚未 reboot 完成时竞争 GATT。
      */
+    @Synchronized
     fun disconnectForOtaReboot(uuid: String, name: String = "") {
         // 1、定位业务已连接设备，并解析可被 Dart 接受的 source/generation 元数据。
         val device = connectedDevices.firstOrNull { candidate ->
@@ -1681,26 +1690,91 @@ class BleManager private constructor() {
     /**
      *  进入升级模式
      */
+    @Synchronized
     fun enterUpgradeState(uuid: String) {
         if (upgradeDevices.contains(uuid)) {
             return
         }
-        upgradeDevices.add(uuid)
         val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
-        handleConnectState(uuid, connectedDevice?.name ?: "", BleConnectState.UPGRADE)
+        if (connectedDevice == null) {
+            sendLog(BleLoggerTag.e, "EnterUpgradeState rejected: $uuid, missing device cache")
+            return
+        }
+        val key = reconnectKey(uuid)
+        val acceptedAdmission = BleBluetoothOffTerminalMetadataPolicy.resolve(
+            currentAdmission = currentAdmissions[key],
+            businessConnectedAdmission = businessConnectedGattSessions[key]?.admission,
+            lastBusinessConnectedAdmission = lastEpochAcceptedAdmissions[key],
+        ) ?: run {
+            sendLog(
+                BleLoggerTag.e,
+                "EnterUpgradeState rejected: $uuid, state=${connectedDevice.connectState}, " +
+                    "missing epoch-accepted admission",
+            )
+            return
+        }
+        if (!BleUpgradeStatePolicy.canEnter(connectedDevice.connectState, acceptedAdmission)) {
+            sendLog(
+                BleLoggerTag.e,
+                "EnterUpgradeState rejected: $uuid, state=${connectedDevice.connectState}",
+            )
+            return
+        }
+        upgradeDevices.add(uuid)
+        handleConnectState(
+            uuid,
+            connectedDevice.name,
+            BleConnectState.UPGRADE,
+            source = acceptedAdmission.source,
+            generation = acceptedAdmission.sessionGeneration,
+            attemptGeneration = acceptedAdmission.generation,
+        )
         sendLog(BleLoggerTag.d, "EnterUpgradeState: $uuid Into upgrade state")
     }
 
     /**
      *  退出升级模式
      */
+    @Synchronized
     fun quiteUpgradeState(uuid: String) {
-        if (!upgradeDevices.contains(uuid)){
+        if (!upgradeDevices.remove(uuid)) {
             return
         }
         val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
-        handleConnectState(uuid, connectedDevice?.name ?: "", BleConnectState.CONNECTED)
-        upgradeDevices.remove(uuid)
+        if (connectedDevice == null) {
+            sendLog(BleLoggerTag.e, "QuiteUpgradeState rejected: $uuid, missing device cache")
+            return
+        }
+        val key = reconnectKey(uuid)
+        val acceptedAdmission = BleBluetoothOffTerminalMetadataPolicy.resolve(
+            currentAdmission = currentAdmissions[key],
+            businessConnectedAdmission = businessConnectedGattSessions[key]?.admission,
+            lastBusinessConnectedAdmission = lastEpochAcceptedAdmissions[key],
+        ) ?: run {
+            // 先移除 upgrade marker，但保留真实断连/错误态；OTA 清理不能复活已失效 GATT。
+            sendLog(
+                BleLoggerTag.e,
+                "QuiteUpgradeState rejected: $uuid, state=${connectedDevice.connectState}, " +
+                    "missing epoch-accepted admission",
+            )
+            return
+        }
+        if (!BleUpgradeStatePolicy.canExitToConnected(connectedDevice.connectState, acceptedAdmission)) {
+            // 先移除 upgrade marker，但保留真实断连/错误态；OTA 清理不能复活已失效 GATT。
+            sendLog(
+                BleLoggerTag.e,
+                "QuiteUpgradeState rejected: $uuid, state=${connectedDevice.connectState}",
+            )
+            return
+        }
+        handleConnectState(
+            uuid,
+            connectedDevice.name,
+            BleConnectState.CONNECTED,
+            source = acceptedAdmission.source,
+            generation = acceptedAdmission.sessionGeneration,
+            attemptGeneration = acceptedAdmission.generation,
+        )
         sendLog(BleLoggerTag.d, "QuiteUpgradeState: $uuid had quite upgrade state")
     }
 
@@ -1897,104 +1971,147 @@ class BleManager private constructor() {
      * 在蓝牙关闭 teardown 前收集所有业务连接终态。
      *
      * Gate 尚未释放的 endpoint 优先复用 current admission；已执行 deviceConnected 的
-     * endpoint 则复用 businessConnectedGattSessions 保存的 exact admission。setConnected
-     * 已建立“业务 connected 必有有效 admission”的不变量；这里若缺失必须显式失败，不能把
-     * 断连静默降级为 unknown/0 或直接跳过。
+     * endpoint 则复用 businessConnectedGattSessions 保存的 exact admission。若历史竞态
+     * 已清掉 admission，只允许从仍存活的 reconnect owner 恢复；完全无 owner 的假连接缓存
+     * 会被隔离释放，诊断不变量不能在系统 BroadcastReceiver 中升级成进程崩溃。
      */
-    private fun captureBluetoothOffTerminalSnapshots(): List<BluetoothOffTerminalSnapshot> =
+    private fun captureBluetoothOffTerminalSnapshots(): BluetoothOffTerminalCapture {
+        val snapshots = mutableListOf<BluetoothOffTerminalSnapshot>()
+        val quarantinedDevices = mutableListOf<BleDevice>()
         connectedDevices
             .filter { it.connectState.isConnected }
-            .map { device ->
+            .forEach { device ->
                 val key = reconnectKey(device.uuid)
-                val admission = checkNotNull(
-                    BleBluetoothOffTerminalMetadataPolicy.resolve(
-                        currentAdmission = currentAdmissions[key],
-                        businessConnectedAdmission = businessConnectedGattSessions[key]?.admission,
-                        lastBusinessConnectedAdmission = lastEpochAcceptedAdmissions[key],
-                    ),
-                ) {
-                    "Bluetooth off terminal invariant violated for ${device.uuid}: missing epoch-accepted admission"
+                val admission = BleBluetoothOffTerminalMetadataPolicy.resolve(
+                    currentAdmission = currentAdmissions[key],
+                    businessConnectedAdmission = businessConnectedGattSessions[key]?.admission,
+                    lastBusinessConnectedAdmission = lastEpochAcceptedAdmissions[key],
+                )
+                val ownerMetadata = if (admission == null) {
+                    autoReconnectSupervisor.ownerSnapshot(device.uuid)?.let { owner ->
+                        BleBluetoothOffTerminalMetadataPolicy.resolveReconnectOwnerTerminalMetadata(
+                            source = owner.source,
+                            sessionGeneration = owner.sessionGeneration,
+                            attemptGeneration = connectionAttemptGenerations[key] ?: 0L,
+                        )
+                    }
+                } else {
+                    null
                 }
-                BluetoothOffTerminalSnapshot(
-                    uuid = device.uuid,
-                    name = device.name,
-                    source = admission.source,
-                    sessionGeneration = admission.sessionGeneration,
-                    attemptGeneration = admission.generation,
+                if (admission != null) {
+                    snapshots.add(
+                        BluetoothOffTerminalSnapshot(
+                            uuid = device.uuid,
+                            name = device.name,
+                            source = admission.source,
+                            sessionGeneration = admission.sessionGeneration,
+                            attemptGeneration = admission.generation,
+                        ),
+                    )
+                } else if (ownerMetadata != null) {
+                    sendLog(
+                        BleLoggerTag.e,
+                        "Bluetooth off terminal recovered from reconnect owner: ${device.uuid}, " +
+                            "state=${device.connectState}, sessionGeneration=${ownerMetadata.sessionGeneration}",
+                    )
+                    snapshots.add(
+                        BluetoothOffTerminalSnapshot(
+                            uuid = device.uuid,
+                            name = device.name,
+                            source = ownerMetadata.source,
+                            sessionGeneration = ownerMetadata.sessionGeneration,
+                            attemptGeneration = ownerMetadata.attemptGeneration,
+                        ),
+                    )
+                } else {
+                    // 无有效 epoch 的缓存不能向 Dart 伪造终态；本轮只释放物理资源并清为 NONE。
+                    quarantinedDevices.add(device)
+                    sendLog(
+                        BleLoggerTag.e,
+                        "Bluetooth off terminal quarantined: ${device.uuid}, " +
+                            "state=${device.connectState}, missing epoch-accepted admission and reconnect owner",
+                    )
+                }
+            }
+        return BluetoothOffTerminalCapture(
+            snapshots = snapshots,
+            quarantinedDevices = quarantinedDevices,
+        )
+    }
+
+    /**
+     * Bluetooth power-cycle 是 Manager 复合状态的全局屏障。
+     *
+     * BroadcastReceiver、GATT callback 与 MethodChannel 可能来自不同线程；这里与所有
+     * admission/upgrade/teardown 入口共用 BleManager monitor，保证不会观察到“先删身份、
+     * 后降级 connectState”的中间态。
+     */
+    @Synchronized
+    private fun handleBluetoothStateChanged(state: Int) {
+        // 1、将稳定 OFF/ON 映射为插件状态；过渡态不推进 teardown/resume。
+        bleState = when (state) {
+            BluetoothAdapter.STATE_OFF -> 4
+            BluetoothAdapter.STATE_ON -> 5
+            BluetoothAdapter.ERROR -> 0
+            else -> return
+        }
+        if (bleState != 5) {
+            // 2、先冻结终态身份，再暂停 supervisor 和关闭所有连接态物理句柄。
+            val transportOffCapture = captureBluetoothOffTerminalSnapshots()
+            autoReconnectSupervisor.pauseForBluetoothOff()
+            val admissionGattHandles = admittedGattSessions.values
+                .map { it.gatt }
+                .distinctBy { System.identityHashCode(it) }
+            admissionGattHandles.forEach { gatt ->
+                runCatching { gatt.disconnect() }
+                runCatching { gatt.close() }
+            }
+            connectedDevices
+                .filter { it.connectState.isConnected }
+                .forEach { it.releaseAndClear() }
+
+            // 3、句柄 teardown 后暂停 Gate，并一次失效全部 attempt/session callback。
+            connectionAdmissionGate.suspendAndReset()
+            currentAdmissions.clear()
+            admittedGattSessions.clear()
+            businessConnectedGattSessions.clear()
+            connectionAttemptGenerations.replaceAll { _, generation ->
+                nextConnectionGeneration(generation)
+            }
+            upgradeDevices.clear()
+
+            // 4、只有冻结到有效 epoch 的设备才上报系统断连；无 owner 脏缓存只做隔离清理。
+            transportOffCapture.snapshots.forEach { snapshot ->
+                preConnectedDevices.remove(snapshot.uuid)
+                handleConnectState(
+                    snapshot.uuid,
+                    snapshot.name,
+                    BleConnectState.DISCONNECT_FROM_SYS,
+                    source = snapshot.source,
+                    generation = snapshot.sessionGeneration,
+                    attemptGeneration = snapshot.attemptGeneration,
                 )
             }
+            transportOffCapture.quarantinedDevices.forEach { device ->
+                preConnectedDevices.remove(device.uuid)
+                device.connectState = BleConnectState.NONE
+                sendCmdQueues.remove(reconnectKey(device.uuid))
+            }
+        } else {
+            // 5、蓝牙恢复只解除 Gate 暂停；最终 recovery session 仍由 Dart 汇总后提交。
+            connectionAdmissionGate.resume()
+            autoReconnectSupervisor.resumeAfterBluetoothOn()
+        }
+        sendLog(BleLoggerTag.d, "Ble statue listener: Original state = $state, to even state = $bleState")
+        checkBluetoothPermission()
+    }
 
     /**
      * 创建蓝牙状态监听器
      */
     private fun createBleStateListener(): BluetoothStateCallback = object : BluetoothStateCallback {
         override fun onBluetoothStateChanged(state: Int) {
-            // 1、将稳定 OFF/ON 映射为插件状态；过渡态不推进 teardown/resume。
-            bleState = when (state) {
-                //  蓝牙关闭
-                BluetoothAdapter.STATE_OFF -> 4
-                //  蓝牙开启
-                BluetoothAdapter.STATE_ON -> 5
-                //  错误处理
-                BluetoothAdapter.ERROR -> 0
-                //  不处理：正在关闭/打开
-                //  BluetoothAdapter.STATE_TURNING_OFF
-                //  BluetoothAdapter.STATE_TURNING_ON
-                else -> return
-            }
-            if (bleState != 5) {
-                // 2、蓝牙关闭：先快照终态 metadata，再暂停 supervisor 和关闭物理句柄。
-                // 2.1、transport teardown 会清空 Gate/current/business session；先冻结每个
-                // 业务 endpoint 的 source/generation，避免终态退化为 unknown/0。
-                val transportOffTerminalSnapshots = captureBluetoothOffTerminalSnapshots()
-                autoReconnectSupervisor.pauseForBluetoothOff()
-                // 2.2、快照并关闭 active/queued/pre-physical GATT；只清 map 会留下 binder handle。
-                val admissionGattHandles = admittedGattSessions.values
-                    .map { it.gatt }
-                    .distinctBy { System.identityHashCode(it) }
-                admissionGattHandles.forEach { gatt ->
-                    runCatching { gatt.disconnect() }
-                    runCatching { gatt.close() }
-                }
-                val admissionEndpoints = currentAdmissions.keys.toSet()
-                connectedDevices
-                    .filter { reconnectKey(it.uuid) in admissionEndpoints }
-                    .forEach { it.releaseAndClear() }
-
-                // 2.3、句柄 teardown 后原子暂停 Gate，并失效所有 generation/session/callback。
-                connectionAdmissionGate.suspendAndReset()
-                currentAdmissions.clear()
-                admittedGattSessions.clear()
-                businessConnectedGattSessions.clear()
-                connectionAttemptGenerations.replaceAll { _, generation -> generation + 1L }
-                // 2.4、清除升级设备数据，避免 OTA 退出时旧状态重新进入回连。
-                upgradeDevices.clear()
-                // 2.5、系统蓝牙关闭统一上报 DISCONNECT_FROM_SYS，让 even_connect 在恢复后接管回连；
-                // 不复用 DISCONNECT_BY_USER，否则用户取消语义会阻断长期 autoReconnect。
-                // 2.5.1、快照筛选必须使用 connectState.isConnected（含 CONNECTED + UPGRADE），
-                // 不能只判断 BleDevice.isConnected，否则 OTA 设备的失效 GATT 会残留并产生假连接。
-                transportOffTerminalSnapshots.forEach { snapshot ->
-                    // 2.6、清理预连接标记，并显式使用 teardown 前冻结的 metadata 上报终态。
-                    preConnectedDevices.remove(snapshot.uuid)
-                    handleConnectState(
-                        snapshot.uuid,
-                        snapshot.name,
-                        BleConnectState.DISCONNECT_FROM_SYS,
-                        source = snapshot.source,
-                        generation = snapshot.sessionGeneration,
-                        attemptGeneration = snapshot.attemptGeneration,
-                    )
-                }
-            } else {
-                // 3、蓝牙恢复：只解除全局 Gate 暂停并登记恢复屏障。
-                // supervisor 不得按 Bluetooth Off 前的旧 session 立即重建 GATT；
-                // 等 Dart 汇总眼镜/戒指后提交一次最终 recovery activation。
-                connectionAdmissionGate.resume()
-                autoReconnectSupervisor.resumeAfterBluetoothOn()
-            }
-            sendLog(BleLoggerTag.d, "Ble statue listener: Original state = $state, to even state = $bleState")
-            //  检查蓝牙权限
-            checkBluetoothPermission()
+            handleBluetoothStateChanged(state)
         }
 
         override fun onDeviceBondStateChanged(
@@ -3199,6 +3316,7 @@ class BleManager private constructor() {
     /**
      *  处理连接状态
      */
+    @Synchronized
     private fun handleConnectState(
         uuid: String,
         name: String,

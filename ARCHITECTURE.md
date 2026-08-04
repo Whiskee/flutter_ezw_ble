@@ -180,8 +180,8 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `deviceConnected` | `Future<void> deviceConnected(String uuid)` | "真连上了"通知：业务侧（如收到设备配对回包后）告诉原生 "连接已业务就绪"，原生再 push `connectFinish` → `connected`。 |
 | `sendCmd` | `Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0})` | 写特征值，等待原生层 write 完成。`psType` 是"私有服务类型"，对应 `BlePrivateService.type`（0=基础，1=OTA，2+=自定义）。 |
 | `sendCmdNoWait` | `Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0})` | 不等 write callback，连发场景使用。Android：`WRITE_TYPE_NO_RESPONSE` 写入。iOS：`psType == 1`（OTA）走 `WriteWithoutResponse` + `canSendWriteWithoutResponse` 背压队列（见 `ios/Classes/ble/OtaWriteQueue.swift` 与 `docs/IOS_OTA_NOWAIT_SPEC.md`），其它 `psType` 退化为 `WriteWithoutResponse` 立即返回路径。 |
-| `enterUpgradeState` | `Future<void> enterUpgradeState(String uuid)` | 标记此 uuid 进入 OTA。原生侧据此切到 OTA 私有服务、延长断连超时（与 `BleConfig.upgradeSwapTime` 配合）。 |
-| `quiteUpgradeState` | `Future<void> quiteUpgradeState(String uuid)` | 退出 OTA 状态。 |
+| `enterUpgradeState` | `Future<void> enterUpgradeState(String uuid)` | 仅允许仍处于真实业务 `connected`、物理链路有效且持有已接受 epoch 的 uuid 进入 OTA；拒绝用缓存制造 `upgrade`。原生侧据此切到 OTA 私有服务、延长断连超时（与 `BleConfig.upgradeSwapTime` 配合）。 |
+| `quiteUpgradeState` | `Future<void> quiteUpgradeState(String uuid)` | 退出 OTA 状态；只有链路仍有效时才恢复 `connected`，断连后到达的旧 OTA 回调只消费 marker，不能复活连接态。 |
 | `openBleSettings` | `Future<void> openBleSettings()` | 跳系统蓝牙开关页。 |
 | `openAppSettings` | `Future<void> openAppSettings()` | 跳本 App 权限设置页。 |
 | `resetBle` | `Future<void> resetBle()` | 让原生层重置内部 BLE 栈状态（清队列、断所有连接、清缓存）。 |
@@ -470,7 +470,7 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 3. 自动回连在物理 callback 前不发送用户可见 `connecting`。第一条回连状态从 `contactDevice` 开始，并携带 `source` 与 `generation`。手动点击若已有 pending session，只把 source/队列优先级提升为 `manualReconnect`。
 4. service/char/timeout 等非系统终态必须先完成 GATT/peripheral teardown，再释放 Gate；普通 CoreBluetooth 终态也必须先移除旧 active request，之后才能调度下一代，避免调度被旧 owner 永久 defer。iOS 使用 exact cancellation token + 2s watchdog；超时债务按 endpoint 用饱和 counter 常数内存保存，迟到 callback 不能误杀新 generation。Android 在业务 connected 后保留 exact `(sessionId, GATT)` metadata，稍后的系统断连仍会清理并重建 passive GATT，旧 GATT 不能命中新 attempt。
 5. UI 的 1 分钟展示超时属于上层展示策略，不会停止 native 长期回连；只有用户点击取消/断开才是真取消，同时清 task、持久化 owner、pending session 与定时器，直到下一次明确手动连接才可重新 arm/activate。
-6. 蓝牙关闭会先快照 active admission 的 generation，并由已业务连接 task 保留最后成功 generation；随后才 teardown 全部 session、清空 Gate 并暂停任务。发给 Dart 的 `disconnectFromSys` 必须复用该可接受 generation，不能退化为 `unknown/0`。恢复后 source 重置为 `autoReconnect`，旧 manual source 不跨 transport generation 泄漏。Android powered-on 只设置 `awaitingRecoveryActivation`，不按关闭前的旧 session 抢先重建 GATT；必须等待 Dart 汇总全部允许目标并以最终 session 调用一次 activation 后才解除屏障。
+6. 蓝牙关闭会先快照 active admission 的 generation，并由已业务连接 task 保留最后成功 generation；随后才 teardown 全部 session、清空 Gate 并暂停任务。发给 Dart 的 `disconnectFromSys` 必须复用该可接受 generation，不能退化为 `unknown/0`。Android 的 power-cycle、admission、升级态和 teardown 共用 Manager 复合状态锁；历史竞态若只剩 reconnect owner，可从 owner 恢复终态 identity；若连 owner 都不存在，只隔离并释放假连接缓存，BroadcastReceiver 禁止用诊断断言杀进程。恢复后 source 重置为 `autoReconnect`，旧 manual source 不跨 transport generation 泄漏。Android powered-on 只设置 `awaitingRecoveryActivation`，不按关闭前的旧 session 抢先重建 GATT；必须等待 Dart 汇总全部允许目标并以最终 session 调用一次 activation 后才解除屏障。
 7. Android Manager 与 Gate 的 endpoint attempt generation 必须共享同一高水位：批量取消先统一推进一次 generation，再逐 endpoint 释放 GATT/runtime；release 阶段不得重复推进。新 attempt 从两侧高水位最大值继续，防止 OTA、设备切换或重复清理后真实物理 callback 被误判为 `STALE`。
 
 触发回连：
@@ -566,6 +566,7 @@ App 启动
 
 OTA 流程
   ├─ EzwBle.to.bleMC.enterUpgradeState(uuid)
+  │    （仅 live business connected + accepted epoch 可进入）
   ├─ ◀ connectStatusEC: upgrade
   ├─ EzwBle.to.bleMC.sendCmdNoWait(..., psType=1)       ▶ 通过 OTA 私有服务连发
   │                                                       Android: WRITE_TYPE_NO_RESPONSE
@@ -577,6 +578,7 @@ OTA 流程
   ├─ （等 upgradeSwapTime ms 后重连）
   ├─ ◀ connectStatusEC: connecting ... connected
   └─ EzwBle.to.bleMC.quiteUpgradeState(uuid)
+       （链路已断时只消费 upgrade marker，不重新上报 connected）
 
 主动断开
   └─ EzwBle.to.bleMC.disconnectDevice(uuid, name, removeBond: false)

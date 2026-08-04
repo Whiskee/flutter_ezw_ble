@@ -1,9 +1,12 @@
 package com.fzfstudio.ezw_ble.ble
 
 import com.fzfstudio.ezw_ble.ble.models.BleConnectSource
+import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 /** 蓝牙关闭终态必须复用已建立会话的 source/generation，不能回退 unknown/0。 */
 class BleBluetoothOffTerminalMetadataPolicyTest {
@@ -121,6 +124,53 @@ class BleBluetoothOffTerminalMetadataPolicyTest {
                 fallbackAdmission = null,
             ),
         )
+    }
+
+    @Test
+    fun `reconnect owner supplies bluetooth-off terminal only with an accepted epoch`() {
+        assertEquals(
+            BleTerminalMetadata(
+                source = BleConnectSource.AUTO_RECONNECT,
+                sessionGeneration = 17L,
+                attemptGeneration = 19L,
+            ),
+            BleBluetoothOffTerminalMetadataPolicy.resolveReconnectOwnerTerminalMetadata(
+                source = BleConnectSource.AUTO_RECONNECT,
+                sessionGeneration = 17L,
+                attemptGeneration = 19L,
+            ),
+        )
+        assertNull(
+            BleBluetoothOffTerminalMetadataPolicy.resolveReconnectOwnerTerminalMetadata(
+                source = BleConnectSource.UNKNOWN,
+                sessionGeneration = 17L,
+                attemptGeneration = 19L,
+            ),
+        )
+        assertNull(
+            BleBluetoothOffTerminalMetadataPolicy.resolveReconnectOwnerTerminalMetadata(
+                source = BleConnectSource.AUTO_RECONNECT,
+                sessionGeneration = 0L,
+                attemptGeneration = 19L,
+            ),
+        )
+    }
+
+    @Test
+    fun `upgrade state cannot manufacture or resurrect a connected device`() {
+        val accepted = admission(21, BleConnectSource.AUTO_RECONNECT)
+
+        assertTrue(BleUpgradeStatePolicy.canEnter(BleConnectState.CONNECTED, accepted))
+        assertFalse(BleUpgradeStatePolicy.canEnter(BleConnectState.CONNECT_FINISH, accepted))
+        assertFalse(BleUpgradeStatePolicy.canEnter(BleConnectState.CONNECTED, null))
+        assertTrue(BleUpgradeStatePolicy.canExitToConnected(BleConnectState.UPGRADE, accepted))
+        assertFalse(
+            BleUpgradeStatePolicy.canExitToConnected(
+                BleConnectState.DISCONNECT_FROM_SYS,
+                accepted,
+            ),
+        )
+        assertFalse(BleUpgradeStatePolicy.canExitToConnected(BleConnectState.UPGRADE, null))
     }
 
     private fun admission(

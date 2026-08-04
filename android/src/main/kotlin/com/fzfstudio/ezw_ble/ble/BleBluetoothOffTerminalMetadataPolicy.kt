@@ -1,6 +1,7 @@
 package com.fzfstudio.ezw_ble.ble
 
 import com.fzfstudio.ezw_ble.ble.models.BleConnectSource
+import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
 
 /** 一条发往 Dart 的连接终态身份；session 与 attempt 代次不可互相替代。 */
 internal data class BleTerminalMetadata(
@@ -32,6 +33,22 @@ internal object BleBluetoothOffTerminalMetadataPolicy {
             admission != null &&
             admission.source != BleConnectSource.UNKNOWN &&
             admission.sessionGeneration > 0L
+
+    /** admission 丢失时只允许从仍存活的 reconnect owner 恢复终态，不能凭缓存伪造身份。 */
+    fun resolveReconnectOwnerTerminalMetadata(
+        source: BleConnectSource,
+        sessionGeneration: Long,
+        attemptGeneration: Long,
+    ): BleTerminalMetadata? =
+        if (source != BleConnectSource.UNKNOWN && sessionGeneration > 0L) {
+            BleTerminalMetadata(
+                source = source,
+                sessionGeneration = sessionGeneration,
+                attemptGeneration = attemptGeneration,
+            )
+        } else {
+            null
+        }
 
     /**
      * 1、显式携带有效 session 的 exact callback 永远优先。
@@ -70,4 +87,21 @@ internal object BleBluetoothOffTerminalMetadataPolicy {
             )
         }
     }
+}
+
+/** OTA UI 状态不得脱离业务连接 epoch 单独制造或复活 connected。 */
+internal object BleUpgradeStatePolicy {
+    fun canEnter(
+        currentState: BleConnectState,
+        admission: BleConnectionAdmission?,
+    ): Boolean =
+        currentState == BleConnectState.CONNECTED &&
+            BleBluetoothOffTerminalMetadataPolicy.isEpochAccepted(admission)
+
+    fun canExitToConnected(
+        currentState: BleConnectState,
+        admission: BleConnectionAdmission?,
+    ): Boolean =
+        currentState == BleConnectState.UPGRADE &&
+            BleBluetoothOffTerminalMetadataPolicy.isEpochAccepted(admission)
 }
