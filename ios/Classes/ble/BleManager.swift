@@ -74,8 +74,8 @@ class BleManager: NSObject {
     private lazy var connectingTimeoutTimers: [(String, String, Timer)] = []
     //  - 扫描后再连接阶段的超时定时器集合(UUID, Name, 倒计时定时器)
     private lazy var scanConnectTimeoutTimers: [(String, String, Timer)] = []
-    //  - 是否正在升级中
-    lazy var upgradeDevices: [String]? = nil
+    //  - Native OTA marker 与写入门禁的唯一状态源；非可选集合保证首次 enter 必定落盘。
+    let upgradeStateRegistry = BleUpgradeStateRegistry()
     //  - 预连接设备集合（使用uuid作为key）
     lazy var preConnectedDevices: Set<String> = []
     //  - OTA WriteWithoutResponse 写队列(key: peripheral.identifier.uuidString)
@@ -272,7 +272,7 @@ extension BleManager {
         preConnectedDevices = Set(preConnectedDevices.filter {
             !endpointKeys.contains(reconnectKey(uuid: $0))
         })
-        upgradeDevices?.removeAll {
+        upgradeStateRegistry.removeAll {
             endpointKeys.contains(reconnectKey(uuid: $0))
         }
         var shouldStopOwnedPairingRecoveryScan = false
@@ -728,7 +728,11 @@ extension BleManager {
         }
         // OTA 数据通道天然放行；common 只有 AUTH/时间同步等由业务协议显式标记后
         // 才能越过升级态，普通业务写入仍保持阻断。
-        guard upgradeDevices?.contains(where: {$0 == uuid}) != true || psType == 1 || allowDuringUpgrade else {
+        guard upgradeStateRegistry.canSend(
+            endpointId: uuid,
+            psType: psType,
+            allowDuringUpgrade: allowDuringUpgrade
+        ) else {
             loggerE(msg: "sendCmd: \(uuid), type=\(psType), cannot send non-OTA commands during upgrade")
             return
         }
@@ -760,7 +764,7 @@ extension BleManager {
             return
         }
         //  2、升级中只放行 OTA 指令(与 sendCmd 保持一致)
-        guard upgradeDevices?.contains(where: { $0 == uuid }) != true || psType == 1 else {
+        guard upgradeStateRegistry.canSend(endpointId: uuid, psType: psType) else {
             loggerE(msg: "sendCmdNoWait: \(uuid), type=\(psType), cannot send non-OTA commands during upgrade")
             result(nil)
             return
@@ -804,7 +808,7 @@ extension BleManager {
      *  进入升级模式
      */
     func enterUpgradeState(uuid: String) {
-        guard upgradeDevices?.contains(where: {$0 == uuid}) != true else {
+        guard !upgradeStateRegistry.contains(uuid) else {
             return
         }
         let connectedDevice = connectedDevices.first(where: { $0.peripheral.identifier.uuidString == uuid })
@@ -828,7 +832,7 @@ extension BleManager {
             loggerE(msg: "enterUpgradeState rejected: \(uuid), missing live connected epoch")
             return
         }
-        upgradeDevices?.append(uuid)
+        upgradeStateRegistry.enter(uuid)
         handleConnectState(
             uuid: uuid,
             name: connectedDevice.peripheral.name ?? "",
@@ -844,11 +848,10 @@ extension BleManager {
      *  退出升级模式
      */
     func quiteUpgradeState(uuid: String) {
-        guard upgradeDevices?.contains(where: {$0 == uuid}) == true else {
+        // 先消费 marker；后续校验失败时保留真实断连态，不能再次被旧 OTA 回调复活。
+        guard upgradeStateRegistry.consume(uuid) else {
             return
         }
-        // 先消费 marker；后续校验失败时保留真实断连态，不能再次被旧 OTA 回调复活。
-        upgradeDevices?.removeAll(where: { $0 == uuid })
         let connectedDevice = connectedDevices.first(where: { $0.peripheral.identifier.uuidString == uuid })
         let reconnectTask = reconnectTasks.values.first(where: { task in
             isSameConnectTarget(
@@ -922,7 +925,7 @@ extension BleManager {
             timer.invalidate()
         }
         scanConnectTimeoutTimers.removeAll()
-        upgradeDevices?.removeAll()
+        upgradeStateRegistry.clear()
         preConnectedDevices.removeAll()
         // 1、冷启动中性 reset 发生在 willRestoreState 与当前设备加载之间。此时只清理
         // 旧 runtime session，必须保留系统交还的 peripheral，等待当前 target activation
@@ -1951,7 +1954,7 @@ extension BleManager: CBCentralManagerDelegate {
             pauseReconnectTasksForBluetoothOff()
             suspendConnectionAdmissionGateForBluetoothOff()
             //  - 1.1、移除所有升级设备，避免退出OTA时，重置会连接状态的设备
-            upgradeDevices?.removeAll()
+            upgradeStateRegistry.clear()
             //  - 1.2、系统级蓝牙关闭：把连接中/已连接端点标记为 .disconnectFromSys，
             //         让 Dart 状态机先退出陈旧连接态；长期回连 task 仍由 native 暂停并在恢复后继续。
             //         ⚠️ 不能用 .bleError / .disconnectByUser：

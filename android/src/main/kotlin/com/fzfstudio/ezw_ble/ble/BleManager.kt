@@ -1669,7 +1669,12 @@ class BleManager private constructor() {
         }
         // OTA 数据通道天然放行；common 只接受业务协议显式标记的 AUTH/时间同步等
         // 恢复控制指令，其余写入继续阻断，避免升级过程中产生通道竞争。
-        if (upgradeDevices.contains(uuid) && psType != 1 && !allowDuringUpgrade) {
+        if (!BleUpgradeCommandPolicy.canSend(
+                isUpgrading = upgradeDevices.contains(uuid),
+                psType = psType,
+                allowDuringUpgrade = allowDuringUpgrade,
+            )
+        ) {
             sendLog(BleLoggerTag.e, "Send cmd: $uuid, Cannot send commands during upgrade")
             return
         }
@@ -1689,6 +1694,18 @@ class BleManager private constructor() {
      */
     fun sendCmdNoWait(uuid: String, data: ByteArray, psType: Int = 0) {
         if (!checkIsFunctionCanBeCalled() || uuid.isEmpty()) {
+            return
+        }
+        // no-wait 只服务 OTA bulk data，不接受业务白名单；升级态下非 OTA 写入必须拒绝。
+        if (!BleUpgradeCommandPolicy.canSend(
+                isUpgrading = upgradeDevices.contains(uuid),
+                psType = psType,
+            )
+        ) {
+            sendLog(
+                BleLoggerTag.e,
+                "Send cmd - no wait: $uuid, Cannot send non-OTA commands during upgrade",
+            )
             return
         }
         connectedDevices.firstOrNull { it.uuid == uuid }?.writeCharacteristic(data, psType)

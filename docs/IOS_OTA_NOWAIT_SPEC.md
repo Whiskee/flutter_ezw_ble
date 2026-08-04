@@ -213,6 +213,10 @@ Future<void> sendCmdNoWait(
 > 行为变更仅影响 `sendCmdNoWait` + `psType==1` 的组合 — 这正是 `even_connect`
 > 的 `sendOTABytesData` 在 Android 已经用的形态。
 
+Native OTA marker 由非可选 `BleUpgradeStateRegistry` 持有：进入升级态必须真实插入
+endpoint，普通 `sendCmdNoWait` 在 marker 存在时默认拒绝；退出时先消费 marker，再校验
+live peripheral 与 accepted epoch。这样 Bluetooth OFF 或迟到 OTA exit 都不能复活旧连接。
+
 ---
 
 ## 6. 验收

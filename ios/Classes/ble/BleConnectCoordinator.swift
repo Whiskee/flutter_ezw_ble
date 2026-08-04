@@ -36,7 +36,7 @@ extension BleManager {
         preConnectedDevices.remove(easyConnect.uuid)
         if !easyConnect.afterUpgrade {
             // 非 OTA 恢复连接不能继续占用升级态，否则普通指令会被升级保护拒绝。
-            upgradeDevices?.removeAll(where: { $0 == easyConnect.uuid })
+            upgradeStateRegistry.consume(easyConnect.uuid)
         }
         guard let bleConfig = findCurrentBleConfig(
             belongConfig: easyConnect.belongConfig,
