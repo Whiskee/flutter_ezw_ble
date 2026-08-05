@@ -840,7 +840,7 @@ extension BleManager {
             // 配置被移除或关闭后，旧任务只保留日志，不再调度。
             return
         }
-        guard upgradeDevices?.contains(uuid) != true else {
+        guard !upgradeStateRegistry.contains(uuid) else {
             // OTA/升级态由升级流程控制连接，避免自动回连打断升级状态机。
             return
         }

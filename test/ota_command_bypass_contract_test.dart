@@ -12,7 +12,11 @@ void main() {
     ).readAsStringSync();
 
     expect(channel, contains('as? Boolean ?: false'));
-    expect(manager, contains('psType != 1 && !allowDuringUpgrade'));
+    expect(manager, contains('BleUpgradeCommandPolicy.canSend'));
+    expect(
+      manager,
+      contains('Cannot send non-OTA commands during upgrade'),
+    );
   });
 
   test('iOS OTA gate keeps default deny and explicit control bypass', () {
@@ -22,6 +26,7 @@ void main() {
     final manager = File('ios/Classes/ble/BleManager.swift').readAsStringSync();
 
     expect(channel, contains('as? Bool ?? false'));
-    expect(manager, contains('psType == 1 || allowDuringUpgrade'));
+    expect(manager, contains('upgradeStateRegistry.canSend'));
+    expect(manager, isNot(contains('upgradeDevices: [String]?')));
   });
 }

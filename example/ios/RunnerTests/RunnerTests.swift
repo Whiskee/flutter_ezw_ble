@@ -11,6 +11,37 @@ import XCTest
 
 class RunnerTests: XCTestCase {
 
+  func testUpgradeStateRegistryInstallsAndConsumesMarkerIdempotently() {
+    let registry = BleUpgradeStateRegistry()
+
+    XCTAssertTrue(registry.enter("g2-left"))
+    XCTAssertFalse(registry.enter("g2-left"))
+    XCTAssertTrue(registry.contains("g2-left"))
+    XCTAssertEqual(registry.countForTesting, 1)
+    XCTAssertTrue(registry.consume("g2-left"))
+    XCTAssertFalse(registry.consume("g2-left"))
+    XCTAssertEqual(registry.countForTesting, 0)
+  }
+
+  func testUpgradeStateRegistryKeepsDefaultDenyAndExplicitBypassMatrix() {
+    let registry = BleUpgradeStateRegistry()
+    registry.enter("g2-right")
+
+    XCTAssertFalse(registry.canSend(endpointId: "g2-right", psType: 0))
+    XCTAssertTrue(registry.canSend(endpointId: "g2-right", psType: 1))
+    XCTAssertTrue(
+      registry.canSend(
+        endpointId: "g2-right",
+        psType: 0,
+        allowDuringUpgrade: true
+      )
+    )
+    XCTAssertTrue(registry.canSend(endpointId: "other", psType: 0))
+
+    registry.clear()
+    XCTAssertTrue(registry.canSend(endpointId: "g2-right", psType: 0))
+  }
+
   func testBleConnectModelEncodesSessionAndAttemptGenerations() throws {
     let model = BleConnectModel(
       uuid: "g2-left",

@@ -533,9 +533,9 @@ void main() {
         contains('attemptGeneration = acceptedAdmission.generation'));
     expect(setConnected, isNot(contains('BleConnectSource.UNKNOWN')));
 
-    expect(manager, contains('val transportOffTerminalSnapshots ='));
+    expect(manager, contains('val transportOffCapture ='));
     expect(
-      manager.indexOf('val transportOffTerminalSnapshots ='),
+      manager.indexOf('val transportOffCapture ='),
       lessThan(manager.indexOf('connectionAdmissionGate.suspendAndReset()')),
     );
     expect(
@@ -545,6 +545,39 @@ void main() {
     expect(manager, contains('source = snapshot.source'));
     expect(manager, contains('generation = snapshot.sessionGeneration'));
     expect(manager, contains('attemptGeneration = snapshot.attemptGeneration'));
+    // BroadcastReceiver 不能用诊断断言杀进程；无 admission 时仅可复用有效 owner，
+    // 否则隔离并释放缓存，同时 power-cycle 与其它复合状态写共享 Manager monitor。
+    expect(manager, isNot(contains('checkNotNull(')));
+    expect(manager, contains('resolveReconnectOwnerTerminalMetadata'));
+    expect(manager, contains('quarantinedDevices'));
+    expect(manager, contains('@Synchronized\n    private fun handleBluetoothStateChanged'));
+    expect(manager, contains('handleBluetoothStateChanged(state)'));
+  });
+
+  test('upgrade state cannot manufacture or resurrect a connected endpoint',
+      () {
+    final androidManager = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleManager.kt',
+    ).readAsStringSync();
+    final androidPolicy = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleBluetoothOffTerminalMetadataPolicy.kt',
+    ).readAsStringSync();
+    final iosManager =
+        File('ios/Classes/ble/BleManager.swift').readAsStringSync();
+
+    expect(androidPolicy, contains('internal object BleUpgradeStatePolicy'));
+    expect(androidManager, contains('BleUpgradeStatePolicy.canEnter'));
+    expect(androidManager, contains('BleUpgradeStatePolicy.canExitToConnected'));
+    expect(androidManager, contains('if (!upgradeDevices.remove(uuid))'));
+    expect(androidManager, contains('source = acceptedAdmission.source'));
+    expect(androidManager,
+        contains('generation = acceptedAdmission.sessionGeneration'));
+    expect(iosManager, contains('connectedDevice.isConnected'));
+    expect(iosManager, contains('connectedDevice.peripheral.state == .connected'));
+    expect(iosManager, contains('let metadata = metadata else'));
+    expect(iosManager,
+        contains('generation: metadata.sessionGeneration'));
+    expect(iosManager, contains('attemptGeneration: metadata.attemptGeneration'));
   });
 
   test('iOS live system disconnect reuses the business-connected epoch', () {
@@ -627,5 +660,27 @@ void main() {
     expect(flow, contains('return false'));
     expect(flow, contains('case .redriveCurrentAttempt:'));
     expect(flow, contains('redriveCurrentConnectionAfterCancellationDebt'));
+  });
+
+  test('iOS scan-then-connect enters the shared admission gate', () {
+    final scan =
+        File('ios/Classes/ble/BleScanPipeline.swift').readAsStringSync();
+    final methodStart = scan.indexOf('private func connectFoundPeripheral(');
+    final methodEnd = scan.indexOf(
+      'private func sendMatchDevices(',
+      methodStart,
+    );
+    final method = scan.substring(methodStart, methodEnd);
+
+    expect(method, contains('registerConnectionAttempt('));
+    expect(method, contains('afterUpgrade: request.afterUpgrade'));
+    expect(method, contains('source: .foreground'));
+    expect(method, contains('connectPeripheralAfterCancellationBarrier('));
+    expect(
+      method.indexOf('registerConnectionAttempt('),
+      lessThan(method.indexOf('connectPeripheralAfterCancellationBarrier(')),
+    );
+    expect(method, isNot(contains('startConnectingCountdown(')));
+    expect(method, isNot(contains('\n        connectPeripheral(')));
   });
 }
