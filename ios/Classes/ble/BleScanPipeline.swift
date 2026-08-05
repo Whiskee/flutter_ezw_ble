@@ -584,7 +584,7 @@ extension BleManager {
     /**
      * 扫描命中待连接外设后继续 CoreBluetooth 连接。
      *
-     * 该函数补全 UUID、写入连接缓存、启动 GATT 超时并调用统一 connectPeripheral。
+     * 该函数补全 UUID、写入连接缓存，并把物理连接交给全局准入 Gate。
      */
     private func connectFoundPeripheral(
         _ peripheral: CBPeripheral,
@@ -599,27 +599,40 @@ extension BleManager {
         let peripheralName = advertisedName.isNotEmpty ? advertisedName : (peripheral.name ?? request.name)
         cancelScanConnectTimeout(uuid: request.uuid, name: request.name)
 
-        // 2. 启动 GATT 连接阶段 timeout。
-        startConnectingCountdown(
-            currentConfig: bleConfig,
-            uuid: peripheral.identifier.uuidString,
-            name: peripheralName,
-            afterUpgrade: request.afterUpgrade
-        )
-
-        // 3. 如果还没有缓存该 peripheral，先写入 connectedDevices 供回调反查配置。
+        // 2. 如果还没有缓存该 peripheral，先写入 connectedDevices 供回调反查配置。
         if !connectedDevices.contains(where: { device in
             device.peripheral.identifier.uuidString == peripheral.identifier.uuidString || device.peripheral.name == peripheralName
         }) {
             connectedDevices.append(BleConnectedDevice(belongConfig: bleConfig, peripheral: peripheral))
         }
 
-        // 4. 原请求可能没有 UUID，扫描命中后必须补全，后续 didConnect/服务发现才能匹配。
+        // 3. 原请求可能没有 UUID，扫描命中后必须补全，后续 didConnect/服务发现才能匹配。
         updateActiveConnectRequestUuid(uuid: peripheral.identifier.uuidString, name: peripheralName)
 
-        // 5. 统一进入连接中状态，并复用 connectPeripheral 处理 auto reconnect options。
+        // 4. scan-then-connect 与 retrieve/direct 路径必须共享同一个物理连接 owner。
+        // Gate 获准后才启动 GATT readiness timeout，排队时间不能误算成连接超时。
+        if currentConnectionAdmission(uuid: peripheral.identifier.uuidString) == nil {
+            guard registerConnectionAttempt(
+                peripheral: peripheral,
+                config: bleConfig,
+                deviceName: peripheralName,
+                afterUpgrade: request.afterUpgrade,
+                source: .foreground
+            ) != nil else {
+                handleConnectState(
+                    uuid: peripheral.identifier.uuidString,
+                    name: peripheralName,
+                    state: .bleError,
+                    tag: "scan device admission rejected"
+                )
+                loggerE(msg: "admission gate: \(peripheral.identifier.uuidString), reject scan-then-connect")
+                return
+            }
+        }
+
+        // 5. cancellation barrier 可拦住同 UUID 的旧 CoreBluetooth callback，避免新 owner 被旧终态污染。
         handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheralName, state: .connecting, tag: "from search device")
-        connectPeripheral(
+        connectPeripheralAfterCancellationBarrier(
             peripheral,
             autoReconnect: isAutoReconnectAttempt(uuid: peripheral.identifier.uuidString, name: peripheralName)
         )

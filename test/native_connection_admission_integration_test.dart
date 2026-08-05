@@ -661,4 +661,26 @@ void main() {
     expect(flow, contains('case .redriveCurrentAttempt:'));
     expect(flow, contains('redriveCurrentConnectionAfterCancellationDebt'));
   });
+
+  test('iOS scan-then-connect enters the shared admission gate', () {
+    final scan =
+        File('ios/Classes/ble/BleScanPipeline.swift').readAsStringSync();
+    final methodStart = scan.indexOf('private func connectFoundPeripheral(');
+    final methodEnd = scan.indexOf(
+      'private func sendMatchDevices(',
+      methodStart,
+    );
+    final method = scan.substring(methodStart, methodEnd);
+
+    expect(method, contains('registerConnectionAttempt('));
+    expect(method, contains('afterUpgrade: request.afterUpgrade'));
+    expect(method, contains('source: .foreground'));
+    expect(method, contains('connectPeripheralAfterCancellationBarrier('));
+    expect(
+      method.indexOf('registerConnectionAttempt('),
+      lessThan(method.indexOf('connectPeripheralAfterCancellationBarrier(')),
+    );
+    expect(method, isNot(contains('startConnectingCountdown(')));
+    expect(method, isNot(contains('\n        connectPeripheral(')));
+  });
 }
