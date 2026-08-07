@@ -37,6 +37,7 @@
 - `initConfigs` 必须使用 `customToJson` 序列化嵌套模型，不要改成浅层 JSON。
 - 不要手工编辑 `*.g.dart`。修改源模型后运行 build_runner。
 - `receiveData` 的二进制 payload 跨 Method/EventChannel 时保持 Base64 约定。
+- Android `onConnectionStateChange` 的 status 使用 HCI/controller 断连语义；characteristic/descriptor 回调才使用 ATT/GATT 操作语义。数值 `8` 在前者是连接超时，严禁触发授权恢复/cache refresh/`needsScanBeforeConnect`；在后者是授权不足，必须走授权恢复后再按回调阶段终止。
 - iOS OTA 中 `psType == 1` 的 `sendCmdNoWait` 必须与 `OtaWriteQueue`、`canSendWriteWithoutResponse` 和 `docs/IOS_OTA_NOWAIT_SPEC.md` 对齐。
 - 改 auto reconnect 或 iOS State Restoration 时，同步更新 `docs/AUTO_RECONNECT_SPEC.md`、`docs/IOS_STATE_RESTORATION_SPEC.md`、`ARCHITECTURE.md` 和相关测试/排障记录。
 - BLE 行为变化通常需要同时审视 Dart 和原生两端，不要假设 Android 与 iOS 可以共享实现细节。

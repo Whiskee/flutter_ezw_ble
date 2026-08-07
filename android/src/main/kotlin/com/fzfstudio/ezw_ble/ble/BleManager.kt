@@ -2503,7 +2503,7 @@ class BleManager private constructor() {
                 isBluetoothEnabled()
             },
             recoverInsufficientAuthorization = { gatt, device ->
-                // 6. 授权失败需要由 manager 统一恢复 cache/bond 状态，callback 不直接操作全局列表。
+                // 6. 只有 ATT/GATT 操作回调里的授权不足才能恢复 cache/bond；连接断连 status 不走这里。
                 recoverInsufficientAuthorization(gatt, device)
             },
             consumeDisconnectingState = { uuid ->

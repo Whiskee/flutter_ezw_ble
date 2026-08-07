@@ -706,9 +706,21 @@ connectFinish 上报给 Dart
 
 R1 的 Android 系统 bond 与协议 `pairAuth` 是两个独立阶段：先 bond 只解决受保护 GATT 的可访问性，`connectFinish` 后仍必须完成协议认证。G1/G2 保持 `initiateBinding=false`；即使 Android 因访问受保护属性自行触发配对，也不能视为插件主动调用 `createBond()`。
 
-### 11.5 `GATT_CONN_LMP_TIMEOUT` 的处理原则
+### 11.5 Android 连接回调状态码的处理原则
 
-Android `onConnectionStateChange(... STATE_DISCONNECTED)` 会打印 HCI/GATT 状态，例如 `GATT_CONN_LMP_TIMEOUT`。这类状态必须和当前连接阶段一起判断：
+Android `onConnectionStateChange(... STATE_DISCONNECTED)` 的 `status` 必须按连接状态回调语义解释，不得复用 descriptor / characteristic 等 GATT 操作回调的 ATT/GATT 状态表。两类回调存在数字重叠：例如 `status=8` 在连接断开回调里是 `HCI_CONNECTION_TIMEOUT(code=8/0x08)`，在 descriptor / characteristic 操作回调里才是 `GATT_INSUFFICIENT_AUTHORIZATION(code=8/0x08)`。
+
+当前连接回调里必须保留的关键映射：
+
+| status | 连接回调语义 |
+| --- | --- |
+| `8 / 0x08` | `HCI_CONNECTION_TIMEOUT` |
+| `19 / 0x13` | `HCI_REMOTE_USER_TERMINATED_CONNECTION` |
+| `22 / 0x16` | `HCI_LOCAL_HOST_TERMINATED_CONNECTION` |
+| `34 / 0x22` | `HCI_LMP_OR_LL_RESPONSE_TIMEOUT` |
+| `62 / 0x3E` | `HCI_CONNECTION_FAILED_TO_BE_ESTABLISHED` |
+
+这类连接断开状态必须和当前连接阶段一起判断：
 
 | 当前阶段 | 建议语义 | 原因 |
 | --- | --- | --- |
@@ -717,7 +729,9 @@ Android `onConnectionStateChange(... STATE_DISCONNECTED)` 会打印 HCI/GATT 状
 | 已 `CONNECTED/UPGRADE` | 优先 `DISCONNECT_FROM_SYS` 或忽略迟到 bond 失败 | 不应把系统 bond 回调降级成 777 |
 | 用户主动断连中 | `DISCONNECT_BY_USER` | 由 `disconnectingDevices` 指定目标语义 |
 
-不要把 `GATT_CONN_LMP_TIMEOUT` 和 `BOUND_FAIL` 直接绑定。`BOUND_FAIL` 只应描述绑定流程失败，不应描述普通链路超时。
+不要把连接回调里的 HCI 断开原因和 `BOUND_FAIL` 直接绑定。`BOUND_FAIL` 只应描述绑定流程失败，不应描述普通链路超时。连接回调中的 `status=8` 也不得触发授权恢复、GATT cache refresh 或 `needsScanBeforeConnect`；它仍按既有阶段语义处理：业务已 connected 后走 `DISCONNECT_FROM_SYS`，connecting 阶段走 `TIMEOUT`。
+
+GATT 操作回调保留相反边界：descriptor / characteristic write 的 `status=8` 是 `GATT_INSUFFICIENT_AUTHORIZATION`，必须先调用 Android 授权恢复入口刷新本端 GATT cache/bond 视图。descriptor write 仍以 `CHARS_FAIL` 终止本次 GATT readiness；characteristic write 发生在业务 connected 后，恢复后以 `DISCONNECT_FROM_SYS` 终止 session，且不得继续 `poll` / `writeNext` 消费发送队列。
 
 ### 11.6 iOS 连接主流程
 
@@ -803,10 +817,11 @@ iOS State Restoration 是自动回连链路的一部分，不是独立业务入�
 10. Android `BluetoothDevice.name` 为空时仍能用 connect 参数或扫描缓存名继续连接；三者都缺失时应失败为 `boundFail`，不能把 MAC address 写进 name。
 11. iOS `directConnect` 缺 UUID/peripheral 缓存但有稳定 name 时应回退扫描，而不是立即 `noDeviceFound`。
 12. `activateAutoReconnectTargets` 对全部目标先直连、后由上层并行扫描；物理 callback 前不发送自动回连 `connecting`。
-13. 多 endpoint 只有 Gate owner 能运行 service/CCCD/业务鉴权；manual 只提升 waiting session，不抢占 active。
-14. UI 1 分钟超时不取消 native task；用户点击取消必须清 task、持久化 owner、pending GATT/peripheral 与迟到 timer/callback 的复活入口。
-15. Android `deviceConnected` 释放 Gate 后的 live GATT 系统断连仍上报 `disconnectFromSys` 并重建 passive GATT；旧 `(sessionId, GATT)` 不得干扰新 attempt。
-16. iOS cancellation watchdog 长期漏回调时每 endpoint 只占一个 debt counter；业务 connected 后的真实断连不能被旧 debt 吞掉。
+13. Android 连接回调与 GATT 操作回调使用不同状态表；`status=8` 在连接回调里是 `HCI_CONNECTION_TIMEOUT` 且不恢复，在 descriptor / characteristic 回调里才是 `GATT_INSUFFICIENT_AUTHORIZATION` 且必须恢复。
+14. 多 endpoint 只有 Gate owner 能运行 service/CCCD/业务鉴权；manual 只提升 waiting session，不抢占 active。
+15. UI 1 分钟超时不取消 native task；用户点击取消必须清 task、持久化 owner、pending GATT/peripheral 与迟到 timer/callback 的复活入口。
+16. Android `deviceConnected` 释放 Gate 后的 live GATT 系统断连仍上报 `disconnectFromSys` 并重建 passive GATT；旧 `(sessionId, GATT)` 不得干扰新 attempt。
+17. iOS cancellation watchdog 长期漏回调时每 endpoint 只占一个 debt counter；业务 connected 后的真实断连不能被旧 debt 吞掉。
 
 ---
 

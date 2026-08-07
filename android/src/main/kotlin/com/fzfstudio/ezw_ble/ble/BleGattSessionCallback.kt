@@ -35,7 +35,7 @@ internal class BleGattSessionCallback(
     private val onSessionTerminal: (BluetoothGatt, BleConnectState, Int) -> Unit,
     /** 查询系统蓝牙是否仍可用；蓝牙关闭时断连由系统状态监听统一处理。 */
     private val isBluetoothEnabled: () -> Boolean,
-    /** 处理 Android 授权失败，必要时由 manager 清理 stale bond / 标记扫描刷新。 */
+    /** 处理 ATT/GATT 操作返回授权不足；连接状态回调不得调用这个恢复入口。 */
     private val recoverInsufficientAuthorization: (BluetoothGatt, BleDevice) -> Unit,
     /** 查询一个 uuid 是否正处于 manager 主动断连流程。 */
     private val consumeDisconnectingState: (String) -> BleConnectState?,
@@ -94,13 +94,11 @@ internal class BleGattSessionCallback(
         // 5. 断连会使本 session 的 GATT readiness 失效。
         isPrivateServiceReady = false
         val device = currentExpectedDeviceForGatt(gatt, "connection disconnected") ?: return
-        val isInsufficientAuthorization = status == BluetoothGatt.GATT_INSUFFICIENT_AUTHORIZATION
+        val connectionStatus = BluetoothGattStatus.getConnectionStatusDescription(status)
 
-        // 6. 授权失败意味着 Android 当前 GATT/bond 视图已拒绝这个 peripheral。
-        //    即使本轮还处在 connecting，也必须先做恢复，否则下一轮 passive autoConnect 仍会等在同一条坏链路上。
-        if (isInsufficientAuthorization) {
-            recoverInsufficientAuthorization(gatt, device)
-        }
+        // 6. 连接状态回调中的 status 是 HCI/controller 断连原因，不是 ATT/GATT 操作码。
+        //    例如 status 8 在这里表示连接超时；只有 descriptor/characteristic 回调里的 8
+        //    才能按 GATT_INSUFFICIENT_AUTHORIZATION 解释和记录。
 
         // 7. 当前 active GATT 在 connecting 阶段收到断连，说明本轮 connectGatt 已经失败。
         //    不能继续静默 keep connecting：G2 第二条腿会等满 timeout，甚至在部分机型上丢失终态。
@@ -108,7 +106,7 @@ internal class BleGattSessionCallback(
         if (device.connectState.isConnecting) {
             sendLog(
                 BleLoggerTag.e,
-                "Connect call back: $address disconnected while connecting, fail active connect as timeout, code=${BluetoothGattStatus.getStatusDescription(status)}",
+                "Connect call back: $address disconnected while connecting, fail active connect as timeout, code=$connectionStatus",
             )
             onSessionTerminal(gatt, BleConnectState.TIMEOUT, DEFAULT_MTU)
             return
@@ -134,7 +132,7 @@ internal class BleGattSessionCallback(
         // 10. 非主动断连统一上报系统断连，由 manager 决定是否调度自动回连。
         sendLog(
             BleLoggerTag.e,
-            "Connect call back: $address state = STATE_DISCONNECTED(code:${BluetoothGattStatus.getStatusDescription(status)})",
+            "Connect call back: $address state = STATE_DISCONNECTED(code:$connectionStatus)",
         )
         onSessionTerminal(gatt, BleConnectState.DISCONNECT_FROM_SYS, DEFAULT_MTU)
     }
@@ -228,9 +226,15 @@ internal class BleGattSessionCallback(
         if (status != BluetoothGatt.GATT_SUCCESS) {
             descriptorQueue.clear()
             isPrivateServiceReady = false
+            val operationStatus = BluetoothGattStatus.getGattOperationStatusDescription(status)
+            if (status == BluetoothGattStatus.GATT_INSUFFICIENT_AUTHORIZATION) {
+                // Descriptor write 已进入 GATT readiness 阶段；这里的 8 是 ATT/GATT 授权不足，
+                // 先恢复 cache/bond 视图，再按原失败语义终止为 CHARS_FAIL 触发重试。
+                recoverInsufficientAuthorization(gatt, device)
+            }
             sendLog(
                 BleLoggerTag.e,
-                "Connect call back: ${gatt.device.address} descriptor write failed, status=${BluetoothGattStatus.getStatusDescription(status)}",
+                "Connect call back: ${gatt.device.address} descriptor write failed, status=$operationStatus",
             )
             onSessionTerminal(gatt, BleConnectState.CHARS_FAIL, DEFAULT_MTU)
             return
@@ -295,12 +299,23 @@ internal class BleGattSessionCallback(
         val address = gatt?.device?.address ?: return
 
         // 2. stale GATT 的写回调不能消费当前队列。
-        if (currentExpectedDeviceForGatt(gatt, "characteristic write") == null) {
+        val device = currentExpectedDeviceForGatt(gatt, "characteristic write")
+        if (device == null) {
             return
         }
 
-        // 3. 交还 manager 推进按 uuid 隔离的发送队列。
-        sendLog(BleLoggerTag.d, "Send cmd: $address, write call back is success = ${status == BluetoothGatt.GATT_SUCCESS}")
+        // 3. 业务 connected 后写 characteristic 返回授权不足，说明系统 GATT/bond 视图已拒绝。
+        //    先恢复本端缓存，再以系统断连终止本 session；不能继续 poll/writeNext 消费发送队列。
+        val operationStatus = BluetoothGattStatus.getGattOperationStatusDescription(status)
+        if (status == BluetoothGattStatus.GATT_INSUFFICIENT_AUTHORIZATION) {
+            recoverInsufficientAuthorization(gatt, device)
+            sendLog(BleLoggerTag.e, "Send cmd: $address, write failed, status=$operationStatus, terminal=DISCONNECT_FROM_SYS")
+            onSessionTerminal(gatt, BleConnectState.DISCONNECT_FROM_SYS, DEFAULT_MTU)
+            return
+        }
+
+        // 4. 其余 characteristic write 状态保留旧行为：仅记录状态并继续推进按 uuid 隔离的发送队列。
+        sendLog(BleLoggerTag.d, "Send cmd: $address, write call back is success = ${status == BluetoothGatt.GATT_SUCCESS}, status=$operationStatus")
         onCharacteristicWriteComplete(address)
     }
 
