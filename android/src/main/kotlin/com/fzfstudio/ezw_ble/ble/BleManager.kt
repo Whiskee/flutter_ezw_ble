@@ -1692,9 +1692,14 @@ class BleManager private constructor() {
      * 
      * - 注意，使用的是要尽量不要跟sendCmd一起使用，避免204响应导致数据丢失
      */
-    fun sendCmdNoWait(uuid: String, data: ByteArray, psType: Int = 0) {
+    fun sendCmdNoWait(uuid: String, data: ByteArray, psType: Int = 0): BleOtaWriteError? {
+        val isOtaChannel = psType == 1
         if (!checkIsFunctionCanBeCalled() || uuid.isEmpty()) {
-            return
+            return if (isOtaChannel) {
+                BleOtaWriteError.unavailable(uuid, "manager unavailable")
+            } else {
+                null
+            }
         }
         // no-wait 只服务 OTA bulk data，不接受业务白名单；升级态下非 OTA 写入必须拒绝。
         if (!BleUpgradeCommandPolicy.canSend(
@@ -1706,10 +1711,32 @@ class BleManager private constructor() {
                 BleLoggerTag.e,
                 "Send cmd - no wait: $uuid, Cannot send non-OTA commands during upgrade",
             )
-            return
+            return if (isOtaChannel) {
+                BleOtaWriteError.unavailable(uuid, "upgrade gate rejected")
+            } else {
+                null
+            }
         }
-        connectedDevices.firstOrNull { it.uuid == uuid }?.writeCharacteristic(data, psType)
+        val device = connectedDevices.firstOrNull { it.uuid == uuid }
+        if (device == null) {
+            return if (isOtaChannel) {
+                BleOtaWriteError.unavailable(uuid, "device or characteristic missing")
+            } else {
+                null
+            }
+        }
+        // Android writeCharacteristic() 的 Boolean 是唯一同步提交结果；OTA 必须使用它
+        // fail-closed，避免 Dart 把 native 拒绝写入误判为已发送并继续等待协议超时。
+        if (isOtaChannel && !device.supportsWriteWithoutResponse(psType)) {
+            return BleOtaWriteError.unsupported(uuid, "missing writeWithoutResponse")
+        }
+        val submitted = device.writeCharacteristic(data, psType)
         sendLog(BleLoggerTag.d, "Send cmd - no wait: $uuid, type=$psType, data length=${data.size}")
+        return if (isOtaChannel && !submitted) {
+            BleOtaWriteError.unavailable(uuid, "writeCharacteristic returned false")
+        } else {
+            null
+        }
     }
 
     /**

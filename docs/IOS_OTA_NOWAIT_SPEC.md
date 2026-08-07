@@ -65,7 +65,7 @@ iOS 走 `sendCmd`(WriteWithResponse),性能瓶颈即在此。
 | 平台 | 通道 (`psType` / `BlePrivateService.type`) | 当前 write type | 改造后 write type |
 | --- | --- | --- | --- |
 | iOS | `common` (0) | WriteWithResponse | **保持 WriteWithResponse** |
-| iOS | `ota` (1) | WriteWithResponse | **WriteWithoutResponse + 背压** |
+| iOS | `ota` (1) | WriteWithResponse | **WriteWithoutResponse + 背压；成功仅表示已提交 CoreBluetooth** |
 | iOS | `stream` (2) | RX 为主,n/a | n/a |
 | iOS | `file` (3) | WriteWithResponse | 二期评估(本期不动) |
 | Android | 所有 | 已是 `WRITE_TYPE_NO_RESPONSE`(OTA / file) | 不变 |
@@ -157,16 +157,26 @@ final class OtaWriteQueue {
 ### 4.3 兜底路径
 
 若该 characteristic 不声明 `.writeWithoutResponse` property(理论上 OTA
-characteristic 一定支持,此处仅作 defensive),回退到 WriteWithResponse 旧路径,
-并打 warn 日志:
+characteristic 一定支持,此处仅作 defensive),本期必须 fail closed,向 Dart 返回
+`FlutterError(code: "ota_write_unsupported")`,不得回退到旧路径并伪装成功:
 
 ```swift
-if !supportsNoResponse {
-    NSLog("[ezw_ble][warn] OTA characteristic missing writeWithoutResponse property, fallback to withResponse")
-    peripheral.writeValue(data, for: characteristic, type: .withResponse)
-    pendingWriteCallbacks[uuid] = result
-}
+result(FlutterError(
+    code: "ota_write_unsupported",
+    message: "missing writeWithoutResponse",
+    details: ["endpoint": uuid, "reason": "missing writeWithoutResponse", "pending": queueDepth]
+))
 ```
+
+同样 fail closed 的 OTA `sendCmdNoWait(psType == 1)` 前置失败包括:
+
+- BLE manager 当前不可用、蓝牙/配置不可调用: `ota_write_unavailable`;
+- device 或 OTA write characteristic 缺失: `ota_write_unavailable`;
+- CoreBluetooth 提交前外设已释放: `ota_write_unavailable`.
+
+Android `sendCmdNoWait(psType == 1)` 同样必须检查 `BluetoothGatt.writeCharacteristic`
+同步返回值；若 native 拒绝提交,返回 `ota_write_unavailable`。其它 `psType` 的 iOS/Android
+no-wait 路径保持原行为。
 
 ### 4.4 与 `enterUpgradeState` / `quiteUpgradeState` 的关系
 
@@ -175,12 +185,14 @@ if !supportsNoResponse {
 
 ### 4.5 日志
 
-每次 OTA noResponse 写入(或软节流暂停)打点:
+每次 OTA noResponse 写入、可写恢复、停滞和取消打确定性日志:
 
 ```
-[ezw_ble][ota] write uuid=<uuid> bytes=<len> canSend=<bool> queueDepth=<n>
-[ezw_ble][ota] pump throttle (sinceLastDrainSync=64), wait peripheralIsReady
-[ezw_ble][ota] peripheralIsReady → resume pump (pending=<n>)
+[ezw_ble][ota] enqueued endpoint=<uuid> bytes=<len> pending=<n>
+[ezw_ble][ota] submitted endpoint=<uuid> char=<charUuid> bytes=<len> pending=<n>
+[ezw_ble][ota] ready endpoint=<uuid> pending=<n>
+[ezw_ble][ota] stalled endpoint=<uuid> reason=<reason> wait=<duration|pending|ready> pending=<n>
+[ezw_ble][ota] cancelled endpoint=<uuid> reason=<reason> pending=<n>
 ```
 
 日志经现有 `logger` EventChannel 上报到 Dart 端 `blePrintEC`(参考 §6 命名约定)。
@@ -212,6 +224,11 @@ Future<void> sendCmdNoWait(
 > **保留兼容性**: `sendCmd` Dart API 不动,iOS 原生侧的 `sendCmd` 处理也不动。
 > 行为变更仅影响 `sendCmdNoWait` + `psType==1` 的组合 — 这正是 `even_connect`
 > 的 `sendOTABytesData` 在 Android 已经用的形态。
+>
+> **成功语义**: `sendCmdNoWait(psType==1)` 的 Future 成功只表示 native 已经调用
+> `peripheral.writeValue(..., type: .withoutResponse)`,即提交到 CoreBluetooth transmit
+> queue;它不是设备收到包、写入 flash、CRC 通过或任何应用层 ACK。设备确认仍由 OTA
+> 协议自身的 CRC/状态回包/超时重试承担。
 
 Native OTA marker 由非可选 `BleUpgradeStateRegistry` 持有：进入升级态必须真实插入
 endpoint，普通 `sendCmdNoWait` 在 marker 存在时默认拒绝；退出时先消费 marker，再校验
@@ -238,7 +255,10 @@ live peripheral 与 accepted epoch。这样 Bluetooth OFF 或迟到 OTA exit 都
 ### 6.3 健壮性验收
 
 - BLE 信号弱场景(走廊外)下 OTA 仍能完成,失败时通过应用层 CRC 检验触发 retry;
-- 升级途中主动断连 → 设备状态机正确回到 `disconnectFromSys`,不留挂起的 noResponse 写;
+- 升级途中主动断连 → 设备状态机正确回到 `disconnectFromSys`,挂起的 noResponse 写以
+  `ota_write_cancelled` 结束,不留 Dart await;
+- 背压超过 native stall 窗口 → 挂起 noResponse 写以 `ota_write_stalled` 结束,details
+  带 `endpoint/reason/wait/pending`;
 - App 退后台 / 锁屏期间不掉包(iOS 后台 BLE 允许 OTA 类长时操作)。
 
 ---
@@ -269,7 +289,7 @@ live peripheral 与 accepted epoch。这样 Bluetooth OFF 或迟到 OTA exit 都
 - [ ] `FlutterEzwBlePlugin.swift` `handle:result:` 中 `sendCmd` / `sendCmdNoWait` 入口按 §4.1 分发;
 - [ ] 新增 `OtaWriteQueue.swift`(§4.2);
 - [ ] 在 `CBPeripheralDelegate` 实现里把 `peripheralIsReady(toSendWriteWithoutResponse:)` 接到 `OtaWriteQueue`;
-- [ ] 兜底回退路径 + warn 日志(§4.3);
+- [ ] OTA unsupported/unavailable fail closed typed error(§4.3);
 - [ ] 日志埋点(§4.5);
 - [ ] Dart 侧 `MethodChannelEzwBle.sendCmdNoWait` 去掉 iOS fall back(§5);
 - [ ] 在内部测试机跑 §6 三类验收 case;

@@ -684,6 +684,130 @@ class RunnerTests: XCTestCase {
     XCTAssertEqual(manager.connectionAdmissionGate.onPhysicalConnected(old), .stale)
   }
 
+  func testOtaWriteQueueCompletesSuccessOnlyAfterCoreBluetoothSubmission() {
+    let peripheral = FakeOtaPeripheral(endpointId: "g2-left")
+    var results: [Any?] = []
+    var submitted: [Data] = []
+    let target = OtaWriteTarget(characteristicUUID: "OTA") { _, data in
+      XCTAssertTrue(results.isEmpty)
+      submitted.append(data)
+      return true
+    }
+    let queue = OtaWriteQueue(
+      peripheral: peripheral,
+      scheduler: FakeOtaScheduler()
+    )
+
+    queue.enqueue(data: Data([0x01]), target: target) { value in
+      results.append(value)
+    }
+
+    XCTAssertEqual(submitted, [Data([0x01])])
+    XCTAssertEqual(results.count, 1)
+    XCTAssertNil(results.first!)
+  }
+
+  func testOtaWriteQueueWaitsForReadyBeforeSubmittingBackpressuredWrite() {
+    let peripheral = FakeOtaPeripheral(endpointId: "g2-left", canSend: false)
+    var results: [Any?] = []
+    var submitCount = 0
+    let queue = OtaWriteQueue(
+      peripheral: peripheral,
+      scheduler: FakeOtaScheduler()
+    )
+
+    queue.enqueue(data: Data([0x02]), target: makeFakeOtaTarget { _ in
+      submitCount += 1
+      return true
+    }) { value in
+      results.append(value)
+    }
+
+    XCTAssertEqual(submitCount, 0)
+    XCTAssertTrue(results.isEmpty)
+
+    peripheral.canSendWriteWithoutResponse = true
+    queue.onPeripheralReadyToSendWriteWithoutResponse()
+
+    XCTAssertEqual(submitCount, 1)
+    XCTAssertEqual(results.count, 1)
+    XCTAssertNil(results.first!)
+  }
+
+  func testOtaWriteQueueCompletesStalledBackpressureWithTypedFlutterError() {
+    let peripheral = FakeOtaPeripheral(endpointId: "g2-left", canSend: false)
+    let clock = FakeOtaClock()
+    let scheduler = FakeOtaScheduler()
+    var results: [Any?] = []
+    let queue = OtaWriteQueue(
+      peripheral: peripheral,
+      clock: clock,
+      scheduler: scheduler
+    )
+
+    queue.enqueue(data: Data([0x03]), target: makeFakeOtaTarget { _ in
+      XCTFail("stalled write must not be submitted")
+      return true
+    }) { value in
+      results.append(value)
+    }
+    clock.advance(by: 4.1)
+    scheduler.runNext()
+
+    let error = results.first as? FlutterError
+    XCTAssertEqual(error?.code, "ota_write_stalled")
+    let details = error?.details as? [String: Any]
+    XCTAssertEqual(details?["endpoint"] as? String, "g2-left")
+    XCTAssertEqual(details?["reason"] as? String, "canSend=false")
+    XCTAssertEqual(details?["pending"] as? Int, 1)
+    XCTAssertGreaterThanOrEqual(details?["wait"] as? TimeInterval ?? 0, 4.0)
+  }
+
+  func testOtaWriteQueueCompletesCancelledPendingWritesWithTypedFlutterError() {
+    let peripheral = FakeOtaPeripheral(endpointId: "g2-left", canSend: false)
+    var results: [Any?] = []
+    let queue = OtaWriteQueue(
+      peripheral: peripheral,
+      scheduler: FakeOtaScheduler()
+    )
+
+    queue.enqueue(data: Data([0x04]), target: makeFakeOtaTarget { _ in
+      XCTFail("cancelled write must not be submitted")
+      return true
+    }) { value in
+      results.append(value)
+    }
+    queue.cancelAll(reason: "reset")
+
+    let error = results.first as? FlutterError
+    XCTAssertEqual(error?.code, "ota_write_cancelled")
+    let details = error?.details as? [String: Any]
+    XCTAssertEqual(details?["endpoint"] as? String, "g2-left")
+    XCTAssertEqual(details?["reason"] as? String, "reset")
+    XCTAssertEqual(details?["pending"] as? Int, 1)
+  }
+
+  func testOtaWriteQueueCompletesSubmitFailureWithUnavailableFlutterError() {
+    let peripheral = FakeOtaPeripheral(endpointId: "g2-left")
+    var results: [Any?] = []
+    let queue = OtaWriteQueue(
+      peripheral: peripheral,
+      scheduler: FakeOtaScheduler()
+    )
+
+    queue.enqueue(data: Data([0x05]), target: makeFakeOtaTarget { _ in
+      return false
+    }) { value in
+      results.append(value)
+    }
+
+    let error = results.first as? FlutterError
+    XCTAssertEqual(error?.code, "ota_write_unavailable")
+    let details = error?.details as? [String: Any]
+    XCTAssertEqual(details?["endpoint"] as? String, "g2-left")
+    XCTAssertEqual(details?["reason"] as? String, "peripheral released before submit")
+  }
+
   private func makeConfig(name: String, autoReconnect: Bool) -> BleConfig {
     BleConfig(
       name: name,
@@ -698,4 +822,58 @@ class RunnerTests: XCTestCase {
     )
   }
 
+  private func makeFakeOtaTarget(
+    submit: @escaping (Data) -> Bool
+  ) -> OtaWriteTarget {
+    OtaWriteTarget(characteristicUUID: "OTA") { _, data in
+      submit(data)
+    }
+  }
+
+}
+
+private final class FakeOtaPeripheral: OtaWritePeripheral {
+  let otaEndpointId: String
+  var canSendWriteWithoutResponse: Bool
+
+  init(endpointId: String, canSend: Bool = true) {
+    self.otaEndpointId = endpointId
+    self.canSendWriteWithoutResponse = canSend
+  }
+}
+
+private final class FakeOtaClock: OtaWriteClock {
+  private(set) var now = Date(timeIntervalSince1970: 0)
+
+  func advance(by interval: TimeInterval) {
+    now = now.addingTimeInterval(interval)
+  }
+}
+
+private final class FakeOtaCancellable: OtaWriteCancellable {
+  private(set) var isCancelled = false
+
+  func cancel() {
+    isCancelled = true
+  }
+}
+
+private final class FakeOtaScheduler: OtaWriteScheduler {
+  private var blocks: [(FakeOtaCancellable, () -> Void)] = []
+
+  func schedule(after interval: TimeInterval, _ block: @escaping () -> Void) -> OtaWriteCancellable {
+    let cancellable = FakeOtaCancellable()
+    blocks.append((cancellable, block))
+    return cancellable
+  }
+
+  func runNext() {
+    guard !blocks.isEmpty else {
+      return
+    }
+    let (cancellable, block) = blocks.removeFirst()
+    if !cancellable.isCancelled {
+      block()
+    }
+  }
 }

@@ -758,15 +758,33 @@ extension BleManager {
      *  - 设计与验收: 见 docs/IOS_OTA_NOWAIT_SPEC.md.
      */
     func sendCmdNoWait(uuid: String, data: Data, psType: Int, result: @escaping FlutterResult) {
-        //  1、基础校验失败立即回调 nil, 避免 Dart 端 await 挂起
+        let isOtaChannel = (psType == 1)
+        //  1、基础校验失败时，OTA 必须显式失败，避免上层把未提交的数据包当已发送。
+        //  -- 非 OTA no-wait 保持历史 nil 返回，避免扩大 MethodChannel 行为面。
         guard checkIsFunctionCanBeCalled() else {
-            result(nil)
+            if isOtaChannel {
+                result(OtaWriteQueue.unavailableError(
+                    endpoint: uuid,
+                    reason: "manager unavailable",
+                    pending: 0
+                ))
+            } else {
+                result(nil)
+            }
             return
         }
         //  2、升级中只放行 OTA 指令(与 sendCmd 保持一致)
         guard upgradeStateRegistry.canSend(endpointId: uuid, psType: psType) else {
             loggerE(msg: "sendCmdNoWait: \(uuid), type=\(psType), cannot send non-OTA commands during upgrade")
-            result(nil)
+            if isOtaChannel {
+                result(OtaWriteQueue.unavailableError(
+                    endpoint: uuid,
+                    reason: "upgrade gate rejected",
+                    pending: 0
+                ))
+            } else {
+                result(nil)
+            }
             return
         }
         //  3、设备/特征不存在视为查找不到设备
@@ -774,11 +792,18 @@ extension BleManager {
             device.peripheral.identifier.uuidString == uuid
         }), let writeChars = device.writeCharsDic[psType] else {
             loggerE(msg: "sendCmdNoWait: \(uuid), type=\(psType), device not found")
-            result(nil)
+            if isOtaChannel {
+                result(OtaWriteQueue.unavailableError(
+                    endpoint: uuid,
+                    reason: "device or characteristic missing",
+                    pending: 0
+                ))
+            } else {
+                result(nil)
+            }
             return
         }
         //  4、分发: OTA 走背压队列, 其它走立即返回的 WriteWithoutResponse
-        let isOtaChannel = (psType == 1)
         let supportsNoResponse = writeChars.properties.contains(.writeWithoutResponse)
         if isOtaChannel && supportsNoResponse {
             //  - 4.1、获取或惰性创建 OTA 写队列, 注入 loggerD 用于埋点
@@ -789,19 +814,40 @@ extension BleManager {
                 }
             )
             otaWriteQueues[uuid] = queue
-            //  - 4.2、入队, result 由 pump 写完后回调; canSend 与 queueDepth 落点便于 tuning
-            loggerD(msg: "[ota] write uuid=\(uuid) bytes=\(data.count) canSend=\(device.peripheral.canSendWriteWithoutResponse) queueDepth=\(queue.queueDepth)")
-            queue.enqueue(data: data, characteristic: writeChars, result: result)
+            //  - 4.2、入队后只有真正调用 peripheral.writeValue 才回调成功。
+            //  -- 这里构造提交目标而不让队列直接依赖 CBCharacteristic，便于 XCTest 覆盖背压时序。
+            let target = OtaWriteTarget(
+                characteristicUUID: writeChars.uuid.uuidString,
+                submit: { peripheral, value in
+                    guard let cbPeripheral = peripheral as? CBPeripheral else {
+                        return false
+                    }
+                    cbPeripheral.writeValue(value, for: writeChars, type: .withoutResponse)
+                    return true
+                }
+            )
+            loggerD(msg: "[ezw_ble][ota] enqueued uuid=\(uuid) bytes=\(data.count) canSend=\(device.peripheral.canSendWriteWithoutResponse) queueDepth=\(queue.queueDepth)")
+            queue.enqueue(data: data, target: target, result: result)
+        } else if isOtaChannel {
+            //  - 4.3、OTA 不支持 WriteWithoutResponse 时 fail closed，不能回退成
+            //  -- 看似成功的旧路径，否则 Dart 继续推进会制造 OTA 死锁/错判。
+            loggerE(msg: "[ezw_ble][ota] unsupported uuid=\(uuid) char=\(writeChars.uuid.uuidString) reason=missing writeWithoutResponse")
+            result(OtaWriteQueue.unsupportedError(
+                endpoint: uuid,
+                reason: "missing writeWithoutResponse",
+                pending: queueDepthForOta(uuid: uuid)
+            ))
         } else {
-            //  - 4.3、兜底: OTA 特征不声明 writeWithoutResponse 时打 warn 后回退
-            if isOtaChannel && !supportsNoResponse {
-                loggerE(msg: "[ezw_ble][warn] OTA characteristic missing writeWithoutResponse property, fallback to existing path uuid=\(uuid)")
-            }
-            //  - 4.4、保持现有 sendCmd 行为: WriteWithoutResponse 立即返回, 不做背压
+            //  - 4.4、保持现有非 OTA 行为: WriteWithoutResponse 立即返回, 不做背压
             device.peripheral.writeValue(data, for: writeChars, type: .withoutResponse)
             loggerD(msg: "sendCmdNoWait: \(uuid), type=\(psType), writeChars=\(writeChars.uuid.uuidString), data length=\(data.count)")
             result(nil)
         }
+    }
+
+    /// OTA 错误 details 需要带上当前 native pending 深度，帮助区分“尚未提交”和“已提交后设备无 ack”。
+    private func queueDepthForOta(uuid: String) -> Int {
+        return otaWriteQueues[uuid]?.queueDepth ?? 0
     }
 
     /**

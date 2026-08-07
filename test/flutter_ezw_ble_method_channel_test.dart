@@ -11,8 +11,8 @@ void main() {
   setUp(() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (MethodCall methodCall) async {
-      return '42';
-    });
+          return '42';
+        });
   });
 
   tearDown(() {
@@ -24,9 +24,9 @@ void main() {
     MethodCall? capturedCall;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (methodCall) async {
-      capturedCall = methodCall;
-      return null;
-    });
+          capturedCall = methodCall;
+          return null;
+        });
 
     await MethodChannelEzwBle().sendCmd(
       'left-uuid',
@@ -36,6 +36,25 @@ void main() {
 
     expect(capturedCall?.method, 'sendCmd');
     expect(capturedCall?.arguments, containsPair('allowDuringUpgrade', true));
+  });
+
+  test('sendCmdNoWait always forwards to the native no-wait method', () async {
+    MethodCall? capturedCall;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (methodCall) async {
+          capturedCall = methodCall;
+          return null;
+        });
+
+    await MethodChannelEzwBle().sendCmdNoWait(
+      'left-uuid',
+      Uint8List.fromList(<int>[0xBB]),
+      psType: 1,
+    );
+
+    expect(capturedCall?.method, 'sendCmdNoWait');
+    expect(capturedCall?.arguments, containsPair('uuid', 'left-uuid'));
+    expect(capturedCall?.arguments, containsPair('psType', 1));
   });
 
   // test('getPlatformVersion', () async {

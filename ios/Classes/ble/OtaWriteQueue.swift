@@ -14,10 +14,69 @@ import CoreBluetooth
 import Foundation
 import Flutter
 
+/// OTA 队列只依赖这组最小外设能力，XCTest 可以注入 fake，生产环境由 CBPeripheral 实现。
+protocol OtaWritePeripheral: AnyObject {
+    var otaEndpointId: String { get }
+    var canSendWriteWithoutResponse: Bool { get }
+}
+
+extension CBPeripheral: OtaWritePeripheral {
+    var otaEndpointId: String {
+        return identifier.uuidString
+    }
+}
+
+/// 单次 CoreBluetooth 提交目标。submit 返回 true 后才允许把 Dart Future 视为成功。
+struct OtaWriteTarget {
+    let characteristicUUID: String
+    let submit: (OtaWritePeripheral, Data) -> Bool
+}
+
+/// OTA 队列使用可注入时钟，让 stall 判定在单元测试中保持确定性。
+protocol OtaWriteClock {
+    var now: Date { get }
+}
+
+struct SystemOtaWriteClock: OtaWriteClock {
+    var now: Date {
+        return Date()
+    }
+}
+
+/// OTA 队列使用可注入调度器；生产环境仍在主队列做 watchdog 重试。
+protocol OtaWriteScheduler {
+    @discardableResult
+    func schedule(after interval: TimeInterval, _ block: @escaping () -> Void) -> OtaWriteCancellable
+}
+
+protocol OtaWriteCancellable: AnyObject {
+    func cancel()
+}
+
+final class DispatchOtaWriteCancellable: OtaWriteCancellable {
+    private let workItem: DispatchWorkItem
+
+    init(workItem: DispatchWorkItem) {
+        self.workItem = workItem
+    }
+
+    func cancel() {
+        workItem.cancel()
+    }
+}
+
+struct MainQueueOtaWriteScheduler: OtaWriteScheduler {
+    func schedule(after interval: TimeInterval, _ block: @escaping () -> Void) -> OtaWriteCancellable {
+        let workItem = DispatchWorkItem(block: block)
+        DispatchQueue.main.asyncAfter(deadline: .now() + interval, execute: workItem)
+        return DispatchOtaWriteCancellable(workItem: workItem)
+    }
+}
+
 /// 单个 OTA 写入条目
 private struct OtaWriteItem {
     let data: Data
-    let characteristic: CBCharacteristic
+    let target: OtaWriteTarget
     let result: FlutterResult
 }
 
@@ -36,12 +95,12 @@ final class OtaWriteQueue {
     private static let backpressureRetryInterval: TimeInterval = 0.1
     //  - 软节流本身用于防突发丢包, 兜底重查要更保守, 避免绕过节流保护。
     private static let softThrottleRetryInterval: TimeInterval = 0.5
-    //  - 上层 OTA 等待响应 5s 超时; 原生侧提前释放 pending, 让业务层走 CRC/timeout retry。
+    //  - 原生侧提前用 typed error 释放 pending，让上层分类并终止当前 OTA 写入链路。
     private static let backpressureStallTimeout: TimeInterval = 4.0
 
     //  =========== Variables
     //  - 关联外设(弱引用避免循环持有)
-    private weak var peripheral: CBPeripheral?
+    private weak var peripheral: OtaWritePeripheral?
     //  - 待写入队列
     private var pending: [OtaWriteItem] = []
     //  - 自上一次软节流以来已成功写入的包数
@@ -49,7 +108,10 @@ final class OtaWriteQueue {
     //  - 进入 canSend=false / 软节流等待的时间
     private var backpressureStartedAt: Date?
     //  - 兜底重查任务; 只允许一个 pending work item
-    private var backpressureRetryWorkItem: DispatchWorkItem?
+    private var backpressureRetryWorkItem: OtaWriteCancellable?
+    //  - 时钟/调度器注入只服务于真实 XCTest 行为覆盖, 生产路径仍使用系统实现。
+    private let clock: OtaWriteClock
+    private let scheduler: OtaWriteScheduler
     //  - 日志回调(由 BleManager 注入, 复用其 loggerD)
     private let logger: ((String) -> Void)?
 
@@ -64,9 +126,16 @@ final class OtaWriteQueue {
         return !pending.isEmpty
     }
 
-    init(peripheral: CBPeripheral, logger: ((String) -> Void)? = nil) {
+    init(
+        peripheral: OtaWritePeripheral,
+        logger: ((String) -> Void)? = nil,
+        clock: OtaWriteClock = SystemOtaWriteClock(),
+        scheduler: OtaWriteScheduler = MainQueueOtaWriteScheduler()
+    ) {
         self.peripheral = peripheral
         self.logger = logger
+        self.clock = clock
+        self.scheduler = scheduler
     }
 }
 
@@ -75,11 +144,12 @@ extension OtaWriteQueue {
 
     /**
      *  入队一笔 OTA 写入
-     *  - 调用方持有 Dart 端的 await, 直到本条 result(nil) 触发后才会发下一包;
+     *  - 调用方持有 Dart 端的 await, 直到本条完成后才会发下一包;
      *  - 即立即触发 pump, 在背压允许的窗口内尽量打满 packets-per-event.
      */
-    func enqueue(data: Data, characteristic: CBCharacteristic, result: @escaping FlutterResult) {
-        pending.append(OtaWriteItem(data: data, characteristic: characteristic, result: result))
+    func enqueue(data: Data, target: OtaWriteTarget, result: @escaping FlutterResult) {
+        pending.append(OtaWriteItem(data: data, target: target, result: result))
+        logger?("[ezw_ble][ota] enqueued endpoint=\(peripheral?.otaEndpointId ?? "released") bytes=\(data.count) pending=\(pending.count)")
         pump()
     }
 
@@ -88,28 +158,40 @@ extension OtaWriteQueue {
      *  - OS 通知背压解除, 立即继续抽干队列.
      */
     func onPeripheralReadyToSendWriteWithoutResponse() {
-        logger?("[ezw_ble][ota] peripheralIsReady → resume pump (pending=\(pending.count))")
+        logger?("[ezw_ble][ota] ready endpoint=\(peripheral?.otaEndpointId ?? "released") pending=\(pending.count)")
         clearBackpressureWait()
         pump()
     }
 
     /**
      *  取消并清空所有待写入数据
-     *  - 用于断连/重置时通知 Dart 端 await 立即返回, 避免挂起;
-     *  - WriteWithoutResponse 本就无 ack, 取消后业务层应通过 CRC 校验决定是否 retry.
+     *  - 用于断连/重置时用 typed FlutterError 释放 Dart await, 避免挂起;
+     *  - WriteWithoutResponse 本就无 ack, 取消后业务层按错误类型分类并终止本轮写入。
      */
     func cancelAll(reason: String) {
         guard !pending.isEmpty else {
             return
         }
-        logger?("[ezw_ble][ota] cancelAll reason=\(reason), discard pending=\(pending.count)")
+        logger?("[ezw_ble][ota] cancelled endpoint=\(peripheral?.otaEndpointId ?? "released") reason=\(reason) pending=\(pending.count)")
         let snapshot = pending
         pending.removeAll()
         sinceLastDrainSync = 0
         clearBackpressureWait()
         snapshot.forEach { item in
-            item.result(nil)
+            item.result(Self.error(code: "ota_write_cancelled", endpoint: peripheral?.otaEndpointId, reason: reason, waitSeconds: nil, pending: snapshot.count))
         }
+    }
+
+    static func unavailableError(endpoint: String, reason: String, pending: Int = 0) -> FlutterError {
+        return error(code: "ota_write_unavailable", endpoint: endpoint, reason: reason, waitSeconds: nil, pending: pending)
+    }
+
+    static func unsupportedError(endpoint: String, reason: String, pending: Int = 0) -> FlutterError {
+        return error(code: "ota_write_unsupported", endpoint: endpoint, reason: reason, waitSeconds: nil, pending: pending)
+    }
+
+    static func stalledError(endpoint: String?, reason: String, waitSeconds: TimeInterval, pending: Int) -> FlutterError {
+        return error(code: "ota_write_stalled", endpoint: endpoint, reason: reason, waitSeconds: waitSeconds, pending: pending)
     }
 }
 
@@ -120,12 +202,12 @@ extension OtaWriteQueue {
      *  驱动队列:
      *  - 1、外设已释放则清空并通知 Dart 端 await 返回, 避免挂起;
      *  - 2、循环写入直到队列空, 或背压挂起, 或触发软节流阈值;
-     *  - 3、每包写入后立即 result(nil), Dart 侧自然按 await 串行发下一包.
+     *  - 3、每包提交给 CoreBluetooth 后 result(nil), Dart 侧自然按 await 串行发下一包.
      */
     private func pump() {
         //  1、外设已被释放(异常断连/重置), 清空所有 pending
         guard let peripheral = peripheral else {
-            cancelAll(reason: "peripheral released")
+            completePendingAsUnavailable(reason: "peripheral released")
             return
         }
         //  2、抽干队列, 直到背压或软节流命中
@@ -135,26 +217,31 @@ extension OtaWriteQueue {
                 if shouldCancelStalledBackpressure(reason: "canSend=false") {
                     return
                 }
-                logger?("[ezw_ble][ota] pump pause canSend=false, wait peripheralIsReady (pending=\(pending.count))")
+                logger?("[ezw_ble][ota] stalled endpoint=\(peripheral.otaEndpointId) reason=canSend=false wait=pending pending=\(pending.count)")
                 scheduleBackpressureRetry(after: Self.backpressureRetryInterval)
                 return
             }
             clearBackpressureWait()
             //  - 2.2、出队并写入
             let head = pending.removeFirst()
-            peripheral.writeValue(
-                head.data,
-                for: head.characteristic,
-                type: .withoutResponse
-            )
+            guard head.target.submit(peripheral, head.data) else {
+                head.result(Self.unavailableError(
+                    endpoint: peripheral.otaEndpointId,
+                    reason: "peripheral released before submit",
+                    pending: pending.count
+                ))
+                continue
+            }
             sinceLastDrainSync += 1
-            //  - 2.3、立即向 Dart 端回包(WriteWithoutResponse 本就无 ack)
+            logger?("[ezw_ble][ota] submitted endpoint=\(peripheral.otaEndpointId) char=\(head.target.characteristicUUID) bytes=\(head.data.count) pending=\(pending.count)")
+            //  - 2.3、CoreBluetooth 已接受本次 writeValue 调用后才向 Dart 回包;
+            //  -- WriteWithoutResponse 无设备 ack, 这里的成功只代表已提交给 CoreBluetooth。
             head.result(nil)
             //  - 2.4、软节流: 每 N 包主动让出
             //  -- canSendWriteWithoutResponse 在 iPhone 6s/SE 一代等老机型上"报喜不报忧",
             //  -- 突发塞包会触发底层丢包, 这里强制等下一次 peripheralIsReady 回调
             if sinceLastDrainSync >= Self.softDrainEvery {
-                logger?("[ezw_ble][ota] pump throttle (sinceLastDrainSync=\(sinceLastDrainSync)), wait peripheralIsReady")
+                logger?("[ezw_ble][ota] stalled endpoint=\(peripheral.otaEndpointId) reason=softThrottle wait=ready pending=\(pending.count)")
                 sinceLastDrainSync = 0
                 markBackpressureWaitStarted()
                 scheduleBackpressureRetry(after: Self.softThrottleRetryInterval)
@@ -165,12 +252,35 @@ extension OtaWriteQueue {
     }
 }
 
+private extension OtaWriteQueue {
+
+    func completePendingAsUnavailable(reason: String) {
+        guard !pending.isEmpty else {
+            return
+        }
+        logger?("[ezw_ble][ota] cancelled endpoint=released reason=\(reason) pending=\(pending.count)")
+        let snapshot = pending
+        pending.removeAll()
+        sinceLastDrainSync = 0
+        clearBackpressureWait()
+        snapshot.forEach { item in
+            item.result(Self.error(
+                code: "ota_write_unavailable",
+                endpoint: nil,
+                reason: reason,
+                waitSeconds: nil,
+                pending: snapshot.count
+            ))
+        }
+    }
+}
+
 // MARK: - Backpressure Watchdog
 private extension OtaWriteQueue {
 
     func markBackpressureWaitStarted() {
         if backpressureStartedAt == nil {
-            backpressureStartedAt = Date()
+            backpressureStartedAt = clock.now
         }
     }
 
@@ -185,7 +295,7 @@ private extension OtaWriteQueue {
         guard backpressureRetryWorkItem == nil else {
             return
         }
-        let workItem = DispatchWorkItem { [weak self] in
+        backpressureRetryWorkItem = scheduler.schedule(after: interval) { [weak self] in
             guard let self = self else {
                 return
             }
@@ -195,11 +305,6 @@ private extension OtaWriteQueue {
             }
             self.pump()
         }
-        backpressureRetryWorkItem = workItem
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + interval,
-            execute: workItem
-        )
     }
 
     func shouldCancelStalledBackpressure(reason: String) -> Bool {
@@ -207,11 +312,50 @@ private extension OtaWriteQueue {
         guard let startedAt = backpressureStartedAt else {
             return false
         }
-        let waitSeconds = Date().timeIntervalSince(startedAt)
+        let waitSeconds = clock.now.timeIntervalSince(startedAt)
         guard waitSeconds >= Self.backpressureStallTimeout else {
             return false
         }
-        cancelAll(reason: "\(reason) stalled \(String(format: "%.1f", waitSeconds))s")
+        logger?("[ezw_ble][ota] stalled endpoint=\(peripheral?.otaEndpointId ?? "released") reason=\(reason) wait=\(String(format: "%.1f", waitSeconds))s pending=\(pending.count)")
+        let snapshot = pending
+        pending.removeAll()
+        sinceLastDrainSync = 0
+        clearBackpressureWait()
+        snapshot.forEach { item in
+            item.result(Self.stalledError(
+                endpoint: peripheral?.otaEndpointId,
+                reason: reason,
+                waitSeconds: waitSeconds,
+                pending: snapshot.count
+            ))
+        }
         return true
+    }
+}
+
+private extension OtaWriteQueue {
+
+    static func error(
+        code: String,
+        endpoint: String?,
+        reason: String,
+        waitSeconds: TimeInterval?,
+        pending: Int
+    ) -> FlutterError {
+        var details: [String: Any] = [
+            "reason": reason,
+            "pending": pending
+        ]
+        if let endpoint = endpoint {
+            details["endpoint"] = endpoint
+        }
+        if let waitSeconds = waitSeconds {
+            details["wait"] = waitSeconds
+        }
+        return FlutterError(
+            code: code,
+            message: reason,
+            details: details
+        )
     }
 }

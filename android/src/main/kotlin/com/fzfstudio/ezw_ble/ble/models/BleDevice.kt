@@ -150,4 +150,14 @@ class BleDevice(
         return isSuccess
     }
 
+    /**
+     * OTA no-wait 只能在 characteristic 声明 no-response 写能力时放行。
+     * 普通通道保留历史行为；该检查只给 BleManager 的 OTA fail-closed 分支使用。
+     */
+    fun supportsWriteWithoutResponse(psType: Int): Boolean {
+        val writeChars = writeAndReadList.firstOrNull { it.psType == psType }?.writeChars
+            ?: return false
+        return writeChars.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
+    }
+
 }
