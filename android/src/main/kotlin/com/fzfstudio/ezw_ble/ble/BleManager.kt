@@ -2192,6 +2192,11 @@ class BleManager private constructor() {
                 .filter { it.connectState.isConnected }
                 .forEach { it.releaseAndClear() }
 
+            // 蓝牙 OFF 已让全部物理 GATT session 失效；必须在清 upgrade marker 前完成所有
+            // OTA Future 并移除 callback barrier。否则 quiteUpgradeState 会因 marker 已清早退，
+            // 蓝牙恢复后的新 attempt 便会复用永远等不到 callback 的旧 inFlight。
+            cancelAllOtaWriteQueues(reason = "bluetoothOff")
+
             // 3、句柄 teardown 后暂停 Gate，并一次失效全部 attempt/session callback。
             connectionAdmissionGate.suspendAndReset()
             currentAdmissions.clear()
