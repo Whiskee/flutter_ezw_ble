@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter_ezw_ble/core/models/ble_config.dart';
@@ -194,6 +195,29 @@ void main() {
     expect(cmd.psType, 2);
     expect(cmd.data, [1, 2, 3]);
     expect(cmd.isSuccess, isTrue);
+  });
+
+  test('BleCmd.receiveMap preserves the complete tagged audio frame', () {
+    // G2 stream frames carry 200 LC3 bytes, a four-byte direction/speaker tag,
+    // and a trailing frame index. The transport must not parse or trim them.
+    final frame = Uint8List.fromList([
+      ...List<int>.generate(200, (index) => index & 0xff),
+      0x01,
+      0x00,
+      0x34,
+      0x12,
+      0x7f,
+    ]);
+
+    final cmd = BleCmd.receiveMap({
+      'uuid': 'g2-stream',
+      'psType': 2,
+      'data': base64Encode(frame),
+      'isSuccess': true,
+    });
+
+    expect(cmd.data, orderedEquals(frame));
+    expect(cmd.data, hasLength(205));
   });
 
   test(
