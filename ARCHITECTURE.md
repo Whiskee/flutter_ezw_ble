@@ -179,7 +179,7 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `devicePreConnected` | `Future<void> devicePreConnected(String uuid)` | "预连接"通知：业务确认要连这个设备前，让原生侧提前做准备（缓存、超时计时器复位），避免接下来的 `connectDevice` 超时。 |
 | `deviceConnected` | `Future<void> deviceConnected(String uuid)` | "真连上了"通知：业务侧（如收到设备配对回包后）告诉原生 "连接已业务就绪"，原生再 push `connectFinish` → `connected`。 |
 | `sendCmd` | `Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0, bool allowDuringUpgrade = false})` | 写特征值，等待原生层 write 完成。`psType` 是"私有服务类型"，对应 `BlePrivateService.type`（0=基础，1=OTA，2+=自定义）。升级态默认阻断非 OTA 写入；只有上层协议白名单确认的 AUTH、时间同步等恢复控制指令可显式传 `allowDuringUpgrade=true`。 |
-| `sendCmdNoWait` | `Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0})` | 不等 write callback，连发场景使用。Android：`WRITE_TYPE_NO_RESPONSE` 写入。iOS：`psType == 1`（OTA）走 `WriteWithoutResponse` + `canSendWriteWithoutResponse` 背压队列（见 `ios/Classes/ble/OtaWriteQueue.swift` 与 `docs/IOS_OTA_NOWAIT_SPEC.md`），其它 `psType` 退化为 `WriteWithoutResponse` 立即返回路径。 |
+| `sendCmdNoWait` | `Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0})` | OTA 连发入口。Android：`psType == 1` 走 per-endpoint `WRITE_TYPE_NO_RESPONSE` 队列；同步 BUSY 保留原包，Future 等本包 `onCharacteristicWrite` 成功后返回，4s 停滞/teardown typed fail，避免固定延时撞 GATT 单槽位。iOS：`psType == 1` 走 `WriteWithoutResponse` + `canSendWriteWithoutResponse` 背压队列（见 `ios/Classes/ble/OtaWriteQueue.swift` 与 `docs/IOS_OTA_NOWAIT_SPEC.md`）。其它 `psType` 保持历史 no-wait 语义。 |
 | `enterUpgradeState` | `Future<void> enterUpgradeState(String uuid)` | 仅允许仍处于真实业务 `connected`、物理链路有效且持有已接受 epoch 的 uuid 进入 OTA；拒绝用缓存制造 `upgrade`。原生侧据此切到 OTA 私有服务、延长断连超时（与 `BleConfig.upgradeSwapTime` 配合）。 |
 | `quiteUpgradeState` | `Future<void> quiteUpgradeState(String uuid)` | 退出 OTA 状态；只有链路仍有效时才恢复 `connected`，断连后到达的旧 OTA 回调只消费 marker，不能复活连接态。 |
 | `openBleSettings` | `Future<void> openBleSettings()` | 跳系统蓝牙开关页。 |
@@ -559,7 +559,9 @@ App 启动
 
 通信
   ├─ EzwBle.to.bleMC.sendCmd(uuid, bytes, psType: 0)   ▶ write，等 callback；升级态默认阻断
-  ├─ EzwBle.to.bleMC.sendCmdNoWait(...)                ▶ Android：WRITE_TYPE_NO_RESPONSE
+  ├─ EzwBle.to.bleMC.sendCmdNoWait(...)                ▶ Android OTA：WRITE_TYPE_NO_RESPONSE
+  │                                                       + 同步 BUSY 原包重试
+  │                                                       + onCharacteristicWrite 后完成 Future
   │                                                       iOS：psType==1 走 OtaWriteQueue 背压
   │                                                       其它 psType 即时 WriteWithoutResponse
   └─ ◀ receiveDataEC: BleCmd(data, psType, isSuccess)
@@ -569,7 +571,7 @@ OTA 流程
   │    （仅 live business connected + accepted epoch 可进入）
   ├─ ◀ connectStatusEC: upgrade
   ├─ EzwBle.to.bleMC.sendCmdNoWait(..., psType=1)       ▶ 通过 OTA 私有服务连发
-  │                                                       Android: WRITE_TYPE_NO_RESPONSE
+  │                                                       Android: callback 驱动的单槽位背压队列
   │                                                       iOS:     OtaWriteQueue + canSendWriteWithoutResponse 背压
   │                                                       (与 Android packets-per-event 行为对齐, 详见 docs/IOS_OTA_NOWAIT_SPEC.md)
   ├─ （固件烧录、设备重启 → 系统断连）
@@ -878,7 +880,7 @@ iOS 端 OTA 通道走单独的 per-peripheral 写队列 `OtaWriteQueue`，目标
 - **软节流**：每 `softDrainEvery = 64` 包主动让出，等下一次 `peripheralIsReady` 或更保守的 watchdog 重查，防御老机型 `canSendWriteWithoutResponse` "报喜不报忧"。该阈值是配置常量，调参后回归测试。
 - **Dart 侧同步**：`MethodChannelEzwBle.sendCmdNoWait` 已统一走 `methodChannel.invokeMethod`，**不再 fall back 到 `sendCmd`**。改 Dart 入口前先确认原生 `sendCmdNoWait` handler 仍然处理所有 `psType` 分支（OTA + 兜底）。
 - **fail closed**：OTA 特征不支持 `.writeWithoutResponse`、manager 不可用、device/characteristic 缺失或提交前外设释放时，`sendCmdNoWait(psType == 1)` 返回 typed `FlutterError`（`ota_write_unsupported` / `ota_write_unavailable`），不得回退为看似成功的旧路径。
-- **Android 对齐**：Android `sendCmdNoWait(psType == 1)` 必须检查 `BluetoothGatt.writeCharacteristic` 同步返回值；返回 `false` 时用 `ota_write_unavailable` 失败 MethodChannel，非 OTA no-wait 保持历史立即成功语义。
+- **Android 对齐**：Android `sendCmdNoWait(psType == 1)` 必须保留同步提交状态；`ERROR_GATT_WRITE_REQUEST_BUSY`（旧 API 的 `false` 无法精确分类时也按瞬时背压处理）不得丢包或立即终止，而要保留原包等待当前写回调/watchdog 重试。本包 Future 只在对应 `onCharacteristicWrite` 成功后完成；4s 仍未释放则 `ota_write_stalled`，断连/退出升级/重置则 `ota_write_cancelled`。非 OTA no-wait 保持历史立即成功语义。
 - **挂起 await 兜底**：断连/`reset()`/配置撤销/外设释放时 `OtaWriteQueue.cancelAll()` 会对所有 pending 写入回调 `ota_write_cancelled`；背压超过 stall 窗口回调 `ota_write_stalled`，details 带 `endpoint/reason/wait/pending`。改这条兜底必须保证**任何路径都不会让 Dart `await` 永远挂着**。
 - **范围外**：`psType == 3`（file）通道、iOS connection interval 协商、`psType == 0`（common）write type 切换均**不在本期范围**，改动前先评估对协议层应答匹配的影响。
 

@@ -12,6 +12,7 @@ import android.content.Context
 import android.content.Context.BLUETOOTH_SERVICE
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.SystemClock
 import android.util.Log
 import com.fzfstudio.ezw_ble.ble.extension.resolveBleDeviceName
 import com.fzfstudio.ezw_ble.ble.extension.toBleDevice
@@ -77,6 +78,10 @@ class BleManager private constructor() {
     private val upgradeDevices: MutableList<String> = Collections.synchronizedList(mutableListOf())
     //  - 指令发送队列。按 uuid 隔离，避免左右腿并发写回调把下一条指令写到错误的 GATT。
     private val sendCmdQueues: MutableMap<String, ConcurrentLinkedQueue<BleCmd>> =
+        Collections.synchronizedMap(mutableMapOf())
+    //  - OTA bulk 写队列。Android GATT 是单槽位，MethodChannel Future 必须等本包 callback；
+    //    同步 BUSY 保留原包并等待前一写完成，不能直接失败或静默丢包。
+    private val otaWriteQueues: MutableMap<String, BleAndroidOtaWriteQueue> =
         Collections.synchronizedMap(mutableMapOf())
     //  - 正在执行断连的设备
     private val disconnectingDevices: MutableList<Pair<String, BleConnectState>> = Collections.synchronizedList(mutableListOf())
@@ -362,6 +367,44 @@ class BleManager private constructor() {
             queue.poll()
             sendLog(BleLoggerTag.e, "Send cmd: ${cmd.uuid}, write start failed, drop queued command")
         }
+    }
+
+    /** 创建单 endpoint OTA 队列；每次提交都重新解析 live device，禁止复用旧 GATT session。 */
+    private fun otaWriteQueueFor(uuid: String): BleAndroidOtaWriteQueue {
+        val key = reconnectKey(uuid)
+        return otaWriteQueues.getOrPut(key) {
+            BleAndroidOtaWriteQueue(
+                endpoint = uuid,
+                submit = { data ->
+                    findConnectedDevice(uuid)?.submitOtaCharacteristic(data, psType = 1)
+                        ?: BleOtaWriteSubmission.rejected(
+                            status = null,
+                            reason = "device or characteristic missing",
+                        )
+                },
+                scheduler = BleOtaWriteScheduler { delayMillis, block ->
+                    val job = mainScope.launch {
+                        delay(delayMillis)
+                        block()
+                    }
+                    BleOtaWriteCancellable { job.cancel() }
+                },
+                nowMillis = SystemClock::elapsedRealtime,
+                logger = { message -> sendLog(BleLoggerTag.d, message) },
+            )
+        }
+    }
+
+    /** 取消并移除 endpoint OTA 队列，确保断连/退出升级不会留下 Dart await。 */
+    private fun cancelOtaWriteQueue(uuid: String, reason: String) {
+        otaWriteQueues.remove(reconnectKey(uuid))?.cancelAll(reason)
+    }
+
+    /** manager 全量 teardown 前先释放全部 OTA MethodChannel result。 */
+    private fun cancelAllOtaWriteQueues(reason: String) {
+        val snapshot = otaWriteQueues.values.toList()
+        otaWriteQueues.clear()
+        snapshot.forEach { it.cancelAll(reason) }
     }
 
     /// =========== Method: Flutter Method
@@ -1612,6 +1655,7 @@ class BleManager private constructor() {
             preConnectedDevices.remove(endpointId)
             upgradeDevices.remove(endpointId)
             sendCmdQueues.remove(reconnectKey(endpointId))
+            cancelOtaWriteQueue(endpointId, reason = "releaseDevice")
         }
         pendingScanConnects.removeAll { pending ->
             reconnectKey(pending.uuid) in endpointKeys ||
@@ -1688,18 +1732,26 @@ class BleManager private constructor() {
     }
     
     /**
-     * 不等待写入结果的指令发送
-     * 
-     * - 注意，使用的是要尽量不要跟sendCmd一起使用，避免204响应导致数据丢失
+     * no-wait 指令入口。
+     *
+     * 非 OTA 保留历史立即完成语义；OTA 虽使用 WRITE_TYPE_NO_RESPONSE，仍必须等待 Android
+     * `onCharacteristicWrite` 释放 GATT 单槽位后才完成本次 MethodChannel Future。同步 BUSY
+     * 交给 per-endpoint 队列重试，禁止固定延时后直接发送下一包。
      */
-    fun sendCmdNoWait(uuid: String, data: ByteArray, psType: Int = 0): BleOtaWriteError? {
+    fun sendCmdNoWait(
+        uuid: String,
+        data: ByteArray,
+        psType: Int = 0,
+        completion: (BleOtaWriteError?) -> Unit,
+    ) {
         val isOtaChannel = psType == 1
         if (!checkIsFunctionCanBeCalled() || uuid.isEmpty()) {
-            return if (isOtaChannel) {
+            completion(if (isOtaChannel) {
                 BleOtaWriteError.unavailable(uuid, "manager unavailable")
             } else {
                 null
-            }
+            })
+            return
         }
         // no-wait 只服务 OTA bulk data，不接受业务白名单；升级态下非 OTA 写入必须拒绝。
         if (!BleUpgradeCommandPolicy.canSend(
@@ -1711,32 +1763,35 @@ class BleManager private constructor() {
                 BleLoggerTag.e,
                 "Send cmd - no wait: $uuid, Cannot send non-OTA commands during upgrade",
             )
-            return if (isOtaChannel) {
+            completion(if (isOtaChannel) {
                 BleOtaWriteError.unavailable(uuid, "upgrade gate rejected")
             } else {
                 null
-            }
+            })
+            return
         }
-        val device = connectedDevices.firstOrNull { it.uuid == uuid }
+        val device = findConnectedDevice(uuid)
         if (device == null) {
-            return if (isOtaChannel) {
+            completion(if (isOtaChannel) {
                 BleOtaWriteError.unavailable(uuid, "device or characteristic missing")
             } else {
                 null
-            }
+            })
+            return
         }
-        // Android writeCharacteristic() 的 Boolean 是唯一同步提交结果；OTA 必须使用它
-        // fail-closed，避免 Dart 把 native 拒绝写入误判为已发送并继续等待协议超时。
         if (isOtaChannel && !device.supportsWriteWithoutResponse(psType)) {
-            return BleOtaWriteError.unsupported(uuid, "missing writeWithoutResponse")
+            completion(BleOtaWriteError.unsupported(uuid, "missing writeWithoutResponse"))
+            return
         }
-        val submitted = device.writeCharacteristic(data, psType)
+
+        if (isOtaChannel) {
+            otaWriteQueueFor(uuid).enqueue(data, completion)
+            return
+        }
+
+        device.writeCharacteristic(data, psType)
         sendLog(BleLoggerTag.d, "Send cmd - no wait: $uuid, type=$psType, data length=${data.size}")
-        return if (isOtaChannel && !submitted) {
-            BleOtaWriteError.unavailable(uuid, "writeCharacteristic returned false")
-        } else {
-            null
-        }
+        completion(null)
     }
 
     /**
@@ -1792,6 +1847,9 @@ class BleManager private constructor() {
         if (!upgradeDevices.remove(uuid)) {
             return
         }
+        // 页面/transport 结束升级即撤销本 endpoint 所有 pending 写，迟到 callback 不得继续
+        // 把旧 attempt 的包投递到下一轮升级。
+        cancelOtaWriteQueue(uuid, reason = "quiteUpgradeState")
         val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
         if (connectedDevice == null) {
             sendLog(BleLoggerTag.e, "QuiteUpgradeState rejected: $uuid, missing device cache")
@@ -1864,6 +1922,7 @@ class BleManager private constructor() {
         cancelAllScanRefresh()
         pendingScanConnects.clear()
         autoReconnectSupervisor.cancelAll(reason = reason)
+        cancelAllOtaWriteQueues(reason)
         connectedDevices.forEach { device ->
             device.releaseAndClear()
             device.connectState = BleConnectState.NONE
@@ -2514,11 +2573,23 @@ class BleManager private constructor() {
                     consumeDisconnectingState(uuid)
                 }
             },
-            onCharacteristicWriteComplete = { uuid ->
-                // 8. 写回调只推进对应 uuid 的发送队列，左右腿并发写不会互相影响。
+            onCharacteristicWriteComplete = { uuid, psType, status, statusName ->
+                // 8. 普通队列与 OTA 队列共用 Android GATT 单槽位，必须由当前普通 head
+                // 精确认领 callback；未被普通队列认领的 OTA callback 才完成 OTA Future。
                 val key = reconnectKey(uuid)
-                sendCmdQueues[key]?.poll()
-                writeNextCommand(uuid)
+                val normalHead = sendCmdQueues[key]?.peek()
+                val normalOwnsCallback = normalHead != null &&
+                    (psType == null || normalHead.psType == psType)
+                if (normalOwnsCallback) {
+                    sendCmdQueues[key]?.poll()
+                    writeNextCommand(uuid)
+                }
+                otaWriteQueues[key]?.onCharacteristicWriteComplete(
+                    ownsInFlight = psType == 1 && !normalOwnsCallback,
+                    success = status == BluetoothGatt.GATT_SUCCESS,
+                    status = status,
+                    statusName = statusName,
+                )
             },
             emitReceiveData = { map ->
                 // 9. EventChannel 必须回到 manager 的协程作用域，避免 callback 持有 Flutter 线程细节。
@@ -3007,6 +3078,7 @@ class BleManager private constructor() {
         // 1. 旧句柄先完整释放，避免 next service discovery 与 disconnect/close 叠加。
         device?.releaseAndClear()
         sendCmdQueues.remove(reconnectKey(current.endpointId))
+        cancelOtaWriteQueue(current.endpointId, reason = state.toFlutterJsonValue())
 
         // 2. Gate 释放后立即启动其它 endpoint。当前 endpoint 的 retry 在后续状态出口调度。
         val next = releaseConnectionAdmission(current, invalidateEndpoint = true)
@@ -3252,6 +3324,7 @@ class BleManager private constructor() {
         // 4、清空设备和命令队列会同步 disconnect/close exact GATT；迟到 callback
         // 因 admission/sessionId 已失效，不可能被投影成 incoming session。
         sendCmdQueues.remove(key)
+        cancelOtaWriteQueue(uuid, reason = "session rebind")
         device.releaseAndClear()
         next?.let { startGrantedGattPipeline(it) }
         sendLog(
@@ -3301,6 +3374,7 @@ class BleManager private constructor() {
         }
         //  3、清空当前设备发送队列，避免断连后继续发送旧指令。
         sendCmdQueues.remove(reconnectKey(uuid))
+        cancelOtaWriteQueue(uuid, reason = state.toFlutterJsonValue())
     }
 
     /**

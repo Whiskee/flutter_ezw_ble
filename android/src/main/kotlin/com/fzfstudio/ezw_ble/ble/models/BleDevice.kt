@@ -6,6 +6,7 @@ import android.bluetooth.BluetoothStatusCodes
 import android.os.Build
 import android.util.Log
 import com.fzfstudio.ezw_ble.ble.BleEC
+import com.fzfstudio.ezw_ble.ble.BleOtaWriteSubmission
 import com.fzfstudio.ezw_ble.ble.models.enums.BleConfigOutAdapter
 import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
 import com.fzfstudio.ezw_utils.gson.GsonSerializable
@@ -158,6 +159,75 @@ class BleDevice(
         val writeChars = writeAndReadList.firstOrNull { it.psType == psType }?.writeChars
             ?: return false
         return writeChars.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
+    }
+
+    /**
+     * 精确提交一包 Android OTA 数据，不发送通用 `BleCmd.fail` EventChannel 事件。
+     *
+     * Android 13+ 会明确返回 `ERROR_GATT_WRITE_REQUEST_BUSY`；旧系统只有 Boolean，false
+     * 无法区分瞬时 BUSY 与其它拒绝，因此先按可恢复背压处理，再由上层 4 秒 watchdog 收口。
+     */
+    internal fun submitOtaCharacteristic(data: ByteArray, psType: Int): BleOtaWriteSubmission {
+        if (data.isEmpty()) {
+            return BleOtaWriteSubmission.rejected(status = null, reason = "empty OTA payload")
+        }
+        val currentGatt = gatt
+            ?: return BleOtaWriteSubmission.rejected(status = null, reason = "GATT missing")
+        val writeChars = writeAndReadList.firstOrNull { it.psType == psType }?.writeChars
+            ?: return BleOtaWriteSubmission.rejected(
+                status = null,
+                reason = "OTA write characteristic missing",
+            )
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val status = currentGatt.writeCharacteristic(
+                writeChars,
+                data,
+                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE,
+            )
+            return when (status) {
+                BluetoothStatusCodes.SUCCESS -> BleOtaWriteSubmission.accepted()
+                BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY ->
+                    BleOtaWriteSubmission.busy(status, androidWriteStatusName(status))
+                else -> BleOtaWriteSubmission.rejected(status, androidWriteStatusName(status))
+            }
+        }
+
+        @Suppress("DEPRECATION")
+        writeChars.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        @Suppress("DEPRECATION")
+        writeChars.value = data
+        @Suppress("DEPRECATION")
+        return if (currentGatt.writeCharacteristic(writeChars)) {
+            BleOtaWriteSubmission.accepted()
+        } else {
+            BleOtaWriteSubmission.busy(
+                status = null,
+                reason = "legacy writeCharacteristic returned false",
+            )
+        }
+    }
+
+    /** 把 write callback 的 characteristic 反查为配置中的 psType，隔离普通与 OTA 队列。 */
+    internal fun psTypeForWriteCharacteristic(characteristic: BluetoothGattCharacteristic?): Int? {
+        if (characteristic == null) {
+            return null
+        }
+        return writeAndReadList.firstOrNull { item ->
+            item.writeChars === characteristic || item.writeChars?.uuid == characteristic.uuid
+        }?.psType
+    }
+
+    private fun androidWriteStatusName(status: Int): String = when (status) {
+        BluetoothStatusCodes.SUCCESS -> "SUCCESS"
+        BluetoothStatusCodes.ERROR_GATT_WRITE_NOT_ALLOWED -> "ERROR_GATT_WRITE_NOT_ALLOWED"
+        BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY -> "ERROR_GATT_WRITE_REQUEST_BUSY"
+        // 4/6/9 是 BluetoothStatusCodes 的公开文档值，但部分 compileSdk stubs 未暴露符号。
+        4 -> "ERROR_DEVICE_NOT_CONNECTED"
+        6 -> "ERROR_MISSING_BLUETOOTH_CONNECT_PERMISSION"
+        9 -> "ERROR_PROFILE_SERVICE_NOT_BOUND"
+        BluetoothStatusCodes.ERROR_UNKNOWN -> "ERROR_UNKNOWN"
+        else -> "status=$status"
     }
 
 }

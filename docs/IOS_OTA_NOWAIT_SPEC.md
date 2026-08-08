@@ -68,7 +68,7 @@ iOS 走 `sendCmd`(WriteWithResponse),性能瓶颈即在此。
 | iOS | `ota` (1) | WriteWithResponse | **WriteWithoutResponse + 背压；成功仅表示已提交 CoreBluetooth** |
 | iOS | `stream` (2) | RX 为主,n/a | n/a |
 | iOS | `file` (3) | WriteWithResponse | 二期评估(本期不动) |
-| Android | 所有 | 已是 `WRITE_TYPE_NO_RESPONSE`(OTA / file) | 不变 |
+| Android | OTA (1) | `WRITE_TYPE_NO_RESPONSE` | per-endpoint callback 驱动队列：同步 BUSY 原包重试，`onCharacteristicWrite` 后完成 Future |
 
 Dart 端不改 public API:`bleMC.sendOTABytesData(uuid, data)` 调用链保持不变,
 只在 iOS 原生侧拦截 `psType == 1` 的 sendCmd / sendCmdNoWait 走新路径。
@@ -174,8 +174,11 @@ result(FlutterError(
 - device 或 OTA write characteristic 缺失: `ota_write_unavailable`;
 - CoreBluetooth 提交前外设已释放: `ota_write_unavailable`.
 
-Android `sendCmdNoWait(psType == 1)` 同样必须检查 `BluetoothGatt.writeCharacteristic`
-同步返回值；若 native 拒绝提交,返回 `ota_write_unavailable`。其它 `psType` 的 iOS/Android
+Android `sendCmdNoWait(psType == 1)` 同样必须保留 `BluetoothGatt.writeCharacteristic`
+同步状态。`ERROR_GATT_WRITE_REQUEST_BUSY` 是单槽位背压，不是包错误：原包进入 per-endpoint
+队列，等待当前 `onCharacteristicWrite` 释放槽位后重试；提交成功后本包 Future 仍等自己的
+`onCharacteristicWrite` 成功才返回。4 秒仍未释放返回 `ota_write_stalled`，断连/退出升级/
+reset 返回 `ota_write_cancelled`。其它明确拒绝才返回 `ota_write_unavailable`；非 OTA
 no-wait 路径保持原行为。
 
 ### 4.4 与 `enterUpgradeState` / `quiteUpgradeState` 的关系

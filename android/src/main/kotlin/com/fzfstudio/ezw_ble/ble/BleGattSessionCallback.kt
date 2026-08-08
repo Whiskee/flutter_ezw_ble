@@ -39,8 +39,8 @@ internal class BleGattSessionCallback(
     private val recoverInsufficientAuthorization: (BluetoothGatt, BleDevice) -> Unit,
     /** 查询一个 uuid 是否正处于 manager 主动断连流程。 */
     private val consumeDisconnectingState: (String) -> BleConnectState?,
-    /** 通知 manager 单条写入完成，让发送队列继续推进下一条命令。 */
-    private val onCharacteristicWriteComplete: (String) -> Unit,
+    /** 通知 manager 写入完成，并携带 psType/status 让普通队列与 OTA 背压队列精确认领。 */
+    private val onCharacteristicWriteComplete: (String, Int?, Int, String) -> Unit,
     /** 把 notify 数据回传到 Flutter EventChannel。 */
     private val emitReceiveData: (Map<String, Any?>) -> Unit,
     /** 统一日志出口，保证所有 GATT 日志仍带 BleManager 前缀。 */
@@ -314,9 +314,15 @@ internal class BleGattSessionCallback(
             return
         }
 
-        // 4. 其余 characteristic write 状态保留旧行为：仅记录状态并继续推进按 uuid 隔离的发送队列。
+        // 4. 其余 characteristic write 状态交给 manager 精确匹配普通/OTA owner；OTA Future
+        //    只有在这里成功后才完成，不能再把同步提交成功当成 GATT 单槽位已经释放。
         sendLog(BleLoggerTag.d, "Send cmd: $address, write call back is success = ${status == BluetoothGatt.GATT_SUCCESS}, status=$operationStatus")
-        onCharacteristicWriteComplete(address)
+        onCharacteristicWriteComplete(
+            address,
+            device.psTypeForWriteCharacteristic(characteristic),
+            status,
+            operationStatus,
+        )
     }
 
     /**

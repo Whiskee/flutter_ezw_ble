@@ -244,16 +244,20 @@ enum class BleMC {
                 BleManager.instance.sendCmd(uuid, data, psType, allowDuringUpgrade)
             }
             SEND_CMD_NO_WAIT -> {
-                // 1. OTA no-wait 的同步提交失败必须直接失败 MethodChannel Future；
-                //    非 OTA 仍落到函数末尾 success(null)，保持旧 no-wait 行为。
+                // 1. Android OTA 必须等本包 characteristic write callback 后才完成 Future；
+                //    manager 内部会把同步 BUSY 留在 per-endpoint 队列重试，并保证取消/超时终态。
                 val jsonMap = arguments as Map<*, *>?
                 val uuid = jsonMap?.get("uuid") as? String ?: ""
                 val data = jsonMap?.get("data") as ByteArray? ?: byteArrayOf()
                 val psType = jsonMap?.get("psType") as Int? ?: 0
-                val error = BleManager.instance.sendCmdNoWait(uuid, data, psType)
-                if (error != null) {
-                    return result.error(error.code, error.reason, error.details)
+                BleManager.instance.sendCmdNoWait(uuid, data, psType) { error ->
+                    if (error == null) {
+                        result.success(null)
+                    } else {
+                        result.error(error.code, error.reason, error.details)
+                    }
                 }
+                return
             }
             ENTER_UPGRADE_STATE -> {
                 // 1. 升级态会影响断连后的重连清理策略。
