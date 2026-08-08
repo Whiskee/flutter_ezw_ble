@@ -49,7 +49,8 @@ void main() {
     );
   });
 
-  test('Android OTA no-wait fails closed when GATT submission is rejected', () {
+  test('Android OTA no-wait reports queue submission failures asynchronously',
+      () {
     final channel = File(
       'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleMethodChannel.kt',
     ).readAsStringSync();
@@ -63,16 +64,18 @@ void main() {
       'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleOtaWriteError.kt',
     ).readAsStringSync();
 
+    expect(channel,
+        contains('BleManager.instance.sendCmdNoWait(uuid, data, psType)'));
+    expect(channel,
+        contains('result.error(error.code, error.reason, error.details)'));
     expect(
-        channel,
-        contains(
-            'return result.error(error.code, error.reason, error.details)'));
-    expect(manager,
-        contains('val submitted = device.writeCharacteristic(data, psType)'));
-    expect(manager, contains('isOtaChannel && !submitted'));
+        manager, contains('otaWriteQueueFor(uuid).enqueue(data, completion)'));
+    expect(manager, contains('BleOtaWriteSubmission.rejected'));
     expect(manager, contains('BleOtaWriteError.unavailable'));
     expect(manager, contains('BleOtaWriteError.unsupported'));
-    expect(device, contains('PROPERTY_WRITE_NO_RESPONSE'));
+    expect(device, contains('supportsWriteWithoutResponse'));
+    expect(device, contains('submitOtaCharacteristic'));
+    expect(device, contains('ERROR_GATT_WRITE_REQUEST_BUSY'));
     expect(error, contains('ota_write_unavailable'));
     expect(error, contains('ota_write_unsupported'));
   });
