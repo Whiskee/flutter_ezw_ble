@@ -126,6 +126,73 @@ class BleAndroidOtaWriteQueueTest {
     }
 
     @Test
+    fun `cancelled in flight callback only drains old slot and cannot complete retry`() {
+        val submissions = mutableListOf<ByteArray>()
+        val oldCompletions = mutableListOf<BleOtaWriteError?>()
+        val retryCompletions = mutableListOf<BleOtaWriteError?>()
+        val queue = queue(
+            submit = { data ->
+                submissions.add(data.copyOf())
+                BleOtaWriteSubmission.accepted()
+            },
+        )
+
+        queue.enqueue(byteArrayOf(0x01)) { oldCompletions.add(it) }
+        queue.cancelAttempt("quiteUpgradeState")
+        queue.enqueue(byteArrayOf(0x02)) { retryCompletions.add(it) }
+
+        assertEquals(1, submissions.size, "retry must not submit before the cancelled callback drains")
+        assertEquals("ota_write_cancelled", oldCompletions.single()?.code)
+        assertEquals(emptyList(), retryCompletions)
+
+        // Hostile timeline: this callback belongs to the cancelled packet. It may only open the
+        // GATT slot; reverting the drain barrier would make it complete the retry packet here.
+        queue.onCharacteristicWriteComplete(true, true, 0, "GATT_SUCCESS")
+
+        assertEquals(2, submissions.size)
+        assertContentEquals(byteArrayOf(0x02), submissions[1])
+        assertEquals(emptyList(), retryCompletions)
+
+        queue.onCharacteristicWriteComplete(true, true, 0, "GATT_SUCCESS")
+
+        assertEquals(1, retryCompletions.size)
+        assertNull(retryCompletions.single())
+        assertEquals(0, queue.queueDepth)
+    }
+
+    @Test
+    fun `missing cancelled callback stalls retry without reusing the occupied gatt slot`() {
+        var nowMillis = 0L
+        val scheduler = FakeScheduler()
+        val submissions = mutableListOf<ByteArray>()
+        val retryCompletions = mutableListOf<BleOtaWriteError?>()
+        val queue = queue(
+            submit = { data ->
+                submissions.add(data.copyOf())
+                BleOtaWriteSubmission.accepted()
+            },
+            scheduler = scheduler,
+            nowMillis = { nowMillis },
+        )
+
+        queue.enqueue(byteArrayOf(0x01)) {}
+        queue.cancelAttempt("quiteUpgradeState")
+        queue.enqueue(byteArrayOf(0x02)) { retryCompletions.add(it) }
+        nowMillis = 4_000L
+        scheduler.runNext()
+
+        assertEquals(1, submissions.size)
+        assertEquals("ota_write_stalled", retryCompletions.single()?.code)
+
+        // Even after the waiting retry fails, the physical slot is not reusable until the old
+        // callback arrives. Draining it allows a later attempt to submit safely.
+        queue.onCharacteristicWriteComplete(true, true, 0, "GATT_SUCCESS")
+        queue.enqueue(byteArrayOf(0x03)) {}
+        assertEquals(2, submissions.size)
+        assertContentEquals(byteArrayOf(0x03), submissions[1])
+    }
+
+    @Test
     fun `failed characteristic callback reports the native status once`() {
         val completions = mutableListOf<BleOtaWriteError?>()
         val queue = queue(
@@ -168,10 +235,16 @@ class BleAndroidOtaWriteQueueTest {
         }
 
         fun runNext() {
-            val task = tasks.removeFirst()
-            if (!task.isCancelled) {
-                task.block()
+            // Production coroutine cancellation removes obsolete watchdog work. The fake keeps
+            // entries for determinism, so skip cancelled tasks and execute the next live one.
+            while (tasks.isNotEmpty()) {
+                val task = tasks.removeFirst()
+                if (!task.isCancelled) {
+                    task.block()
+                    return
+                }
             }
+            error("No active scheduled task")
         }
     }
 

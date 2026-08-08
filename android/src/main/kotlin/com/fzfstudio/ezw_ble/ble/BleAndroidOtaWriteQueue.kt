@@ -39,7 +39,8 @@ internal fun interface BleOtaWriteScheduler {
  *
  * Android 的 no-response 写仍然是单槽位 GATT 操作：同步 `SUCCESS` 只表示系统接受提交，
  * 真正释放下一包必须等 `onCharacteristicWrite`。同步 BUSY 是可恢复背压，原包保留到活动
- * 写回调或 watchdog 重试；其它错误、断连与超时均 fail closed，保证 Dart await 必有终态。
+ * 写回调或 watchdog 重试；取消 attempt 后还必须保留旧 callback 的 drain barrier，避免旧回调
+ * 完成下一轮写入。其它错误、断连与超时均 fail closed，保证 Dart await 必有终态。
  */
 internal class BleAndroidOtaWriteQueue(
     private val endpoint: String,
@@ -55,6 +56,9 @@ internal class BleAndroidOtaWriteQueue(
 
     private val pending = ArrayDeque<Item>()
     private var inFlight: Item? = null
+    // Android callback 不回传调用方 token；同一 GATT session 取消已提交写时，必须保留这个
+    // 单槽位屏障，直到旧 callback 到达。新 attempt 只能排队，不能把旧 callback 当成自己的。
+    private var cancelledInFlightCallbackPending = false
     private var waitStartedAtMillis: Long? = null
     private var watchdog: BleOtaWriteCancellable? = null
     private var lastBackpressure: BleOtaWriteSubmission? = null
@@ -62,6 +66,10 @@ internal class BleAndroidOtaWriteQueue(
     /** 包含已提交但尚未收到 GATT callback 的包，便于错误详情反映真实深度。 */
     val queueDepth: Int
         @Synchronized get() = pending.size + if (inFlight == null) 0 else 1
+
+    /** 当前 endpoint 是否仍占有物理 GATT 写槽；普通命令也必须等待该槽释放。 */
+    val hasOutstandingGattWrite: Boolean
+        @Synchronized get() = inFlight != null || cancelledInFlightCallbackPending
 
     /** 入队后立即尝试提交；成功回调只会在本包自己的 characteristic callback 后触发。 */
     @Synchronized
@@ -83,8 +91,20 @@ internal class BleAndroidOtaWriteQueue(
         success: Boolean,
         status: Int,
         statusName: String,
-    ) {
+    ): Boolean {
         if (ownsInFlight) {
+            if (cancelledInFlightCallbackPending) {
+                // 这条 callback 只证明上一个已取消 attempt 的系统写槽已释放。此时新 attempt
+                // 尚未提交，因此绝不能完成它的 Future；解除屏障后再驱动排队写入。
+                cancelledInFlightCallbackPending = false
+                clearWait()
+                logger(
+                    "[ezw_ble][ota][android] drained cancelled callback " +
+                        "endpoint=$endpoint status=$statusName pending=$queueDepth",
+                )
+                pump()
+                return true
+            }
             val completed = inFlight
             if (completed != null) {
                 inFlight = null
@@ -104,28 +124,65 @@ internal class BleAndroidOtaWriteQueue(
                         ),
                     )
                 }
+                pump()
+                return true
             }
         } else if (inFlight == null && pending.isNotEmpty()) {
             // 前一笔普通/旧 OTA 写回调证明 GATT 单槽位已经释放，从头开始计算本包等待窗口。
             clearWait()
         }
         pump()
+        return false
     }
 
-    /** 断连、退出升级或 manager teardown 时释放所有 MethodChannel Future。 */
+    /**
+     * 取消当前 OTA attempt，但保留同一 GATT session 已提交写的 callback 屏障。
+     *
+     * 退出升级不会关闭 GATT，Android 又无法在 callback 中回传本地 write token；因此只取消
+     * Dart Future 不足以隔离下一轮 attempt，必须等旧 callback 被 drain 后才允许任何新写。
+     */
+    @Synchronized
+    fun cancelAttempt(reason: String) {
+        val hadInFlight = inFlight != null
+        val snapshot = buildList {
+            inFlight?.let(::add)
+            addAll(pending)
+        }
+        inFlight = null
+        pending.clear()
+        if (hadInFlight) {
+            cancelledInFlightCallbackPending = true
+        }
+        clearWait()
+        if (snapshot.isEmpty()) {
+            return
+        }
+        logger("[ezw_ble][ota][android] attempt cancelled endpoint=$endpoint reason=$reason pending=${snapshot.size}")
+        snapshot.forEach { item ->
+            item.completion(
+                BleOtaWriteError.cancelled(
+                    endpoint = endpoint,
+                    reason = reason,
+                    pending = snapshot.size,
+                ),
+            )
+        }
+    }
+
+    /** 物理 GATT session 已失效时释放所有 Future，并丢弃旧 session 的 callback 屏障。 */
     @Synchronized
     fun cancelAll(reason: String) {
         val snapshot = buildList {
             inFlight?.let(::add)
             addAll(pending)
         }
-        if (snapshot.isEmpty()) {
-            clearWait()
-            return
-        }
         inFlight = null
         pending.clear()
+        cancelledInFlightCallbackPending = false
         clearWait()
+        if (snapshot.isEmpty()) {
+            return
+        }
         logger("[ezw_ble][ota][android] cancelled endpoint=$endpoint reason=$reason pending=${snapshot.size}")
         snapshot.forEach { item ->
             item.completion(
@@ -140,6 +197,18 @@ internal class BleAndroidOtaWriteQueue(
 
     /** 驱动同步提交；任何时刻最多只有一包处于已提交、等 callback 状态。 */
     private fun pump() {
+        if (cancelledInFlightCallbackPending) {
+            if (pending.isEmpty()) {
+                clearWait()
+                return
+            }
+            // 旧 callback 丢失时 fail closed 当前新 attempt，但继续保留 drain barrier；只有
+            // 物理 session teardown 或旧 callback 到达，才允许后续 attempt 复用该 GATT。
+            if (!failIfStalled("cancelled write callback timeout", lastBackpressure)) {
+                scheduleWatchdog()
+            }
+            return
+        }
         if (inFlight != null) {
             if (!failIfStalled("onCharacteristicWrite timeout", lastBackpressure)) {
                 scheduleWatchdog()

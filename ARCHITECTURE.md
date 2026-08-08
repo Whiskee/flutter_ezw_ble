@@ -880,7 +880,7 @@ iOS 端 OTA 通道走单独的 per-peripheral 写队列 `OtaWriteQueue`，目标
 - **软节流**：每 `softDrainEvery = 64` 包主动让出，等下一次 `peripheralIsReady` 或更保守的 watchdog 重查，防御老机型 `canSendWriteWithoutResponse` "报喜不报忧"。该阈值是配置常量，调参后回归测试。
 - **Dart 侧同步**：`MethodChannelEzwBle.sendCmdNoWait` 已统一走 `methodChannel.invokeMethod`，**不再 fall back 到 `sendCmd`**。改 Dart 入口前先确认原生 `sendCmdNoWait` handler 仍然处理所有 `psType` 分支（OTA + 兜底）。
 - **fail closed**：OTA 特征不支持 `.writeWithoutResponse`、manager 不可用、device/characteristic 缺失或提交前外设释放时，`sendCmdNoWait(psType == 1)` 返回 typed `FlutterError`（`ota_write_unsupported` / `ota_write_unavailable`），不得回退为看似成功的旧路径。
-- **Android 对齐**：Android `sendCmdNoWait(psType == 1)` 必须保留同步提交状态；`ERROR_GATT_WRITE_REQUEST_BUSY`（旧 API 的 `false` 无法精确分类时也按瞬时背压处理）不得丢包或立即终止，而要保留原包等待当前写回调/watchdog 重试。本包 Future 只在对应 `onCharacteristicWrite` 成功后完成；4s 仍未释放则 `ota_write_stalled`，断连/退出升级/重置则 `ota_write_cancelled`。非 OTA no-wait 保持历史立即成功语义。
+- **Android 对齐**：Android `sendCmdNoWait(psType == 1)` 必须保留同步提交状态；`ERROR_GATT_WRITE_REQUEST_BUSY`（旧 API 的 `false` 无法精确分类时也按瞬时背压处理）不得丢包或立即终止，而要保留原包等待当前写回调/watchdog 重试。本包 Future 只在对应 `onCharacteristicWrite` 成功后完成；4s 仍未释放则 `ota_write_stalled`，断连/退出升级/重置则 `ota_write_cancelled`。退出升级但复用同一 GATT session 时，已提交写的旧 callback 必须先经过 drain barrier，期间新的普通命令和 OTA RAW 都不能提交；旧 callback 只释放物理槽，不能完成新 attempt。只有物理 session 已 teardown 且 exact GATT identity 失效后才能丢弃该屏障。非 OTA no-wait 保持历史立即成功语义。
 - **挂起 await 兜底**：断连/`reset()`/配置撤销/外设释放时 `OtaWriteQueue.cancelAll()` 会对所有 pending 写入回调 `ota_write_cancelled`；背压超过 stall 窗口回调 `ota_write_stalled`，details 带 `endpoint/reason/wait/pending`。改这条兜底必须保证**任何路径都不会让 Dart `await` 永远挂着**。
 - **范围外**：`psType == 3`（file）通道、iOS connection interval 协商、`psType == 0`（common）write type 切换均**不在本期范围**，改动前先评估对协议层应答匹配的影响。
 
