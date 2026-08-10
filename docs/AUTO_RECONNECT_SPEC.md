@@ -37,7 +37,10 @@ Public methods:
 - `activateAutoReconnectTargets(devices, source)` immediately opens or reuses a
   pending direct connection for every target. `source` is `autoReconnect` or
   `manualReconnect`; manual activation promotes the same pending session rather
-  than opening a duplicate connection. It returns one acknowledgement per
+  than opening a duplicate connection. On iOS it first claims a matching State
+  Restoration escrow by stable UUID or unique exact endpoint name: a connected
+  escrow enters the Gate, while an already-connecting escrow only attaches the
+  current admission and does not issue a duplicate `connect`. It returns one acknowledgement per
   target: `resolved` means native owns a stable UUID/address,
   `identityPending` means iOS owns an exact config/name identity awaiting a
   CoreBluetooth UUID, and `rejected` means no native reconnect owner exists.
@@ -266,6 +269,17 @@ After a previously business-connected device disconnects, the app hands a known
 `CBPeripheral` back to CoreBluetooth immediately. That pending `connect` is the
 preserved operation that can wake or relaunch the app later.
 
+`willRestoreState` may arrive before configs and the current account's bound
+targets. The restored peripheral therefore enters a native physical escrow
+instead of the GATT pipeline. Before claim, `didConnect` only holds the physical
+link; it must not discover services, enable notify, emit `noBleConfigFound`, or
+run business AUTH. A terminal callback keeps the system reconnect when
+`isReconnecting=true`; otherwise it re-arms exactly one long-lived pending
+connect. `activateAutoReconnectTargets` is the only claim point. After all G2
+legs and R1 activation calls return, the caller invokes
+`finalizeStateRestorationClaims`; remaining historical/ambiguous escrows are
+cancelled behind the existing late-callback barrier.
+
 iOS lookup order:
 
 1. `retrieveConnectedPeripherals(withServices:)`, using configured private services plus ANCS.
@@ -353,6 +367,9 @@ hard cancel reachability without linear memory growth.
    business state but must not create per-endpoint activation sessions.
    Bluetooth available consumes that recovery debt once and submits the
    combined endpoint set.
+   On iOS, wait for every target acknowledgement in this combined batch before
+   calling `finalizeStateRestorationClaims`; finalizing per leg can cancel a
+   restored left/right/R1 endpoint that has not been offered for claim yet.
 3. Start the app-level scan concurrently, never before direct activation. Stop
    it when all devices connect or at 20 seconds, whichever comes first. A later
    Bluetooth-on recovery trigger may reopen only this scan window for the same

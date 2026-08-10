@@ -240,14 +240,18 @@ void main() {
     final manager = File('ios/Classes/ble/BleManager.swift').readAsStringSync();
     final restoration = File('ios/Classes/ble/BleStateRestorationFlow.swift')
         .readAsStringSync();
+    final reconnect = File(
+      'ios/Classes/ble/BleAutoReconnectCoordinator.swift',
+    ).readAsStringSync();
     final flow = File('ios/Classes/ble/BleConnectionAdmissionFlow.swift')
         .readAsStringSync();
 
     expect(flow, contains('connectionAdmissionGate.onPhysicalConnected'));
     expect(flow, contains('startGrantedGattPipeline'));
     expect(flow, contains('completeBusinessConnectionAdmission'));
-    expect(restoration, contains('source: .stateRestoration'));
-    expect(restoration, contains('enqueueRestoredPeripheralThroughGate'));
+    expect(restoration, contains('escrowStateRestorationPeripheral'));
+    expect(reconnect, contains('activateClaimedStateRestoration'));
+    expect(reconnect, contains('enqueuePhysicalConnectionThroughGate'));
     expect(manager, contains('willRestoreState'));
   });
 

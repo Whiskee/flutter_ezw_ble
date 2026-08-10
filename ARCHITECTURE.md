@@ -777,7 +777,7 @@ iOS 的关键差异：系统级 ANCS 连接会让外设停止广播，`scanForPe
 
 ### 11.8 iOS State Preservation / Restoration
 
-iOS State Restoration 是自动回连链路的一部分，不是独立业务入口。`centralManager(_:willRestoreState:)` 可能早于 Flutter 引擎、EventChannel 订阅和 `initConfigs`，因此 Swift 回调里只能缓存 restored peripherals，不能直接执行业务认证，也不能假设 `BleConfig` 已经存在。
+iOS State Restoration 是自动回连链路的一部分，不是独立业务入口。`centralManager(_:willRestoreState:)` 可能早于 Flutter 引擎、EventChannel 订阅、`initConfigs` 和当前账号设备加载，因此 Swift 回调里只能把 restored peripheral 放进 UUID 级 `idle / pending / connected` 物理 escrow，不能直接发现服务、开启 notify、发送业务认证或假设当前 owner 已存在。
 
 恢复流程：
 
@@ -785,10 +785,12 @@ iOS State Restoration 是自动回连链路的一部分，不是独立业务入�
 2. 系统异常断连后，原生立即把已知 `CBPeripheral` 交回 `centralManager.connect`，让 CoreBluetooth 持有 pending connect。
 3. App 后台、挂起或被系统回收后，外设重新出现。
 4. CoreBluetooth 通过 State Restoration 恢复进程，并在 `willRestoreState` 里交回 peripheral。
-5. 原生等 `initConfigs` 完成后匹配 `BleConfig` 和 reconnect target。
-6. restored peripheral 与普通 `didConnect`、already-connected callback 一样进入全局 admission Gate。
-7. `connectFinish` 上报给 Dart，Dart 重新发送业务 AUTH / 通道切换 / 时间同步。
-8. Dart 再次调用 `deviceConnected(uuid)`，重新 arm 后续回连。
+5. claim 前若 peripheral 断连，系统已持有 reconnect 时继续等待，否则原生补一条 autoReconnect pending connect；claim 前的 `didConnect` 只保留物理链路。
+6. 当前账号一次提交全部 G2 双腿/R1 target；`activateAutoReconnectTargets` 按 UUID 或唯一完整名称精确认领 escrow。
+7. 已连接 escrow 安装当前 session admission 后进入 Gate；仍 `.connecting` 的 escrow 只挂 admission/watchdog，禁止重复 connect。
+8. 全部 target activation 返回后调用 `finalizeStateRestorationClaims`，以 cancellation barrier 清理未认领历史对象。
+9. `connectFinish` 上报给 Dart，Dart 重新发送业务 AUTH / 通道切换 / 时间同步。
+10. Dart 再次调用 `deviceConnected(uuid)`，重新 arm 后续回连。
 
 重要边界：
 
@@ -798,6 +800,7 @@ iOS State Restoration 是自动回连链路的一部分，不是独立业务入�
 - State Restoration 不承诺把 App UI 拉到前台。
 - 用户显式强制退出后的后台恢复受 iOS 系统策略限制，不能作为稳定业务承诺。
 - `connectFinish` 只表示 GATT ready，不表示业务 connected。
+- 冷启动中性 `resetBle(preserveStateRestoration: true)` 保留 escrow；登出、移除、配置撤销、普通 reset/clean 必须取消匹配 escrow 并阻止迟到 callback 复活。
 - 蓝牙 poweredOff 只暂停任务；清空 Gate 前必须保存 connecting/connected 端点的有效 generation，并用同代 `disconnectFromSys` 清理 Dart 状态；poweredOn 后继续 replay reconnect target。
 - EventChannel 订阅可能晚于恢复事件，原生需要缓冲关键 reconnect/restoration 事件供 Dart 补读。
 

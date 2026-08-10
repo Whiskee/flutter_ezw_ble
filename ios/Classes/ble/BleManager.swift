@@ -203,6 +203,14 @@ extension BleManager {
     private func revokeReconnectConfigs(_ configNames: Set<String>) {
         let revokedTasks = reconnectTasks.values.filter { configNames.contains($0.belongConfig) }
         let revokedTargets = reconnectStore.removeTargets(configNames: configNames)
+        // 配置授权撤销必须同时清除尚未被当前账号 claim 的 restoration escrow。
+        revokedTargets.forEach {
+            cancelStateRestorationEscrow(
+                uuid: $0.uuid,
+                name: $0.name,
+                reason: "initConfigs revoked \($0.belongConfig)"
+            )
+        }
         let revokedDevices = connectedDevices.filter { configNames.contains($0.belongConfig.name) }
         let revokedSessions = peripheralConnectionSessions.values.filter {
             configNames.contains($0.config.name)
@@ -939,7 +947,7 @@ extension BleManager {
         startConnectInfos.removeAll()
         cancelAllReconnectTasks()
         clearPersistedReconnectTargets()
-        restorationCoordinator.clearPendingPeripherals()
+        cancelAllStateRestorationEscrow(reason: "cleanConnectCache")
         //  2、取消连接超时计时器。
         connectingTimeoutTimers.forEach { (uuid, name, timer) in
             timer.invalidate()
@@ -977,7 +985,7 @@ extension BleManager {
         // 旧 runtime session，必须保留系统交还的 peripheral，等待当前 target activation
         // 精确认领；登出、移除设备等 hard reset 仍立即清除 restoration 债务。
         if !preserveStateRestoration {
-            restorationCoordinator.clearPendingPeripherals()
+            cancelAllStateRestorationEscrow(reason: "hard reset")
         }
         cancelAllReconnectTasks()
         // resetBle 是中性 runtime teardown：持久 owner/autoReconnect 配置必须保留，
@@ -2054,7 +2062,7 @@ extension BleManager: CBCentralManagerDelegate {
         )
         loggerD(msg: "stateRestoration: willRestoreState id=\(BleManager.restorationIdentifier), peripherals=\(peripherals.count), keys=\(Array(dict.keys))")
         peripherals.forEach { peripheral in
-            restorePeripheral(peripheral, source: "willRestoreState")
+            escrowStateRestorationPeripheral(peripheral, source: "willRestoreState")
         }
     }
     
@@ -2069,6 +2077,11 @@ extension BleManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, timestamp: CFAbsoluteTime, isReconnecting: Bool, error: (any Error)?) {
         loggerE(msg: "didDisconnectPeripheral: timestamp = \(timestamp), isReconnecting = \(isReconnecting), error = \(String(describing: error))")
         if consumePeripheralCancellationBarrier(peripheral) { return }
+        if handleStateRestorationEscrowTerminal(
+            peripheral,
+            systemIsReconnecting: isReconnecting,
+            reason: "didDisconnect isReconnecting=\(isReconnecting)"
+        ) { return }
         if isReconnecting {
             // 系统已持有 reconnect 时只结束旧业务 session 并重建 admission；再次 connect/cancel
             // 会破坏 CoreBluetooth 的自动回连和 State Restoration rendezvous。
@@ -2096,6 +2109,7 @@ extension BleManager: CBCentralManagerDelegate {
             loggerD(msg: "admission gate: \(peripheral.identifier.uuidString), stale didConnect blocked by cancellation barrier")
             return
         }
+        if handleStateRestorationEscrowDidConnect(peripheral) { return }
         //  1、检查是否获取到了蓝牙配置
         guard let connectRequest = findActiveConnectRequest(peripheral: peripheral),
               let bleConfig = connectRequest.bleConfig else {
@@ -2112,6 +2126,11 @@ extension BleManager: CBCentralManagerDelegate {
      */
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         if consumePeripheralCancellationBarrier(peripheral) { return }
+        if handleStateRestorationEscrowTerminal(
+            peripheral,
+            systemIsReconnecting: false,
+            reason: "didFailToConnect error=\(String(describing: error))"
+        ) { return }
         handleConnectError(peripheral: peripheral, error: error, formMethod: "didFailToConnect")
     }
 
@@ -2120,6 +2139,11 @@ extension BleManager: CBCentralManagerDelegate {
      */
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         if consumePeripheralCancellationBarrier(peripheral) { return }
+        if handleStateRestorationEscrowTerminal(
+            peripheral,
+            systemIsReconnecting: false,
+            reason: "didDisconnect legacy error=\(String(describing: error))"
+        ) { return }
         handleConnectError(peripheral: peripheral, error: error, formMethod: "didDisconnectPeripheral")
     }
     

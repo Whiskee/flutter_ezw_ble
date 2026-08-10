@@ -632,36 +632,41 @@ class RunnerTests: XCTestCase {
     XCTAssertEqual(store.targets().map(\.belongConfig), ["kept"])
   }
 
-  func testStateRestorationRejectsSingleConfigWithoutPersistedOrRuntimeOwner() {
-    let singleConfig = makeConfig(name: "g2", autoReconnect: true)
-    XCTAssertNil(BleStateRestorationAuthorization.config(
-      persistedTarget: nil,
-      runtimeTask: nil,
-      configs: [singleConfig]
-    ))
+  func testStateRestorationEscrowRearmsDisconnectedLeftLegBeforeClaim() {
+    let escrow = BleStateRestorationEscrowStateMachine()
+    let left = "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"
+
     XCTAssertEqual(
-      BleStateRestorationAuthorization.replayDecision(
-        configsInitialized: true,
-        hasAuthorizedConfig: false
-      ),
-      .rejectUnauthorized
+      escrow.stage(endpointId: left, peripheralState: .connected),
+      .holdConnected
     )
     XCTAssertEqual(
-      BleStateRestorationAuthorization.replayDecision(
-        configsInitialized: false,
-        hasAuthorizedConfig: false
-      ),
-      .deferUntilConfigsReady
+      escrow.didTerminate(endpointId: left, systemIsReconnecting: false),
+      .rearm
     )
-    XCTAssertNil(BleStateRestorationAuthorization.config(
-      persistedTarget: BleReconnectTarget(
-        belongConfig: "g2",
-        uuid: "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
-        name: "left"
-      ),
-      runtimeTask: nil,
-      configs: [makeConfig(name: "g2", autoReconnect: false)]
-    ))
+    XCTAssertEqual(escrow.didConnect(endpointId: left), .holdConnected)
+    XCTAssertEqual(escrow.claim(endpointId: left), .connected)
+    XCTAssertEqual(escrow.countForTesting, 0)
+  }
+
+  func testStateRestorationEscrowKeepsSystemReconnectAndBoundsThreeEndpoints() {
+    let escrow = BleStateRestorationEscrowStateMachine()
+    let endpoints = ["g2-left", "g2-right", "r1"]
+    endpoints.forEach {
+      XCTAssertEqual(
+        escrow.stage(endpointId: $0, peripheralState: .connecting),
+        .keepPending
+      )
+    }
+    XCTAssertEqual(escrow.countForTesting, 3)
+    XCTAssertEqual(
+      escrow.didTerminate(endpointId: "g2-left", systemIsReconnecting: true),
+      .keepPending
+    )
+    XCTAssertEqual(escrow.claim(endpointId: "g2-right"), .pending)
+    XCTAssertEqual(escrow.didConnect(endpointId: "historical"), .ignore)
+    escrow.remove(endpointIds: Set(["g2-left", "r1"]))
+    XCTAssertEqual(escrow.countForTesting, 0)
   }
 
   func testResetBlePreservesPersistentOwnerAndInvalidatesRuntimeGate() {

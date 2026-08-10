@@ -3,7 +3,7 @@
 本文定义 `flutter_ezw_ble` 在 iOS 侧落地 CoreBluetooth State Preservation / Restoration 的工程契约。它是 `docs/AUTO_RECONNECT_SPEC.md` 的 iOS 专项补充，重点回答三个问题：
 
 - App 被系统挂起或回收后，CoreBluetooth 能恢复到什么程度；
-- 原生层如何把 restored peripheral 重新接回统一 GATT pipeline；
+- 原生层如何在当前账号设备加载前保住 restored peripheral，并在精确认领后接回统一 GATT pipeline；
 - Dart / even_connect 在恢复后必须重新执行哪些业务步骤。
 
 ## 1. 能力边界
@@ -14,7 +14,8 @@ iOS State Restoration 的目标是恢复 BLE 进程内工作，不是把 App 拉
 
 - 系统在合适的 CoreBluetooth 事件到来时恢复 App 进程；
 - `centralManager(_:willRestoreState:)` 收到系统保存的 peripheral；
-- 原生层在 `initConfigs` 完成后继续 pending connect 或复用已连接 peripheral；
+- 原生层在当前账号 target 加载前维持 restored peripheral 的 pending/connected 物理 escrow；
+- 当前账号通过 `activateAutoReconnectTargets` 精确认领后继续 pending connect 或复用已连接 peripheral；
 - 重新执行 service discovery、characteristic discovery、notify / CCCD 注册；
 - GATT ready 后上报 `connectFinish`，等待 Dart 业务重新鉴权。
 
@@ -60,24 +61,28 @@ iOS 侧必须满足以下条件，否则 State Restoration 只会变成普通前
   -> 外设回到手机附近
   -> CoreBluetooth 恢复 App 进程
   -> centralManager(_:willRestoreState:) 收到 restored peripheral
-  -> initConfigs 完成后匹配 BleConfig
-  -> restored peripheral 以 source=stateRestoration 进入全局 admission Gate
+  -> 原生把 peripheral 放入 UUID 级 physical escrow
+  -> 断连且系统未自动重连时，原生只补一条 autoReconnect pending connect
+  -> 当前账号加载全部目标并调用 activateAutoReconnectTargets
+  -> 每个目标按 UUID 或唯一完整名称认领 escrow
+  -> 全部目标 activation 返回后调用 finalizeStateRestorationClaims
+  -> 已认领 peripheral 以 source=stateRestoration 进入全局 admission Gate
   -> Gate granted 后才启动 timeout 与统一 GATT pipeline
   -> connectFinish
   -> Dart 重新发送业务 AUTH / sync 命令
   -> Dart 再次调用 deviceConnected(uuid)
 ```
 
-`willRestoreState` 可能早于 Flutter 引擎、MethodChannel、EventChannel 和 `initConfigs`。因此回调里只能收集恢复信息，不能直接执行 Dart 业务，也不能假设配置已经可用。
+`willRestoreState` 可能早于 Flutter 引擎、MethodChannel、EventChannel、`initConfigs` 和当前账号设备加载。因此回调里只能建立物理 escrow，不能直接执行 Dart 业务、service discovery、notify 或 AUTH，也不能假设配置或当前 owner 已经可用。
 
 ## 4. 模块职责
 
 | 模块 | 职责 |
 | --- | --- |
 | `BleManager` | 创建带 restore id 的 `CBCentralManager`，接收 CoreBluetooth delegate 回调，统一进入 GATT pipeline。 |
-| `BleStateRestorationCoordinator` | 缓存 `willRestoreState` 里的 restored peripherals，等待 `initConfigs` 后再 replay。 |
-| `BleStateRestorationFlow` | 把 restored peripheral 匹配到 reconnect target 和 `BleConfig`，决定直接 GATT、继续 connect 或丢弃。 |
-| `BleAutoReconnectCoordinator` | 在业务 `connected` 后持有长期 reconnect intent，负责 pending connect、退避、蓝牙关闭暂停。 |
+| `BleStateRestorationCoordinator` | 按 peripheral UUID 持有 `idle / pending / connected` escrow，直到当前账号 target claim、hard cancel 或收尾。 |
+| `BleStateRestorationFlow` | 在 claim 前维持物理 pending/connected，不运行 GATT；负责 hard cancel、未认领收尾和迟到 callback barrier。 |
+| `BleAutoReconnectCoordinator` | 在业务 `connected` 后持有长期 reconnect intent；activation 精确认领 escrow 并接入 admission/GATT。 |
 | `BleReconnectStore` | 持久化 reconnect target，并缓存 EventChannel 尚未订阅时发生的 restoration / reconnect 事件。 |
 | `BleGattReadiness` | 聚合 service、write characteristic、read characteristic、notify ready 状态，保证 `connectFinish` 只发一次。 |
 | `BleConnectionAdmissionGate` | 串行所有 endpoint 的 service / characteristic / CCCD / 业务鉴权；restoration、普通 didConnect、already-connected 共用同一 Gate。 |
@@ -98,6 +103,26 @@ iOS 自动回连的关键不是扫描，而是把已知 `CBPeripheral` 尽快交
 Pending connect 与 Gate 排队阶段都不能使用短连接超时主动取消。设备离开几分钟、几十分钟甚至更久，都应该让 CoreBluetooth 持有这个系统级等待点；`connectTimeout` 只在 `didConnect` 获得 Gate 后启动，并持续覆盖 GATT readiness 与业务鉴权。UI 的 1 分钟展示超时由上层单独管理，不取消 pending connect。
 
 Dart 的 `notifyAutoReconnectTargetVisible` 仅用于 Android passive GATT 的节能退避唤醒；iOS MethodChannel 必须返回 `false` 且不执行 cancel/connect，避免破坏 CoreBluetooth pending connect 与 State Restoration 的单一 owner。
+
+### 5.1 Restoration Escrow 与 Claim
+
+`willRestoreState` 交回的 peripheral 在当前账号设备加载完成前只能处于以下 escrow 状态：
+
+- `pending`：CoreBluetooth 已有或由插件补建一条长期 pending connect；
+- `connected`：物理连接已经完成，但尚未获得当前账号授权；
+- `idle`：系统正在结束旧链路，等待 terminal callback 决定下一步。
+
+claim 前的 `didConnect` 只把状态更新为 `connected`，不得创建 active request、发现服务、开启 notify、发送 AUTH 或上报 `noBleConfigFound`。claim 前收到 `didDisconnect` / `didFailToConnect` 时，若 iOS 17 回调表明 `isReconnecting=true`，继续复用系统 pending；否则只补一次 `connectPeripheral(..., autoReconnect: true)`，仍不进入业务 Gate。
+
+`activateAutoReconnectTargets` 是唯一 claim 入口：
+
+1. 优先按稳定 UUID 精确匹配；UUID 不可用时只允许唯一完整端点名匹配。
+2. escrow 为 `connected` 时，安装当前 session 的 request/cache/admission 后直接提交 Gate。
+3. escrow 为 `pending` 且 peripheral 仍为 `.connecting` 时，只挂 admission 与观察 watchdog，禁止重复 `centralManager.connect`。
+4. peripheral 已 `.disconnected` 时，安装 admission 后只发起一条长期 pending connect。
+5. 未被当前账号 claim 的对象必须等本批所有 G2 双腿/R1 activation 都返回后，再由 `finalizeStateRestorationClaims` 统一取消；每个取消先建立 cancellation barrier，阻止迟到 `didConnect` 复活历史设备。
+
+普通、非 escrow 的未知 `didConnect` 保持既有 fail-closed 行为，不能因本机制获得业务 owner。
 
 ## 6. ANCS / 系统已连接场景
 
@@ -149,7 +174,7 @@ service/char/timeout 等非 CoreBluetooth 终态要先调用 cancel，并保持 
 
 ## 8. 取消与继续
 
-以下事件会**真取消** restoration / auto reconnect 意图：
+以下事件会**真取消** restoration escrow / auto reconnect 意图：
 
 - 用户或业务主动 `disconnectDevice`；
 - `removeDevice` / `removeBond`；
@@ -157,6 +182,8 @@ service/char/timeout 等非 CoreBluetooth 终态要先调用 cancel，并保持 
 - `cleanConnectCache`；
 - 目标配置被删除或 `autoReconnect=false`；
 - 插件释放。
+
+hard cancel、登出、移除设备、配置删除或 `autoReconnect=false` 必须同步移除匹配 escrow，并在取消物理连接前建立 cancellation barrier。冷启动为了加载当前账号而执行的 `resetBle(preserveStateRestoration: true)` 只清 runtime session，必须保留 escrow；普通 `resetBle` 仍是 hard reset。当前目标批次完成后，未认领 escrow 由 finalize fail-closed 清理。
 
 以下事件不能取消长期回连意图：
 
@@ -174,12 +201,13 @@ service/char/timeout 等非 CoreBluetooth 终态要先调用 cancel，并保持 
 
 `connectFinish` 只表示 GATT ready，不表示业务 connected。Dart 集成层必须在每次 restoration / auto reconnect 后重新做业务握手：
 
-1. 收到 `connectFinish`。
-2. 发送设备业务认证命令。
-3. 等待认证成功回调。
-4. 调用 `devicePreConnected(uuid)` 进入有界鉴权宽限。
-5. 发送业务必要的收尾命令，例如通道切换、时间同步。
-6. 调用 `deviceConnected(uuid)`，重新 arm 下一轮 auto reconnect。
+1. 冷启动时一次提交全部允许的 G2 双腿/R1 target，等待每个 `activateAutoReconnectTargets` 回执完成，再调用 `finalizeStateRestorationClaims`。
+2. 收到 `connectFinish`。
+3. 发送设备业务认证命令。
+4. 等待认证成功回调。
+5. 调用 `devicePreConnected(uuid)` 进入有界鉴权宽限。
+6. 发送业务必要的收尾命令，例如通道切换、时间同步。
+7. 调用 `deviceConnected(uuid)`，重新 arm 下一轮 auto reconnect。
 
 如果 Flutter EventChannel 订阅晚于 restoration 事件，Dart 应调用原生提供的 buffered reconnect event drain API，补读原生恢复期间发生的关键事件。
 
@@ -189,7 +217,10 @@ service/char/timeout 等非 CoreBluetooth 终态要先调用 cancel，并保持 
 
 - `stateRestoration: willRestoreState`
 - `pending-after-initConfigs`
-- `restore peripheral`
+- `ios_restore_escrow_rearm`
+- `ios_restore_escrow_connected`
+- `ios_restore_escrow_claimed`
+- `ios_restore_unclaimed`
 - `autoReconnect`
 - `CBConnectPeripheralOptionEnableAutoReconnect`
 - `didConnect`
@@ -217,7 +248,9 @@ service/char/timeout 等非 CoreBluetooth 终态要先调用 cancel，并保持 
 - App 首连成功后调用 `deviceConnected(uuid)`，原生持久化 reconnect target。
 - 外设离开后 App 后台，原生保持 pending connect，不用短 timeout 取消。
 - 冷启动/蓝牙恢复时所有 owner 先 activate pending 直连，App 扫描只并行补 cache，最多 20s。
-- 系统恢复后能看到 `willRestoreState`，且 restored peripheral 被缓存到 `initConfigs` 之后 replay。
+- 系统恢复后能看到 `willRestoreState`，且 restored peripheral 在当前账号 target activation 前只处于 escrow，不提前运行 GATT/AUTH。
+- 左腿在 claim 前断连且 `isReconnecting=false` 时立即重新建立长期 pending；随后 `didConnect` 仍被 escrow 吸收，当前账号 claim 后才进入 Gate。
+- G2 双腿/R1 都完成 activation 回执后才 finalize；未认领历史对象被 barrier 保护地取消，迟到 `didConnect` 不会复活。
 - 蓝牙 poweredOff 先用 active/last-connected generation 上报 `disconnectFromSys`，再暂停任务；poweredOn 后继续恢复。
 - ANCS / 系统已连接外设扫描不可见时仍可通过 retrieve 路径进入 GATT。
 - 每次恢复都重新 discovery service、characteristic、notify / CCCD。

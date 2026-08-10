@@ -1,5 +1,31 @@
 # BLE Issue Playbook
 
+## iOS restoration: one G2 leg disconnects before current targets load
+
+Symptoms:
+
+- `willRestoreState` returns both G2 peripherals, and one leg is already physically connected.
+- Before Flutter loads the current account's bound targets, that leg reports `didDisconnectPeripheral` with `isReconnecting=false`.
+- Native logs then report that it is not the current connected device; the other leg reconnects, while the first leg stays absent until a later manual attempt.
+
+Root cause:
+
+- A restored peripheral is a system-owned physical opportunity, not yet a business owner.
+- The old startup path only cached the object while configs were unavailable. If it disconnected before target activation, normal terminal handling could not find an active request or business cache and therefore did not rebuild a CoreBluetooth pending connect.
+- Matching immediately after `initConfigs` is also unsafe: config type alone cannot prove that a restored endpoint belongs to the current account.
+
+Fix:
+
+- Put every restored peripheral into a UUID-level `idle / pending / connected` physical escrow.
+- Before claim, hold `didConnect` without service discovery, notify, AUTH, or `noBleConfigFound`; on terminal, keep an existing system reconnect or re-arm one long-lived auto-reconnect pending connect.
+- Let `activateAutoReconnectTargets` claim by stable UUID or unique exact endpoint name. Attach the current admission to an existing `.connecting` request instead of opening a duplicate connect.
+- Finalize only after all current G2 legs and R1 targets have returned activation acknowledgements. Cancel unclaimed historical objects behind the late-callback cancellation barrier.
+
+Owner:
+
+- `flutter_ezw_ble` iOS native owns restoration escrow, claim, re-arm, and hard-cancel isolation.
+- even_connect owns submitting the complete current target batch before calling `finalizeStateRestorationClaims`.
+
 ## iOS State Restoration crashes without bluetooth-central background mode
 
 Symptoms:

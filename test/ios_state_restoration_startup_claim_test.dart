@@ -73,4 +73,36 @@ void main() {
       );
     },
   );
+
+  test('restoration callbacks stay in physical escrow until exact claim', () {
+    final manager = File('ios/Classes/ble/BleManager.swift').readAsStringSync();
+    final flow = File(
+      'ios/Classes/ble/BleStateRestorationFlow.swift',
+    ).readAsStringSync();
+    final reconnect = File(
+      'ios/Classes/ble/BleAutoReconnectCoordinator.swift',
+    ).readAsStringSync();
+
+    expect(manager, contains('escrowStateRestorationPeripheral('));
+    expect(
+      manager.indexOf('handleStateRestorationEscrowDidConnect(peripheral)'),
+      lessThan(manager.indexOf('guard let connectRequest =')),
+      reason: 'claim 前 didConnect 不能落入 noBleConfigFound',
+    );
+    expect(
+      manager.indexOf('handleStateRestorationEscrowTerminal('),
+      lessThan(manager.indexOf('handleConnectError(peripheral: peripheral')),
+      reason: 'claim 前 terminal 必须先重挂，不能进入普通 owner 判断',
+    );
+    expect(flow, contains('type: "ios_restore_escrow_rearm"'));
+    expect(flow, contains('type: "ios_restore_escrow_connected"'));
+    expect(flow, contains('beginPeripheralCancellationBarrier(peripheral)'));
+    expect(reconnect, contains('activateClaimedStateRestoration('));
+    expect(reconnect, contains('type: "ios_restore_escrow_claimed"'));
+    expect(
+      reconnect,
+      contains('else if peripheral.state == .connecting'),
+      reason: '已 pending 的 CoreBluetooth connect 只附着 admission，不得重复 connect',
+    );
+  });
 }

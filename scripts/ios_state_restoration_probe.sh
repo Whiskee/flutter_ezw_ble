@@ -116,10 +116,10 @@ check_static_wiring() {
     failed=1
   fi
 
-  if grep -q 'restorePeripheral' "$ROOT_DIR/ios/Classes/ble/BleManager.swift"; then
-    echo "PASS restored peripherals are routed into restorePeripheral"
+  if grep -q 'escrowStateRestorationPeripheral' "$ROOT_DIR/ios/Classes/ble/BleManager.swift"; then
+    echo "PASS restored peripherals are routed into pre-claim escrow"
   else
-    echo "FAIL missing restorePeripheral flow"
+    echo "FAIL missing State Restoration escrow flow"
     failed=1
   fi
 
