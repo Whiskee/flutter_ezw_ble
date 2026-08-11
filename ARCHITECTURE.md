@@ -219,6 +219,8 @@ enum BleEventChannel {
 
 > **修改提示**：`receiveData` 的 `data` 走 Base64 是为了避开 MethodChannel 二进制流跨 isolate 的成本；新增二进制通道时建议沿用这套约定。
 
+`receiveData` 是纯传输边界，Android、iOS 与 Dart 都必须保留通知 payload 的完整字节序列，不在本层解析、截断或重排。G2 音频流当前可能携带 `200 字节 LC3 + 4 字节方向/角色标签 + 1 字节帧序号`；这些尾部字节由上层 `even_connect` 按协议拆分，再由音频算法解释。本仓回归测试固定覆盖 205 字节帧的 Base64 往返，避免依赖升级时静默丢失方向或说话人元数据。
+
 ### iOS 连接缓存约束
 
 `connectedDevices` 是 iOS 原生的业务/GATT 缓存，不等价于 CoreBluetooth 的物理连接状态。缓存以稳定 peripheral UUID 去重；`CBPeripheral` 对象引用仅用于 session/callback 的精确归属。自动回连只有在缓存业务已连接且 `peripheral.state == .connected` 时才可跳过新的 `centralManager.connect`，系统断连必须使同 UUID 的全部缓存项失效，避免陈旧缓存让长期回连意图存在但没有实际 pending connect。

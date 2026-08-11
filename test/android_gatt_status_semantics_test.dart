@@ -95,8 +95,11 @@ void main() {
       'if (status == BluetoothGattStatus.GATT_INSUFFICIENT_AUTHORIZATION)',
     );
     final authorizationBranchEnd = characteristicCallback.indexOf(
-      '// 4. 其余 characteristic write 状态保留旧行为',
+      '\n        // 4.',
+      authorizationBranchStart,
     );
+    expect(authorizationBranchStart, isNonNegative);
+    expect(authorizationBranchEnd, greaterThan(authorizationBranchStart));
     final authorizationBranch = characteristicCallback.substring(
       authorizationBranchStart,
       authorizationBranchEnd,
