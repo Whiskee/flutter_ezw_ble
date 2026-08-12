@@ -632,6 +632,7 @@ extension BleManager {
         visiblePendingRecoveryWatchdogs.takeIfCurrent(current)?.cancel()
         currentConnectionAdmissions.removeValue(forKey: reconnectKey(uuid: current.endpointId))
         peripheralConnectionSessions.removeValue(forKey: current.sessionId)
+        businessConnectionLeases.remove(endpointKey: reconnectKey(uuid: current.endpointId))
         // 2、根据终态是完成还是硬取消，选择 complete 或 cancelEndpoint 推进 Gate。
         return invalidateEndpoint
             ? connectionAdmissionGate.cancelEndpoint(current.endpointId)
@@ -833,6 +834,9 @@ extension BleManager {
         connectionAdmissionGate.suspendAndReset()
         currentConnectionAdmissions.removeAll()
         peripheralConnectionSessions.removeAll()
+        // Bluetooth OFF invalidates every exact prepare token while preserving
+        // paused long-lived autoReconnect tasks for poweredOn recovery.
+        businessConnectionLeases.clear()
         peripheralCancellationWatchdogs.values.forEach { $0.workItem.cancel() }
         peripheralCancellationWatchdogs.removeAll()
         pendingPhysicalConnectWatchdogs.removeAll().forEach { $0.cancel() }

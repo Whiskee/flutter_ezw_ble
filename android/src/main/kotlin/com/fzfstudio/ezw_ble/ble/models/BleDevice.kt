@@ -51,6 +51,9 @@ class BleDevice(
     /** 各私有服务类型对应的 write/read characteristic 缓存。 */
     private val writeAndReadList: MutableList<BleWriteAndRead> = Collections.synchronizedList(mutableListOf())
 
+    /** CCCD/notify 已经成功开启的私有服务类型。 */
+    private val notifiedPsTypes: MutableSet<Int> = Collections.synchronizedSet(mutableSetOf())
+
     /** 连接/GATT readiness 超时器，连接成功或释放 session 时必须取消。 */
     @Volatile
     var timeoutTimer: Timer? = null
@@ -79,7 +82,13 @@ class BleDevice(
 
         // 3. 同一个 psType 只保留最新 characteristic，避免服务重发现后写到旧对象。
         writeAndReadList.removeAll { it.psType == psType }
+        notifiedPsTypes.remove(psType)
         writeAndReadList.add(BleWriteAndRead(psType, write, read))
+    }
+
+    /** Mark one private service notify/CCCD write as complete for this GATT session. */
+    fun markNotifyReady(psType: Int) {
+        notifiedPsTypes.add(psType)
     }
 
     /**
@@ -104,6 +113,7 @@ class BleDevice(
 
         // 4. 清空读写特征缓存；每次物理回连都必须重新 discover services/enable notify。
         writeAndReadList.clear()
+        notifiedPsTypes.clear()
     }
 
     /**
@@ -159,6 +169,25 @@ class BleDevice(
         val writeChars = writeAndReadList.firstOrNull { it.psType == psType }?.writeChars
             ?: return false
         return writeChars.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
+    }
+
+    /**
+     * Business connected may only be committed after every configured private
+     * service has an active write/read characteristic cache on the current GATT.
+     *
+     * Android notify/CCCD completion is what populates this list, so matching
+     * the configured service count keeps commit aligned with `connectFinish`.
+     */
+    fun hasCompleteGattReadiness(): Boolean {
+        val expectedTypes = belongConfig.privateServices.map { it.type }.toSet()
+        if (expectedTypes.isEmpty()) {
+            return false
+        }
+        val characteristicReadyTypes = writeAndReadList.mapNotNull { item ->
+            if (item.writeChars != null && item.readChars != null) item.psType else null
+        }.toSet()
+        return characteristicReadyTypes.containsAll(expectedTypes) &&
+            notifiedPsTypes.containsAll(expectedTypes)
     }
 
     /**

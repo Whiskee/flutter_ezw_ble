@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:flutter_ezw_ble/core/models/ble_config.dart';
 import 'package:flutter_ezw_ble/core/models/ble_cmd.dart';
+import 'package:flutter_ezw_ble/core/models/ble_business_connection_attempt.dart';
 import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
 import 'package:flutter_ezw_ble/core/models/ble_device.dart';
 import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
@@ -95,6 +96,25 @@ class MockFlutterEzwBlePlatform
 
   @override
   Future<void> deviceConnected(String uuid) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<BleBusinessConnectionStatus> prepareBusinessConnection(
+    BleBusinessConnectionAttempt attempt,
+  ) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<BleBusinessConnectionStatus> commitBusinessConnection(
+    BleBusinessConnectionAttempt attempt,
+  ) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<bool> abortBusinessConnection(BleBusinessConnectionAttempt attempt) {
     throw UnimplementedError();
   }
 

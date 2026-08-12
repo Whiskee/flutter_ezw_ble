@@ -116,6 +116,10 @@ class BleManager: NSObject {
     let visiblePendingRecoveryWatchdogs = BleVisiblePendingRecoveryWatchdogRegistry()
     let deferredPeripheralReconnectRegistry = BleDeferredPeripheralReconnectRegistry()
     var pendingConnectionAdmissionTeardowns: [String: BlePendingConnectionAdmissionTeardown] = [:]
+    // Business-auth leases are exact session/attempt tokens. A new prepare for
+    // the same endpoint replaces the old one, while stale abort/cleanup paths
+    // must not remove a newer token.
+    let businessConnectionLeases = BleBusinessConnectionLeaseRegistry()
     let reconnectStore = BleReconnectStore()
     let restorationCoordinator = BleStateRestorationCoordinator()
     //  - 最近一次已输出的扫描配置签名，用于避免每次 startScan 都重复刷配置详情。
@@ -418,24 +422,147 @@ extension BleManager {
     /**
      *  设置连接成功
      */
-    func setConnected(uuid: String) {
+    @discardableResult
+    func setConnected(
+        uuid: String,
+        expectedAttempt: BleBusinessConnectionAttempt? = nil
+    ) -> BleBusinessConnectionStatus {
         guard checkIsFunctionCanBeCalled() else {
-            return
+            return .invalidArguments
+        }
+        let exactAdmission: BleConnectionAdmission?
+        if let expectedAttempt = expectedAttempt {
+            guard let admission = currentConnectionAdmission(uuid: uuid) else {
+                return .missingAdmission
+            }
+            guard admission.sessionGeneration == expectedAttempt.sessionGeneration,
+                  admission.generation == expectedAttempt.attemptGeneration else {
+                return .attemptMismatch
+            }
+            // Exact commit must publish the same admission token that Dart
+            // prepared; legacy deviceConnected keeps its historical best-effort
+            // path by leaving expectedAttempt nil.
+            exactAdmission = admission
+        } else {
+            exactAdmission = currentConnectionAdmission(uuid: uuid)
         }
         if !preConnectedDevices.contains(uuid) {
             loggerE(msg: "setConnected: \(uuid) connected failed, not pre-connected")
-            return
+            return .missingPrepare
         }
         loggerD(msg: "setConnected: \(uuid) connected")
         //  移除预连接状态
         preConnectedDevices.remove(uuid)
+        businessConnectionLeases.remove(endpointKey: reconnectKey(uuid: uuid))
         let connectedDevice = connectedDevices.first(where: { device in
             device.peripheral.identifier.uuidString == uuid
         })
         if let connectedDevice = connectedDevice {
             persistReconnectTarget(device: connectedDevice)
         }
-        updateConnectedDevice(uuid: uuid, name: connectedDevice?.peripheral.name ?? "", isConnected: true)
+        updateConnectedDevice(
+            uuid: uuid,
+            name: connectedDevice?.peripheral.name ?? "",
+            isConnected: true,
+            source: exactAdmission?.source,
+            generation: exactAdmission?.sessionGeneration,
+            attemptGeneration: exactAdmission?.generation
+        )
+        let committed = connectedDevices.first(where: { device in
+            device.peripheral.identifier.uuidString == uuid
+        })?.isConnected == true
+        return committed ? .accepted : .deviceDisconnected
+    }
+
+    /**
+     * Install a bounded business-auth lease for the exact GATT attempt that
+     * emitted `connectFinish`. Legacy `devicePreConnected` remains available
+     * for older integrations and non-G2 products.
+     */
+    func prepareBusinessConnection(
+        _ attempt: BleBusinessConnectionAttempt
+    ) -> BleBusinessConnectionStatus {
+        let status = validateBusinessConnectionAttempt(attempt, requirePrepare: false)
+        guard status == .accepted else {
+            return status
+        }
+        businessConnectionLeases.prepare(
+            endpointKey: reconnectKey(uuid: attempt.uuid),
+            attempt: attempt,
+            at: Date()
+        )
+        // Reuse the existing bounded auth-grace timeout so a prepared but never
+        // committed attempt still times out through the established path.
+        preConnectedDevices.insert(attempt.uuid)
+        loggerD(msg: "businessConnection prepare accepted: uuid=\(attempt.uuid), sessionGeneration=\(attempt.sessionGeneration), attemptGeneration=\(attempt.attemptGeneration)")
+        return .accepted
+    }
+
+    /**
+     * Commit business connected only while the exact prepared attempt still
+     * owns admission, the physical peripheral is connected, and every
+     * private-service write/read/notify readiness bit is complete.
+     */
+    func commitBusinessConnection(
+        _ attempt: BleBusinessConnectionAttempt
+    ) -> BleBusinessConnectionStatus {
+        let status = validateBusinessConnectionAttempt(attempt, requirePrepare: true)
+        guard status == .accepted else {
+            return status
+        }
+        return setConnected(uuid: attempt.uuid, expectedAttempt: attempt)
+    }
+
+    /**
+     * Abort only the exact prepared token. Stale aborts are no-ops and must not
+     * cancel CoreBluetooth pending connect, admission, or autoReconnect owner.
+     */
+    func abortBusinessConnection(_ attempt: BleBusinessConnectionAttempt) -> Bool {
+        guard !attempt.uuid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+        let key = reconnectKey(uuid: attempt.uuid)
+        guard businessConnectionLeases.abort(endpointKey: key, attempt: attempt) else {
+            return false
+        }
+        preConnectedDevices.remove(attempt.uuid)
+        loggerD(msg: "businessConnection abort accepted: uuid=\(attempt.uuid), sessionGeneration=\(attempt.sessionGeneration), attemptGeneration=\(attempt.attemptGeneration)")
+        return true
+    }
+
+    private func validateBusinessConnectionAttempt(
+        _ attempt: BleBusinessConnectionAttempt,
+        requirePrepare: Bool
+    ) -> BleBusinessConnectionStatus {
+        let key = reconnectKey(uuid: attempt.uuid)
+        let admission = currentConnectionAdmission(uuid: attempt.uuid)
+        let admissionAttempt = admission.map {
+            BleBusinessConnectionAttempt(
+                uuid: attempt.uuid,
+                sessionGeneration: $0.sessionGeneration,
+                attemptGeneration: $0.generation
+            )
+        }
+        let session = admission.flatMap { peripheralConnectionSessions[$0.sessionId] }
+        let device = connectedDevices.first(where: {
+            $0.peripheral.identifier.uuidString == attempt.uuid
+        })
+        let isSamePeripheral = device != nil && session != nil &&
+            device!.peripheral === session!.peripheral
+        let readiness = device.map {
+            BleGattReadiness.make(device: $0, config: $0.belongConfig)
+        }
+        return BleBusinessConnectionCommitPolicy.evaluate(
+            attempt: attempt,
+            admissionAttempt: admissionAttempt,
+            preparedAttempt: businessConnectionLeases.attempt(for: key),
+            requirePrepare: requirePrepare,
+            hasSession: session != nil,
+            hasDevice: device != nil,
+            isSamePeripheral: isSamePeripheral,
+            isPeripheralConnected: session?.peripheral.state == .connected,
+            isGattReady: readiness?.isComplete == true
+        )
     }
     
     /**
@@ -506,6 +633,8 @@ extension BleManager {
         //  1、移除预连接状态（uuid 为空则为 no-op，但保留以兼容旧路径）
         preConnectedDevices.remove(uuid)
         preConnectedDevices.remove(effectiveUuid)
+        businessConnectionLeases.remove(endpointKey: reconnectKey(uuid: uuid))
+        businessConnectionLeases.remove(endpointKey: reconnectKey(uuid: effectiveUuid))
         //  注意：不要在此处调用 removeActiveConnectRequest；需先按 uuid/name 命中 in-flight 或
         // 未完成连接的外设（见 findUnfinishedConnectDevice），否则 Dart 空 uuid + 名称取消无法关联到 CB 外设。
 
@@ -744,11 +873,21 @@ extension BleManager {
             loggerE(msg: "sendCmd: \(uuid), type=\(psType), cannot send non-OTA commands during upgrade")
             return
         }
-        //  通过uuid无法查询设备和特征，都被视为查找不到设备
         guard let device = connectedDevices.first(where: { device in
             device.peripheral.identifier.uuidString == uuid
-        }), let writeChars = device.writeCharsDic[psType] else {
-            loggerE(msg: "sendCmd: \(uuid), type=\(psType), device not found")
+        }) else {
+            loggerE(msg: "sendCmd: \(uuid), type=\(psType), device cache missing")
+            return
+        }
+        if let admission = currentConnectionAdmission(uuid: uuid) {
+            guard let session = peripheralConnectionSessions[admission.sessionId],
+                  session.peripheral === device.peripheral else {
+                loggerE(msg: "sendCmd: \(uuid), type=\(psType), attempt stale, sessionGeneration=\(admission.sessionGeneration), attemptGeneration=\(admission.generation)")
+                return
+            }
+        }
+        guard let writeChars = device.writeCharsDic[psType] else {
+            loggerE(msg: "sendCmd: \(uuid), type=\(psType), write characteristic missing")
             return
         }
         //  根据不同uuid类型获取不同的服务特征
@@ -942,6 +1081,7 @@ extension BleManager {
      */
     func cleanConnectCache() {
         cancelAllConnectionAdmissions(reason: "cleanConnectCache")
+        businessConnectionLeases.clear()
         //  1、清理当前连接请求和搜索连接信息。
         activeConnectRequests.removeAll()
         startConnectInfos.removeAll()
@@ -965,6 +1105,7 @@ extension BleManager {
     func reset(preserveStateRestoration: Bool = false) {
         stopScan()
         cancelAllConnectionAdmissions(reason: "reset")
+        businessConnectionLeases.clear()
         connectedDevices.forEach { device in
             centralManager.cancelPeripheralConnection(device.peripheral)
         }

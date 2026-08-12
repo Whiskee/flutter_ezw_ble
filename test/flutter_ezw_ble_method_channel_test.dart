@@ -1,4 +1,5 @@
 import 'package:flutter/services.dart';
+import 'package:flutter_ezw_ble/core/models/ble_business_connection_attempt.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_method_channel.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -11,8 +12,8 @@ void main() {
   setUp(() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (MethodCall methodCall) async {
-          return '42';
-        });
+      return '42';
+    });
   });
 
   tearDown(() {
@@ -24,9 +25,9 @@ void main() {
     MethodCall? capturedCall;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (methodCall) async {
-          capturedCall = methodCall;
-          return null;
-        });
+      capturedCall = methodCall;
+      return null;
+    });
 
     await MethodChannelEzwBle().sendCmd(
       'left-uuid',
@@ -42,9 +43,9 @@ void main() {
     MethodCall? capturedCall;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (methodCall) async {
-          capturedCall = methodCall;
-          return null;
-        });
+      capturedCall = methodCall;
+      return null;
+    });
 
     await MethodChannelEzwBle().sendCmdNoWait(
       'left-uuid',
@@ -55,6 +56,66 @@ void main() {
     expect(capturedCall?.method, 'sendCmdNoWait');
     expect(capturedCall?.arguments, containsPair('uuid', 'left-uuid'));
     expect(capturedCall?.arguments, containsPair('psType', 1));
+  });
+
+  test('prepareBusinessConnection forwards exact attempt and decodes status',
+      () async {
+    MethodCall? capturedCall;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (methodCall) async {
+      capturedCall = methodCall;
+      return 'accepted';
+    });
+
+    final status = await MethodChannelEzwBle().prepareBusinessConnection(
+      const BleBusinessConnectionAttempt(
+        uuid: 'left-uuid',
+        sessionGeneration: 37,
+        attemptGeneration: 9,
+      ),
+    );
+
+    expect(capturedCall?.method, 'prepareBusinessConnection');
+    expect(capturedCall?.arguments, containsPair('uuid', 'left-uuid'));
+    expect(capturedCall?.arguments, containsPair('sessionGeneration', 37));
+    expect(capturedCall?.arguments, containsPair('attemptGeneration', 9));
+    expect(status, BleBusinessConnectionStatus.accepted);
+  });
+
+  test('commitBusinessConnection decodes attempt mismatch', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (methodCall) async {
+      expect(methodCall.method, 'commitBusinessConnection');
+      return 'attemptMismatch';
+    });
+
+    final status = await MethodChannelEzwBle().commitBusinessConnection(
+      const BleBusinessConnectionAttempt(
+        uuid: 'left-uuid',
+        sessionGeneration: 37,
+        attemptGeneration: 8,
+      ),
+    );
+
+    expect(status, BleBusinessConnectionStatus.attemptMismatch);
+  });
+
+  test('abortBusinessConnection returns native boolean', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (methodCall) async {
+      expect(methodCall.method, 'abortBusinessConnection');
+      return true;
+    });
+
+    final aborted = await MethodChannelEzwBle().abortBusinessConnection(
+      const BleBusinessConnectionAttempt(
+        uuid: 'left-uuid',
+        sessionGeneration: 37,
+        attemptGeneration: 8,
+      ),
+    );
+
+    expect(aborted, isTrue);
   });
 
   // test('getPlatformVersion', () async {

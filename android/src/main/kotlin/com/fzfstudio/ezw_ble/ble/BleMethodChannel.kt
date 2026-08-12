@@ -35,6 +35,12 @@ enum class BleMC {
     DEVICE_PRE_CONNECTED,
     /** 标记设备业务鉴权成功并启用自动回连。 */
     DEVICE_CONNECTED,
+    /** 为 exact GATT attempt 安装业务鉴权 lease。 */
+    PREPARE_BUSINESS_CONNECTION,
+    /** 只在 exact lease 和 GATT readiness 仍成立时提交业务 connected。 */
+    COMMIT_BUSINESS_CONNECTION,
+    /** 只撤销 exact 业务鉴权 lease，不取消长期回连 owner。 */
+    ABORT_BUSINESS_CONNECTION,
     /** 补种 native 自动回连目标，不发起前台连接。 */
     ARM_AUTO_RECONNECT_TARGETS,
     /** 立即建立/复用所有目标的 native 直连，并保留调用来源。 */
@@ -157,6 +163,24 @@ enum class BleMC {
                 // 1. Dart 业务认证成功后，原生才允许 arm 自动回连。
                 val uuid = arguments as? String ?: ""
                 BleManager.instance.setConnected(uuid)
+            }
+            PREPARE_BUSINESS_CONNECTION -> {
+                val attempt = (arguments as? Map<*, *>)?.toBusinessConnectionAttempt()
+                return result.success(
+                    BleManager.instance.prepareBusinessConnection(attempt).flutterValue,
+                )
+            }
+            COMMIT_BUSINESS_CONNECTION -> {
+                val attempt = (arguments as? Map<*, *>)?.toBusinessConnectionAttempt()
+                return result.success(
+                    BleManager.instance.commitBusinessConnection(attempt).flutterValue,
+                )
+            }
+            ABORT_BUSINESS_CONNECTION -> {
+                val attempt = (arguments as? Map<*, *>)?.toBusinessConnectionAttempt()
+                return result.success(
+                    BleManager.instance.abortBusinessConnection(attempt),
+                )
             }
             ARM_AUTO_RECONNECT_TARGETS -> {
                 // 1. 旧缓存/进程恢复时，Dart 只补种长期回连意图，不打开 GATT。
@@ -306,6 +330,13 @@ enum class BleMC {
         result.success(null)
     }
 }
+
+private fun Map<*, *>.toBusinessConnectionAttempt(): BleBusinessConnectionAttempt =
+    BleBusinessConnectionAttempt(
+        uuid = this["uuid"] as? String ?: "",
+        sessionGeneration = (this["sessionGeneration"] as? Number)?.toLong() ?: 0L,
+        attemptGeneration = (this["attemptGeneration"] as? Number)?.toLong() ?: 0L,
+    )
 
 /**
  * 将 Dart `BleConfig` JSON 转成 Android 模型。

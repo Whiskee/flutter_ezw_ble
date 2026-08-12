@@ -11,6 +11,73 @@ import XCTest
 
 class RunnerTests: XCTestCase {
 
+  func testBusinessConnectionStaleAbortDoesNotRemoveReplacementLease() {
+    let registry = BleBusinessConnectionLeaseRegistry()
+    let attemptA = businessAttempt(generation: 1)
+    let attemptB = businessAttempt(generation: 2)
+    registry.prepare(endpointKey: "g2-left", attempt: attemptA, at: Date())
+    registry.prepare(endpointKey: "g2-left", attempt: attemptB, at: Date())
+
+    XCTAssertFalse(registry.abort(endpointKey: "g2-left", attempt: attemptA))
+    XCTAssertEqual(registry.attempt(for: "g2-left"), attemptB)
+    XCTAssertTrue(registry.abort(endpointKey: "g2-left", attempt: attemptB))
+    XCTAssertNil(registry.attempt(for: "g2-left"))
+  }
+
+  func testBusinessConnectionCommitRejectsStaleDisconnectedAndIncompleteReadiness() {
+    let attemptA = businessAttempt(generation: 1)
+    let attemptB = businessAttempt(generation: 2)
+
+    XCTAssertEqual(evaluateBusinessCommit(attempt: attemptA, admission: attemptB), .attemptMismatch)
+    XCTAssertEqual(evaluateBusinessCommit(attempt: attemptA, isConnected: false), .deviceDisconnected)
+    XCTAssertEqual(evaluateBusinessCommit(attempt: attemptA, isGattReady: false), .gattNotReady)
+  }
+
+  func testBusinessConnectionAcceptedTokenCannotCommitTwice() {
+    let registry = BleBusinessConnectionLeaseRegistry()
+    let attempt = businessAttempt(generation: 1)
+    registry.prepare(endpointKey: "g2-left", attempt: attempt, at: Date())
+
+    XCTAssertEqual(
+      evaluateBusinessCommit(attempt: attempt, prepared: registry.attempt(for: "g2-left")),
+      .accepted
+    )
+    registry.remove(endpointKey: "g2-left")
+    XCTAssertEqual(
+      evaluateBusinessCommit(attempt: attempt, hasPrepare: false),
+      .missingPrepare
+    )
+  }
+
+  private func businessAttempt(generation: Int64) -> BleBusinessConnectionAttempt {
+    BleBusinessConnectionAttempt(
+      uuid: "g2-left",
+      sessionGeneration: 10,
+      attemptGeneration: generation
+    )
+  }
+
+  private func evaluateBusinessCommit(
+    attempt: BleBusinessConnectionAttempt,
+    admission: BleBusinessConnectionAttempt? = nil,
+    prepared: BleBusinessConnectionAttempt? = nil,
+    hasPrepare: Bool = true,
+    isConnected: Bool = true,
+    isGattReady: Bool = true
+  ) -> BleBusinessConnectionStatus {
+    BleBusinessConnectionCommitPolicy.evaluate(
+      attempt: attempt,
+      admissionAttempt: admission ?? attempt,
+      preparedAttempt: hasPrepare ? (prepared ?? attempt) : nil,
+      requirePrepare: true,
+      hasSession: true,
+      hasDevice: true,
+      isSamePeripheral: true,
+      isPeripheralConnected: isConnected,
+      isGattReady: isGattReady
+    )
+  }
+
   func testUpgradeStateRegistryInstallsAndConsumesMarkerIdempotently() {
     let registry = BleUpgradeStateRegistry()
 

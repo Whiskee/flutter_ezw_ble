@@ -4,6 +4,7 @@ import 'package:flutter_ezw_ble/core/models/ble_config.dart';
 import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
 import 'package:flutter_ezw_ble/core/models/ble_device.dart';
 import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
+import 'package:flutter_ezw_ble/core/models/ble_business_connection_attempt.dart';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
 import 'flutter_ezw_ble_method_channel.dart';
@@ -169,6 +170,39 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   Future<void> deviceConnected(String uuid) {
     throw UnimplementedError(
       'deviceConnected(uuid: $uuid) has not been implemented.',
+    );
+  }
+
+  /// Prepare exact business-auth completion for the current GATT attempt.
+  ///
+  /// This is the generation-aware replacement for G2/GATT-ready flows that need
+  /// to reject stale `connectFinish` callbacks. Legacy [devicePreConnected]
+  /// remains available for G1/R1 and older integrations.
+  Future<BleBusinessConnectionStatus> prepareBusinessConnection(
+    BleBusinessConnectionAttempt attempt,
+  ) {
+    throw UnimplementedError(
+      'prepareBusinessConnection(attempt: $attempt) has not been implemented.',
+    );
+  }
+
+  /// Commit business connected only if the same prepared attempt still owns the
+  /// native admission, physical link, and complete GATT readiness.
+  Future<BleBusinessConnectionStatus> commitBusinessConnection(
+    BleBusinessConnectionAttempt attempt,
+  ) {
+    throw UnimplementedError(
+      'commitBusinessConnection(attempt: $attempt) has not been implemented.',
+    );
+  }
+
+  /// Abort only the exact prepared business-auth attempt.
+  ///
+  /// A stale abort must not clear a newer prepare lease or cancel the long-lived
+  /// native autoReconnect owner.
+  Future<bool> abortBusinessConnection(BleBusinessConnectionAttempt attempt) {
+    throw UnimplementedError(
+      'abortBusinessConnection(attempt: $attempt) has not been implemented.',
     );
   }
 

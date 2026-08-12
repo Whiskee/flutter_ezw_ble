@@ -4,6 +4,7 @@ import 'package:flutter_ezw_ble/core/models/ble_config.dart';
 import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
 import 'package:flutter_ezw_ble/core/models/ble_device.dart';
 import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
+import 'package:flutter_ezw_ble/core/models/ble_business_connection_attempt.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble.dart';
 
 import 'flutter_ezw_ble_platform_interface.dart';
@@ -118,6 +119,38 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
   @override
   Future<void> deviceConnected(String uuid) async =>
       methodChannel.invokeMethod("deviceConnected", uuid);
+
+  @override
+  Future<BleBusinessConnectionStatus> prepareBusinessConnection(
+    BleBusinessConnectionAttempt attempt,
+  ) async {
+    final raw = await methodChannel.invokeMethod<String>(
+      'prepareBusinessConnection',
+      attempt.toJson(),
+    );
+    return bleBusinessConnectionStatusFromNative(raw);
+  }
+
+  @override
+  Future<BleBusinessConnectionStatus> commitBusinessConnection(
+    BleBusinessConnectionAttempt attempt,
+  ) async {
+    final raw = await methodChannel.invokeMethod<String>(
+      'commitBusinessConnection',
+      attempt.toJson(),
+    );
+    return bleBusinessConnectionStatusFromNative(raw);
+  }
+
+  @override
+  Future<bool> abortBusinessConnection(
+    BleBusinessConnectionAttempt attempt,
+  ) async =>
+      await methodChannel.invokeMethod<bool>(
+        'abortBusinessConnection',
+        attempt.toJson(),
+      ) ??
+      false;
 
   @override
   Future<void> armAutoReconnectTargets(List<BleDevice> devices) async =>

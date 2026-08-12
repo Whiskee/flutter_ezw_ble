@@ -36,7 +36,7 @@ iOS 侧必须满足以下条件，否则 State Restoration 只会变成普通前
   `Info.plist` 已声明 `UIBackgroundModes = bluetooth-central` 时才会传该 restore identifier。
 - `Info.plist` 保留 `UIBackgroundModes = bluetooth-central`。
 - 已经对目标 peripheral 发起过 `centralManager.connect(peripheral)`，让 CoreBluetooth 持有 pending connect。
-- 设备已经达到业务 `connected`，即 Dart 调用过 `deviceConnected(uuid)`，原生才会 arm 自动回连任务。
+- 设备已经达到业务 `connected`，即 G2 exact `commitBusinessConnection(attempt)`（或 G1/R1 兼容 `deviceConnected(uuid)`）已成功，原生才会 arm 自动回连任务。
 - 本地存在 reconnect target，可在进程恢复后把 restored peripheral 匹配回 `BleConfig`。
 
 如果宿主没有声明 `bluetooth-central`，iOS 会在带 restore identifier 初始化 `CBCentralManager` 时直接抛
@@ -53,7 +53,7 @@ iOS 侧必须满足以下条件，否则 State Restoration 只会变成普通前
 
 ```text
 业务首连成功
-  -> Dart 调用 deviceConnected(uuid)
+  -> G2 exact commit（G1/R1 调用 legacy deviceConnected）
   -> iOS 持久化 reconnect target 并 arm auto reconnect
   -> 异常断连
   -> 原生立即把已知 CBPeripheral 交回 centralManager.connect
@@ -70,7 +70,7 @@ iOS 侧必须满足以下条件，否则 State Restoration 只会变成普通前
   -> Gate granted 后才启动 timeout 与统一 GATT pipeline
   -> connectFinish
   -> Dart 重新发送业务 AUTH / sync 命令
-  -> Dart 再次调用 deviceConnected(uuid)
+  -> Dart 使用同一 connectFinish token 调用 prepareBusinessConnection / commitBusinessConnection
 ```
 
 `willRestoreState` 可能早于 Flutter 引擎、MethodChannel、EventChannel、`initConfigs` 和当前账号设备加载。因此回调里只能建立物理 escrow，不能直接执行 Dart 业务、service discovery、notify 或 AUTH，也不能假设配置或当前 owner 已经可用。
@@ -87,6 +87,7 @@ iOS 侧必须满足以下条件，否则 State Restoration 只会变成普通前
 | `BleGattReadiness` | 聚合 service、write characteristic、read characteristic、notify ready 状态，保证 `connectFinish` 只发一次。 |
 | `BleConnectionAdmissionGate` | 串行所有 endpoint 的 service / characteristic / CCCD / 业务鉴权；restoration、普通 didConnect、already-connected 共用同一 Gate。 |
 | `BlePeripheralCancellationBarrierGate` | 用 exact token、2s watchdog 与每 endpoint 单个饱和 debt counter 隔离 cancel 的迟到终态。 |
+| `BleBusinessConnectionAttempt` | Dart 从 `connectFinish` 携带的 `uuid/sessionGeneration/attemptGeneration` 生成 exact token；prepare/commit/abort 只作用于完全匹配的当前 admission。 |
 
 ## 5. Pending Connect 规则
 
@@ -149,7 +150,7 @@ task、alias、持久 target 和 Gate identity，随后仍走同一条 GATT/业�
 - automatic / restoration 按真实物理 callback FIFO；
 - waiting manual 优先于 automatic，但不能抢占 active owner；
 - 只有 owner 能运行 service discovery、characteristic、notify / CCCD 与业务鉴权；
-- `connectFinish` 不释放 owner，只有业务 `deviceConnected` 或已确认 teardown 的终态释放；
+- `connectFinish` 不释放 owner，只有 G2 exact commit、G1/R1 `deviceConnected` 或已确认 teardown 的终态释放；
 - 事件携带 `source`、兼容键 `generation`、`sessionGeneration` 与 `attemptGeneration`。`generation` 序列化为 Dart session generation；`attemptGeneration` 使用 admission.generation，并通过 endpoint + attemptGeneration + session + `CBPeripheral` 对象身份拒绝迟到 callback。
 
 `CBPeripheral` 对象身份只用于拒绝迟到 callback，不能用于 `connectedDevices` 缓存判重。恢复、retrieve 或蓝牙开关后，系统可为同一稳定 UUID 返回不同对象实例；缓存必须按 UUID 单例化。业务缓存显示已连接时，还必须同时确认该实例的 `peripheral.state == .connected` 才能跳过新 pending connect。收到终态要失效全部同 UUID 缓存项，随后由新一代连接替换为当前实例，避免陈旧 `isConnected=true` 把自动回连静默短路。
@@ -199,15 +200,15 @@ hard cancel、登出、移除设备、配置删除或 `autoReconnect=false` 必�
 
 ## 9. Dart / even_connect 职责
 
-`connectFinish` 只表示 GATT ready，不表示业务 connected。Dart 集成层必须在每次 restoration / auto reconnect 后重新做业务握手：
+`connectFinish` 只表示 GATT ready，不表示业务 connected。Dart 集成层必须在每次 restoration / auto reconnect 后重新做业务握手，并使用该事件携带的 `uuid/sessionGeneration/attemptGeneration` 生成 `BleBusinessConnectionAttempt`：
 
 1. 冷启动时一次提交全部允许的 G2 双腿/R1 target，等待每个 `activateAutoReconnectTargets` 回执完成，再调用 `finalizeStateRestorationClaims`。
 2. 收到 `connectFinish`。
 3. 发送设备业务认证命令。
 4. 等待认证成功回调。
-5. 调用 `devicePreConnected(uuid)` 进入有界鉴权宽限。
+5. 调用 `prepareBusinessConnection(attempt)` 进入有界鉴权宽限；拒绝状态只终止本次业务握手，不取消 State Restoration / auto reconnect owner。
 6. 发送业务必要的收尾命令，例如通道切换、时间同步。
-7. 调用 `deviceConnected(uuid)`，重新 arm 下一轮 auto reconnect。
+7. 调用 `commitBusinessConnection(attempt)`，由原生再次校验 exact admission、`CBPeripheral.state == .connected`、缓存对象身份和 `BleGattReadiness` 后发布 `connected` 并重新 arm 下一轮 auto reconnect。旧 token 或本地取消只调用 `abortBusinessConnection(attempt)`。
 
 如果 Flutter EventChannel 订阅晚于 restoration 事件，Dart 应调用原生提供的 buffered reconnect event drain API，补读原生恢复期间发生的关键事件。
 
@@ -245,7 +246,7 @@ hard cancel、登出、移除设备、配置删除或 `autoReconnect=false` 必�
 
 ## 11. 验收清单
 
-- App 首连成功后调用 `deviceConnected(uuid)`，原生持久化 reconnect target。
+- App 首连 G2 exact commit（或 G1/R1 `deviceConnected`）成功后，原生持久化 reconnect target。
 - 外设离开后 App 后台，原生保持 pending connect，不用短 timeout 取消。
 - 冷启动/蓝牙恢复时所有 owner 先 activate pending 直连，App 扫描只并行补 cache，最多 20s。
 - 系统恢复后能看到 `willRestoreState`，且 restored peripheral 在当前账号 target activation 前只处于 escrow，不提前运行 GATT/AUTH。
@@ -254,7 +255,7 @@ hard cancel、登出、移除设备、配置删除或 `autoReconnect=false` 必�
 - 蓝牙 poweredOff 先用 active/last-connected generation 上报 `disconnectFromSys`，再暂停任务；poweredOn 后继续恢复。
 - ANCS / 系统已连接外设扫描不可见时仍可通过 retrieve 路径进入 GATT。
 - 每次恢复都重新 discovery service、characteristic、notify / CCCD。
-- `connectFinish` 后 Dart 重新发业务认证，认证成功后再 `deviceConnected`。
+- `connectFinish` 后 Dart 重新发业务认证；G2 使用该事件的 exact attempt prepare/commit，G1/R1 继续调用兼容 `deviceConnected`。
 - 用户主动断连或移除后不再自动恢复。
 - 多 endpoint 的 service/CCCD/业务鉴权不重叠；Gate 只在业务 connected 或 terminal teardown ack/watchdog 后释放。
 - 连续 1000 次 cancel watchdog 漏回调仍只有一个 debt counter slot；迟到 debt 不吞业务 connected 后的真实断连。

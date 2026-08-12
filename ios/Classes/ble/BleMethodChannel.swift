@@ -37,6 +37,12 @@ enum BleMC: String {
     case devicePreConnected
     /// Mark business-layer auth as complete and arm auto reconnect.
     case deviceConnected
+    /// Install an exact business-auth lease for the current GATT attempt.
+    case prepareBusinessConnection
+    /// Commit business connected after exact lease and GATT readiness checks.
+    case commitBusinessConnection
+    /// Abort only the exact business-auth lease.
+    case abortBusinessConnection
     /// 仅补种 native 长期回连意图。
     case armAutoReconnectTargets
     /// 立即建立/复用所有目标的 CoreBluetooth pending connect。
@@ -138,6 +144,24 @@ enum BleMC: String {
             let uuid = arguments as? String ?? ""
             BleManager.shared.setConnected(uuid: uuid)
             break
+        case .prepareBusinessConnection:
+            let data = arguments as? [String: Any] ?? [:]
+            result(BleManager.shared.prepareBusinessConnection(
+                BleBusinessConnectionAttempt(data: data)
+            ).rawValue)
+            return
+        case .commitBusinessConnection:
+            let data = arguments as? [String: Any] ?? [:]
+            result(BleManager.shared.commitBusinessConnection(
+                BleBusinessConnectionAttempt(data: data)
+            ).rawValue)
+            return
+        case .abortBusinessConnection:
+            let data = arguments as? [String: Any] ?? [:]
+            result(BleManager.shared.abortBusinessConnection(
+                BleBusinessConnectionAttempt(data: data)
+            ))
+            return
         case .devicePreConnected:
             let uuid = arguments as? String ?? ""
             BleManager.shared.setPreConnected(uuid: uuid)

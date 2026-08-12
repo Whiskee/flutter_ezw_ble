@@ -13,7 +13,7 @@ contracts, see `ARCHITECTURE.md`.
 
 `flutter_ezw_ble` provides a native auto reconnect supervisor for devices that have already reached the business `connected` state. Android and iOS own reconnect scheduling, cancellation, backoff, and GATT restoration. Dart callers keep the existing `connectStatusEC` flow and only opt in through `BleConfig`.
 
-This design is intended for `even_connect` integration: `even_connect` declares which device configs support native auto reconnect, listens to the existing connection stream, sends the G2 business authentication command when `connectFinish` arrives, then calls `devicePreConnected(uuid)` only after the authentication callback reports success. For the right leg it then sends the channel switch and time sync commands before finally calling `deviceConnected(uuid)`.
+This design is intended for `even_connect` integration: `even_connect` declares which device configs support native auto reconnect, listens to the existing connection stream, sends the G2 business authentication command when `connectFinish` arrives, then calls the exact-attempt `prepareBusinessConnection` / `commitBusinessConnection` pair with that event's `uuid`, `sessionGeneration`, and `attemptGeneration`. `devicePreConnected(uuid)` / `deviceConnected(uuid)` remain as legacy G1/R1 compatibility APIs.
 
 For G2, the scan config must keep `BleScan.matchCount = 2`. G2 is exposed to business code as one whole device only after both BLE endpoints with the same SN have been paired by the native scanner. A single-leg scan hit must not be shown as a connectable G2 item.
 
@@ -53,6 +53,19 @@ Public methods:
   source and long-lived passive owner after that direct attempt ends. iOS returns
   `false` because CoreBluetooth pending connect and State Restoration remain
   authoritative.
+- `prepareBusinessConnection(BleBusinessConnectionAttempt)` installs an
+  in-memory lease for the exact endpoint/sessionGeneration/attemptGeneration
+  that emitted `connectFinish`. Repeating the same token is idempotent and a
+  different token replaces the old lease for that endpoint. The lease only opens
+  the bounded auth grace window; rejection does not cancel the reconnect owner.
+- `commitBusinessConnection(BleBusinessConnectionAttempt)` is the G2 final
+  business-connected boundary. Native must still own the same admission and
+  physical GATT/CBPeripheral, the device must remain physically connected, and
+  write/read/notify readiness for every configured private service must be
+  complete. It returns `accepted` only after native has published `connected`.
+- `abortBusinessConnection(BleBusinessConnectionAttempt)` removes only an exact
+  matching lease. Stale aborts are no-ops and must not disconnect, remove
+  persisted autoReconnect intent, or delete a newer prepared token.
 
 Every reconnect status event carries `source`, `generation`,
 `sessionGeneration`, and `attemptGeneration`. `generation` is retained as the
@@ -382,10 +395,10 @@ hard cancel reachability without linear memory growth.
    same one-minute display timeout and may show a timeout prompt, but still does
    not cancel native reconnect.
 6. Stop running a parallel Dart reconnect loop for native-managed configs.
-7. On `connectFinish`, send G2 `AUTHENTICATION(0x04)` through `UX_DEVICE_SETTINGS_APP_ID(0x80)` with `AuthMgr.secAuth = true`, the platform-specific `phoneType`, `syncBoth = false`, `timeout = 500ms`, and `maxRetry = 1`.
-8. Wait for the `DevCfgDataPackage` callback. Only when `authMgr.secAuth == true`, call `devicePreConnected(uuid)` to enter the bounded auth grace window.
+7. On `connectFinish`, capture `uuid`, `sessionGeneration`, and `attemptGeneration`, then send G2 `AUTHENTICATION(0x04)` through `UX_DEVICE_SETTINGS_APP_ID(0x80)` with `AuthMgr.secAuth = true`, the platform-specific `phoneType`, `syncBoth = false`, `timeout = 500ms`, and `maxRetry = 1`.
+8. Wait for the `DevCfgDataPackage` callback. Only when `authMgr.secAuth == true`, call `prepareBusinessConnection(attempt)` to enter the bounded auth grace window. If it returns anything except `accepted`, stop that business attempt and let native reconnect continue.
 9. For the right leg, send `PIPE_ROLE_CHANGE(0x05)` with `asCmdRole = RIGHT`, then send `TIME_SYNC(0x80)` with the current timestamp and 15-minute timezone unit.
-10. Call `deviceConnected(uuid)` in the post-auth `finally` path so native can publish the final `connected` state and release the Gate.
+10. Call `commitBusinessConnection(attempt)` in the post-auth success path so native can publish the final `connected` state and release the Gate. On local cancellation or stale orchestration, call `abortBusinessConnection(attempt)`; do not add command retries to compensate for a rejected commit.
 11. Any visible cancel action is a hard cancel: call `disconnectDevice`, stop
     automatic connection, and do not reactivate until the next explicit manual
     connect.

@@ -10,6 +10,7 @@ export 'core/tools/connect_state_converter.dart';
 
 /// Models
 export 'core/models/ble_cmd.dart';
+export 'core/models/ble_business_connection_attempt.dart';
 export 'core/models/ble_config.dart';
 export 'core/models/ble_connect_model.dart';
 export 'core/models/ble_connect_source.dart';

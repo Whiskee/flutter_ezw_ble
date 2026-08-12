@@ -88,7 +88,8 @@ lib/
     │   ├── ble_connect_model.dart        # 连接状态事件
     │   ├── ble_status.dart               # 蓝牙开关/权限状态
     │   ├── ble_cmd.dart                  # 收发的字节命令
-    │   └── ble_device_hardware.dart      # 设备硬件信息（电量/版本，G1 解析协议）
+    │   ├── ble_device_hardware.dart      # 设备硬件信息（电量/版本，G1 解析协议）
+    │   └── ble_business_connection_attempt.dart # exact-attempt 业务 connected 提交令牌与状态
     ├── tools/
     │   └── connect_state_converter.dart  # BleConnectState 的 JSON 转换器
     └── extension/
@@ -176,8 +177,11 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `activateAutoReconnectTargets` | `Future<List<BleReconnectActivationResult>> activateAutoReconnectTargets(List<BleDevice> devices, {BleConnectSource source = BleConnectSource.autoReconnect})` | 对全部目标立即建立/复用原生 pending 直连并逐目标返回接管结果；`resolved` 表示已有稳定身份，`identityPending` 表示 iOS 已按配置与完整名称持有待解析 owner，`rejected` 表示原生没有接管。`manualReconnect` 会提升同一 pending session，不创建重复连接。 |
 | `notifyAutoReconnectTargetVisible` | `Future<bool> notifyAutoReconnectTargetVisible({required String uuid, String name = ''})` | 上层并行扫描重新看到目标时提示原生。Android 接管该 UUID 尚未物理连接的 exact passive GATT 或其 pending retry，并在全局单槽位中执行一次 `autoConnect=false` 直连；随后仍保留长期 passive owner。iOS 保持 State Restoration/pending connect，固定返回 `false`。 |
 | `disconnectDevice` | `Future<void> disconnectDevice(String uuid, String name, {bool removeBond = false})` | 主动断连。`removeBond=true`（仅 Android）会一并移除系统配对。 |
-| `devicePreConnected` | `Future<void> devicePreConnected(String uuid)` | "预连接"通知：业务确认要连这个设备前，让原生侧提前做准备（缓存、超时计时器复位），避免接下来的 `connectDevice` 超时。 |
-| `deviceConnected` | `Future<void> deviceConnected(String uuid)` | "真连上了"通知：业务侧（如收到设备配对回包后）告诉原生 "连接已业务就绪"，原生再 push `connectFinish` → `connected`。 |
+| `devicePreConnected` | `Future<void> devicePreConnected(String uuid)` | G1/R1 兼容的“预连接”通知；G2 禁止使用该 UUID-only 接口。 |
+| `deviceConnected` | `Future<void> deviceConnected(String uuid)` | G1/R1 兼容的业务 connected 提交；G2 禁止使用该 UUID-only 接口。 |
+| `prepareBusinessConnection` | `Future<BleBusinessConnectionStatus> prepareBusinessConnection(BleBusinessConnectionAttempt attempt)` | G2 exact-attempt 预连接入口。`attempt` 必须来自同一次 `connectFinish` 的 `uuid/sessionGeneration/attemptGeneration`；同 token 幂等刷新有界鉴权宽限，不同 token 替换旧 lease。拒绝只返回状态，不取消长期 autoReconnect owner。 |
+| `commitBusinessConnection` | `Future<BleBusinessConnectionStatus> commitBusinessConnection(BleBusinessConnectionAttempt attempt)` | G2 exact-attempt 真连接入口。原生同时校验 prepare lease、当前 admission、物理连接、当前 GATT/CBPeripheral 身份，以及 write/read/notify readiness；只有成功发布 `connected` 后返回 `accepted`。 |
+| `abortBusinessConnection` | `Future<bool> abortBusinessConnection(BleBusinessConnectionAttempt attempt)` | 只撤销完全匹配的 prepare lease；旧 token abort 不能删除新 lease，也不能断开 GATT、移除 autoReconnect owner 或伪造用户断连。 |
 | `sendCmd` | `Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0, bool allowDuringUpgrade = false})` | 写特征值，等待原生层 write 完成。`psType` 是"私有服务类型"，对应 `BlePrivateService.type`（0=基础，1=OTA，2+=自定义）。升级态默认阻断非 OTA 写入；只有上层协议白名单确认的 AUTH、时间同步等恢复控制指令可显式传 `allowDuringUpgrade=true`。 |
 | `sendCmdNoWait` | `Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0})` | OTA 连发入口。Android：`psType == 1` 走 per-endpoint `WRITE_TYPE_NO_RESPONSE` 队列；同步 BUSY 保留原包，Future 等本包 `onCharacteristicWrite` 成功后返回，4s 停滞/teardown typed fail，避免固定延时撞 GATT 单槽位。iOS：`psType == 1` 走 `WriteWithoutResponse` + `canSendWriteWithoutResponse` 背压队列（见 `ios/Classes/ble/OtaWriteQueue.swift` 与 `docs/IOS_OTA_NOWAIT_SPEC.md`）。其它 `psType` 保持历史 no-wait 语义。 |
 | `enterUpgradeState` | `Future<void> enterUpgradeState(String uuid)` | 仅允许仍处于真实业务 `connected`、物理链路有效且持有已接受 epoch 的 uuid 进入 OTA；拒绝用缓存制造 `upgrade`。原生侧据此切到 OTA 私有服务、延长断连超时（与 `BleConfig.upgradeSwapTime` 配合）。 |
@@ -459,7 +463,7 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 
 - 任一非"连接中"终态（connected / 断开 / 错误）到达 → `handleConnectState` 清除该定时器。
 - `connectFinish`（BLE 物理连接完成、但应用层鉴权尚未完成）**不清除**定时器，作为鉴权阶段的安全兜底。
-- **鉴权宽限（重点）**：业务层收到 `connectFinish` 后先发鉴权指令；鉴权成功后调用 `devicePreConnected(uuid)`（iOS `setPreConnected` / Android `preConnectedDevices`）告知原生"即将连上"，随后执行必要的业务收尾指令并调用 `deviceConnected(uuid)`。历史实现是 pre-connected 后**永久豁免**超时——一旦 Dart 端鉴权流程异常/挂起（`deviceConnected` 永不到达），设备会永久停在 `connectFinish`（属 `isConnecting`），App UI 一直"连接中"且无法自愈。现改为**有界宽限**（`isAuthGrace`）：定时器触发时若已 pre-connected 但仍未 `connected`，再续一次（连接成功仍由 `handleConnectState` 清除）；二次到期仍未连接则强制上报 `timeout`，杜绝永久卡死。iOS/Android 行为对齐。
+- **鉴权宽限（重点）**：G1/R1 继续通过 `devicePreConnected(uuid)` / `deviceConnected(uuid)` 进入有界宽限并提交业务 connected。G2 必须从 `connectFinish` 冻结 `uuid/sessionGeneration/attemptGeneration`，通过 `prepareBusinessConnection(attempt)` / `commitBusinessConnection(attempt)` 完成两阶段提交；旧 attempt 只能 exact abort，不能删除新 lease。无论哪条路径，宽限二次到期仍未 connected 都强制上报 `timeout`，避免永久卡在 `connectFinish`。
 
 ### 8.6 原生自动回连（`autoReconnect`）
 
@@ -468,7 +472,7 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 本次回连契约：
 
 1. `armAutoReconnectTargets` 只登记 owner；`activateAutoReconnectTargets` 立即对**全部目标**发起/复用 pending 直连，不等待扫描。Android 常态使用 `connectGatt(autoConnect=true)`；辅助扫描命中未完成 target 时，才接管 exact pre-physical GATT 并在全局单槽位中执行一次 `connectGatt(autoConnect=false)` 直连。iOS 一律把可 retrieve/cache/restoration 的 `CBPeripheral` 交给带 auto-reconnect option 的 `centralManager.connect`。Android 仅对尚未收到物理 callback 的 exact GATT 使用 `connectTimeout`（至少1秒）deadline 回收 zombie handle；收到 callback 后立即取消，Gate 排队不计入该 deadline。
-2. 物理连接可以并行等待，但真实连接 callback 到达后必须进入一个进程级 Gate。automatic 按 callback FIFO；等待中的 manual 优先于 automatic，但不抢占 active owner。Gate 独占 service discovery、characteristic、CCCD/notify 与业务鉴权，直到 `deviceConnected` 或终态 teardown 确认才释放。
+2. 物理连接可以并行等待，但真实连接 callback 到达后必须进入一个进程级 Gate。automatic 按 callback FIFO；等待中的 manual 优先于 automatic，但不抢占 active owner。Gate 独占 service discovery、characteristic、CCCD/notify 与业务鉴权，直到 G2 exact `commitBusinessConnection`、G1/R1 `deviceConnected` 或终态 teardown 确认才释放。
 3. 自动回连在物理 callback 前不发送用户可见 `connecting`。第一条回连状态从 `contactDevice` 开始，并携带 `source` 与 `generation`。手动点击若已有 pending session，只把 source/队列优先级提升为 `manualReconnect`。
 4. service/char/timeout 等非系统终态必须先完成 GATT/peripheral teardown，再释放 Gate；普通 CoreBluetooth 终态也必须先移除旧 active request，之后才能调度下一代，避免调度被旧 owner 永久 defer。iOS 使用 exact cancellation token + 2s watchdog；超时债务按 endpoint 用饱和 counter 常数内存保存，迟到 callback 不能误杀新 generation。Android 在业务 connected 后保留 exact `(sessionId, GATT)` metadata，稍后的系统断连仍会清理并重建 passive GATT，旧 GATT 不能命中新 attempt。
 5. UI 的 1 分钟展示超时属于上层展示策略，不会停止 native 长期回连；只有用户点击取消/断开才是真取消，同时清 task、持久化 owner、pending session 与定时器，直到下一次明确手动连接才可重新 arm/activate。
@@ -507,7 +511,7 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 1. 重新发现所有服务；
 2. 每条私有服务都找到 write/read characteristic；
 3. 每条 read characteristic 都重新打开 notify/CCCD；
-4. 全部成功后才上报 `connectFinish`，等待业务鉴权后调用 `deviceConnected` 进入 `connected`。
+4. 全部成功后才上报 `connectFinish`；G2 等待业务鉴权后用该事件的 exact attempt 两阶段提交进入 `connected`，G1/R1 继续调用兼容 `deviceConnected`。
 
 Android 自动/手动回连统一使用 `connectGatt(autoConnect = true)`；`autoReconnectUseNativePassive` 不再决定是否退回 active/scan-first。pending 阶段的 exact-GATT deadline 只回收未收到物理 callback 的 zombie handle；Gate queued 与业务 pipeline 阶段不会被它关闭。
 
@@ -536,7 +540,6 @@ App 启动
 
 发起连接
   │
-  ├─ EzwBle.to.bleMC.devicePreConnected(uuid)    （可选；提前告知）
   ├─ EzwBle.to.bleMC.connectDevice(belongConfig, uuid, name, sn: sn, directConnect: false)
   │
   ├─ （默认 scan-first：缓存不可见时先扫描，未命中 → noDeviceFound）
@@ -545,9 +548,11 @@ App 启动
   ├─ ◀ connectStatusEC: searchService
   ├─ ◀ connectStatusEC: searchChars
   ├─ ◀ connectStatusEC: startBinding   （仅 initiateBinding=true）
-  ├─ ◀ connectStatusEC: connectFinish  + mtu
-  │      （业务层此时确认应用层握手完成，比如收到 0xf5/0x11）
-  ├─ EzwBle.to.bleMC.deviceConnected(uuid)     ▶ 告知原生 "业务握手 OK"
+  ├─ ◀ connectStatusEC: connectFinish + mtu + sessionGeneration + attemptGeneration
+  │      （G2 由业务层冻结 exact attempt 并完成 AUTH）
+  ├─ prepareBusinessConnection(attempt)        ▶ exact lease + 有界鉴权宽限
+  ├─ G2 右腿业务收尾（pipe/time sync，每个 await 后复验 attempt）
+  ├─ commitBusinessConnection(attempt)         ▶ exact admission/GATT/readiness 复验
   └─ ◀ connectStatusEC: connected
 
 已绑定设备冷启动 / 蓝牙恢复 / 手动重连
@@ -556,7 +561,7 @@ App 启动
   ├─ 原生同时建立/复用全部 pending 直连；上层可并行扫描最多 20s，但不等待扫描
   ├─ 最先收到物理 callback 的 endpoint 获得全局 Gate，其余 callback 排队
   ├─ ◀ contactDevice(source, generation) → service/chars/CCCD → connectFinish
-  ├─ deviceConnected(uuid) 释放 Gate，下一 endpoint 才开始 GATT readiness
+  ├─ G2 exact commit（G1/R1 为 legacy deviceConnected）释放 Gate，下一 endpoint 才开始 GATT readiness
   └─ UI 1 分钟超时只结束展示；点击取消才清长期回连 owner 与 pending session
 
 通信
@@ -681,19 +686,19 @@ Android 的防重入重点是 `isWaitingDevice`：scan-then-connect 阶段已经
 `startConnectTimeout()` 挂在 `BleDevice.timeoutTimer` 上：
 
 1. 正常连接中超时 → `handleConnectState(TIMEOUT)`。
-2. 已 `devicePreConnected(uuid)` 但未 `deviceConnected(uuid)` → 只续一次有界鉴权宽限。
+2. 已 `devicePreConnected(uuid)` 但未 `deviceConnected(uuid)`，或 G2 exact lease 已 prepare 但未 commit → 只续一次有界鉴权宽限。
 3. 宽限二次到期仍未 connected → 强制 `TIMEOUT`，防止永久卡 `connectFinish`。
 4. `handleConnectState(CONNECTED)` 会清理 timer；`disconnect/reset` 会清理 `preConnectedDevices`。
 
-`devicePreConnected` 与 `deviceConnected` 是业务层鉴权的桥：
+G2 业务鉴权桥必须携带 exact attempt；UUID-only 接口只保留给 G1/R1：
 
 ```
 connectFinish 上报给 Dart
-  → even_connect 发 AUTH/pairAuth
-  → 业务确认成功
-  → devicePreConnected(uuid)
-  → 业务收尾（G2 右腿 PIPE_ROLE_CHANGE(RIGHT)/TIME_SYNC）
-  → deviceConnected(uuid)
+  → even_connect 冻结 uuid/sessionGeneration/attemptGeneration
+  → 发 G2 AUTH 并确认同一 attempt 仍有效
+  → prepareBusinessConnection(attempt)
+  → 右腿 PIPE_ROLE_CHANGE(RIGHT)/TIME_SYNC，每个 await 后复验
+  → commitBusinessConnection(attempt)
   → handleConnectState(CONNECTED)
 ```
 
@@ -775,7 +780,7 @@ iOS 的关键差异：系统级 ANCS 连接会让外设停止广播，`scanForPe
 - false：新连接开始、断连、错误、跨会话重连时重置。
 - 已 `isConnected && isBleFlowCompleted`：可以通过 `handleAlreadyConnected` 重放 `connectFinish/connected` 状态，避免系统已连但 Dart 侧丢状态。
 
-这个标记只描述 CoreBluetooth/GATT 流程，不代表 G2 应用层 AUTH 已成功；G2/Ring1 的最终成功仍由业务层调用 `deviceConnected`。
+这个标记只描述 CoreBluetooth/GATT 流程，不代表 G2 应用层 AUTH 已成功；G2 的最终成功由 exact `commitBusinessConnection` 提交，Ring1 继续调用兼容 `deviceConnected`。
 
 ### 11.8 iOS State Preservation / Restoration
 
@@ -783,7 +788,7 @@ iOS State Restoration 是自动回连链路的一部分，不是独立业务入�
 
 恢复流程：
 
-1. App 首连成功后，业务调用 `deviceConnected(uuid)`，原生持久化 reconnect target。
+1. App 首连成功后，G2 业务 exact commit（R1 为兼容 `deviceConnected`）成功，原生持久化 reconnect target。
 2. 系统异常断连后，原生立即把已知 `CBPeripheral` 交回 `centralManager.connect`，让 CoreBluetooth 持有 pending connect。
 3. App 后台、挂起或被系统回收后，外设重新出现。
 4. CoreBluetooth 通过 State Restoration 恢复进程，并在 `willRestoreState` 里交回 peripheral。
@@ -792,7 +797,7 @@ iOS State Restoration 是自动回连链路的一部分，不是独立业务入�
 7. 已连接 escrow 安装当前 session admission 后进入 Gate；仍 `.connecting` 的 escrow 只挂 admission/watchdog，禁止重复 connect。
 8. 全部 target activation 返回后调用 `finalizeStateRestorationClaims`，以 cancellation barrier 清理未认领历史对象。
 9. `connectFinish` 上报给 Dart，Dart 重新发送业务 AUTH / 通道切换 / 时间同步。
-10. Dart 再次调用 `deviceConnected(uuid)`，重新 arm 后续回连。
+10. Dart 使用该 `connectFinish` 的 exact attempt prepare/commit，重新 arm 后续回连。
 
 重要边界：
 
@@ -819,7 +824,7 @@ iOS State Restoration 是自动回连链路的一部分，不是独立业务入�
 5. iOS ANCS/system-connected 设备不依赖广播扫描，仍能直接恢复服务发现。
 6. `directConnect=true` 只绕过 scan-visible 前置条件，不绕过真实 GATT 连接、服务发现、特征订阅和连接超时。
 7. `directConnect=false` 的前台路径仍应在离线设备上快速 `noDeviceFound`，不能因为后台优化退化成长期 blind timeout。
-8. `devicePreConnected` 后如果业务层异常未调用 `deviceConnected`，有界鉴权宽限会最终超时自愈。
+8. G2 prepare 后未 exact commit（或 G1/R1 `devicePreConnected` 后未 `deviceConnected`）时，有界鉴权宽限会最终超时自愈。
 9. 主动断连不会被后续系统断连回调改写成系统失败。
 10. Android `BluetoothDevice.name` 为空时仍能用 connect 参数或扫描缓存名继续连接；三者都缺失时应失败为 `boundFail`，不能把 MAC address 写进 name。
 11. iOS `directConnect` 缺 UUID/peripheral 缓存但有稳定 name 时应回退扫描，而不是立即 `noDeviceFound`。
@@ -827,7 +832,7 @@ iOS State Restoration 是自动回连链路的一部分，不是独立业务入�
 13. Android 连接回调与 GATT 操作回调使用不同状态表；`status=8` 在连接回调里是 `HCI_CONNECTION_TIMEOUT` 且不恢复，在 descriptor / characteristic 回调里才是 `GATT_INSUFFICIENT_AUTHORIZATION` 且必须恢复。
 14. 多 endpoint 只有 Gate owner 能运行 service/CCCD/业务鉴权；manual 只提升 waiting session，不抢占 active。
 15. UI 1 分钟超时不取消 native task；用户点击取消必须清 task、持久化 owner、pending GATT/peripheral 与迟到 timer/callback 的复活入口。
-16. Android `deviceConnected` 释放 Gate 后的 live GATT 系统断连仍上报 `disconnectFromSys` 并重建 passive GATT；旧 `(sessionId, GATT)` 不得干扰新 attempt。
+16. Android exact commit（或 G1/R1 `deviceConnected`）释放 Gate 后的 live GATT 系统断连仍上报 `disconnectFromSys` 并重建 passive GATT；旧 `(sessionId, GATT)` 不得干扰新 attempt。
 17. iOS cancellation watchdog 长期漏回调时每 endpoint 只占一个 debt counter；业务 connected 后的真实断连不能被旧 debt 吞掉。
 
 ---

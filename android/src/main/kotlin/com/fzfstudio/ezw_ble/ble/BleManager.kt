@@ -116,6 +116,9 @@ class BleManager private constructor() {
     // 同时到达时重复发送 disconnectFromSys。
     private val reconciledBusinessSessions: MutableSet<String> =
         Collections.synchronizedSet(mutableSetOf())
+    // 业务鉴权 lease 只属于一个 exact session/attempt。prepare 替换同 endpoint 的旧
+    // token，abort/cleanup 只能移除匹配 token，避免旧回调删掉新 attempt。
+    private val businessConnectionLeases = BleBusinessConnectionLeaseRegistry()
 
     /** Gate 排队期间保留真实 GATT；只有获得准入后才启动 timeout 和 service discovery。 */
     private data class GrantedGattSession(
@@ -1381,14 +1384,14 @@ class BleManager private constructor() {
      *  主动设置连接成功
      */
     @Synchronized
-    fun setConnected(uuid: String) {
+    fun setConnected(uuid: String): BleBusinessConnectionStatus {
         // 1、校验请求、pre-connected 标记和当前 admission，确保业务 connected 有合法代次。
         if (!checkIsFunctionCanBeCalled() || uuid.isEmpty()) {
-            return
+            return BleBusinessConnectionStatus.INVALID_ARGUMENTS
         }
         if (!preConnectedDevices.contains(uuid)) {
             sendLog(BleLoggerTag.e, "Set $uuid connected failed, not pre-connected")
-            return
+            return BleBusinessConnectionStatus.MISSING_PREPARE
         }
         val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
         val admission = currentAdmissions[reconnectKey(uuid)]
@@ -1396,13 +1399,13 @@ class BleManager private constructor() {
         // 读取依赖不可靠的 smart-cast，同时维持 unknown/0 fail-closed 约束。
         val acceptedAdmission = admission ?: run {
             sendLog(BleLoggerTag.e, "Set $uuid connected failed, no epoch-accepted admission")
-            return
+            return BleBusinessConnectionStatus.MISSING_ADMISSION
         }
         // 业务 connected 后 Gate 会释放，所以此刻必须已经持有可被 Dart epoch guard 接受的
         // admission。拒绝 unknown/0，确保蓝牙关闭时总能从 current/business session 取到终态。
         if (!BleBluetoothOffTerminalMetadataPolicy.isEpochAccepted(acceptedAdmission)) {
             sendLog(BleLoggerTag.e, "Set $uuid connected failed, no epoch-accepted admission")
-            return
+            return BleBusinessConnectionStatus.ATTEMPT_MISMATCH
         }
         sendLog(BleLoggerTag.d, "Set $uuid connected")
         // 新业务 session 已经完成鉴权；清除旧对账去重标记，后续真实断连可再次纠偏。
@@ -1413,6 +1416,7 @@ class BleManager private constructor() {
         lastEpochAcceptedAdmissions[reconnectKey(uuid)] = acceptedAdmission
         // 3、清除 pre-connected 标记并发布 connected 状态。
         preConnectedDevices.remove(uuid)
+        businessConnectionLeases.remove(reconnectKey(uuid))
         handleConnectState(
             uuid,
             connectedDevice?.name ?: "",
@@ -1423,6 +1427,7 @@ class BleManager private constructor() {
         )
         // 4、业务确认 connected 后释放当前 Gate owner，允许下一 endpoint 开始 pipeline。
         completeBusinessConnectionAdmission(uuid)
+        return BleBusinessConnectionStatus.ACCEPTED
     }
 
     /**
@@ -1444,6 +1449,7 @@ class BleManager private constructor() {
         cancelPendingScanConnect(uuid)
         // 2、清除 pre-connected 标记，避免超时宽限逻辑复用旧 session。
         preConnectedDevices.remove(uuid)
+        businessConnectionLeases.remove(key)
         // 3、读取当前 GATT 设备并发起带用户来源的物理断开。
         val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
         handleConnectState(uuid, connectedDevice?.name ?: "", BleConnectState.DISCONNECT_BY_USER, removeBond)
@@ -1649,6 +1655,7 @@ class BleManager private constructor() {
             .forEach { currentAdmissions.remove(it) }
         admissionSessions.forEach { admittedGattSessions.remove(it.admission.sessionId) }
         endpointKeys.forEach {
+            businessConnectionLeases.remove(it)
             businessConnectedGattSessions.remove(it)
             lastEpochAcceptedAdmissions.remove(it)
         }
@@ -1665,7 +1672,9 @@ class BleManager private constructor() {
             cancelScanRefresh(endpointId)
             preConnectedDevices.remove(endpointId)
             upgradeDevices.remove(endpointId)
-            sendCmdQueues.remove(reconnectKey(endpointId))
+            val endpointKey = reconnectKey(endpointId)
+            businessConnectionLeases.remove(endpointKey)
+            sendCmdQueues.remove(endpointKey)
             discardOtaWriteQueueForSession(endpointId, reason = "releaseDevice")
         }
         pendingScanConnects.removeAll { pending ->
@@ -1740,6 +1749,105 @@ class BleManager private constructor() {
         if (shouldStart) {
             writeNextCommand(uuid)
         }
+    }
+
+    /**
+     * Install a bounded business-auth lease for the exact GATT attempt that
+     * emitted `connectFinish`. This replaces legacy pre-connected calls for G2
+     * without changing G1/R1 callers that still use `devicePreConnected`.
+     */
+    @Synchronized
+    fun prepareBusinessConnection(
+        attempt: BleBusinessConnectionAttempt?,
+    ): BleBusinessConnectionStatus {
+        val status = validateBusinessConnectionAttempt(attempt, requirePrepare = false)
+        if (status != BleBusinessConnectionStatus.ACCEPTED || attempt == null) {
+            return status
+        }
+        val key = reconnectKey(attempt.uuid)
+        businessConnectionLeases.prepare(key, attempt, SystemClock.elapsedRealtime())
+        // Reuse the existing bounded auth-grace timer so a prepared but never
+        // committed business handshake still times out instead of pinning Gate.
+        preConnectedDevices.add(attempt.uuid)
+        sendLog(
+            BleLoggerTag.d,
+            "Business connection prepare accepted: uuid=${attempt.uuid}, " +
+                "sessionGeneration=${attempt.sessionGeneration}, " +
+                "attemptGeneration=${attempt.attemptGeneration}",
+        )
+        return BleBusinessConnectionStatus.ACCEPTED
+    }
+
+    /**
+     * Commit business connected only while the exact prepared attempt still
+     * owns admission, the physical GATT is current, and all configured
+     * private-service write/read caches are ready.
+     */
+    @Synchronized
+    fun commitBusinessConnection(
+        attempt: BleBusinessConnectionAttempt?,
+    ): BleBusinessConnectionStatus {
+        val status = validateBusinessConnectionAttempt(attempt, requirePrepare = true)
+        if (status != BleBusinessConnectionStatus.ACCEPTED || attempt == null) {
+            return status
+        }
+        return setConnected(attempt.uuid)
+    }
+
+    /**
+     * Abort only the exact prepared token. Stale aborts are harmless and must
+     * not cancel native reconnect intent, GATT admission, or newer prepare.
+     */
+    @Synchronized
+    fun abortBusinessConnection(attempt: BleBusinessConnectionAttempt?): Boolean {
+        if (attempt?.uuid.isNullOrBlank()) {
+            return false
+        }
+        val key = reconnectKey(attempt!!.uuid)
+        if (!businessConnectionLeases.abort(key, attempt)) {
+            return false
+        }
+        preConnectedDevices.remove(attempt.uuid)
+        sendLog(
+            BleLoggerTag.d,
+            "Business connection abort accepted: uuid=${attempt.uuid}, " +
+                "sessionGeneration=${attempt.sessionGeneration}, " +
+                "attemptGeneration=${attempt.attemptGeneration}",
+        )
+        return true
+    }
+
+    private fun validateBusinessConnectionAttempt(
+        attempt: BleBusinessConnectionAttempt?,
+        requirePrepare: Boolean,
+    ): BleBusinessConnectionStatus {
+        if (attempt == null) {
+            return BleBusinessConnectionStatus.INVALID_ARGUMENTS
+        }
+        val key = reconnectKey(attempt.uuid)
+        val admission = currentAdmissions[key]
+        val admissionAttempt = admission?.let {
+            BleBusinessConnectionAttempt(
+                uuid = attempt.uuid,
+                sessionGeneration = it.sessionGeneration,
+                attemptGeneration = it.generation,
+            )
+        }
+        val session = admission?.let { admittedGattSessions[it.sessionId] }
+        val device = findConnectedDevice(attempt.uuid)
+        return BleBusinessConnectionCommitPolicy.evaluate(
+            attempt = attempt,
+            admissionAttempt = admissionAttempt,
+            preparedAttempt = businessConnectionLeases.attempt(key),
+            requirePrepare = requirePrepare,
+            hasGattSession = session != null,
+            hasDevice = device != null,
+            isSameGatt = device?.myGatt != null && device.myGatt === session?.gatt,
+            isSystemConnected = device != null &&
+                querySystemGattConnectionState(attempt.uuid) !=
+                BleSystemGattConnectionState.DISCONNECTED,
+            isGattReady = device?.hasCompleteGattReadiness() == true,
+        )
     }
     
     /**
@@ -1950,6 +2058,7 @@ class BleManager private constructor() {
         sendCmdQueues.clear()
         disconnectingDevices.clear()
         preConnectedDevices.clear()
+        businessConnectionLeases.clear()
     }
 
     /**
@@ -1967,6 +2076,7 @@ class BleManager private constructor() {
         sendCmdQueues.clear()
         disconnectingDevices.clear()
         preConnectedDevices.clear()
+        businessConnectionLeases.clear()
         reconciledBusinessSessions.clear()
         sendLog(BleLoggerTag.d, "Reset: success")
     }
@@ -2202,6 +2312,7 @@ class BleManager private constructor() {
             currentAdmissions.clear()
             admittedGattSessions.clear()
             businessConnectedGattSessions.clear()
+            businessConnectionLeases.clear()
             connectionAttemptGenerations.replaceAll { _, generation ->
                 nextConnectionGeneration(generation)
             }
@@ -3009,6 +3120,7 @@ class BleManager private constructor() {
         val current = currentAdmissionFor(admission) ?: return null
         currentAdmissions.remove(reconnectKey(current.endpointId))
         admittedGattSessions.remove(current.sessionId)
+        businessConnectionLeases.remove(reconnectKey(current.endpointId))
         return if (invalidateEndpoint) {
             invalidateConnectionAttempts(setOf(current.endpointId))
         } else {
@@ -3175,6 +3287,9 @@ class BleManager private constructor() {
         }
         val key = reconnectKey(uuid)
         currentAdmissions.remove(key)?.let { admittedGattSessions.remove(it.sessionId) }
+        // Business prepare is scoped to the exact admission; cancelling Gate
+        // invalidates the auth grace without touching persisted reconnect owner.
+        businessConnectionLeases.remove(key)
         invalidateConnectionAttempts(setOf(uuid))?.let { startGrantedGattPipeline(it) }
         sendLog(BleLoggerTag.d, "Admission gate: $uuid cancelled, reason=$reason")
     }
@@ -3228,6 +3343,7 @@ class BleManager private constructor() {
                 val device = findConnectedDevice(uuid)
                 currentAdmissions.remove(key)
                 invalidateConnectionAttempts(setOf(uuid))?.let { startGrantedGattPipeline(it) }
+                businessConnectionLeases.remove(key)
                 sendCmdQueues.remove(key)
                 device?.releaseAndClear() ?: runCatching { gatt.close() }
                 sendLog(
@@ -3280,6 +3396,7 @@ class BleManager private constructor() {
         val staleAdmission = currentAdmissions.remove(key)
         staleAdmission?.let { admittedGattSessions.remove(it.sessionId) }
         val next = invalidateConnectionAttempts(setOf(uuid))
+        businessConnectionLeases.remove(key)
         sendCmdQueues.remove(key)
         device?.releaseAndClear()
         if (managerGatt !== staleGatt) {
@@ -3327,6 +3444,7 @@ class BleManager private constructor() {
             // 2、STATE_CONNECTED 前还没有 Gate admission，但 passive autoConnect GATT
             // 已经持有旧 callback/session。精确关闭该句柄后，supervisor 才能创建携带
             // incoming session 的唯一 replacement。
+            businessConnectionLeases.remove(key)
             sendCmdQueues.remove(key)
             device.releaseAndClear()
             sendLog(
@@ -3343,6 +3461,7 @@ class BleManager private constructor() {
         // 3、先撤销 exact callback 归属；Gate 返回的其它 endpoint 可以在旧句柄关闭后继续。
         currentAdmissions.remove(key)
         admittedGattSessions.remove(admission.sessionId)
+        businessConnectionLeases.remove(key)
         businessConnectedGattSessions.remove(key)
         val next = invalidateConnectionAttempts(setOf(uuid))
 
@@ -3398,7 +3517,9 @@ class BleManager private constructor() {
             sendLog(BleLoggerTag.d, "${device.name} clear all gatt")
         }
         //  3、清空当前设备发送队列，避免断连后继续发送旧指令。
-        sendCmdQueues.remove(reconnectKey(uuid))
+        val key = reconnectKey(uuid)
+        sendCmdQueues.remove(key)
+        businessConnectionLeases.remove(key)
         discardOtaWriteQueueForSession(uuid, reason = state.toFlutterJsonValue())
     }
 

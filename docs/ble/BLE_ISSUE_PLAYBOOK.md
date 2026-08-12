@@ -1081,3 +1081,40 @@ Owner:
 - even_connect owns persisting the callback UUID into the logical device cache.
 - The App owns initializing auto-connect only when authoritative server binding
   exists and the current user namespace has never stored an intent.
+
+## G2: late AUTH publishes connected for a replaced attempt
+
+Symptoms:
+
+- Attempt A reaches `connectFinish` and AUTH, then the endpoint disconnects.
+- Attempt B reuses the same UUID and reaches GATT ready.
+- A late Future resumes, publishes business `connected`, and the following
+  initialization command fails with `device not found` or a missing write
+  characteristic.
+
+Root cause:
+
+- UUID-only `devicePreConnected` / `deviceConnected` cannot distinguish A from B.
+- A stale Dart continuation can therefore promote whichever native cache now
+  occupies that UUID, even though AUTH, GATT readiness, and business connected
+  belong to different physical attempts.
+
+Fix:
+
+- Freeze `uuid`, `sessionGeneration`, and `attemptGeneration` from the accepted
+  `connectFinish` event.
+- G2 must use `prepareBusinessConnection(attempt)` followed by
+  `commitBusinessConnection(attempt)`; native revalidates the exact admission,
+  live peripheral/GATT identity, physical connection, write characteristics,
+  and complete notify readiness at commit time.
+- Abort by exact compare-and-remove only. A stale abort must not delete B's
+  lease, disconnect B, or remove the long-lived autoReconnect owner.
+- Treat every non-`accepted` status as fail-closed. Do not add command retries,
+  change FlowPolicy, or publish a synthetic disconnect to hide the rejection.
+
+Owner:
+
+- `even_connect` owns endpoint-scoped AUTH promotion and revalidation after
+  every await.
+- Native `flutter_ezw_ble` owns the exact lease and final physical/GATT commit
+  gate.

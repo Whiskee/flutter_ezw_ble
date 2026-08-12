@@ -53,6 +53,9 @@ internal class BleGattSessionCallback(
     /** CCCD 写入队列必须跟随单个 callback，避免多设备并发连接时互相消费 descriptor。 */
     private val descriptorQueue: Queue<Pair<Int, BluetoothGattDescriptor>> = LinkedList()
 
+    /** 当前已提交、正在等待 onDescriptorWrite 的 CCCD 所属私有服务类型。 */
+    private var inFlightDescriptorPsType: Int? = null
+
     /**
      * 监听物理链路连接/断开。
      *
@@ -64,6 +67,7 @@ internal class BleGattSessionCallback(
         // 1. 新的物理连接状态到来后，旧 descriptor 队列都不再可信。
         val address = gatt.device.address
         descriptorQueue.clear()
+        inFlightDescriptorPsType = null
 
         // 2. 物理链路建立后只提交全局 Gate。禁止在 callback 内直接 discoverServices，
         //    否则多设备会同时占用 HCI/GATT 初始化通道。
@@ -225,6 +229,7 @@ internal class BleGattSessionCallback(
         // connectFinish，而 auto reconnect supervisor 也拿不到可重试的失败终态。
         if (status != BluetoothGatt.GATT_SUCCESS) {
             descriptorQueue.clear()
+            inFlightDescriptorPsType = null
             isPrivateServiceReady = false
             val operationStatus = BluetoothGattStatus.getGattOperationStatusDescription(status)
             if (status == BluetoothGattStatus.GATT_INSUFFICIENT_AUTHORIZATION) {
@@ -241,6 +246,8 @@ internal class BleGattSessionCallback(
         }
 
         // 4. 当前 descriptor 已完成，继续写下一个；队列空时会请求 MTU。
+        inFlightDescriptorPsType?.let { device.markNotifyReady(it) }
+        inFlightDescriptorPsType = null
         sendLog(BleLoggerTag.d, "Connect call back: ${gatt.device.address} is descriptor write success = ${status == BluetoothGatt.GATT_SUCCESS}")
         processNextDescriptor(gatt)
     }
@@ -372,6 +379,7 @@ internal class BleGattSessionCallback(
         // 3. 写入队首 descriptor，等待 onDescriptorWrite 回调再继续。
         val item = descriptorQueue.poll() ?: return
         val descriptor = item.second
+        inFlightDescriptorPsType = item.first
         val isWrite = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothStatusCodes.SUCCESS
         } else {
@@ -387,6 +395,7 @@ internal class BleGattSessionCallback(
         if (!isWrite) {
             val device = currentExpectedDeviceForGatt(gatt, "descriptor enqueue failure") ?: return
             descriptorQueue.clear()
+            inFlightDescriptorPsType = null
             isPrivateServiceReady = false
             sendLog(
                 BleLoggerTag.e,
