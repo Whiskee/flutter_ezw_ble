@@ -28,6 +28,7 @@
 - `timeout`、`noDeviceFound`、`serviceFail`、`charsFail` 是单次尝试失败，不是长期回连停止条件；只有用户/业务主动断连、移除、reset、清缓存、配置关闭或插件释放才能取消 reconnect intent。
 - iOS State Restoration 只能恢复进程内 BLE 工作和 CoreBluetooth peripheral；私有服务、notify/CCCD、业务认证指令必须重新执行，不承诺把 App UI 拉到前台。
 - iOS `CBCentralManager(queue: nil)` 的 `retrieveConnectedPeripherals` / `retrievePeripherals` 只允许经 active 生命周期门禁调用；inactive/background/terminating 时只能复用 restoration/内存 peripheral，缺失时保留 exact deferred owner，不得制造 `noDeviceFound` 或增加 retry。`didBecomeActive` 补偿必须复验 config、owner 和 session generation。
+- iOS 业务 `connected` 释放 Gate 前必须把已接受的 `sessionGeneration + attemptGeneration` 成对保存在 reconnect owner；随后的 CoreBluetooth `didDisconnect` / 蓝牙关闭终态必须回传该 exact pair。禁止只恢复 session 而把 attempt 降为 0，显式取消、替换、移除 owner 必须同时使该快照不可达。
 
 ## 修改规则
 

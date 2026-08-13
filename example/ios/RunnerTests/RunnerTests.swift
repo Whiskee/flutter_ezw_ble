@@ -394,6 +394,7 @@ class RunnerTests: XCTestCase {
     task.attempt = 7
     task.pausedByBluetoothOff = true
     task.lastConnectedGeneration = 19
+    task.lastConnectedAttemptGeneration = 27
     let newUuid = "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"
     let migrated = BleReconnectIdentityPolicy.migratedTask(
       task,
@@ -406,6 +407,7 @@ class RunnerTests: XCTestCase {
     XCTAssertEqual(migrated?.source, .manualReconnect)
     XCTAssertEqual(migrated?.pausedByBluetoothOff, true)
     XCTAssertEqual(migrated?.lastConnectedGeneration, 19)
+    XCTAssertEqual(migrated?.lastConnectedAttemptGeneration, 27)
     XCTAssertNil(BleReconnectIdentityPolicy.migratedTask(
       task,
       peripheralUuid: newUuid,
@@ -468,7 +470,7 @@ class RunnerTests: XCTestCase {
     XCTAssertEqual(BleReconnectSourcePolicy.afterTransportReset(), .autoReconnect)
   }
 
-  func testBusinessConnectedSystemDisconnectReusesLastAcceptedGeneration() {
+  func testBusinessConnectedSystemDisconnectReusesLastAcceptedExactOwner() {
     var task = BleReconnectTask(
       belongConfig: "ring_bcl_1",
       uuid: "ring",
@@ -476,6 +478,7 @@ class RunnerTests: XCTestCase {
       source: .autoReconnect
     )
     task.lastConnectedGeneration = 9
+    task.lastConnectedAttemptGeneration = 21
 
     XCTAssertEqual(
       BleTerminalConnectionMetadataPolicy.resolve(
@@ -483,7 +486,11 @@ class RunnerTests: XCTestCase {
         currentAdmission: nil,
         reconnectTask: task
       ),
-      BleTerminalConnectionMetadata(source: .autoReconnect, generation: 9)
+      BleTerminalConnectionMetadata(
+        source: .autoReconnect,
+        generation: 9,
+        attemptGeneration: 21
+      )
     )
   }
 
@@ -495,6 +502,7 @@ class RunnerTests: XCTestCase {
       source: .autoReconnect
     )
     task.lastConnectedGeneration = 9
+    task.lastConnectedAttemptGeneration = 21
 
     // didDisconnect 进入 manager 前，connectedDevices 的本地 bool 可能已被底层清理。
     // 只要 reconnect task 仍持有最后一次真实业务成功 epoch，就必须保持同代终态，
@@ -503,7 +511,11 @@ class RunnerTests: XCTestCase {
       state: .disconnectFromSys,
       currentAdmission: nil,
       reconnectTask: task
-    ), BleTerminalConnectionMetadata(source: .autoReconnect, generation: 9))
+    ), BleTerminalConnectionMetadata(
+      source: .autoReconnect,
+      generation: 9,
+      attemptGeneration: 21
+    ))
     XCTAssertNil(BleTerminalConnectionMetadataPolicy.resolve(
       state: .disconnectByUser,
       currentAdmission: nil,
@@ -550,6 +562,7 @@ class RunnerTests: XCTestCase {
     )
     task.sessionGeneration = 13
     task.lastConnectedGeneration = 13
+    task.lastConnectedAttemptGeneration = 31
 
     XCTAssertEqual(
       BleExplicitCancellationMetadataPolicy.resolve(
@@ -559,7 +572,7 @@ class RunnerTests: XCTestCase {
       BleExplicitCancellationMetadata(
         source: .autoReconnect,
         sessionGeneration: 13,
-        attemptGeneration: 0
+        attemptGeneration: 31
       )
     )
   }
@@ -578,6 +591,30 @@ class RunnerTests: XCTestCase {
     ))
   }
 
+  func testExplicitCancellationDoesNotPairHistoricalAttemptWithNewSession() {
+    var task = BleReconnectTask(
+      belongConfig: "g2_glasses",
+      uuid: "right",
+      name: "Even G2_32_R_654321",
+      source: .autoReconnect
+    )
+    task.lastConnectedGeneration = 12
+    task.lastConnectedAttemptGeneration = 17
+    task.sessionGeneration = 13
+
+    XCTAssertEqual(
+      BleExplicitCancellationMetadataPolicy.resolve(
+        currentAdmission: nil,
+        reconnectTask: task
+      ),
+      BleExplicitCancellationMetadata(
+        source: .autoReconnect,
+        sessionGeneration: 13,
+        attemptGeneration: 0
+      )
+    )
+  }
+
   func testCurrentAdmissionPrecedesHistoricalConnectedGeneration() {
     var task = BleReconnectTask(
       belongConfig: "ring_bcl_1",
@@ -586,6 +623,7 @@ class RunnerTests: XCTestCase {
       source: .autoReconnect
     )
     task.lastConnectedGeneration = 9
+    task.lastConnectedAttemptGeneration = 18
     let admission = BleConnectionAdmission(
       endpointId: "ring",
       generation: 10,
@@ -599,7 +637,42 @@ class RunnerTests: XCTestCase {
         currentAdmission: admission,
         reconnectTask: task
       ),
-      BleTerminalConnectionMetadata(source: .manualReconnect, generation: 10)
+      BleTerminalConnectionMetadata(
+        source: .manualReconnect,
+        generation: 10,
+        attemptGeneration: 10
+      )
+    )
+  }
+
+  func testNewAdmissionPreventsHistoricalAttemptFromTerminatingReplacement() {
+    var task = BleReconnectTask(
+      belongConfig: "g2_glasses",
+      uuid: "right",
+      name: "Even G2_32_R_654321",
+      source: .autoReconnect
+    )
+    task.lastConnectedGeneration = 12
+    task.lastConnectedAttemptGeneration = 17
+    let replacement = BleConnectionAdmission(
+      endpointId: "right",
+      generation: 18,
+      sessionId: 101,
+      source: .manualReconnect,
+      sessionGeneration: 12
+    )
+
+    XCTAssertEqual(
+      BleTerminalConnectionMetadataPolicy.resolve(
+        state: .disconnectFromSys,
+        currentAdmission: replacement,
+        reconnectTask: task
+      ),
+      BleTerminalConnectionMetadata(
+        source: .manualReconnect,
+        generation: 12,
+        attemptGeneration: 18
+      )
     )
   }
 

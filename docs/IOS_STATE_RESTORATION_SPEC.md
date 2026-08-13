@@ -170,7 +170,7 @@ readCharsNotify == bleConfig.privateServices.count
 
 service/char/timeout 等非 CoreBluetooth 终态要先调用 cancel，并保持 Gate owner，直到 `didFailToConnect` / `didDisconnect` 确认 teardown；CoreBluetooth 永不回调时由 2 秒 exact-token watchdog 放行。watchdog 超时债务必须使用每 endpoint 一个饱和 counter，不能保存无限 token 数组。迟到 callback 先消费债务；若新代仍在途则 exact redrive，若新代已业务 connected 且 peripheral 实际断开，则仍继续正常 `disconnectFromSys` 清理与回连，不能把真实断连吞掉。收到终态后必须先释放 exact admission、移除旧 active request，再调度下一 generation；barrier completion 与普通终态只能有一个调度 owner。
 
-蓝牙关闭会清空当前 Gate，因此必须在 teardown 前冻结连接元数据：connecting 端点使用 active admission 的 sessionGeneration，已业务 connected 端点使用 runtime task 保存的 last connected sessionGeneration。随后发送的 `disconnectFromSys` 必须通过兼容键 `generation` 携带该 sessionGeneration，禁止回退为 `unknown/0`，否则 Dart epoch guard 会拒绝终态并保留陈旧已连接状态。
+业务 exact commit 释放 Gate 前，runtime task 必须成对保存最后成功的 sessionGeneration 与 attemptGeneration。CoreBluetooth `didDisconnect` 不携带业务 token，Gate 释放后的普通系统断连必须复用该 exact pair；若新 admission 已存在，则当前 admission 始终优先，历史 task 不得终止新 attempt。蓝牙关闭同样在 teardown 前冻结 active 或 last-connected exact pair，随后发送的 `disconnectFromSys` 必须同时携带两个正代次，禁止只恢复 session 并将 attempt 回退为 0，否则 Dart epoch guard 会拒绝真实终态并保留陈旧已连接 UI。
 
 同名扫描结果导致 UUID A→B→C 漂移时，task、持久化 target 与 Gate identity 必须在 admission 前原子迁移。每个 canonical target 最多保留两个 direct alias（最早 UI owner + 最近旧身份）；hard cancel 仍能从原 UI UUID 命中，同时历史 UUID/Gate generation 不线性增长。
 
@@ -253,7 +253,7 @@ hard cancel、登出、移除设备、配置删除或 `autoReconnect=false` 必�
 - 系统恢复后能看到 `willRestoreState`，且 restored peripheral 在当前账号 target activation 前只处于 escrow，不提前运行 GATT/AUTH。
 - 左腿在 claim 前断连且 `isReconnecting=false` 时立即重新建立长期 pending；随后 `didConnect` 仍被 escrow 吸收，当前账号 claim 后才进入 Gate。
 - G2 双腿/R1 都完成 activation 回执后才 finalize；未认领历史对象被 barrier 保护地取消，迟到 `didConnect` 不会复活。
-- 蓝牙 poweredOff 先用 active/last-connected generation 上报 `disconnectFromSys`，再暂停任务；poweredOn 后继续恢复。
+- 业务 connected 后的普通 `didDisconnect` 与蓝牙 poweredOff 都使用 active/last-connected session/attempt exact pair 上报 `disconnectFromSys`，旧 task 不得覆盖当前 admission。
 - ANCS / 系统已连接外设扫描不可见时仍可通过 retrieve 路径进入 GATT。
 - inactive/background/terminating 期间两个同步 retrieve API 均被生命周期门禁阻断；name-only 与 UUID owner 保留原状态，回到 active 后只恢复 exact 当前 generation。
 - 每次恢复都重新 discovery service、characteristic、notify / CCCD。

@@ -51,8 +51,12 @@ struct BleReconnectTask {
     var deferredByAppInactivity: Bool = false
     /// 当前 pending attempt 来源；manual 只能影响本轮，终态后恢复 auto。
     var source: BleConnectSource = .autoReconnect
-    /// 最近一次业务 connected 对应的 generation；Gate 释放后的系统断连复用它发送同代终态。
+    /// 最近一次业务 connected 对应的 Dart session generation；必须和下面的 native
+    /// attempt generation 成对写入，Gate 释放后的系统断连才能回到 exact owner。
     var lastConnectedGeneration: Int64?
+    /// 最近一次业务 connected 对应的 native Gate attempt generation。CoreBluetooth 的
+    /// didDisconnect 不携带业务 token，因此必须在 commit 释放 Gate 前冻结该值。
+    var lastConnectedAttemptGeneration: Int64?
     /// Dart recovery batch 的逻辑代次。native Gate attempt 可多次变化，但 Flutter
     /// 状态必须始终回到同一逻辑 session，防止 epoch guard 把真实终态当成旧回调。
     var sessionGeneration: Int64 = 0
@@ -66,6 +70,7 @@ struct BleReconnectTask {
 struct BleTerminalConnectionMetadata: Equatable {
     let source: BleConnectSource
     let generation: Int64
+    let attemptGeneration: Int64
 }
 
 /// 用户显式取消前冻结的连接身份。
@@ -103,10 +108,15 @@ enum BleExplicitCancellationMetadataPolicy {
         guard generation > 0 else {
             return nil
         }
+        // lastConnected attempt 只能和同一次成功的 session 成对使用。owner 已推进到新的
+        // deferred/pending session 但尚无 admission 时，不得把历史 attempt 拼到新 session。
+        let attemptGeneration = task.lastConnectedGeneration == generation
+            ? (task.lastConnectedAttemptGeneration ?? 0)
+            : 0
         return BleExplicitCancellationMetadata(
             source: task.source,
             sessionGeneration: generation,
-            attemptGeneration: 0
+            attemptGeneration: attemptGeneration
         )
     }
 }
@@ -122,7 +132,8 @@ enum BleTerminalConnectionMetadataPolicy {
         if let admission = currentAdmission, admission.generation > 0 {
             return BleTerminalConnectionMetadata(
                 source: admission.source,
-                generation: admission.sessionGeneration
+                generation: admission.sessionGeneration,
+                attemptGeneration: admission.generation
             )
         }
         // Gate 在业务 connected 后会释放；此后的真实系统断连只能继承最后一次
@@ -130,18 +141,22 @@ enum BleTerminalConnectionMetadataPolicy {
         // didDisconnect 到达前，该易变缓存可能已被其它清理分支清成 false，导致真实
         // 终态退化为 unknown/0 并被 Dart epoch guard 拒绝。
         //
-        // lastConnectedGeneration 只在业务 connected 后写入；显式取消、换设备会删除
-        // reconnect task，而正在进行的新连接优先由上方 admission 归属。因此它是比
-        // 当前缓存布尔值更稳定、且不会放宽旧 cancel callback 的终态凭据。
+        // lastConnectedGeneration/lastConnectedAttemptGeneration 只在业务 connected
+        // 后成对写入；显式取消、换设备会删除 reconnect task，而正在进行的新连接
+        // 优先由上方 admission 归属。不允许只恢复 session 并将 attempt 降为 0，否则
+        // Dart exact-attempt guard 会拒绝真实断连并保留假 connected UI。
         guard state == .disconnectFromSys,
               let task = reconnectTask,
               let generation = task.lastConnectedGeneration,
-              generation > 0 else {
+              let attemptGeneration = task.lastConnectedAttemptGeneration,
+              generation > 0,
+              attemptGeneration > 0 else {
             return nil
         }
         return BleTerminalConnectionMetadata(
             source: task.source,
-            generation: generation
+            generation: generation,
+            attemptGeneration: attemptGeneration
         )
     }
 }
@@ -152,6 +167,7 @@ struct BleTransportOffConnectionSnapshot {
     let name: String
     let source: BleConnectSource
     let generation: Int64
+    let attemptGeneration: Int64
 }
 
 /// 辅助扫描只有在稳定旧 UUID 与新 peripheral UUID 不同、且非空 name 明确相同时才允许

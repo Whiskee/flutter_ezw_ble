@@ -487,14 +487,25 @@ void main() {
     ).readAsStringSync();
 
     expect(reconnectStore, contains('lastConnectedGeneration'));
+    expect(reconnectStore, contains('lastConnectedAttemptGeneration'));
     expect(
       reconnectCoordinator,
       contains('task.lastConnectedGeneration = generation'),
     );
     expect(
       reconnectCoordinator,
+      contains('task.lastConnectedAttemptGeneration = attemptGeneration'),
+    );
+    expect(
+      reconnectCoordinator,
       contains(
         'let generation = admission?.sessionGeneration ?? task?.lastConnectedGeneration',
+      ),
+    );
+    expect(
+      reconnectCoordinator,
+      contains(
+        'let attemptGeneration = admission?.generation ?? task?.lastConnectedAttemptGeneration',
       ),
     );
     expect(reconnectCoordinator, contains('capturedEndpointKeys.insert(key)'));
@@ -506,6 +517,8 @@ void main() {
     );
     expect(manager, contains('source: snapshot.source'));
     expect(manager, contains('generation: snapshot.generation'));
+    expect(manager,
+        contains('attemptGeneration: snapshot.attemptGeneration'));
   });
 
   test('Android bluetooth-off terminals preserve an epoch-accepted generation',
@@ -584,7 +597,8 @@ void main() {
     expect(iosManager, contains('attemptGeneration: metadata.attemptGeneration'));
   });
 
-  test('iOS live system disconnect reuses the business-connected epoch', () {
+  test('iOS live system disconnect reuses the exact business-connected owner',
+      () {
     final manager = File('ios/Classes/ble/BleManager.swift').readAsStringSync();
     final reconnectStore =
         File('ios/Classes/ble/BleReconnectStore.swift').readAsStringSync();
@@ -595,6 +609,8 @@ void main() {
     );
     expect(reconnectStore, contains('state == .disconnectFromSys'));
     expect(reconnectStore, contains('task.lastConnectedGeneration'));
+    expect(reconnectStore,
+        contains('task.lastConnectedAttemptGeneration'));
     expect(
       manager,
       contains('BleTerminalConnectionMetadataPolicy.resolve'),
@@ -611,6 +627,10 @@ void main() {
     expect(
       manager,
       contains('generation ?? terminalMetadata?.generation ?? 0'),
+    );
+    expect(
+      manager,
+      contains('attemptGeneration ?? terminalMetadata?.attemptGeneration'),
     );
   });
 
@@ -649,7 +669,7 @@ void main() {
     expect(
       manager,
       contains(
-        'let eventAttemptGeneration = attemptGeneration ?? currentAdmission?.generation ?? 0',
+        'let eventAttemptGeneration = attemptGeneration ?? terminalMetadata?.attemptGeneration ?? currentAdmission?.generation ?? 0',
       ),
     );
   });

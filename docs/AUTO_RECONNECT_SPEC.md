@@ -269,6 +269,13 @@ A later `STATE_DISCONNECTED` from that exact `(sessionId, GATT)` must still emit
 handle. A callback from any older GATT/session must not change the newer
 attempt.
 
+On iOS, exact business commit stores the accepted `sessionGeneration` and
+`attemptGeneration` as one reconnect-task snapshot before the Gate is released.
+CoreBluetooth terminal callbacks do not carry a business token, so a later
+`didDisconnect` must reuse that exact pair. A current admission always wins over
+the historical task snapshot, preventing an old attempt from terminating its
+replacement.
+
 On Bluetooth-on, Android does not replay paused tasks by itself. It waits for
 the Dart recovery activation carrying the final `sessionGeneration`; ordinary
 `arm` calls cannot consume this barrier. Manual promotion also classifies the
@@ -363,11 +370,10 @@ this ordering for deferred teardown; the ordinary terminal path must use the
 same cleanup-before-schedule rule and must not schedule a second time.
 
 Before Bluetooth-off teardown clears admission, each platform snapshots the
-active sessionGeneration for connecting endpoints. A business-connected
-reconnect task keeps its last successful sessionGeneration. The emitted
-`disconnectFromSys` reuses that accepted sessionGeneration through the
-compatibility `generation` key instead of falling back to
-`source=unknown, generation=0`. Android serializes this transport barrier with
+active sessionGeneration and attemptGeneration for connecting endpoints. A
+business-connected reconnect task keeps its last successful exact pair. The
+emitted `disconnectFromSys` reuses both accepted generations instead of falling
+back to `source=unknown`, session zero, or attempt zero. Android serializes this transport barrier with
 admission, upgrade-state, and runtime teardown mutations. If a legacy race has
 already removed admission, only a live reconnect owner with an accepted epoch
 may restore terminal metadata; a cache with no owner is quarantined and its
@@ -433,7 +439,9 @@ hard cancel reachability without linear memory growth.
 - Bluetooth off pauses tasks; Bluetooth on waits for one final combined Dart
   activation before native opens replacement GATT handles.
 - Bluetooth-off terminals preserve the active or last business-connected
-  generation, so Dart can accept the disconnect before reconnect resumes.
+  session/attempt exact pair, so Dart can accept the disconnect before reconnect resumes.
+- iOS business-connected `didDisconnect` after Gate release reuses the last
+  accepted exact pair; a historical task cannot override a current admission.
 - Bluetooth-off teardown cannot crash on a missing admission; it recovers only
   from a valid reconnect owner or quarantines the ownerless cache.
 - A late OTA exit after transport loss never changes the endpoint back to

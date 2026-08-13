@@ -120,7 +120,8 @@ extension BleManager {
         device: BleConnectedDevice,
         source: BleConnectSource = .autoReconnect,
         businessConnected: Bool = false,
-        generation: Int64? = nil
+        generation: Int64? = nil,
+        attemptGeneration: Int64? = nil
     ) {
         let config = device.belongConfig
         // 配置关闭 autoReconnect 时，业务层仍可主动 connect，但原生不保留长期回连意图。
@@ -145,10 +146,16 @@ extension BleManager {
             incoming: source,
             businessConnected: businessConnected
         )
-        if businessConnected, let generation = generation, generation > 0 {
-            // connected 释放 admission 后仍需保留最后一次被 Dart 接受的 epoch，
-            // poweredOff 或普通 didDisconnect 才能发送同代终态，而不是 unknown/0。
+        if businessConnected,
+           let generation = generation,
+           let attemptGeneration = attemptGeneration,
+           generation > 0,
+           attemptGeneration > 0 {
+            // connected 释放 admission 后仍需保留最后一次被 Dart 接受的
+            // session/attempt exact pair。poweredOff 或 didDisconnect 只有恢复完整对，
+            // 才不会被上层 exact-attempt guard 当成迟到回调。
             task.lastConnectedGeneration = generation
+            task.lastConnectedAttemptGeneration = attemptGeneration
             task.sessionGeneration = generation
         }
         task.attempt = 0
@@ -193,7 +200,9 @@ extension BleManager {
                 )
             })
             guard let generation = admission?.sessionGeneration ?? task?.lastConnectedGeneration,
-                  generation > 0 else {
+                  let attemptGeneration = admission?.generation ?? task?.lastConnectedAttemptGeneration,
+                  generation > 0,
+                  attemptGeneration > 0 else {
                 loggerE(msg: "bluetooth off: \(uuid)-\(name), skip terminal without accepted generation")
                 continue
             }
@@ -202,7 +211,8 @@ extension BleManager {
                 uuid: uuid,
                 name: name,
                 source: admission?.source ?? .autoReconnect,
-                generation: generation
+                generation: generation,
+                attemptGeneration: attemptGeneration
             ))
             capturedEndpointKeys.insert(key)
         }
@@ -216,7 +226,8 @@ extension BleManager {
                 uuid: admission.endpointId,
                 name: session?.deviceName ?? "",
                 source: admission.source,
-                generation: admission.sessionGeneration
+                generation: admission.sessionGeneration,
+                attemptGeneration: admission.generation
             ))
             capturedEndpointKeys.insert(key)
         }

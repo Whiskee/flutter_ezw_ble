@@ -2003,12 +2003,12 @@ extension BleManager {
         )
         let eventSource = source ?? terminalMetadata?.source ?? .unknown
         let eventGeneration = generation ?? terminalMetadata?.generation ?? 0
-        let eventAttemptGeneration = attemptGeneration ?? currentAdmission?.generation ?? 0
+        let eventAttemptGeneration = attemptGeneration ?? terminalMetadata?.attemptGeneration ?? currentAdmission?.generation ?? 0
         if currentAdmission == nil,
            source == nil,
            generation == nil,
            let terminalMetadata = terminalMetadata {
-            loggerD(msg: "connect-flow: \(uuid)-\(name), reuse business-connected terminal epoch, state=\(state.rawValue), source=\(terminalMetadata.source.rawValue), generation=\(terminalMetadata.generation)")
+            loggerD(msg: "connect-flow: \(uuid)-\(name), reuse business-connected terminal epoch, state=\(state.rawValue), source=\(terminalMetadata.source.rawValue), generation=\(terminalMetadata.generation), attemptGeneration=\(terminalMetadata.attemptGeneration)")
         }
         if state == .disconnectFromSys,
            currentAdmission == nil,
@@ -2017,7 +2017,7 @@ extension BleManager {
            terminalMetadata == nil {
             // 终态绝不能静默退化：保留 task 与缓存快照，便于定位 identity/task 被错误
             // 清除的路径；Dart 侧仍会严格拒绝 unknown/0，避免迟到回调污染新会话。
-            loggerE(msg: "connect-flow: \(uuid)-\(name), missing terminal epoch, cachedConnected=\(currentDevice?.isConnected == true), taskFound=\(reconnectTask != nil), taskGeneration=\(reconnectTask?.lastConnectedGeneration ?? 0), taskSource=\(reconnectTask?.source.rawValue ?? "unknown")")
+            loggerE(msg: "connect-flow: \(uuid)-\(name), missing terminal epoch, cachedConnected=\(currentDevice?.isConnected == true), taskFound=\(reconnectTask != nil), taskGeneration=\(reconnectTask?.lastConnectedGeneration ?? 0), taskAttemptGeneration=\(reconnectTask?.lastConnectedAttemptGeneration ?? 0), taskSource=\(reconnectTask?.source.rawValue ?? "unknown")")
         }
         if state == .disconnectByUser {
             cancelReconnectTask(uuid: uuid, name: name)
@@ -2109,7 +2109,8 @@ extension BleManager {
                 device: device,
                 source: .autoReconnect,
                 businessConnected: true,
-                generation: eventGeneration
+                generation: eventGeneration,
+                attemptGeneration: eventAttemptGeneration
             )
         }
         if state == .connected {
@@ -2227,7 +2228,8 @@ extension BleManager: CBCentralManagerDelegate {
                     name: snapshot.name,
                     state: .disconnectFromSys,
                     source: snapshot.source,
-                    generation: snapshot.generation
+                    generation: snapshot.generation,
+                    attemptGeneration: snapshot.attemptGeneration
                 )
             }
             //  - 1.3、清除缓存

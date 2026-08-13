@@ -1150,3 +1150,42 @@ Owner:
   every await.
 - Native `flutter_ezw_ble` owns the exact lease and final physical/GATT commit
   gate.
+
+## iOS: system Bluetooth disconnected but App stays connected
+
+Symptoms:
+
+- CoreBluetooth reports `didDisconnect` and subsequent writes fail because the
+  characteristic cache has been cleared.
+- The App still shows one or both G2 legs as business `connected`.
+- The native terminal event has the accepted session generation but
+  `attemptGeneration=0`, and the Dart epoch guard rejects it.
+
+Root cause:
+
+- Exact business commit released the admission Gate after publishing
+  `connected`, but the reconnect task retained only the Dart session generation.
+- A later CoreBluetooth terminal callback has no business token of its own, so
+  native restored the session but lost the attempt. Relaxing the Dart guard
+  would let an old physical attempt terminate a newer attempt in the same
+  session.
+
+Fix:
+
+- Before releasing Gate, store the accepted `sessionGeneration` and
+  `attemptGeneration` together on the runtime reconnect task.
+- Gate-released `didDisconnect` and Bluetooth-off snapshots must emit that exact
+  pair. If a current admission exists, it always takes precedence over the
+  historical task snapshot.
+- Hard cancel, owner replacement, identity migration, and removal must delete or
+  migrate the pair with the owner; never reconstruct it from UI cache booleans.
+- Keep the Dart exact-attempt guard strict. Do not patch Home UI, infer physical
+  disconnect from heartbeat failures, or accept `attemptGeneration=0` as a
+  shortcut.
+
+Owner:
+
+- Native iOS `flutter_ezw_ble` owns preserving and emitting the exact terminal
+  owner.
+- `even_connect` owns rejecting terminal events that do not match the active
+  endpoint/session/attempt.
