@@ -100,6 +100,7 @@ iOS 自动回连的关键不是扫描，而是把已知 `CBPeripheral` 尽快交
 5. App 并行启动的最多 20s 扫描中，只有配置、完整广播名和可选 MAC 后缀全部匹配时，才允许 pending owner 在普通 MAC/SN 过滤之前吸收该 `CBPeripheral.identifier`，迁移成稳定 UUID task 并立即进入既有直连/Gate 流程。
 6. `manufacturerData` 为空的广播只能解析已经明确声明的 pending owner，不能作为普通扫描结果上报，也不能凭名称创建未声明连接。
 7. 没有 known peripheral 或 pending identity 时保持长期意图，不在插件内另起 scan-by-name；等待后续 App 扫描、retrieve 或 restoration。
+8. `CBCentralManager(queue: nil)` 下的两个 retrieve API 只允许在 App active 窗口同步调用。inactive/background/terminating 时优先使用 restoration escrow 或进程已持有的内存 peripheral；否则保留 `identityPending` / UUID deferred owner，不上报 `noDeviceFound`、不增加 retry。`didBecomeActive` 后仅对配置仍授权、owner 未取消且 session generation 未替换的目标补偿查询。
 
 Pending connect 与 Gate 排队阶段都不能使用短连接超时主动取消。设备离开几分钟、几十分钟甚至更久，都应该让 CoreBluetooth 持有这个系统级等待点；`connectTimeout` 只在 `didConnect` 获得 Gate 后启动，并持续覆盖 GATT readiness 与业务鉴权。UI 的 1 分钟展示超时由上层单独管理，不取消 pending connect。
 
@@ -254,6 +255,7 @@ hard cancel、登出、移除设备、配置删除或 `autoReconnect=false` 必�
 - G2 双腿/R1 都完成 activation 回执后才 finalize；未认领历史对象被 barrier 保护地取消，迟到 `didConnect` 不会复活。
 - 蓝牙 poweredOff 先用 active/last-connected generation 上报 `disconnectFromSys`，再暂停任务；poweredOn 后继续恢复。
 - ANCS / 系统已连接外设扫描不可见时仍可通过 retrieve 路径进入 GATT。
+- inactive/background/terminating 期间两个同步 retrieve API 均被生命周期门禁阻断；name-only 与 UUID owner 保留原状态，回到 active 后只恢复 exact 当前 generation。
 - 每次恢复都重新 discovery service、characteristic、notify / CCCD。
 - `connectFinish` 后 Dart 重新发业务认证；G2 使用该事件的 exact attempt prepare/commit，G1/R1 继续调用兼容 `deviceConnected`。
 - 用户主动断连或移除后不再自动恢复。

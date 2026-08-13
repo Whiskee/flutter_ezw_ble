@@ -398,7 +398,9 @@ extension BleManager {
                 name: trimmedName
             )
             let systemConnectedPeripheral: CBPeripheral? = {
-                guard claimedRestoration == nil, trimmedUuid.isEmpty else {
+                guard claimedRestoration == nil,
+                      trimmedUuid.isEmpty,
+                      allowsSynchronousCoreBluetoothLookup else {
                     return nil
                 }
                 return findPeripheralFromConnected(
@@ -518,11 +520,14 @@ extension BleManager {
                         : pendingReconnectIdentities[pendingKey]?.sessionGeneration ?? 0
                 )
                 pendingReconnectIdentities[pending.key] = pending
-                loggerD(msg: "autoReconnect identityPending: config=\(target.belongConfig), name=\(trimmedName), macSuffix=\(target.expectedMacSuffix)")
+                let pendingReason = allowsSynchronousCoreBluetoothLookup
+                    ? "awaitingPeripheralIdentity"
+                    : "appInactiveDeferred"
+                loggerD(msg: "autoReconnect identityPending: config=\(target.belongConfig), name=\(trimmedName), macSuffix=\(target.expectedMacSuffix), reason=\(pendingReason)")
                 return BleReconnectActivationResult(
                     target: target,
                     state: .identityPending,
-                    reason: "awaitingPeripheralIdentity",
+                    reason: pendingReason,
                     source: source,
                     sessionGeneration: sessionGeneration
                 )
@@ -560,11 +565,11 @@ extension BleManager {
                 )
             }
             // 3、复用已有 pending owner，或创建同一 Gate 管理的新 attempt。
-            activateArmedReconnectTask(task, source: source)
+            let deferredByAppInactivity = activateArmedReconnectTask(task, source: source)
             return BleReconnectActivationResult(
                 target: target,
                 state: .resolved,
-                reason: "",
+                reason: deferredByAppInactivity ? "appInactiveDeferred" : "",
                 source: source,
                 sessionGeneration: task.sessionGeneration
             )
@@ -572,54 +577,60 @@ extension BleManager {
     }
 
     /// 激活一个已经拥有稳定 UUID 的 task；MethodChannel 与扫描身份解析共用此顺序。
-    private func activateArmedReconnectTask(_ task: BleReconnectTask, source: BleConnectSource) {
-            // 1、已有 admission 时优先判断是否可安全复用当前 pending session。
-            let key = reconnectKey(uuid: task.uuid)
-            if let current = currentConnectionAdmission(uuid: task.uuid) {
-                let pendingTeardown = pendingConnectionAdmissionTeardowns[key]
-                let currentIsPendingTeardown = pendingTeardown.map {
-                    $0.admission.generation == current.generation &&
-                        $0.admission.sessionId == current.sessionId
-                } == true
-                if task.sessionGeneration > current.sessionGeneration {
-                    // 1.1、更高 Dart session 不能只覆盖 task 元数据：当前 CoreBluetooth
-                    // admission 和后续回调仍封装旧 session。先建立 exact cancellation
-                    // barrier，再注册唯一 replacement；真正 connect 会等待旧终态释放。
-                    if !currentIsPendingTeardown,
-                       let session = peripheralConnectionSessions[current.sessionId] {
-                        deferConnectionAdmissionReleaseUntilPeripheralTerminal(
-                            admission: current,
-                            peripheral: session.peripheral,
-                            deviceName: session.deviceName,
-                            terminalState: .disconnectFromSys
-                        )
-                        centralManager.cancelPeripheralConnection(session.peripheral)
-                    }
-                    loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), session owner replacement old=\(current.sessionGeneration), incoming=\(task.sessionGeneration), pendingTeardown=\(currentIsPendingTeardown)")
-                    beginReconnectAttempt(uuid: task.uuid)
-                    return
+    @discardableResult
+    private func activateArmedReconnectTask(
+        _ task: BleReconnectTask,
+        source: BleConnectSource
+    ) -> Bool {
+        let deferredByAppInactivity = shouldDeferReconnectForAppInactivity(task)
+        // 1、已有 admission 时优先判断是否可安全复用当前 pending session。
+        let key = reconnectKey(uuid: task.uuid)
+        if let current = currentConnectionAdmission(uuid: task.uuid) {
+            let pendingTeardown = pendingConnectionAdmissionTeardowns[key]
+            let currentIsPendingTeardown = pendingTeardown.map {
+                $0.admission.generation == current.generation &&
+                    $0.admission.sessionId == current.sessionId
+            } == true
+            if task.sessionGeneration > current.sessionGeneration {
+                // 1.1、更高 Dart session 不能只覆盖 task 元数据：当前 CoreBluetooth
+                // admission 和后续回调仍封装旧 session。先建立 exact cancellation
+                // barrier，再注册唯一 replacement；真正 connect 会等待旧终态释放。
+                if !currentIsPendingTeardown,
+                   let session = peripheralConnectionSessions[current.sessionId] {
+                    deferConnectionAdmissionReleaseUntilPeripheralTerminal(
+                        admission: current,
+                        peripheral: session.peripheral,
+                        deviceName: session.deviceName,
+                        terminalState: .disconnectFromSys
+                    )
+                    centralManager.cancelPeripheralConnection(session.peripheral)
                 }
-                if source != .manualReconnect || !currentIsPendingTeardown {
-                    if source == .manualReconnect {
-                        // 1.2、手动请求只提升 source；仅超过替换阈值且从未物理接触才允许 barrier 替换。
-                        // 默认仅提升同一 pending owner，避免手动点击引入第二条 GATT。
-                        // 只有旧 owner 已超过 20 秒且从未收到物理回调，才先走 cancel
-                        // barrier 后建立新 generation，给 CoreBluetooth 卡住的 pending 一个
-                        // 有界恢复机会。
-                        if let session = peripheralConnectionSessions[current.sessionId],
-                           replaceStalePendingManualAttemptIfNeeded(session.peripheral) {
-                            loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), manual stale pending replacement requested")
-                            beginReconnectAttempt(uuid: task.uuid)
-                            return
-                        }
-                        _ = promotePendingAttempt(uuid: task.uuid)
-                    }
-                    return
-                }
+                loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), session owner replacement old=\(current.sessionGeneration), incoming=\(task.sessionGeneration), pendingTeardown=\(currentIsPendingTeardown)")
+                beginReconnectAttempt(uuid: task.uuid)
+                return deferredByAppInactivity
             }
-            // 2、cancellation barrier 内的手动请求不能提升即将销毁的旧 session；继续创建
-            // 新 generation，并由旧 didDisconnect/watchdog 释放后原子启动。
-            beginReconnectAttempt(uuid: task.uuid)
+            if source != .manualReconnect || !currentIsPendingTeardown {
+                if source == .manualReconnect {
+                    // 1.2、手动请求只提升 source；仅超过替换阈值且从未物理接触才允许 barrier 替换。
+                    // 默认仅提升同一 pending owner，避免手动点击引入第二条 GATT。
+                    // 只有旧 owner 已超过 20 秒且从未收到物理回调，才先走 cancel
+                    // barrier 后建立新 generation，给 CoreBluetooth 卡住的 pending 一个
+                    // 有界恢复机会。
+                    if let session = peripheralConnectionSessions[current.sessionId],
+                       replaceStalePendingManualAttemptIfNeeded(session.peripheral) {
+                        loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), manual stale pending replacement requested")
+                        beginReconnectAttempt(uuid: task.uuid)
+                        return deferredByAppInactivity
+                    }
+                    _ = promotePendingAttempt(uuid: task.uuid)
+                }
+                return false
+            }
+        }
+        // 2、cancellation barrier 内的手动请求不能提升即将销毁的旧 session；继续创建
+        // 新 generation，并由旧 didDisconnect/watchdog 释放后原子启动。
+        beginReconnectAttempt(uuid: task.uuid)
+        return deferredByAppInactivity
     }
 
     /// 把 escrow 物理状态接到正式 owner；connecting 只挂 admission，禁止重复 connect。
@@ -859,6 +870,123 @@ extension BleManager {
         resumeReconnectTasksAfterBluetoothOn()
     }
 
+    /// 返回当前进程已持有的 peripheral；inactive 期间只允许复用这些对象或 restoration
+    /// escrow，禁止通过同步 CoreBluetooth retrieve 获取新对象。
+    private func inMemoryReconnectPeripheral(_ task: BleReconnectTask) -> CBPeripheral? {
+        if let connected = connectedDevices.first(where: { device in
+            isSameConnectTarget(
+                storedUuid: device.peripheral.identifier.uuidString,
+                storedName: device.peripheral.name ?? "",
+                uuid: task.uuid,
+                name: task.name
+            )
+        })?.peripheral {
+            return connected
+        }
+        if let sessionPeripheral = peripheralConnectionSessions.values.first(where: { session in
+            isSameConnectTarget(
+                storedUuid: session.admission.endpointId,
+                storedName: session.deviceName,
+                uuid: task.uuid,
+                name: task.name
+            )
+        })?.peripheral {
+            return sessionPeripheral
+        }
+        return scanResultTemp.first(where: { entry in
+            isSameConnectTarget(
+                storedUuid: entry.0.uuid,
+                storedName: entry.0.name.isEmpty ? (entry.1.name ?? "") : entry.0.name,
+                uuid: task.uuid,
+                name: task.name
+            )
+        })?.1
+    }
+
+    /// inactive/background/terminating 只在没有 restoration/内存 peripheral 时 defer。
+    /// 这不是失败 attempt，不递增 retry，不发布 noDeviceFound，也不删除长期 owner。
+    private func shouldDeferReconnectForAppInactivity(_ task: BleReconnectTask) -> Bool {
+        !allowsSynchronousCoreBluetoothLookup && inMemoryReconnectPeripheral(task) == nil
+    }
+
+    /// 把 exact reconnect task 标记为等待前台；旧 generation 或已取消 owner 无法写回。
+    private func deferReconnectTaskForAppInactivity(
+        _ task: BleReconnectTask,
+        context: String
+    ) {
+        let key = reconnectKey(uuid: task.uuid)
+        guard var current = reconnectTasks[key],
+              current.sessionGeneration == task.sessionGeneration,
+              current.belongConfig == task.belongConfig else {
+            loggerD(msg: "appLifecycle: ignore stale reconnect defer uuid=\(task.uuid), sessionGeneration=\(task.sessionGeneration), context=\(context)")
+            return
+        }
+        current.timer?.invalidate()
+        current.timer = nil
+        current.deferredByAppInactivity = true
+        reconnectTasks[key] = current
+        loggerD(msg: "appLifecycle: reconnect deferred uuid=\(current.uuid), name=\(current.name), sessionGeneration=\(current.sessionGeneration), context=\(context)")
+    }
+
+    /// didBecomeActive 后补偿 name-only system-connected identity。每个快照在查询前后都
+    /// 复验当前 owner，避免取消、替换 generation 或配置撤销后被旧补偿复活。
+    private func resolveAppInactivePendingIdentities() {
+        guard allowsSynchronousCoreBluetoothLookup else { return }
+        let deferredPending = Array(pendingReconnectIdentities.values)
+        for pending in deferredPending {
+            guard let currentPending = pendingReconnectIdentities[pending.key],
+                  currentPending.sessionGeneration == pending.sessionGeneration,
+                  currentPending.belongConfig == pending.belongConfig,
+                  currentPending.name == pending.name,
+                  let config = bleConfigs.first(where: {
+                      $0.name == pending.belongConfig && $0.autoReconnect
+                  }),
+                  let peripheral = findPeripheralFromConnected(
+                      uuid: "",
+                      name: pending.name,
+                      serviceUUIDs: config.privateServices.map { $0.serviceUUID },
+                      requireUniqueMatch: true
+                  ),
+                  let revalidated = pendingReconnectIdentities[pending.key],
+                  revalidated.sessionGeneration == pending.sessionGeneration,
+                  revalidated.source == pending.source,
+                  revalidated.expectedMacSuffix == pending.expectedMacSuffix,
+                  allowsSynchronousCoreBluetoothLookup else {
+                continue
+            }
+            loggerD(msg: "appLifecycle: resolve deferred identity config=\(pending.belongConfig), name=\(pending.name), uuid=\(peripheral.identifier.uuidString), sessionGeneration=\(pending.sessionGeneration)")
+            _ = resolvePendingReconnectIdentity(
+                peripheral: peripheral,
+                advertisedName: pending.name,
+                belongConfig: pending.belongConfig,
+                rssi: 0
+            )
+        }
+    }
+
+    /// didBecomeActive 后只恢复仍是当前 exact generation 的 UUID owner。task 已取消、
+    /// session 已替换或 config 授权已撤销时直接跳过，不创建新 GATT attempt。
+    private func resumeAppInactiveDeferredReconnects() {
+        guard allowsSynchronousCoreBluetoothLookup else { return }
+        let deferredTasks = reconnectTasks.values.filter { $0.deferredByAppInactivity }
+        for deferred in deferredTasks {
+            let key = reconnectKey(uuid: deferred.uuid)
+            guard var current = reconnectTasks[key],
+                  current.deferredByAppInactivity,
+                  current.sessionGeneration == deferred.sessionGeneration,
+                  current.belongConfig == deferred.belongConfig,
+                  bleConfigs.contains(where: {
+                      $0.name == current.belongConfig && $0.autoReconnect
+                  }) else {
+                continue
+            }
+            current.deferredByAppInactivity = false
+            reconnectTasks[key] = current
+            loggerD(msg: "appLifecycle: resume deferred reconnect uuid=\(current.uuid), name=\(current.name), sessionGeneration=\(current.sessionGeneration)")
+            activateArmedReconnectTask(current, source: current.source)
+        }
+    }
+
     /**
      *  App 即将回到前台时补偿恢复暂停任务。
      *
@@ -868,12 +996,35 @@ extension BleManager {
         resumeReconnectTasksIfBluetoothOn(reason: "willEnterForeground")
     }
 
+    /// resign active 是退出/锁屏/系统遮挡的最早边界；立即关闭同步 XPC 查询门禁。
+    @objc func handleAppWillResignActive() {
+        allowsSynchronousCoreBluetoothLookup = false
+        loggerD(msg: "appLifecycle: synchronous CoreBluetooth lookup disabled reason=willResignActive")
+    }
+
+    /// background 再次 fail-close，覆盖通知乱序或冷启动恢复路径。
+    @objc func handleAppDidEnterBackground() {
+        allowsSynchronousCoreBluetoothLookup = false
+        loggerD(msg: "appLifecycle: synchronous CoreBluetooth lookup disabled reason=didEnterBackground")
+    }
+
+    /// 进程退出宽限期绝不允许同步 retrieve 阻塞主线程。
+    @objc func handleAppWillTerminate() {
+        allowsSynchronousCoreBluetoothLookup = false
+        loggerD(msg: "appLifecycle: synchronous CoreBluetooth lookup disabled reason=willTerminate")
+    }
+
     /**
      *  App 激活后补偿恢复暂停任务。
      *
      *  与 willEnterForeground 互补，覆盖从 restoration / push / 普通打开进入 active 的不同路径。
      */
     @objc func handleAppDidBecomeActive() {
+        allowsSynchronousCoreBluetoothLookup = true
+        // name-only owner 先尝试接管 ANCS/system-connected identity，再恢复 UUID owner；
+        // 两条路径都复用原有 pending/Gate，不增加 MethodChannel 状态或 retry。
+        resolveAppInactivePendingIdentities()
+        resumeAppInactiveDeferredReconnects()
         resumeReconnectTasksIfBluetoothOn(reason: "didBecomeActive")
     }
 
@@ -928,6 +1079,10 @@ extension BleManager {
             task.pausedByBluetoothOff = true
             reconnectTasks[reconnectKey(uuid: task.uuid)] = task
             loggerD(msg: "autoReconnect: \(task.uuid), paused because bluetooth is unavailable")
+            return
+        }
+        if shouldDeferReconnectForAppInactivity(task) {
+            deferReconnectTaskForAppInactivity(task, context: "scheduleReconnect \(state.rawValue)")
             return
         }
         // 4、已有 peripheral 时交给 CoreBluetooth pending connect；无 identity 时才防抖重试。
@@ -996,12 +1151,17 @@ extension BleManager {
             reconnectTasks[key] = task
             return
         }
+        if shouldDeferReconnectForAppInactivity(task) {
+            deferReconnectTaskForAppInactivity(task, context: "beginReconnectAttempt")
+            return
+        }
         // attempt 只用于退避和日志，不再作为停止条件。自动回连是业务 connected 后建立的
         // 持续意图，不能因为设备离开较久或多次 timeout 被 native 主动放弃。
         // 2、递增日志 attempt，不把次数作为长期 autoReconnect 的停止条件。
         task.attempt = nextReconnectAttemptCount(task.attempt)
         task.timer?.invalidate()
         task.timer = nil
+        task.deferredByAppInactivity = false
         reconnectTasks[key] = task
         loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), attempt \(task.attempt), native pending connect")
         // 回连不再复用会发 connecting/启动短超时的前台 connect 路由。
@@ -1033,6 +1193,11 @@ extension BleManager {
                })?.1 {
                 return discovered
             }
+            if !allowsSynchronousCoreBluetoothLookup,
+               let held = inMemoryReconnectPeripheral(task) {
+                loggerD(msg: "appLifecycle: reuse in-memory peripheral while inactive uuid=\(held.identifier.uuidString), owner=\(task.uuid)")
+                return held
+            }
             // App 重装会让服务端/业务缓存中的 CoreBluetooth UUID 失效。若目标已被
             // iOS/ANCS 持有连接，它可能停止广播，必须在旧 UUID retrieve 和扫描缓存前
             // 通过配置私有服务 + ANCS 接管系统连接，再复用下方同一条 Gate/GATT 流程。
@@ -1045,7 +1210,10 @@ extension BleManager {
                 return systemConnected
             }
             if let identifier = UUID(uuidString: task.uuid),
-               let retrieved = centralManager.retrievePeripherals(withIdentifiers: [identifier]).first {
+               let retrieved = retrievePeripheralsWhenAppActive(
+                   withIdentifiers: [identifier],
+                   context: "auto reconnect by UUID"
+               ).first {
                 return retrieved
             }
             return scanResultTemp.first(where: {
@@ -1054,6 +1222,13 @@ extension BleManager {
             })?.1
         }()
         guard let peripheral = cachedPeripheral else {
+            guard allowsSynchronousCoreBluetoothLookup else {
+                deferReconnectTaskForAppInactivity(
+                    task,
+                    context: "beginDirectReconnectAttempt no in-memory peripheral"
+                )
+                return
+            }
             loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), no peripheral cache yet, wait concurrent scan/retrieve")
             scheduleReconnect(
                 uuid: task.uuid,

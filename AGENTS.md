@@ -27,6 +27,7 @@
 - 原生自动回连只在业务调用 `deviceConnected(uuid)` 后启用；`connectFinish` 只表示 GATT ready，不表示业务 connected。
 - `timeout`、`noDeviceFound`、`serviceFail`、`charsFail` 是单次尝试失败，不是长期回连停止条件；只有用户/业务主动断连、移除、reset、清缓存、配置关闭或插件释放才能取消 reconnect intent。
 - iOS State Restoration 只能恢复进程内 BLE 工作和 CoreBluetooth peripheral；私有服务、notify/CCCD、业务认证指令必须重新执行，不承诺把 App UI 拉到前台。
+- iOS `CBCentralManager(queue: nil)` 的 `retrieveConnectedPeripherals` / `retrievePeripherals` 只允许经 active 生命周期门禁调用；inactive/background/terminating 时只能复用 restoration/内存 peripheral，缺失时保留 exact deferred owner，不得制造 `noDeviceFound` 或增加 retry。`didBecomeActive` 补偿必须复验 config、owner 和 session generation。
 
 ## 修改规则
 

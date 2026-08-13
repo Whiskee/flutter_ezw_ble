@@ -46,6 +46,9 @@ struct BleReconnectTask {
     var timer: Timer?
     /// 蓝牙关闭期间暂停任务，poweredOn 后由系统状态回调恢复。
     var pausedByBluetoothOff: Bool = false
+    /// App inactive/background/terminating 时禁止同步 CoreBluetooth retrieve；该标记
+    /// 保留 exact owner，等 didBecomeActive 复验 session 后补偿解析，不制造失败或 retry。
+    var deferredByAppInactivity: Bool = false
     /// 当前 pending attempt 来源；manual 只能影响本轮，终态后恢复 auto。
     var source: BleConnectSource = .autoReconnect
     /// 最近一次业务 connected 对应的 generation；Gate 释放后的系统断连复用它发送同代终态。

@@ -83,6 +83,9 @@ class BleManager: NSObject {
     private lazy var otaWriteQueues: [String: OtaWriteQueue] = [:]
     //  - 原生自动回连任务，只有业务 connected 后才会加入
     lazy var reconnectTasks: [String: BleReconnectTask] = [:]
+    //  - CBCentralManager 使用主队列；同步 retrieve 只允许在 App active 窗口执行，
+    //    避免退出宽限期主线程卡在 CoreBluetooth XPC 同步查询并触发 0x8BADF00D。
+    var allowsSynchronousCoreBluetoothLookup = false
     //  - Code 14 配对失配恢复的有界扫描窗口。只在该任务自己启动扫描时才负责停止，
     //    不能抢占发现页或 Dart 身份补全扫描的所有权。
     var pairingRecoveryScanTimers: [String: (timer: Timer, ownsScan: Bool)] = [:]
@@ -148,6 +151,9 @@ class BleManager: NSObject {
             queue: nil,
             options: options
         )
+        // 插件可能在 didBecomeActive 之后才初始化；此时允许继承当前 active 事实。
+        // 后续所有切换仍只由 UIApplication 生命周期通知更新。
+        allowsSynchronousCoreBluetoothLookup = UIApplication.shared.applicationState == .active
         if options == nil {
             loggerE(msg: BleManager.stateRestorationMissingBluetoothCentralWarning)
         } else {
@@ -163,6 +169,24 @@ class BleManager: NSObject {
             self,
             selector: #selector(handleAppDidBecomeActive),
             name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAppWillResignActive),
+            name: UIApplication.willResignActiveNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAppDidEnterBackground),
+            name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAppWillTerminate),
+            name: UIApplication.willTerminateNotification,
             object: nil
         )
     }
@@ -400,7 +424,10 @@ extension BleManager {
         }
         if !uuid.isEmpty,
            let cbUuid = UUID(uuidString: uuid),
-           let peripheral = centralManager.retrievePeripherals(withIdentifiers: [cbUuid]).first,
+           let peripheral = retrievePeripheralsWhenAppActive(
+               withIdentifiers: [cbUuid],
+               context: "system-connected probe"
+           ).first,
            peripheral.state == .connected {
             loggerD(msg: "system-connected probe: \(uuid)-\(name), hit retrievePeripherals")
             return true
@@ -1207,7 +1234,10 @@ extension BleManager {
             queryServices.append(BleManager.ancsServiceUUID)
         }
         guard !queryServices.isEmpty else { return nil }
-        let connectedPeripherals = centralManager.retrieveConnectedPeripherals(withServices: queryServices)
+        let connectedPeripherals = retrieveConnectedPeripheralsWhenAppActive(
+            withServices: queryServices,
+            context: "findPeripheralFromConnected"
+        )
         let matches = connectedPeripherals.filter { device in
             BleReconnectIdentityPolicy.matchesSystemConnectedPeripheral(
                 taskUuid: uuid,
@@ -1222,6 +1252,41 @@ extension BleManager {
             return nil
         }
         return matches.first
+    }
+
+    /**
+     * Active-only wrapper for CoreBluetooth's synchronous connected-peripheral query.
+     *
+     * `CBCentralManager(queue: nil)` and MethodChannel callbacks both use the main queue.
+     * During process exit this API can block in synchronous XPC longer than FrontBoard's
+     * five-second grace window, so inactive callers must defer instead of querying.
+     */
+    func retrieveConnectedPeripheralsWhenAppActive(
+        withServices serviceUUIDs: [CBUUID],
+        context: String
+    ) -> [CBPeripheral] {
+        guard allowsSynchronousCoreBluetoothLookup else {
+            loggerD(msg: "appLifecycle: defer retrieveConnectedPeripherals context=\(context)")
+            return []
+        }
+        return centralManager.retrieveConnectedPeripherals(withServices: serviceUUIDs)
+    }
+
+    /**
+     * Active-only wrapper for CoreBluetooth's synchronous identifier lookup.
+     *
+     * Callers retain their existing in-memory/restoration peripheral while inactive; an empty
+     * result here means "deferred", not "device missing", and must not create a terminal state.
+     */
+    func retrievePeripheralsWhenAppActive(
+        withIdentifiers identifiers: [UUID],
+        context: String
+    ) -> [CBPeripheral] {
+        guard allowsSynchronousCoreBluetoothLookup else {
+            loggerD(msg: "appLifecycle: defer retrievePeripherals context=\(context)")
+            return []
+        }
+        return centralManager.retrievePeripherals(withIdentifiers: identifiers)
     }
     
     

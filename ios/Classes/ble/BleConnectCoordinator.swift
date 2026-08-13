@@ -114,7 +114,10 @@ extension BleManager {
             tag += "from connected device list"
             var device = connectedDevices[index]
             let id = device.peripheral.identifier
-            let list = centralManager.retrievePeripherals(withIdentifiers: [id])
+            let list = retrievePeripheralsWhenAppActive(
+                withIdentifiers: [id],
+                context: "foreground connected-device cache"
+            )
             oldPeripheral = list.first ?? device.peripheral
             oldPeripheral?.delegate = self
             device.peripheral = oldPeripheral!
@@ -185,7 +188,10 @@ extension BleManager {
 
         if oldPeripheral == nil, !easyConnect.uuid.isEmpty,
            let cbUuid = UUID(uuidString: easyConnect.uuid),
-           let peripheral = centralManager.retrievePeripherals(withIdentifiers: [cbUuid]).first {
+           let peripheral = retrievePeripheralsWhenAppActive(
+               withIdentifiers: [cbUuid],
+               context: "foreground connect by UUID"
+           ).first {
             // retrievePeripherals 修复系统已连接但不广播的 ANCS 场景，避免 scan-first 永远扫不到。
             if peripheral.state == .connected {
                 tag += "from retrievePeripherals (system-connected)"

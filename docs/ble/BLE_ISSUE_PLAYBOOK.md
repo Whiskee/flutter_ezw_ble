@@ -1,5 +1,37 @@
 # BLE Issue Playbook
 
+## iOS process-exit watchdog during auto-reconnect activation
+
+Symptoms:
+
+- The app is backgrounded or being terminated while native auto reconnect activation is resolving an R1/G2 peripheral.
+- The `.ips` report is `0x8BADF00D` / `process-exit`, with the main thread blocked in `xpc_connection_send_message_with_reply_sync` -> `CBCentralManager.retrieveConnectedPeripherals` -> `findPeripheralFromConnected` -> `activateAutoReconnectTargets`.
+- App CPU time is negligible; the failure is a synchronous CoreBluetooth/XPC wait during FrontBoard's termination grace period, not a busy loop or BLE protocol error.
+
+Root cause:
+
+- iOS creates `CBCentralManager(delegate:queue:nil)`, so CoreBluetooth callbacks and Flutter MethodChannel activation share the main queue.
+- The name-only auto-reconnect resolver synchronously queried system-connected peripherals even after the App had resigned active or entered its process-exit window.
+- Moving only the retrieve call to a global queue is unsafe because the same central manager and reconnect state remain main-queue owned.
+
+Fix:
+
+- Gate both `retrieveConnectedPeripherals` and `retrievePeripherals` behind App active lifecycle state. Close the gate at `willResignActive`, `didEnterBackground`, and `willTerminate`; reopen only at `didBecomeActive`.
+- Preserve State Restoration escrow and already-held in-memory peripherals. Otherwise keep name-only targets as `identityPending` and UUID targets as deferred owners without `noDeviceFound` or retry advancement.
+- On `didBecomeActive`, revalidate config authorization, owner identity, and session generation before a single compensation pass. Reuse `resolvePendingReconnectIdentity` and the existing Gate; never revive cancelled/replaced owners.
+- Keep CBCentralManager on its current queue in this emergency fix. A full queue migration is a separate architecture change.
+
+Validation:
+
+- Automated source-contract tests cover lifecycle closure, active-only retrieve wrappers, deferred reason/state, no fake failure, and exact foreground generation checks.
+- Full Flutter tests, Flutter analyze, and Swift parse must pass before pinning the dependency SHA.
+- Release acceptance still requires the original kill/relaunch scenario plus MetricKit `app_watchdog` and Crashlytics inspection; automated tests do not prove watchdog absence on a physical device.
+
+Owner:
+
+- `flutter_ezw_ble` iOS native owns lifecycle containment and exact deferred-owner recovery.
+- even_connect/App keep their existing activation, retry, protocol, and business-connected semantics.
+
 ## iOS restoration: one G2 leg disconnects before current targets load
 
 Symptoms:

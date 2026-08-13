@@ -293,6 +293,23 @@ legs and R1 activation calls return, the caller invokes
 `finalizeStateRestorationClaims`; remaining historical/ambiguous escrows are
 cancelled behind the existing late-callback barrier.
 
+The central manager uses the main queue (`queue: nil`), so synchronous
+`retrieveConnectedPeripherals` and `retrievePeripherals` calls are allowed only
+while the host app is active. `willResignActive`, `didEnterBackground`, and
+`willTerminate` close this gate immediately; only `didBecomeActive` reopens it.
+This prevents a MethodChannel activation during the process-exit grace window
+from blocking the main thread in CoreBluetooth synchronous XPC.
+
+While inactive, restoration escrow and a peripheral already held in the
+process may still use the existing Gate/pending-connect path. A name-only owner
+stays `identityPending` with reason `appInactiveDeferred`; a UUID owner records
+`deferredByAppInactivity`. Neither path emits `noDeviceFound`, advances retry,
+or removes the long-lived owner. On `didBecomeActive`, native revalidates the
+current config, owner key, and session generation before one compensation pass:
+name-only system-connected hits reuse `resolvePendingReconnectIdentity`, and
+UUID owners reuse the normal activation/Gate path. Cancelled, replaced, or
+revoked owners fail closed.
+
 iOS lookup order:
 
 1. `retrieveConnectedPeripherals(withServices:)`, using configured private services plus ANCS.
@@ -422,6 +439,9 @@ hard cancel reachability without linear memory growth.
 - A late OTA exit after transport loss never changes the endpoint back to
   `connected` on either platform.
 - iOS ANCS/system-connected devices do not fall into scan timeout.
+- iOS inactive/background/terminating paths do not call either synchronous
+  retrieve API, manufacture `noDeviceFound`, or advance reconnect attempts;
+  active compensation only resumes the exact current owner/generation.
 - Android out-of-range devices recover through the mandatory passive reconnect path.
 - Android business-connected system disconnect rebuilds `passiveGatt`; an old
   GATT/session cannot terminate a newer attempt.

@@ -65,7 +65,9 @@ void main() {
     );
     expect(
       normalReconnect.indexOf('findPeripheralFromConnected('),
-      lessThan(normalReconnect.indexOf('retrievePeripherals(')),
+      lessThan(
+        normalReconnect.indexOf('retrievePeripheralsWhenAppActive('),
+      ),
     );
     expect(
       normalReconnect,
