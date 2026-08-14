@@ -197,6 +197,10 @@ hard cancel、登出、移除设备、配置删除或 `autoReconnect=false` 必�
 
 蓝牙关闭只能暂停任务。恢复到 poweredOn 后，iOS 原生层应重新 replay reconnect target，继续 pending connect 或 GATT pipeline；Android 同样恢复长期 passive owner，上层最多 20 秒的扫描只并行刷新身份，不能成为直连前置条件。
 
+iOS R1 的 CoreBluetooth Code 14 新鲜广播恢复属于同一个长期 reconnect owner，而不是新的 restoration owner。自动来源首次失败后，active/poweredOn 生命周期内按 10 秒扫描和 5 秒等待循环；inactive/background/terminating 或蓝牙关闭必须立即停掉该 owner 的扫描与 timer，但保留 config、session generation 和已进入恢复的事实。回到 active/poweredOn 只能复验当前 generation 后重新开始完整窗口，等待阶段不得消费共享扫描，扫描 miss 也不得发布 restoration/Dart 终态。
+
+新鲜广播命中后必须用回调提供的真实 `CBPeripheral` 创建新正 attempt。该 peripheral 再次 Code 14 才停止自动 owner；其它物理失败交回普通 reconnect。手动接管正在连接的自动恢复时，要先 exact teardown automatic admission，再通过 cancellation barrier 启动独立 manual generation；历史 restoration、旧自动 callback 或 generation 0 都不能被解释为当前手动 Code 14。
+
 任何界面上的“取消”都必须调用真取消入口：清 task、持久化 target、`identityPending` owner、pending peripheral/session、timer 与迟到 callback 的复活入口；此后只有再次明确手动点击连接才能重新 activate。自动/手动连接 UI 的 1 分钟超时只停止展示（手动可提示超时），不能隐式调用取消。蓝牙关闭则 teardown Gate/session 并把下一 attempt source 重置为 `autoReconnect`，旧 manual source 不跨 transport reset。
 
 ## 9. Dart / even_connect 职责

@@ -12,12 +12,37 @@ import Foundation
 
 /// iOS 单次连接 attempt 内的 Code 14 恢复阶段。
 ///
-/// 这里只描述“首次失败后的有界恢复”，不表示 App 正在等待用户处理。恢复扫描或
-/// 恢复连接一旦再次失败，native 会结束该 owner；下一次手动点击再创建全新 attempt。
+/// 这里只描述首次 Code 14 后的新鲜广播恢复，不表示 App 正在等待用户处理。自动来源
+/// 会在扫描窗口之间保留 owner；只有新 peripheral 再次 Code 14 才结束自动恢复。
 enum BlePeerPairingRecoveryState: String {
     case normal
     case awaitingFreshAdvertisement
+    /// 自动窗口未命中后的 5 秒静默等待；此阶段不得消费其它业务的共享扫描结果。
+    case waitingFreshAdvertisementRetry
     case foregroundRecoveryConnecting
+}
+
+/// 新鲜广播窗口结束后的内部动作。该纯策略供 XCTest 锁定自动/手动语义，避免计时器
+/// 分支在未来重构时把自动 owner 重新误删。
+enum BlePeerPairingRecoveryWindowAction: Equatable {
+    case retryAfterDelay
+    case finishManualAttempt
+}
+
+/// Code 14 新鲜广播扫描的固定时序。手动路径沿用历史 20 秒窗口；自动路径按产品恢复
+/// 策略使用 10 秒窗口和 5 秒间隔，且没有次数上限。
+enum BlePeerPairingRecoveryPolicy {
+    static let retryDelay: TimeInterval = 5
+
+    static func scanWindow(for source: BleConnectSource) -> TimeInterval {
+        source == .manualReconnect ? 20 : 10
+    }
+
+    static func actionAfterWindowMiss(
+        source: BleConnectSource
+    ) -> BlePeerPairingRecoveryWindowAction {
+        source == .manualReconnect ? .finishManualAttempt : .retryAfterDelay
+    }
 }
 
 /// 当前 Code 14 回调对本次 attempt 的处置动作。
@@ -60,9 +85,9 @@ struct BleReconnectTask {
     /// Dart recovery batch 的逻辑代次。native Gate attempt 可多次变化，但 Flutter
     /// 状态必须始终回到同一逻辑 session，防止 epoch guard 把真实终态当成旧回调。
     var sessionGeneration: Int64 = 0
-    /// Code 14 恢复状态；只在当前 attempt 内有效，不承担长期等待用户语义。
+    /// Code 14 恢复状态；只在当前 owner 内有效，不承担等待用户处理语义。
     var pairingRecoveryState: BlePeerPairingRecoveryState = .normal
-    /// 同一 attempt 最多自动执行一轮配对恢复；再次失败立即结束本轮。
+    /// 是否已进入过新鲜 peripheral 恢复；只有该 peripheral 再次 Code 14 才结束 owner。
     var hasAttemptedPairingRecovery: Bool = false
 }
 

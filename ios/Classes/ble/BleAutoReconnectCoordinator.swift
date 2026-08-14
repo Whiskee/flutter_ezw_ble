@@ -18,7 +18,15 @@ import Foundation
  */
 extension BleManager {
     private var passiveReconnectDebounceMs: TimeInterval { 1500 }
-    private var pairingRecoveryDiscoveryTimeout: TimeInterval { 20.0 }
+    private var automaticPairingRecoveryScanWindow: TimeInterval {
+        BlePeerPairingRecoveryPolicy.scanWindow(for: .autoReconnect)
+    }
+    private var manualPairingRecoveryScanWindow: TimeInterval {
+        BlePeerPairingRecoveryPolicy.scanWindow(for: .manualReconnect)
+    }
+    private var pairingRecoveryRetryDelay: TimeInterval {
+        BlePeerPairingRecoveryPolicy.retryDelay
+    }
 
     /**
      *  判断两个连接目标是否指向同一 BLE 设备。
@@ -297,6 +305,7 @@ extension BleManager {
             name: effectiveTarget.name,
             source: source
         )
+        let previousSessionGeneration = task.sessionGeneration
         task.name = effectiveTarget.name.isEmpty ? task.name : effectiveTarget.name
         task.source = BleReconnectSourcePolicy.onArm(
             current: task.source,
@@ -307,11 +316,20 @@ extension BleManager {
         // 降回更小代次，否则 CoreBluetooth 成功回调会再次被上层 epoch guard 拒绝。
         if sessionGeneration > task.sessionGeneration {
             task.sessionGeneration = sessionGeneration
+            // 新 recovery batch 必须淘汰旧 5 秒 timer，并从完整扫描窗口重新开始。
+            if task.pairingRecoveryState == .waitingFreshAdvertisementRetry {
+                task.pairingRecoveryState = .awaitingFreshAdvertisement
+            }
         }
         task.attempt = 0
         task.pausedByBluetoothOff = false
-        task.timer?.invalidate()
-        task.timer = nil
+        let preservesCurrentRecoveryWait = source != .manualReconnect &&
+            task.pairingRecoveryState == .waitingFreshAdvertisementRetry &&
+            task.sessionGeneration == previousSessionGeneration
+        if !preservesCurrentRecoveryWait {
+            task.timer?.invalidate()
+            task.timer = nil
+        }
         reconnectTasks[key] = task
         reconnectStore.upsert(target: effectiveTarget)
         return task
@@ -557,13 +575,22 @@ extension BleManager {
                     sessionGeneration: sessionGeneration
                 )
             }
-            // 2.1、历史 Code 14 只改变下一次手动连接的取 peripheral 方式：先等
-            // 新广告，再在 Gate 内真正连接。不能依据历史失败直接返回 720。
-            if source == .manualReconnect, hasStoppedPeerPairingRecovery(target) {
+            // 2.1、历史 Code 14，或仍在自动扫描/间隔等待中的 owner，被手动点击后都
+            // 立即切换到新的手动新鲜广播窗口。不得等待自动 5 秒 timer，也不得复用
+            // 旧 peripheral；只有这次手动物理 attempt 的真实 Code 14 才能返回 720。
+            let takesOverFreshAdvertisementWait =
+                task.pairingRecoveryState == .awaitingFreshAdvertisement ||
+                task.pairingRecoveryState == .waitingFreshAdvertisementRetry
+            if source == .manualReconnect,
+               hasStoppedPeerPairingRecovery(target) || takesOverFreshAdvertisementWait {
                 var freshTask = task
                 freshTask.hasAttemptedPairingRecovery = true
                 freshTask.pairingRecoveryState = .awaitingFreshAdvertisement
-                reconnectTasks[reconnectKey(uuid: freshTask.uuid)] = freshTask
+                let freshKey = reconnectKey(uuid: freshTask.uuid)
+                freshTask.timer?.invalidate()
+                freshTask.timer = nil
+                cancelPairingRecoveryDiscovery(key: freshKey)
+                reconnectTasks[freshKey] = freshTask
                 purgeStaleScanCache(uuid: freshTask.uuid, name: freshTask.name)
                 startPairingRecoveryDiscoveryIfNeeded(freshTask)
                 loggerD(msg: "autoReconnect: \(freshTask.uuid)-\(freshTask.name), manual attempt waits for fresh advertisement sessionGeneration=\(freshTask.sessionGeneration)")
@@ -596,12 +623,27 @@ extension BleManager {
         let deferredByAppInactivity = shouldDeferReconnectForAppInactivity(task)
         // 1、已有 admission 时优先判断是否可安全复用当前 pending session。
         let key = reconnectKey(uuid: task.uuid)
+        // 自动窗口之间的静默等待由 task.timer 独占。重复 activation 只确认 owner 仍在，
+        // 不能提前开始扫描或 retrieve，也不能让共享扫描结果穿过等待门禁。
+        if source != .manualReconnect,
+           task.pairingRecoveryState == .waitingFreshAdvertisementRetry {
+            return deferredByAppInactivity
+        }
         if let current = currentConnectionAdmission(uuid: task.uuid) {
             let pendingTeardown = pendingConnectionAdmissionTeardowns[key]
             let currentIsPendingTeardown = pendingTeardown.map {
                 $0.admission.generation == current.generation &&
                     $0.admission.sessionId == current.sessionId
             } == true
+            if source == .manualReconnect,
+               takeOverPeerPairingRecoveryManually(
+                   task,
+                   current: current,
+                   currentIsPendingTeardown: currentIsPendingTeardown
+               ) {
+                beginReconnectAttempt(uuid: task.uuid)
+                return deferredByAppInactivity
+            }
             if task.sessionGeneration > current.sessionGeneration {
                 // 1.1、更高 Dart session 不能只覆盖 task 元数据：当前 CoreBluetooth
                 // admission 和后续回调仍封装旧 session。先建立 exact cancellation
@@ -642,6 +684,33 @@ extension BleManager {
         // 新 generation，并由旧 didDisconnect/watchdog 释放后原子启动。
         beginReconnectAttempt(uuid: task.uuid)
         return deferredByAppInactivity
+    }
+
+    /// 手动点击接管正在使用新 peripheral 的自动恢复时，旧自动 admission 必须先进入
+    /// cancellation barrier。旧 source 保持 automatic；新手动 attempt 等 CoreBluetooth
+    /// teardown 后再连接，避免同一 peripheral 并行 connect 或把迟到 Code 14 误算成手动。
+    private func takeOverPeerPairingRecoveryManually(
+        _ task: BleReconnectTask,
+        current: BleConnectionAdmission,
+        currentIsPendingTeardown: Bool
+    ) -> Bool {
+        guard task.pairingRecoveryState == .foregroundRecoveryConnecting,
+              current.source != .manualReconnect else {
+            return false
+        }
+        if !currentIsPendingTeardown,
+           let session = peripheralConnectionSessions[current.sessionId] {
+            pendingPhysicalConnectWatchdogs.takeIfCurrent(current)?.cancel()
+            deferConnectionAdmissionReleaseUntilPeripheralTerminal(
+                admission: current,
+                peripheral: session.peripheral,
+                deviceName: session.deviceName,
+                terminalState: .disconnectFromSys
+            )
+            centralManager.cancelPeripheralConnection(session.peripheral)
+        }
+        loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), manual takeover waits for automatic pairing recovery teardown sessionGeneration=\(task.sessionGeneration)")
+        return true
     }
 
     /// 把 escrow 物理状态接到正式 owner；connecting 只挂 admission，禁止重复 connect。
@@ -821,6 +890,7 @@ extension BleManager {
      *  poweredOff 不是最终失败，不能把任务标记为 noDeviceFound；等待 poweredOn 后继续调度。
      */
     func pauseReconnectTasksForBluetoothOff() {
+        pausePeerPairingRecoveryForBluetoothOff()
         for key in reconnectTasks.keys {
             guard var task = reconnectTasks[key] else {
                 continue
@@ -834,6 +904,22 @@ extension BleManager {
         }
         if !reconnectTasks.isEmpty {
             loggerD(msg: "autoReconnect: pause \(reconnectTasks.count) task(s), bluetooth off")
+        }
+    }
+
+    /// Bluetooth OFF 会销毁当前 CoreBluetooth attempt。Code 14 扫描/等待必须立即静默，
+    /// 但 owner 与已消耗恢复事实继续保留；poweredOn 后从新的 10 秒窗口恢复。
+    private func pausePeerPairingRecoveryForBluetoothOff() {
+        let recoveryKeys = reconnectTasks.compactMap { key, task in
+            task.pairingRecoveryState == .normal ? nil : key
+        }
+        recoveryKeys.forEach { key in
+            cancelPairingRecoveryDiscovery(key: key)
+            guard var current = reconnectTasks[key] else { return }
+            current.timer?.invalidate()
+            current.timer = nil
+            current.pairingRecoveryState = .awaitingFreshAdvertisement
+            reconnectTasks[key] = current
         }
     }
 
@@ -998,6 +1084,29 @@ extension BleManager {
         }
     }
 
+    /// App 不再 active 时，Code 14 专用扫描和 5 秒 timer 都必须立即停下。owner、session
+    /// 和恢复事实保持不变；didBecomeActive 只恢复仍通过 config/generation 复验的任务。
+    private func pausePeerPairingRecoveryForAppInactivity(reason: String) {
+        let recoveryKeys = reconnectTasks.compactMap { key, task in
+            switch task.pairingRecoveryState {
+            case .awaitingFreshAdvertisement, .waitingFreshAdvertisementRetry:
+                return key
+            case .normal, .foregroundRecoveryConnecting:
+                return nil
+            }
+        }
+        recoveryKeys.forEach { key in
+            cancelPairingRecoveryDiscovery(key: key)
+            guard var current = reconnectTasks[key] else { return }
+            current.timer?.invalidate()
+            current.timer = nil
+            current.pairingRecoveryState = .awaitingFreshAdvertisement
+            current.deferredByAppInactivity = true
+            reconnectTasks[key] = current
+            loggerD(msg: "freshAdvertisementRecoveryPaused owner=\(current.uuid), sessionGeneration=\(current.sessionGeneration), reason=\(reason)")
+        }
+    }
+
     /**
      *  App 即将回到前台时补偿恢复暂停任务。
      *
@@ -1010,18 +1119,21 @@ extension BleManager {
     /// resign active 是退出/锁屏/系统遮挡的最早边界；立即关闭同步 XPC 查询门禁。
     @objc func handleAppWillResignActive() {
         allowsSynchronousCoreBluetoothLookup = false
+        pausePeerPairingRecoveryForAppInactivity(reason: "willResignActive")
         loggerD(msg: "appLifecycle: synchronous CoreBluetooth lookup disabled reason=willResignActive")
     }
 
     /// background 再次 fail-close，覆盖通知乱序或冷启动恢复路径。
     @objc func handleAppDidEnterBackground() {
         allowsSynchronousCoreBluetoothLookup = false
+        pausePeerPairingRecoveryForAppInactivity(reason: "didEnterBackground")
         loggerD(msg: "appLifecycle: synchronous CoreBluetooth lookup disabled reason=didEnterBackground")
     }
 
     /// 进程退出宽限期绝不允许同步 retrieve 阻塞主线程。
     @objc func handleAppWillTerminate() {
         allowsSynchronousCoreBluetoothLookup = false
+        pausePeerPairingRecoveryForAppInactivity(reason: "willTerminate")
         loggerD(msg: "appLifecycle: synchronous CoreBluetooth lookup disabled reason=willTerminate")
     }
 
@@ -1189,7 +1301,11 @@ extension BleManager {
             armReconnectTask(device: connected, source: .autoReconnect, businessConnected: true)
             return
         }
-        // 2、Code 14 后等待新广播阶段禁止 retrieve 旧 peripheral。
+        // 2、Code 14 后等待新广播阶段禁止 retrieve 旧 peripheral。5 秒间隔由专用
+        // timer 唯一推进；任何其它重入都必须保持静默。
+        if task.pairingRecoveryState == .waitingFreshAdvertisementRetry {
+            return
+        }
         if task.pairingRecoveryState == .awaitingFreshAdvertisement {
             startPairingRecoveryDiscoveryIfNeeded(task)
             return
@@ -1351,6 +1467,9 @@ extension BleManager {
             return nil
         }
         if source == .manualReconnect || task.hasAttemptedPairingRecovery {
+            if source != .manualReconnect && task.hasAttemptedPairingRecovery {
+                loggerE(msg: "freshPeripheralStillRejectedPairing owner=\(task.uuid), sessionGeneration=\(task.sessionGeneration)")
+            }
             stopPeerPairingRecoveryTask(
                 task,
                 reason: source == .manualReconnect
@@ -1368,6 +1487,33 @@ extension BleManager {
         return .retryFreshAdvertisement
     }
 
+    /// 新鲜 peripheral 若出现非 Code 14 的物理失败，说明本轮没有再次证明配对信息失配。
+    /// 清除专用阶段后交回普通 persistent autoReconnect；不得写 stopped marker。
+    func resetPeerPairingRecoveryAfterNonPairingFailure(
+        uuid: String,
+        name: String
+    ) {
+        guard let key = reconnectTasks.first(where: { _, task in
+            isSameConnectTarget(
+                storedUuid: task.uuid,
+                storedName: task.name,
+                uuid: uuid,
+                name: name
+            )
+        })?.key,
+        var task = reconnectTasks[key],
+        task.pairingRecoveryState == .foregroundRecoveryConnecting else {
+            return
+        }
+        task.timer?.invalidate()
+        task.timer = nil
+        task.pairingRecoveryState = .normal
+        task.hasAttemptedPairingRecovery = false
+        reconnectTasks[key] = task
+        purgeStaleScanCache(uuid: task.uuid, name: task.name)
+        loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), non-Code14 terminal exits fresh peripheral recovery")
+    }
+
     /// 取消某个 owner 的配对恢复扫描。只有该 owner 自己启动的扫描才允许停止，
     /// 避免抢占 Discovery/其它恢复批次共享的 central scan。
     func cancelPairingRecoveryDiscovery(key: String) {
@@ -1378,42 +1524,128 @@ extension BleManager {
         }
     }
 
+    /// 自动窗口 miss 后只保留 owner 并等待 5 秒；timer 回调必须复验 config、session、
+    /// 蓝牙和 App active。等待阶段使用独立状态，明确禁止消费共享扫描结果。
+    private func schedulePairingRecoveryRetry(_ task: BleReconnectTask) {
+        let key = reconnectKey(uuid: task.uuid)
+        guard var current = reconnectTasks[key],
+              current.sessionGeneration == task.sessionGeneration,
+              current.belongConfig == task.belongConfig,
+              current.source != .manualReconnect,
+              current.pairingRecoveryState == .awaitingFreshAdvertisement else {
+            return
+        }
+        current.timer?.invalidate()
+        current.pairingRecoveryState = .waitingFreshAdvertisementRetry
+        let expectedSessionGeneration = current.sessionGeneration
+        let expectedConfig = current.belongConfig
+        current.timer = Timer.scheduledTimer(
+            withTimeInterval: pairingRecoveryRetryDelay,
+            repeats: false
+        ) { [weak self] _ in
+            guard let self = self,
+                  var resumed = self.reconnectTasks[key],
+                  resumed.sessionGeneration == expectedSessionGeneration,
+                  resumed.belongConfig == expectedConfig,
+                  resumed.source != .manualReconnect,
+                  resumed.pairingRecoveryState == .waitingFreshAdvertisementRetry,
+                  self.bleConfigs.contains(where: {
+                      $0.name == expectedConfig && $0.autoReconnect
+                  }) else {
+                return
+            }
+            resumed.timer = nil
+            guard self.centralManager.state == .poweredOn else {
+                resumed.pausedByBluetoothOff = true
+                resumed.pairingRecoveryState = .awaitingFreshAdvertisement
+                self.reconnectTasks[key] = resumed
+                return
+            }
+            guard self.allowsSynchronousCoreBluetoothLookup else {
+                resumed.deferredByAppInactivity = true
+                resumed.pairingRecoveryState = .awaitingFreshAdvertisement
+                self.reconnectTasks[key] = resumed
+                return
+            }
+            resumed.pairingRecoveryState = .awaitingFreshAdvertisement
+            self.reconnectTasks[key] = resumed
+            self.startPairingRecoveryDiscoveryIfNeeded(resumed)
+        }
+        reconnectTasks[key] = current
+        loggerD(msg: "freshAdvertisementRetryScheduled owner=\(current.uuid), sessionGeneration=\(current.sessionGeneration), scanWindow=\(Int(automaticPairingRecoveryScanWindow))s, retryDelay=\(Int(pairingRecoveryRetryDelay))s")
+    }
+
     /// 在已有扫描上共享窗口；只有本任务主动开的扫描，超时才允许停止，避免抢占其他业务扫描。
     private func startPairingRecoveryDiscoveryIfNeeded(_ task: BleReconnectTask) {
         let key = reconnectKey(uuid: task.uuid)
-        guard pairingRecoveryScanTimers[key] == nil else { return }
+        guard pairingRecoveryScanTimers[key] == nil,
+              let current = reconnectTasks[key],
+              current.sessionGeneration == task.sessionGeneration,
+              current.belongConfig == task.belongConfig,
+              current.pairingRecoveryState == .awaitingFreshAdvertisement,
+              bleConfigs.contains(where: {
+                  $0.name == current.belongConfig && $0.autoReconnect
+              }) else {
+            return
+        }
+        guard centralManager.state == .poweredOn else {
+            var paused = current
+            paused.pausedByBluetoothOff = true
+            reconnectTasks[key] = paused
+            return
+        }
+        guard allowsSynchronousCoreBluetoothLookup else {
+            deferReconnectTaskForAppInactivity(
+                current,
+                context: "peer pairing recovery scan"
+            )
+            return
+        }
         let ownsScan = !centralManager.isScanning
         if ownsScan {
             startScan()
         }
-        let timer = Timer.scheduledTimer(withTimeInterval: pairingRecoveryDiscoveryTimeout, repeats: false) { [weak self] _ in
+        let scanWindow = current.source == .manualReconnect
+            ? manualPairingRecoveryScanWindow
+            : automaticPairingRecoveryScanWindow
+        let expectedSessionGeneration = current.sessionGeneration
+        let timer = Timer.scheduledTimer(withTimeInterval: scanWindow, repeats: false) { [weak self] _ in
             guard let self = self,
-                  let entry = self.pairingRecoveryScanTimers.removeValue(forKey: key),
+                  let activeEntry = self.pairingRecoveryScanTimers[key],
+                  activeEntry.sessionGeneration == expectedSessionGeneration,
                   let current = self.reconnectTasks[key],
+                  current.sessionGeneration == expectedSessionGeneration,
                   current.pairingRecoveryState == .awaitingFreshAdvertisement else {
                 return
             }
-            if entry.ownsScan {
+            self.pairingRecoveryScanTimers.removeValue(forKey: key)
+            if activeEntry.ownsScan {
                 self.stopScan()
             }
-            // 自动首次 Code 14 的恢复窗口耗尽后静默结束；历史 Code 14 后的手动
-            // 新连接若仍无广告，则按扫描失败结束，不能伪造新的 Code 14/720。
-            let terminalState: BleConnectState = current.source == .manualReconnect
-                ? .noDeviceFound
-                : .alreadyBound
-            self.stopPeerPairingRecoveryTask(current, reason: "freshAdvertisementTimeout")
-            self.handleConnectState(
-                uuid: current.uuid,
-                name: current.name,
-                state: terminalState,
-                source: current.source,
-                generation: current.sessionGeneration,
-                suppressReconnectSchedule: true,
-                tag: "peer pairing recovery scan timeout"
-            )
+            switch BlePeerPairingRecoveryPolicy.actionAfterWindowMiss(
+                source: current.source
+            ) {
+            case .retryAfterDelay:
+                // 自动 miss 不是连接终态：不删除 owner、不发 Flutter 状态，也不制造
+                // attempt 0；只在本 owner 的静默间隔后重新打开窗口。
+                self.loggerD(msg: "freshAdvertisementWindowMissed owner=\(current.uuid), sessionGeneration=\(current.sessionGeneration), scanWindow=\(Int(scanWindow))s")
+                self.schedulePairingRecoveryRetry(current)
+            case .finishManualAttempt:
+                // 手动扫描未命中沿用原有 noDeviceFound 失败路径，且不能伪装成 Code 14。
+                self.stopPeerPairingRecoveryTask(current, reason: "manualFreshAdvertisementTimeout")
+                self.handleConnectState(
+                    uuid: current.uuid,
+                    name: current.name,
+                    state: .noDeviceFound,
+                    source: current.source,
+                    generation: current.sessionGeneration,
+                    suppressReconnectSchedule: true,
+                    tag: "manual peer pairing recovery scan timeout"
+                )
+            }
         }
-        pairingRecoveryScanTimers[key] = (timer, ownsScan)
-        loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), start peer pairing recovery scan ownsScan=\(ownsScan)")
+        pairingRecoveryScanTimers[key] = (timer, ownsScan, expectedSessionGeneration)
+        loggerD(msg: "autoReconnect: \(current.uuid)-\(current.name), start peer pairing recovery scan ownsScan=\(ownsScan), sessionGeneration=\(expectedSessionGeneration), window=\(Int(scanWindow))s")
     }
 
     /// 仅精确名称/配置命中的新广告可以解除 Code 14 恢复门禁；这样附近同型号设备不会抢占 owner。
@@ -1425,8 +1657,13 @@ extension BleManager {
         advertisedMac: String,
         rssi: Int
     ) -> Bool {
-        guard let entry = reconnectTasks.first(where: { _, task in
+        guard allowsSynchronousCoreBluetoothLookup,
+              centralManager.state == .poweredOn,
+              let entry = reconnectTasks.first(where: { key, task in
             task.pairingRecoveryState == .awaitingFreshAdvertisement &&
+                !task.deferredByAppInactivity &&
+                !task.pausedByBluetoothOff &&
+                pairingRecoveryScanTimers[key]?.sessionGeneration == task.sessionGeneration &&
                 task.belongConfig == belongConfig &&
                 !task.name.isEmpty &&
                 task.name == advertisedName

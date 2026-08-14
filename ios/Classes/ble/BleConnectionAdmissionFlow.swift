@@ -342,6 +342,10 @@ extension BleManager {
                 uuid: pending.admission.endpointId,
                 name: pending.deviceName
             )
+            resetPeerPairingRecoveryAfterNonPairingFailure(
+                uuid: pending.admission.endpointId,
+                name: pending.deviceName
+            )
             scheduleReconnect(
                 uuid: pending.admission.endpointId,
                 name: pending.deviceName,

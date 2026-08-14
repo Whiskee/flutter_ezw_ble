@@ -50,8 +50,8 @@ void main() {
       iosReconnect,
       contains('no peripheral cache yet, wait concurrent scan/retrieve'),
     );
-    // UUID 已知的常规回连不扫描；仅 CBError 14 的配对失配恢复才有一个 20 秒、
-    // 精确 owner 的例外扫描窗口，不能回退为所有 autoReconnect scan-first。
+    // UUID 已知的常规回连不扫描；仅 CBError 14 的配对失配恢复才允许精确 owner
+    // 使用 10 秒扫描/5 秒等待循环，不能回退为所有 autoReconnect scan-first。
     final normalReconnect = iosReconnect.substring(
       iosReconnect.indexOf('func beginDirectReconnectAttempt'),
       iosReconnect.indexOf('func registerPeerPairingFailure'),
@@ -73,8 +73,8 @@ void main() {
       normalReconnect,
       contains('migrateReconnectTaskIdentityIfNeeded'),
     );
-    expect(iosReconnect,
-        contains('pairingRecoveryDiscoveryTimeout: TimeInterval { 20.0 }'));
+    expect(iosReconnect, contains('automaticPairingRecoveryScanWindow'));
+    expect(iosReconnect, contains('pairingRecoveryRetryDelay'));
     expect(iosReconnect, contains('resumePeerPairingRecoveryIfMatched'));
     expect(
       iosConnect,
