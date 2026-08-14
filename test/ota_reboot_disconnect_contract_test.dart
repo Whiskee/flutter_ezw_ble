@@ -53,8 +53,7 @@ void main() {
     expect(iosMethod, isNot(contains('cancelReconnectTask')));
     expect(iosMethod, isNot(contains('removePersistedReconnectTarget')));
     expect(ios, contains('consumeOtaRebootDisconnectSuppression'));
-    expect(ios,
-        contains('OTA reboot teardown suppresses native reconnect schedule'));
+    expect(ios, contains('native reconnect schedule suppressed, tag='));
     expect(android, contains('consumeOtaRebootDisconnectSuppression'));
     expect(iosStore, contains('lastConnectedGeneration'));
   });

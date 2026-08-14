@@ -159,6 +159,39 @@ Do not schedule reconnect for:
 - `systemError`
 - Devices currently in `upgrade`
 
+## iOS R1 Peer Pairing Recovery
+
+An automatic CoreBluetooth Code 14 does not immediately terminate the native
+reconnect intent. The first exact automatic failure moves the owner to
+`awaitingFreshAdvertisement` and purges the stale scan cache. While the app is
+active and Bluetooth is powered on, native repeats a 10-second exact scan window
+followed by a 5-second quiet wait until the target advertises. A window miss is
+not a connection terminal: it must not emit `alreadyBound`, `noDeviceFound`, or
+an attempt generation of zero, and it must not delete the reconnect owner.
+
+The scan match requires the current config, full device name, and the persisted
+MAC suffix when both sides expose one. The recovery attempt uses the
+`CBPeripheral` delivered by that advertisement and allocates a new positive
+Gate attempt; it must not retrieve the previously rejected peripheral. A second
+Code 14 from this fresh peripheral stops the automatic owner and writes the
+existing stopped marker without requesting user UI. Any non-Code14 timeout or
+disconnect exits the specialized recovery state and returns the owner to normal
+persistent auto reconnect.
+
+The 5-second wait is an explicit owner state and cannot consume a shared scan's
+results. Only a scan started by this owner may be stopped by it. App inactivity,
+termination, or Bluetooth off cancels the scan/timer but preserves the exact
+owner; resume is allowed only after config, owner, session generation, app
+lifecycle, and Bluetooth state are revalidated.
+
+A manual activation cancels an automatic scan/wait immediately. If the fresh
+automatic attempt is already connecting, native first neutral-cancels that
+admission and waits for its cancellation barrier before creating a distinct
+manual generation. The old automatic source is never promoted to manual. Only
+an exact positive manual physical attempt that itself returns Code 14 may emit
+`alreadyBound`; a manual scan miss remains `noDeviceFound`, and stale automatic
+callbacks remain silent.
+
 ## Pending Session and Timeout Boundary
 
 Native reconnect is a persistent intent after `deviceConnected(uuid)`. Reaching

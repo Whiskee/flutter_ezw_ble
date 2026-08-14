@@ -11,6 +11,23 @@ import XCTest
 
 class RunnerTests: XCTestCase {
 
+  func testAutomaticPairingRecoveryUsesTenSecondWindowsAndFiveSecondRetryDelay() {
+    XCTAssertEqual(BlePeerPairingRecoveryPolicy.scanWindow(for: .autoReconnect), 10)
+    XCTAssertEqual(BlePeerPairingRecoveryPolicy.retryDelay, 5)
+    XCTAssertEqual(
+      BlePeerPairingRecoveryPolicy.actionAfterWindowMiss(source: .autoReconnect),
+      .retryAfterDelay
+    )
+  }
+
+  func testManualPairingRecoveryKeepsBoundedExistingWindow() {
+    XCTAssertEqual(BlePeerPairingRecoveryPolicy.scanWindow(for: .manualReconnect), 20)
+    XCTAssertEqual(
+      BlePeerPairingRecoveryPolicy.actionAfterWindowMiss(source: .manualReconnect),
+      .finishManualAttempt
+    )
+  }
+
   func testBusinessConnectionStaleAbortDoesNotRemoveReplacementLease() {
     let registry = BleBusinessConnectionLeaseRegistry()
     let attemptA = businessAttempt(generation: 1)

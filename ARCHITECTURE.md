@@ -479,6 +479,14 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 6. 蓝牙关闭会先快照 active admission 的 `sessionGeneration + attemptGeneration`，并由已业务连接 task 成对保留最后成功 owner；随后才 teardown 全部 session、清空 Gate 并暂停任务。发给 Dart 的 `disconnectFromSys` 必须复用该 exact pair，不能只恢复 session 而退化为 `attemptGeneration=0`。Android 的 power-cycle、admission、升级态和 teardown 共用 Manager 复合状态锁；历史竞态若只剩 reconnect owner，可从 owner 恢复终态 identity；若连 owner 都不存在，只隔离并释放假连接缓存，BroadcastReceiver 禁止用诊断断言杀进程。恢复后 source 重置为 `autoReconnect`，旧 manual source 不跨 transport generation 泄漏。Android powered-on 只设置 `awaitingRecoveryActivation`，不按关闭前的旧 session 抢先重建 GATT；必须等待 Dart 汇总全部允许目标并以最终 session 调用一次 activation 后才解除屏障。
 7. Android Manager 与 Gate 的 endpoint attempt generation 必须共享同一高水位：批量取消先统一推进一次 generation，再逐 endpoint 释放 GATT/runtime；release 阶段不得重复推进。新 attempt 从两侧高水位最大值继续，防止 OTA、设备切换或重复清理后真实物理 callback 被误判为 `STALE`。
 
+#### iOS R1 Code 14 新鲜广播恢复
+
+CoreBluetooth Code 14 表示系统和 peripheral 的配对信息已不一致。自动回连首次收到该错误时，不得继续 retrieve 或复用旧 `CBPeripheral`，也不得因一次扫描 miss 把长期 reconnect intent 映射成 `alreadyBound` / `noDeviceFound`。当前 exact owner 在 App active、蓝牙 poweredOn 时循环执行 10 秒新鲜广播窗口和 5 秒静默等待；等待期间不消费其它业务的共享扫描结果，只有自己启动的 scan lease 才能由自己停止。每次 timer、广播和 activation 都必须复验 config、owner 与正 session generation。
+
+精确命中完整设备名、config 及可用 MAC suffix 后，恢复必须直接使用该广告携带的真实 `CBPeripheral` 创建新正 attempt，并走原有 Gate、GATT、`pairAuth` 和业务 `connected`。新 peripheral 再次返回 Code 14 才删除自动 owner并写 stopped marker，自动来源保持静默；若返回其它 timeout/disconnect，则退出专用阶段并交回普通 persistent autoReconnect。App inactive、蓝牙关闭、owner 替换或用户取消只暂停/失效相应 exact generation，不能产生扫描终态。
+
+用户手动点击可立即接管扫描或 5 秒等待；若自动恢复已经进入物理连接，必须先中性取消旧 automatic admission并等待 cancellation barrier，再建立新的 manual generation。禁止修改旧 attempt 的 source 或并行连接。只有当前手动物理 attempt 的真实 Code 14 才能上报 `alreadyBound`；手动扫描 miss 仍使用既有 `noDeviceFound`，旧自动回调和 generation 0 都不能触发配对修复 UI。
+
 触发回连：
 
 - `disconnectFromSys`

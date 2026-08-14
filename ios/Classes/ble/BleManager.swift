@@ -86,9 +86,9 @@ class BleManager: NSObject {
     //  - CBCentralManager 使用主队列；同步 retrieve 只允许在 App active 窗口执行，
     //    避免退出宽限期主线程卡在 CoreBluetooth XPC 同步查询并触发 0x8BADF00D。
     var allowsSynchronousCoreBluetoothLookup = false
-    //  - Code 14 配对失配恢复的有界扫描窗口。只在该任务自己启动扫描时才负责停止，
-    //    不能抢占发现页或 Dart 身份补全扫描的所有权。
-    var pairingRecoveryScanTimers: [String: (timer: Timer, ownsScan: Bool)] = [:]
+    /// Code 14 新鲜广播窗口按 exact session 持有扫描 lease；只有本任务启动的扫描
+    /// 才能由它停止，旧窗口回调也不得移除新 owner 的 timer。
+    var pairingRecoveryScanTimers: [String: (timer: Timer, ownsScan: Bool, sessionGeneration: Int64)] = [:]
     //  - 已因 Code 14 结束的稳定 config+name 身份。它不保留 GATT/owner，也不直接
     //    触发 720；仅让下一次手动连接绕过旧 peripheral，等待一次新鲜广播。
     var stoppedPeerPairingRecoveryKeys: Set<String> = []
@@ -1728,6 +1728,11 @@ extension BleManager {
                     name: peripheral.name ?? session.deviceName,
                     source: admission.source
                 )
+            } else if nsError?.code != 14, hasAutoReconnectTask {
+                resetPeerPairingRecoveryAfterNonPairingFailure(
+                    uuid: admission.endpointId,
+                    name: peripheral.name ?? session.deviceName
+                )
             }
             // stopAttempt 表示当前 owner 已删除；统一上报 alreadyBound 终态。
             // App 只会把 manual source 的本次真实 Code 14 映射成 720，自动来源静默。
@@ -1818,6 +1823,12 @@ extension BleManager {
                 : BleConnectState.disconnectFromSys.rawValue
             loggerE(msg: "\(logHead) \(peripheral.identifier.uuidString), error code = \(error.code), msg = \(error.localizedDescription), pairingRecovery=\(pairingRecoveryLabel), mapped to \(mappedStateLabel) for autoReconnect")
             return
+        }
+        if error.code != 14, reconnectTask != nil {
+            resetPeerPairingRecoveryAfterNonPairingFailure(
+                uuid: peripheral.identifier.uuidString,
+                name: peripheral.name ?? ""
+            )
         }
         if error.code == 14 {
             handleConnectState(
@@ -2126,8 +2137,14 @@ extension BleManager {
                 return
             }
             if suppressReconnectSchedule {
-                loggerD(msg: "connect-flow: \(uuid)-\(name), OTA reboot teardown suppresses native reconnect schedule")
+                loggerD(msg: "connect-flow: \(uuid)-\(name), native reconnect schedule suppressed, tag=\(fromTag)")
                 return
+            }
+            if state != .alreadyBound {
+                resetPeerPairingRecoveryAfterNonPairingFailure(
+                    uuid: uuid,
+                    name: name
+                )
             }
             scheduleReconnect(uuid: uuid, name: name, state: state)
             return
