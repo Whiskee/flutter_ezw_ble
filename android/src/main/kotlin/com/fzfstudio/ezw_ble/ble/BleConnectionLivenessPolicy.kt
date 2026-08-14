@@ -36,6 +36,8 @@ internal data class BleConnectionLivenessInput(
     val hasPersistentReconnectOwner: Boolean,
     val protectedByLifecycle: Boolean,
     val sessionAlreadyReconciled: Boolean,
+    /** exact admission 尚未完成业务 connected，当前写失败不能反向终止这次建链。 */
+    val connectionAttemptInProgress: Boolean,
 )
 
 /** Android 业务连接存活对账的单一决策表。 */
@@ -46,7 +48,8 @@ internal object BleConnectionLivenessPolicy {
             !input.hasEpochAcceptedAdmission ||
             !input.hasPersistentReconnectOwner ||
             input.protectedByLifecycle ||
-            input.sessionAlreadyReconciled
+            input.sessionAlreadyReconciled ||
+            input.connectionAttemptInProgress
         ) {
             return BleConnectionLivenessAction.NO_OP
         }

@@ -918,6 +918,9 @@ class BleManager private constructor() {
                 protectedByLifecycle = protectedByLifecycle,
                 sessionAlreadyReconciled =
                     dedupKey != null && reconciledBusinessSessions.contains(dedupKey),
+                // createConnectCallBack 注册 admission，只有业务 deviceConnected 或终态才释放。
+                // 因此它是比系统 Bluetooth 列表更精确的“当前建链仍在进行”证据。
+                connectionAttemptInProgress = currentAdmissions[key] != null,
             ),
         )
 
@@ -925,6 +928,7 @@ class BleManager private constructor() {
             BleLoggerTag.d,
             "Liveness reconcile: trigger=$trigger, endpoint=${target.uuid}, " +
                 "nativeState=${device?.connectState}, osState=$systemState, action=$action, " +
+                "attemptInProgress=${currentAdmissions[key] != null}, " +
                 "source=${metadata?.source?.flutterValue}, " +
                 "sessionGeneration=${metadata?.sessionGeneration ?: 0L}, " +
                 "attemptGeneration=${metadata?.attemptGeneration ?: 0L}",

@@ -13,6 +13,17 @@ class BleConnectionLivenessPolicyTest {
     }
 
     @Test
+    fun `active connection attempt cannot be replayed as stale dart terminal`() {
+        assertEquals(
+            BleConnectionLivenessAction.NO_OP,
+            decide(
+                nativeBusinessConnected = false,
+                connectionAttemptInProgress = true,
+            ),
+        )
+    }
+
+    @Test
     fun `missing gatt terminates stale native connected state`() {
         assertEquals(
             BleConnectionLivenessAction.TERMINATE_STALE_CONNECTED,
@@ -77,6 +88,7 @@ class BleConnectionLivenessPolicyTest {
         hasPersistentReconnectOwner: Boolean = true,
         protectedByLifecycle: Boolean = false,
         sessionAlreadyReconciled: Boolean = false,
+        connectionAttemptInProgress: Boolean = false,
     ): BleConnectionLivenessAction = BleConnectionLivenessPolicy.decide(
         BleConnectionLivenessInput(
             dartClaimsConnected = true,
@@ -87,6 +99,7 @@ class BleConnectionLivenessPolicyTest {
             hasPersistentReconnectOwner = hasPersistentReconnectOwner,
             protectedByLifecycle = protectedByLifecycle,
             sessionAlreadyReconciled = sessionAlreadyReconciled,
+            connectionAttemptInProgress = connectionAttemptInProgress,
         ),
     )
 }
