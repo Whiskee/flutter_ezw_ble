@@ -23,6 +23,7 @@ void main() {
     final manager = File('ios/Classes/ble/BleManager.swift').readAsStringSync();
 
     expect(channel, contains('as? Bool ?? false'));
+    expect(channel, contains('sendOtaPacketBatch'));
     expect(manager, contains('upgradeStateRegistry.canSend'));
     expect(manager, isNot(contains('upgradeDevices: [String]?')));
   });
@@ -66,6 +67,7 @@ void main() {
 
     expect(channel,
         contains('BleManager.instance.sendCmdNoWait(uuid, data, psType)'));
+    expect(channel, contains('sendOtaPacketBatch'));
     expect(channel,
         contains('result.error(error.code, error.reason, error.details)'));
     expect(

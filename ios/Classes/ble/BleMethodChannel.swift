@@ -53,6 +53,8 @@ enum BleMC: String {
     case sendCmd
     /// Send without waiting; OTA uses the no-response backpressure queue.
     case sendCmdNoWait
+    /// Submit a batch of already-framed OTA packets; Future waits for the last packet.
+    case sendOtaPacketBatch
     /// Mark a device as entering OTA mode.
     case enterUpgradeState
     /// Mark a device as leaving OTA mode.
@@ -270,6 +272,25 @@ enum BleMC: String {
                 return
             }
             BleManager.shared.sendCmdNoWait(uuid: uuid, data: data.data, psType: psType, result: result)
+            return
+        case .sendOtaPacketBatch:
+            let jsonData: [String: Any] = arguments as? [String: Any] ?? [:]
+            let uuid: String = jsonData["uuid"] as? String ?? ""
+            let psType: Int = jsonData["psType"] as? Int ?? 1
+            let packets: [Data]
+            if let typed = jsonData["packets"] as? [FlutterStandardTypedData] {
+                packets = typed.map { $0.data }
+            } else if let raw = jsonData["packets"] as? [Any] {
+                packets = raw.compactMap { ($0 as? FlutterStandardTypedData)?.data }
+            } else {
+                packets = []
+            }
+            BleManager.shared.sendOtaPacketBatch(
+                uuid: uuid,
+                packets: packets,
+                psType: psType,
+                result: result
+            )
             return
         case .enterUpgradeState:
             let uuid = arguments as? String ?? ""

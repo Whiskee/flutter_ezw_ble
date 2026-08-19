@@ -1019,6 +1019,92 @@ extension BleManager {
         }
     }
 
+    /**
+     *  一次提交一组 already-framed OTA 小包。
+     *
+     *  - Future 等最后一包被 CoreBluetooth 接受后才完成；
+     *  - 中途失败立即丢掉剩余包；
+     *  - 不把 4KB 当成一条 GATT/HCI 写。
+     */
+    func sendOtaPacketBatch(
+        uuid: String,
+        packets: [Data],
+        psType: Int,
+        result: @escaping FlutterResult
+    ) {
+        guard psType == 1 else {
+            result(OtaWriteQueue.unsupportedError(
+                endpoint: uuid,
+                reason: "batch requires OTA psType=1",
+                pending: 0
+            ))
+            return
+        }
+        guard !packets.isEmpty else {
+            result(OtaWriteQueue.unavailableError(
+                endpoint: uuid,
+                reason: "empty batch",
+                pending: 0
+            ))
+            return
+        }
+        guard checkIsFunctionCanBeCalled() else {
+            result(OtaWriteQueue.unavailableError(
+                endpoint: uuid,
+                reason: "manager unavailable",
+                pending: 0
+            ))
+            return
+        }
+        guard upgradeStateRegistry.canSend(endpointId: uuid, psType: psType) else {
+            loggerE(msg: "sendOtaPacketBatch: \(uuid), type=\(psType), cannot send non-OTA commands during upgrade")
+            result(OtaWriteQueue.unavailableError(
+                endpoint: uuid,
+                reason: "upgrade gate rejected",
+                pending: 0
+            ))
+            return
+        }
+        guard let device = connectedDevices.first(where: { device in
+            device.peripheral.identifier.uuidString == uuid
+        }), let writeChars = device.writeCharsDic[psType] else {
+            loggerE(msg: "sendOtaPacketBatch: \(uuid), type=\(psType), device not found")
+            result(OtaWriteQueue.unavailableError(
+                endpoint: uuid,
+                reason: "device or characteristic missing",
+                pending: 0
+            ))
+            return
+        }
+        guard writeChars.properties.contains(.writeWithoutResponse) else {
+            loggerE(msg: "[ezw_ble][ota] unsupported batch uuid=\(uuid) char=\(writeChars.uuid.uuidString) reason=missing writeWithoutResponse")
+            result(OtaWriteQueue.unsupportedError(
+                endpoint: uuid,
+                reason: "missing writeWithoutResponse",
+                pending: queueDepthForOta(uuid: uuid)
+            ))
+            return
+        }
+        let queue = otaWriteQueues[uuid] ?? OtaWriteQueue(
+            peripheral: device.peripheral,
+            logger: { [weak self] msg in
+                self?.loggerD(msg: msg)
+            }
+        )
+        otaWriteQueues[uuid] = queue
+        let target = OtaWriteTarget(
+            characteristicUUID: writeChars.uuid.uuidString,
+            submit: { peripheral, value in
+                guard let cbPeripheral = peripheral as? CBPeripheral else {
+                    return false
+                }
+                cbPeripheral.writeValue(value, for: writeChars, type: .withoutResponse)
+                return true
+            }
+        )
+        queue.enqueueBatch(packets: packets, target: target, result: result)
+    }
+
     /// OTA 错误 details 需要带上当前 native pending 深度，帮助区分“尚未提交”和“已提交后设备无 ack”。
     private func queueDepthForOta(uuid: String) -> Int {
         return otaWriteQueues[uuid]?.queueDepth ?? 0
@@ -1061,6 +1147,8 @@ extension BleManager {
             generation: metadata.sessionGeneration,
             attemptGeneration: metadata.attemptGeneration
         )
+        // 与 Android setPreferredPhy 对齐：iOS 只能记录无法主机侧切 2M，不能伪造成功。
+        logLe2mPhyUnavailable(endpoint: uuid, reason: "enterUpgradeState")
         loggerD(msg: "enterUpgradeState: \(uuid), enter upgrade state")
     }
     
@@ -1968,6 +2056,8 @@ extension BleManager {
             connectedDevices[connectedIndex] = connectedDevice
             let mtu = getDeviceMTU(peripheral: connectedDevice.peripheral)
             handleConnectState(uuid: connectedDevice.peripheral.identifier.uuidString, name: connectedDevice.peripheral.name ?? name, state: .connectFinish, mtu: mtu, tag: tag)
+            // CoreBluetooth 没有公开 setPreferredPHY；2M 只能由系统/外设协商，App 不得走私有 API。
+            logLe2mPhyUnavailable(endpoint: connectedDevice.peripheral.identifier.uuidString, reason: "connectFinish")
             loggerD(msg: "connect-flow readiness: \(connectedDevice.peripheral.identifier.uuidString), connect finish, writeCharsCount = \(connectedDevice.writeCharsDic.keys.count), ps = \(bleConfig.privateServices.count), tag=\(tag)")
         }
     }
@@ -2164,6 +2254,16 @@ extension BleManager {
         loggerD(msg: "connect-flow: \(uuid)-\(name), state = \(state), remove active request, tag = \(fromTag)")
     }
     
+    /**
+     * 记录 iOS 无法由主机侧请求 2M PHY。
+     *
+     * CoreBluetooth 没有公开 `setPreferredPHY`；2M 只能由系统/外设协商。
+     * 这里只打日志，避免把 Android 的 `setPreferredPhy` 误移植成私有 API。
+     */
+    private func logLe2mPhyUnavailable(endpoint: String, reason: String) {
+        loggerD(msg: "[ezw_ble][phy] iOS cannot request 2M endpoint=\(endpoint) reason=\(reason)")
+    }
+
     /**
      * 获取设备的 MTU 值
      */

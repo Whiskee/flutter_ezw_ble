@@ -214,6 +214,65 @@ class BleAndroidOtaWriteQueueTest {
         assertEquals(0, queue.queueDepth)
     }
 
+    @Test
+    fun `batch completes only after the last characteristic write callback`() {
+        val submissions = mutableListOf<ByteArray>()
+        val completions = mutableListOf<BleOtaWriteError?>()
+        val queue = queue(
+            submit = { data ->
+                submissions.add(data.copyOf())
+                BleOtaWriteSubmission.accepted()
+            },
+        )
+
+        queue.enqueueBatch(
+            listOf(byteArrayOf(0x01), byteArrayOf(0x02), byteArrayOf(0x03)),
+        ) { completions.add(it) }
+
+        assertEquals(1, submissions.size)
+        assertEquals(emptyList(), completions)
+
+        queue.onCharacteristicWriteComplete(true, true, 0, "GATT_SUCCESS")
+        assertEquals(2, submissions.size)
+        assertEquals(emptyList(), completions)
+
+        queue.onCharacteristicWriteComplete(true, true, 0, "GATT_SUCCESS")
+        assertEquals(3, submissions.size)
+        assertEquals(emptyList(), completions)
+
+        queue.onCharacteristicWriteComplete(true, true, 0, "GATT_SUCCESS")
+        assertEquals(listOf<BleOtaWriteError?>(null), completions)
+        assertEquals(0, queue.queueDepth)
+    }
+
+    @Test
+    fun `batch failure drops remaining packets and settles once`() {
+        val submissions = mutableListOf<ByteArray>()
+        val completions = mutableListOf<BleOtaWriteError?>()
+        val queue = queue(
+            submit = { data ->
+                submissions.add(data.copyOf())
+                BleOtaWriteSubmission.accepted()
+            },
+        )
+
+        queue.enqueueBatch(
+            listOf(byteArrayOf(0x01), byteArrayOf(0x02), byteArrayOf(0x03)),
+        ) { completions.add(it) }
+
+        queue.onCharacteristicWriteComplete(
+            ownsInFlight = true,
+            success = false,
+            status = 133,
+            statusName = "GATT_ERROR",
+        )
+
+        assertEquals(1, submissions.size)
+        assertEquals(1, completions.size)
+        assertEquals("ota_write_unavailable", completions.single()?.code)
+        assertEquals(0, queue.queueDepth)
+    }
+
     private fun queue(
         submit: (ByteArray) -> BleOtaWriteSubmission,
         scheduler: BleOtaWriteScheduler = FakeScheduler(),

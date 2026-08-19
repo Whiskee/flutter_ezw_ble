@@ -267,6 +267,12 @@ class BleManager private constructor() {
         }
         restorePersistedConfigsIfNeeded()
         checkBluetoothPermission()
+        // 手机控制器不支持 2M 时，setPreferredPhy 会以 SUCCESS 返回但仍停在 1M；
+        // 先记录本机能力，才能把「没切成」归因到手机还是外设。
+        BleAndroidPreferredPhy.logAdapterCapability(
+            bluetoothAdapter = bluetoothAdapter,
+            logger = { sendLog(BleLoggerTag.d, it) },
+        )
         sendLog(BleLoggerTag.d, "Init: success")
     }
 
@@ -1918,6 +1924,54 @@ class BleManager private constructor() {
     }
 
     /**
+     * OTA 批次入口：一次接收 already-framed 小包，原生仍按 GATT 单槽位串行写。
+     *
+     * Future 只在最后一包 `onCharacteristicWrite` 成功后完成；中途失败立即丢掉剩余包。
+     * 不能把 4KB 当成一条 ATT/HCI 写，也不能并发提交 2～4 个 GATT write。
+     */
+    fun sendOtaPacketBatch(
+        uuid: String,
+        packets: List<ByteArray>,
+        psType: Int = 1,
+        completion: (BleOtaWriteError?) -> Unit,
+    ) {
+        if (psType != 1) {
+            completion(BleOtaWriteError.unsupported(uuid, "batch requires OTA psType=1"))
+            return
+        }
+        if (packets.isEmpty()) {
+            completion(BleOtaWriteError.unavailable(uuid, "empty batch"))
+            return
+        }
+        if (!checkIsFunctionCanBeCalled() || uuid.isEmpty()) {
+            completion(BleOtaWriteError.unavailable(uuid, "manager unavailable"))
+            return
+        }
+        if (!BleUpgradeCommandPolicy.canSend(
+                isUpgrading = upgradeDevices.contains(uuid),
+                psType = psType,
+            )
+        ) {
+            sendLog(
+                BleLoggerTag.e,
+                "Send ota batch: $uuid, Cannot send non-OTA commands during upgrade",
+            )
+            completion(BleOtaWriteError.unavailable(uuid, "upgrade gate rejected"))
+            return
+        }
+        val device = findConnectedDevice(uuid)
+        if (device == null) {
+            completion(BleOtaWriteError.unavailable(uuid, "device or characteristic missing"))
+            return
+        }
+        if (!device.supportsWriteWithoutResponse(psType)) {
+            completion(BleOtaWriteError.unsupported(uuid, "missing writeWithoutResponse"))
+            return
+        }
+        otaWriteQueueFor(uuid).enqueueBatch(packets, completion)
+    }
+
+    /**
      *  进入升级模式
      */
     @Synchronized
@@ -1958,6 +2012,13 @@ class BleManager private constructor() {
             source = acceptedAdmission.source,
             generation = acceptedAdmission.sessionGeneration,
             attemptGeneration = acceptedAdmission.generation,
+        )
+        // 已连上的 1M 链路不会因为 connectGatt hint 自动变 2M；进入 OTA 再请求一次。
+        BleAndroidPreferredPhy.requestLe2m(
+            gatt = connectedDevice.myGatt,
+            endpoint = uuid,
+            reason = "enterUpgradeState",
+            logger = { sendLog(BleLoggerTag.d, it) },
         )
         sendLog(BleLoggerTag.d, "EnterUpgradeState: $uuid Into upgrade state")
     }

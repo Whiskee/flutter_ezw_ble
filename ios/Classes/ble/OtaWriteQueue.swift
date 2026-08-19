@@ -73,11 +73,32 @@ struct MainQueueOtaWriteScheduler: OtaWriteScheduler {
     }
 }
 
+/// 一批 framed OTA 小包共享一个 Dart Future；成功只在最后一包被 CoreBluetooth 接受后结算。
+private final class OtaWriteBatch {
+    let result: FlutterResult
+    var remaining: Int
+    var settled = false
+
+    init(result: @escaping FlutterResult, remaining: Int) {
+        self.result = result
+        self.remaining = remaining
+    }
+
+    func settle(_ value: Any?) {
+        guard !settled else {
+            return
+        }
+        settled = true
+        result(value)
+    }
+}
+
 /// 单个 OTA 写入条目
 private struct OtaWriteItem {
     let data: Data
     let target: OtaWriteTarget
     let result: FlutterResult
+    let batch: OtaWriteBatch?
 }
 
 /// 单外设的 OTA 写队列
@@ -148,8 +169,39 @@ extension OtaWriteQueue {
      *  - 即立即触发 pump, 在背压允许的窗口内尽量打满 packets-per-event.
      */
     func enqueue(data: Data, target: OtaWriteTarget, result: @escaping FlutterResult) {
-        pending.append(OtaWriteItem(data: data, target: target, result: result))
+        pending.append(OtaWriteItem(data: data, target: target, result: result, batch: nil))
         logger?("[ezw_ble][ota] enqueued endpoint=\(peripheral?.otaEndpointId ?? "released") bytes=\(data.count) pending=\(pending.count)")
+        pump()
+    }
+
+    /**
+     * 一次入队一组已封装小包。
+     *
+     * Future 必须等最后一包 `writeValue` 被 CoreBluetooth 接受后才完成；第 N 包失败
+     * 立即丢掉本批剩余 pending。不能把入队成功当成整批已写入。
+     */
+    func enqueueBatch(packets: [Data], target: OtaWriteTarget, result: @escaping FlutterResult) {
+        guard !packets.isEmpty else {
+            result(Self.unavailableError(
+                endpoint: peripheral?.otaEndpointId ?? "",
+                reason: "empty batch",
+                pending: 0
+            ))
+            return
+        }
+        let batch = OtaWriteBatch(result: result, remaining: packets.count)
+        packets.forEach { packet in
+            pending.append(OtaWriteItem(
+                data: packet,
+                target: target,
+                result: result,
+                batch: batch
+            ))
+        }
+        logger?(
+            "[ezw_ble][ota] batch enqueued endpoint=\(peripheral?.otaEndpointId ?? "released") " +
+            "packets=\(packets.count) bytes=\(packets.reduce(0) { $0 + $1.count }) pending=\(pending.count)"
+        )
         pump()
     }
 
@@ -177,9 +229,16 @@ extension OtaWriteQueue {
         pending.removeAll()
         sinceLastDrainSync = 0
         clearBackpressureWait()
-        snapshot.forEach { item in
-            item.result(Self.error(code: "ota_write_cancelled", endpoint: peripheral?.otaEndpointId, reason: reason, waitSeconds: nil, pending: snapshot.count))
-        }
+        completeSnapshot(
+            snapshot,
+            Self.error(
+                code: "ota_write_cancelled",
+                endpoint: peripheral?.otaEndpointId,
+                reason: reason,
+                waitSeconds: nil,
+                pending: snapshot.count
+            )
+        )
     }
 
     static func unavailableError(endpoint: String, reason: String, pending: Int = 0) -> FlutterError {
@@ -225,18 +284,23 @@ extension OtaWriteQueue {
             //  - 2.2、出队并写入
             let head = pending.removeFirst()
             guard head.target.submit(peripheral, head.data) else {
-                head.result(Self.unavailableError(
-                    endpoint: peripheral.otaEndpointId,
-                    reason: "peripheral released before submit",
-                    pending: pending.count
-                ))
+                completeItem(
+                    head,
+                    Self.unavailableError(
+                        endpoint: peripheral.otaEndpointId,
+                        reason: "peripheral released before submit",
+                        pending: pending.count
+                    )
+                )
                 continue
             }
             sinceLastDrainSync += 1
-            logger?("[ezw_ble][ota] submitted endpoint=\(peripheral.otaEndpointId) char=\(head.target.characteristicUUID) bytes=\(head.data.count) pending=\(pending.count)")
+            if head.batch == nil {
+                logger?("[ezw_ble][ota] submitted endpoint=\(peripheral.otaEndpointId) char=\(head.target.characteristicUUID) bytes=\(head.data.count) pending=\(pending.count)")
+            }
             //  - 2.3、CoreBluetooth 已接受本次 writeValue 调用后才向 Dart 回包;
             //  -- WriteWithoutResponse 无设备 ack, 这里的成功只代表已提交给 CoreBluetooth。
-            head.result(nil)
+            completeItem(head, nil)
             //  - 2.4、软节流: 每 N 包主动让出
             //  -- canSendWriteWithoutResponse 在 iPhone 6s/SE 一代等老机型上"报喜不报忧",
             //  -- 突发塞包会触发底层丢包, 这里强制等下一次 peripheralIsReady 回调
@@ -263,14 +327,45 @@ private extension OtaWriteQueue {
         pending.removeAll()
         sinceLastDrainSync = 0
         clearBackpressureWait()
-        snapshot.forEach { item in
-            item.result(Self.error(
+        completeSnapshot(
+            snapshot,
+            Self.error(
                 code: "ota_write_unavailable",
                 endpoint: nil,
                 reason: reason,
                 waitSeconds: nil,
                 pending: snapshot.count
-            ))
+            )
+        )
+    }
+
+    func completeItem(_ item: OtaWriteItem, _ value: Any?) {
+        guard let batch = item.batch else {
+            item.result(value)
+            return
+        }
+        if let error = value {
+            pending.removeAll { $0.batch === batch }
+            batch.settle(error)
+            return
+        }
+        batch.remaining -= 1
+        if batch.remaining <= 0 {
+            logger?("[ezw_ble][ota] batch completed endpoint=\(peripheral?.otaEndpointId ?? "released") pending=\(pending.count)")
+            batch.settle(nil)
+        }
+    }
+
+    func completeSnapshot(_ snapshot: [OtaWriteItem], _ error: FlutterError) {
+        var settledBatches = Set<ObjectIdentifier>()
+        snapshot.forEach { item in
+            if let batch = item.batch {
+                if settledBatches.insert(ObjectIdentifier(batch)).inserted {
+                    batch.settle(error)
+                }
+            } else {
+                item.result(error)
+            }
         }
     }
 }
@@ -321,14 +416,15 @@ private extension OtaWriteQueue {
         pending.removeAll()
         sinceLastDrainSync = 0
         clearBackpressureWait()
-        snapshot.forEach { item in
-            item.result(Self.stalledError(
+        completeSnapshot(
+            snapshot,
+            Self.stalledError(
                 endpoint: peripheral?.otaEndpointId,
                 reason: reason,
                 waitSeconds: waitSeconds,
                 pending: snapshot.count
-            ))
-        }
+            )
+        )
         return true
     }
 }

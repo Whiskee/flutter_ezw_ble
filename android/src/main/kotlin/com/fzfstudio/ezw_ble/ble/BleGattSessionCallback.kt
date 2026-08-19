@@ -359,6 +359,32 @@ internal class BleGattSessionCallback(
     }
 
     /**
+     * PHY 读回只用于确认当前链路是 1M 还是 2M，不得影响连接状态机。
+     */
+    override fun onPhyRead(gatt: BluetoothGatt?, txPhy: Int, rxPhy: Int, status: Int) {
+        super.onPhyRead(gatt, txPhy, rxPhy, status)
+        val address = gatt?.device?.address ?: return
+        sendLog(
+            BleLoggerTag.d,
+            "[ezw_ble][phy] read endpoint=$address tx=${BleAndroidPreferredPhy.describe(txPhy)} " +
+                "rx=${BleAndroidPreferredPhy.describe(rxPhy)} status=$status",
+        )
+    }
+
+    /**
+     * `setPreferredPhy` 的异步结果。失败或仍停在 1M 只记日志，不能回退 connectFinish。
+     */
+    override fun onPhyUpdate(gatt: BluetoothGatt?, txPhy: Int, rxPhy: Int, status: Int) {
+        super.onPhyUpdate(gatt, txPhy, rxPhy, status)
+        val address = gatt?.device?.address ?: return
+        sendLog(
+            BleLoggerTag.d,
+            "[ezw_ble][phy] update endpoint=$address tx=${BleAndroidPreferredPhy.describe(txPhy)} " +
+                "rx=${BleAndroidPreferredPhy.describe(rxPhy)} status=$status",
+        )
+    }
+
+    /**
      * 串行写入下一个 CCCD。
      *
      * Android descriptor 写入是异步操作，不能在循环里一次性写完；否则后写入会覆盖前写入。
@@ -443,6 +469,14 @@ internal class BleGattSessionCallback(
         val name = device.name
         // 2. GATT readiness 完成后上报 connectFinish，等待 Dart 业务认证后再进入 connected。
         handleConnectState(address, name, BleConnectState.CONNECT_FINISH, mtu)
+        // 3. 建连 hint 不能把已连上的 1M 链路切到 2M；在 GATT ready 后再请求一次。
+        //    PHY 回调异步到达，不得挡住 connectFinish。
+        BleAndroidPreferredPhy.requestLe2m(
+            gatt = gatt,
+            endpoint = address,
+            reason = "connectFinish",
+            logger = { sendLog(BleLoggerTag.d, it) },
+        )
         sendLog(BleLoggerTag.d, "Connect call back: $address, connect finish")
     }
 

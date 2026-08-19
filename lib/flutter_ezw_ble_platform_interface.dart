@@ -271,6 +271,19 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     throw UnimplementedError('sendCmdNoWait() has not been implemented.');
   }
 
+  /// 一次提交一组已经完成 Even 协议封装的 OTA 小包。
+  ///
+  /// [uuid] 是 endpoint / 设备标识，不是 characteristic UUID；写特征仍由 [psType]
+  /// 解析。Future 必须等本批最后一包被原生队列真正提交成功后才完成，不能在入队时
+  /// 返回，否则上层 5s 固件 ACK 计时会提前启动。
+  Future<void> sendOtaPacketBatch(
+    String uuid,
+    List<Uint8List> framedPackets, {
+    int psType = 1,
+  }) {
+    throw UnimplementedError('sendOtaPacketBatch() has not been implemented.');
+  }
+
   /// 进入升级模式
   ///
   /// - param uuid 设备唯一标识

@@ -970,6 +970,57 @@ class RunnerTests: XCTestCase {
     XCTAssertEqual(details?["reason"] as? String, "peripheral released before submit")
   }
 
+  func testOtaWriteQueueBatchCompletesOnlyAfterLastCoreBluetoothSubmission() {
+    let peripheral = FakeOtaPeripheral(endpointId: "g2-left")
+    var results: [Any?] = []
+    var submitted: [Data] = []
+    let queue = OtaWriteQueue(
+      peripheral: peripheral,
+      scheduler: FakeOtaScheduler()
+    )
+
+    queue.enqueueBatch(
+      packets: [Data([0x01]), Data([0x02]), Data([0x03])],
+      target: makeFakeOtaTarget { data in
+        XCTAssertEqual(results.count, 0)
+        submitted.append(data)
+        return true
+      }
+    ) { value in
+      results.append(value)
+    }
+
+    XCTAssertEqual(submitted, [Data([0x01]), Data([0x02]), Data([0x03])])
+    XCTAssertEqual(results.count, 1)
+    XCTAssertNil(results.first!)
+  }
+
+  func testOtaWriteQueueBatchFailureDropsRemainingPackets() {
+    let peripheral = FakeOtaPeripheral(endpointId: "g2-left")
+    var results: [Any?] = []
+    var submitted: [Data] = []
+    let queue = OtaWriteQueue(
+      peripheral: peripheral,
+      scheduler: FakeOtaScheduler()
+    )
+
+    queue.enqueueBatch(
+      packets: [Data([0x01]), Data([0x02]), Data([0x03])],
+      target: makeFakeOtaTarget { data in
+        submitted.append(data)
+        return data != Data([0x02])
+      }
+    ) { value in
+      results.append(value)
+    }
+
+    XCTAssertEqual(submitted, [Data([0x01]), Data([0x02])])
+    XCTAssertEqual(results.count, 1)
+    let error = results.first as? FlutterError
+    XCTAssertEqual(error?.code, "ota_write_unavailable")
+    XCTAssertEqual(queue.queueDepth, 0)
+  }
+
   private func makeConfig(name: String, autoReconnect: Bool) -> BleConfig {
     BleConfig(
       name: name,

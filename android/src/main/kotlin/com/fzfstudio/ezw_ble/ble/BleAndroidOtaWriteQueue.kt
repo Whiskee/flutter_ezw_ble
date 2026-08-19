@@ -49,9 +49,25 @@ internal class BleAndroidOtaWriteQueue(
     private val nowMillis: () -> Long,
     private val logger: (String) -> Unit = {},
 ) {
+    /** 一批 framed OTA 小包共享一个 Dart Future；成功只在最后一包 callback 后结算。 */
+    private class OtaWriteBatch(
+        val completion: (BleOtaWriteError?) -> Unit,
+        var remaining: Int,
+        var settled: Boolean = false,
+    ) {
+        fun settle(error: BleOtaWriteError?) {
+            if (settled) {
+                return
+            }
+            settled = true
+            completion(error)
+        }
+    }
+
     private data class Item(
         val data: ByteArray,
         val completion: (BleOtaWriteError?) -> Unit,
+        val batch: OtaWriteBatch? = null,
     )
 
     private val pending = ArrayDeque<Item>()
@@ -76,6 +92,29 @@ internal class BleAndroidOtaWriteQueue(
     fun enqueue(data: ByteArray, completion: (BleOtaWriteError?) -> Unit) {
         pending.addLast(Item(data.copyOf(), completion))
         logger("[ezw_ble][ota][android] enqueued endpoint=$endpoint bytes=${data.size} pending=$queueDepth")
+        pump()
+    }
+
+    /**
+     * 一次入队一组已封装小包，但仍保持 GATT 单槽位。
+     *
+     * 第 N 包失败会立刻丢掉本批剩余 pending，并且只结算一次 Future；不能把入队成功
+     * 当成整批已写入，否则 even_connect 的 5s ACK 计时会提前启动。
+     */
+    @Synchronized
+    fun enqueueBatch(packets: List<ByteArray>, completion: (BleOtaWriteError?) -> Unit) {
+        if (packets.isEmpty()) {
+            completion(BleOtaWriteError.unavailable(endpoint, "empty batch"))
+            return
+        }
+        val batch = OtaWriteBatch(completion, remaining = packets.size)
+        packets.forEach { packet ->
+            pending.addLast(Item(packet.copyOf(), completion = {}, batch = batch))
+        }
+        logger(
+            "[ezw_ble][ota][android] batch enqueued endpoint=$endpoint " +
+                "packets=${packets.size} bytes=${packets.sumOf { it.size }} pending=$queueDepth",
+        )
         pump()
     }
 
@@ -110,11 +149,14 @@ internal class BleAndroidOtaWriteQueue(
                 inFlight = null
                 clearWait()
                 if (success) {
-                    logger("[ezw_ble][ota][android] completed endpoint=$endpoint status=$statusName pending=$queueDepth")
-                    completed.completion(null)
+                    if (completed.batch == null) {
+                        logger("[ezw_ble][ota][android] completed endpoint=$endpoint status=$statusName pending=$queueDepth")
+                    }
+                    completeItem(completed, error = null)
                 } else {
                     logger("[ezw_ble][ota][android] failed endpoint=$endpoint status=$statusName pending=$queueDepth")
-                    completed.completion(
+                    completeItem(
+                        completed,
                         BleOtaWriteError.unavailable(
                             endpoint = endpoint,
                             reason = "onCharacteristicWrite failed: $statusName",
@@ -158,15 +200,14 @@ internal class BleAndroidOtaWriteQueue(
             return
         }
         logger("[ezw_ble][ota][android] attempt cancelled endpoint=$endpoint reason=$reason pending=${snapshot.size}")
-        snapshot.forEach { item ->
-            item.completion(
-                BleOtaWriteError.cancelled(
-                    endpoint = endpoint,
-                    reason = reason,
-                    pending = snapshot.size,
-                ),
-            )
-        }
+        completeSnapshot(
+            snapshot,
+            BleOtaWriteError.cancelled(
+                endpoint = endpoint,
+                reason = reason,
+                pending = snapshot.size,
+            ),
+        )
     }
 
     /** 物理 GATT session 已失效时释放所有 Future，并丢弃旧 session 的 callback 屏障。 */
@@ -184,15 +225,14 @@ internal class BleAndroidOtaWriteQueue(
             return
         }
         logger("[ezw_ble][ota][android] cancelled endpoint=$endpoint reason=$reason pending=${snapshot.size}")
-        snapshot.forEach { item ->
-            item.completion(
-                BleOtaWriteError.cancelled(
-                    endpoint = endpoint,
-                    reason = reason,
-                    pending = snapshot.size,
-                ),
-            )
-        }
+        completeSnapshot(
+            snapshot,
+            BleOtaWriteError.cancelled(
+                endpoint = endpoint,
+                reason = reason,
+                pending = snapshot.size,
+            ),
+        )
     }
 
     /** 驱动同步提交；任何时刻最多只有一包处于已提交、等 callback 状态。 */
@@ -244,7 +284,8 @@ internal class BleAndroidOtaWriteQueue(
                 BleOtaWriteSubmission.Disposition.REJECTED -> {
                     pending.removeFirst()
                     logger("[ezw_ble][ota][android] rejected endpoint=$endpoint reason=${submission.reason} pending=$queueDepth")
-                    head.completion(
+                    completeItem(
+                        head,
                         BleOtaWriteError.unavailable(
                             endpoint = endpoint,
                             reason = submission.reason,
@@ -278,18 +319,51 @@ internal class BleAndroidOtaWriteQueue(
         pending.clear()
         clearWait()
         logger("[ezw_ble][ota][android] stalled endpoint=$endpoint reason=$reason wait=${waitedMillis}ms pending=${snapshot.size}")
-        snapshot.forEach { item ->
-            item.completion(
-                BleOtaWriteError.stalled(
-                    endpoint = endpoint,
-                    reason = reason,
-                    waitSeconds = waitedMillis / 1_000.0,
-                    pending = snapshot.size,
-                    status = submission?.status,
-                ),
-            )
-        }
+        completeSnapshot(
+            snapshot,
+            BleOtaWriteError.stalled(
+                endpoint = endpoint,
+                reason = reason,
+                waitSeconds = waitedMillis / 1_000.0,
+                pending = snapshot.size,
+                status = submission?.status,
+            ),
+        )
         return true
+    }
+
+    /** 单包走自己的 completion；批次只结算一次，失败时丢掉同批剩余 pending。 */
+    private fun completeItem(item: Item, error: BleOtaWriteError?) {
+        val batch = item.batch
+        if (batch == null) {
+            item.completion(error)
+            return
+        }
+        if (error != null) {
+            pending.removeAll { it.batch === batch }
+            batch.settle(error)
+            return
+        }
+        batch.remaining -= 1
+        if (batch.remaining <= 0) {
+            logger(
+                "[ezw_ble][ota][android] batch completed endpoint=$endpoint pending=$queueDepth",
+            )
+            batch.settle(null)
+        }
+    }
+
+    /** 取消/停滞快照里同一批次只能回调一次，避免重复完成 Dart Future。 */
+    private fun completeSnapshot(snapshot: List<Item>, error: BleOtaWriteError) {
+        val settledBatches = mutableSetOf<OtaWriteBatch>()
+        snapshot.forEach { item ->
+            val batch = item.batch
+            if (batch == null) {
+                item.completion(error)
+            } else if (settledBatches.add(batch)) {
+                batch.settle(error)
+            }
+        }
     }
 
     private fun markWaitStarted() {

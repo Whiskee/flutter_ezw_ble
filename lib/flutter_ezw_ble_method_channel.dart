@@ -218,6 +218,38 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
         "psType": psType,
       });
 
+  /// 把 even_connect 已组好的 OTA 协议小包一次交给原生队列。
+  ///
+  /// 插件不拆 4KB、不改字节；Android 仍保持单槽 GATT 写，iOS 由
+  /// `OtaWriteQueue` 在背压允许时连续泵送。空列表和非 OTA 通道直接拒绝，
+  /// 避免把未定义语义伪装成成功。
+  @override
+  Future<void> sendOtaPacketBatch(
+    String uuid,
+    List<Uint8List> framedPackets, {
+    int psType = 1,
+  }) async {
+    if (framedPackets.isEmpty) {
+      throw ArgumentError.value(
+        framedPackets,
+        'framedPackets',
+        'sendOtaPacketBatch requires at least one already-framed OTA packet',
+      );
+    }
+    if (psType != 1) {
+      throw ArgumentError.value(
+        psType,
+        'psType',
+        'sendOtaPacketBatch only supports the OTA channel (psType=1)',
+      );
+    }
+    await methodChannel.invokeMethod<void>('sendOtaPacketBatch', {
+      'uuid': uuid,
+      'packets': framedPackets,
+      'psType': psType,
+    });
+  }
+
   @override
   Future<void> enterUpgradeState(String uuid) =>
       methodChannel.invokeMethod("enterUpgradeState", uuid);

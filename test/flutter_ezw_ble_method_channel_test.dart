@@ -58,6 +58,37 @@ void main() {
     expect(capturedCall?.arguments, containsPair('psType', 1));
   });
 
+  test('sendOtaPacketBatch forwards framed packets in one MethodChannel call',
+      () async {
+    MethodCall? capturedCall;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (methodCall) async {
+      capturedCall = methodCall;
+      return null;
+    });
+
+    final packets = <Uint8List>[
+      Uint8List.fromList(<int>[0x01]),
+      Uint8List.fromList(<int>[0x02]),
+    ];
+    await MethodChannelEzwBle().sendOtaPacketBatch('left-uuid', packets);
+
+    expect(capturedCall?.method, 'sendOtaPacketBatch');
+    expect(capturedCall?.arguments, containsPair('uuid', 'left-uuid'));
+    expect(capturedCall?.arguments, containsPair('psType', 1));
+    expect(capturedCall?.arguments, containsPair('packets', packets));
+  });
+
+  test('sendOtaPacketBatch rejects an empty packet list before native', () {
+    expect(
+      () => MethodChannelEzwBle().sendOtaPacketBatch(
+        'left-uuid',
+        const <Uint8List>[],
+      ),
+      throwsArgumentError,
+    );
+  });
+
   test('prepareBusinessConnection forwards exact attempt and decodes status',
       () async {
     MethodCall? capturedCall;

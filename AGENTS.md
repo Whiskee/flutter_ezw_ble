@@ -42,6 +42,8 @@
 - `receiveData` 的二进制 payload 跨 Method/EventChannel 时保持 Base64 约定。
 - Android `onConnectionStateChange` 的 status 使用 HCI/controller 断连语义；characteristic/descriptor 回调才使用 ATT/GATT 操作语义。数值 `8` 在前者是连接超时，严禁触发授权恢复/cache refresh/`needsScanBeforeConnect`；在后者是授权不足，必须走授权恢复后再按回调阶段终止。
 - iOS OTA 中 `psType == 1` 的 `sendCmdNoWait` 必须与 `OtaWriteQueue`、`canSendWriteWithoutResponse` 和 `docs/IOS_OTA_NOWAIT_SPEC.md` 对齐。
+- `sendOtaPacketBatch` 只接受 already-framed OTA 小包；Future 等最后一包提交成功，Android 禁止并发 GATT write，失败必须丢掉剩余包。
+- Android GATT ready 与进入 OTA 后必须请求 LE 2M PHY（`setPreferredPhy`）；`connectGatt` 的 `PHY_LE_2M` hint 不能当成已切到 2M。PHY 失败不得阻断连接或传输。iOS 无公开 PHY API，只记日志。
 - 改 auto reconnect 或 iOS State Restoration 时，同步更新 `docs/AUTO_RECONNECT_SPEC.md`、`docs/IOS_STATE_RESTORATION_SPEC.md`、`ARCHITECTURE.md` 和相关测试/排障记录。
 - BLE 行为变化通常需要同时审视 Dart 和原生两端，不要假设 Android 与 iOS 可以共享实现细节。
 
