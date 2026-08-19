@@ -1021,6 +1021,67 @@ class RunnerTests: XCTestCase {
     XCTAssertEqual(queue.queueDepth, 0)
   }
 
+  func testFileWriteQueueKeepsItsOwnPendingWhenTheOtaQueueIsCancelled() {
+    // 退出升级只取消 OTA 队列。共用实例会让一次 quiteUpgradeState 顺手结算文件批次，
+    // 用户看到的是"传文件传到一半莫名失败"。
+    let peripheral = FakeOtaPeripheral(endpointId: "g2-left", canSend: false)
+    var otaResults: [Any?] = []
+    var fileResults: [Any?] = []
+    let otaQueue = OtaWriteQueue(peripheral: peripheral, scheduler: FakeOtaScheduler())
+    let fileQueue = OtaWriteQueue(
+      peripheral: peripheral,
+      scheduler: FakeOtaScheduler(),
+      channel: OtaWriteChannel.file
+    )
+
+    otaQueue.enqueue(data: Data([0x01]), target: makeFakeOtaTarget { _ in true }) { value in
+      otaResults.append(value)
+    }
+    fileQueue.enqueueBatch(
+      packets: [Data([0x02]), Data([0x03])],
+      target: makeFakeOtaTarget { _ in true }
+    ) { value in
+      fileResults.append(value)
+    }
+
+    otaQueue.cancelAll(reason: "quiteUpgradeState")
+
+    XCTAssertEqual((otaResults.first as? FlutterError)?.code, "ota_write_cancelled")
+    XCTAssertTrue(fileResults.isEmpty)
+    XCTAssertEqual(fileQueue.queueDepth, 2)
+
+    // 文件通道自己的终态必须带 file 前缀，排障时不能误读成 OTA 失败。
+    fileQueue.cancelAll(reason: "disconnect")
+    XCTAssertEqual((fileResults.first as? FlutterError)?.code, "file_write_cancelled")
+    XCTAssertEqual(fileQueue.queueDepth, 0)
+  }
+
+  func testFileWriteQueueBatchCompletesOnlyAfterLastCoreBluetoothSubmission() {
+    let peripheral = FakeOtaPeripheral(endpointId: "g2-left")
+    var results: [Any?] = []
+    var submitted: [Data] = []
+    let queue = OtaWriteQueue(
+      peripheral: peripheral,
+      scheduler: FakeOtaScheduler(),
+      channel: OtaWriteChannel.file
+    )
+
+    queue.enqueueBatch(
+      packets: [Data([0x01]), Data([0x02]), Data([0x03])],
+      target: makeFakeOtaTarget { data in
+        XCTAssertEqual(results.count, 0)
+        submitted.append(data)
+        return true
+      }
+    ) { value in
+      results.append(value)
+    }
+
+    XCTAssertEqual(submitted, [Data([0x01]), Data([0x02]), Data([0x03])])
+    XCTAssertEqual(results.count, 1)
+    XCTAssertNil(results.first!)
+  }
+
   private func makeConfig(name: String, autoReconnect: Bool) -> BleConfig {
     BleConfig(
       name: name,

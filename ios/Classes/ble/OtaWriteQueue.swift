@@ -101,8 +101,23 @@ private struct OtaWriteItem {
     let batch: OtaWriteBatch?
 }
 
-/// 单外设的 OTA 写队列
-/// - 仅服务于 `psType == 1` (BlePrivateService.type.ota) 通道;
+/// 使用无应答批量写队列的通道标识。
+///
+/// 只用于日志前缀和 typed error code；OTA 与文件各自持有独立队列实例，pending 从不共享，
+/// 退出升级只能取消 OTA 队列，不得连带清掉正在传输的文件批次。
+enum OtaWriteChannel {
+    static let ota = "ota"
+    static let file = "file"
+}
+
+/// 与 Dart `BleG2PsType` 对齐的私有服务类型；批量写入口只放行各自的通道。
+enum BlePsTypeValue {
+    static let ota = 1
+    static let file = 3
+}
+
+/// 单外设、单通道的无应答写队列
+/// - 服务于 `psType == 1` (OTA) 与 `psType == 3` (文件) 两条通道, 各自独立实例;
 /// - 每 `softDrainEvery` 包主动让出, 等待 `peripheralIsReady` 回调再继续, 防止
 ///   `canSendWriteWithoutResponse` 在老机型上报喜不报忧时塞包丢失.
 final class OtaWriteQueue {
@@ -133,6 +148,8 @@ final class OtaWriteQueue {
     //  - 时钟/调度器注入只服务于真实 XCTest 行为覆盖, 生产路径仍使用系统实现。
     private let clock: OtaWriteClock
     private let scheduler: OtaWriteScheduler
+    //  - 通道标识: 只影响日志前缀与 typed error code, 不改变任何队列语义。
+    private let channel: String
     //  - 日志回调(由 BleManager 注入, 复用其 loggerD)
     private let logger: ((String) -> Void)?
 
@@ -151,12 +168,14 @@ final class OtaWriteQueue {
         peripheral: OtaWritePeripheral,
         logger: ((String) -> Void)? = nil,
         clock: OtaWriteClock = SystemOtaWriteClock(),
-        scheduler: OtaWriteScheduler = MainQueueOtaWriteScheduler()
+        scheduler: OtaWriteScheduler = MainQueueOtaWriteScheduler(),
+        channel: String = OtaWriteChannel.ota
     ) {
         self.peripheral = peripheral
         self.logger = logger
         self.clock = clock
         self.scheduler = scheduler
+        self.channel = channel
     }
 }
 
@@ -170,7 +189,7 @@ extension OtaWriteQueue {
      */
     func enqueue(data: Data, target: OtaWriteTarget, result: @escaping FlutterResult) {
         pending.append(OtaWriteItem(data: data, target: target, result: result, batch: nil))
-        logger?("[ezw_ble][ota] enqueued endpoint=\(peripheral?.otaEndpointId ?? "released") bytes=\(data.count) pending=\(pending.count)")
+        logger?("[ezw_ble][\(channel)] enqueued endpoint=\(peripheral?.otaEndpointId ?? "released") bytes=\(data.count) pending=\(pending.count)")
         pump()
     }
 
@@ -185,7 +204,8 @@ extension OtaWriteQueue {
             result(Self.unavailableError(
                 endpoint: peripheral?.otaEndpointId ?? "",
                 reason: "empty batch",
-                pending: 0
+                pending: 0,
+                channel: channel
             ))
             return
         }
@@ -199,7 +219,7 @@ extension OtaWriteQueue {
             ))
         }
         logger?(
-            "[ezw_ble][ota] batch enqueued endpoint=\(peripheral?.otaEndpointId ?? "released") " +
+            "[ezw_ble][\(channel)] batch enqueued endpoint=\(peripheral?.otaEndpointId ?? "released") " +
             "packets=\(packets.count) bytes=\(packets.reduce(0) { $0 + $1.count }) pending=\(pending.count)"
         )
         pump()
@@ -210,7 +230,7 @@ extension OtaWriteQueue {
      *  - OS 通知背压解除, 立即继续抽干队列.
      */
     func onPeripheralReadyToSendWriteWithoutResponse() {
-        logger?("[ezw_ble][ota] ready endpoint=\(peripheral?.otaEndpointId ?? "released") pending=\(pending.count)")
+        logger?("[ezw_ble][\(channel)] ready endpoint=\(peripheral?.otaEndpointId ?? "released") pending=\(pending.count)")
         clearBackpressureWait()
         pump()
     }
@@ -224,7 +244,7 @@ extension OtaWriteQueue {
         guard !pending.isEmpty else {
             return
         }
-        logger?("[ezw_ble][ota] cancelled endpoint=\(peripheral?.otaEndpointId ?? "released") reason=\(reason) pending=\(pending.count)")
+        logger?("[ezw_ble][\(channel)] cancelled endpoint=\(peripheral?.otaEndpointId ?? "released") reason=\(reason) pending=\(pending.count)")
         let snapshot = pending
         pending.removeAll()
         sinceLastDrainSync = 0
@@ -232,7 +252,7 @@ extension OtaWriteQueue {
         completeSnapshot(
             snapshot,
             Self.error(
-                code: "ota_write_cancelled",
+                code: "\(channel)_write_cancelled",
                 endpoint: peripheral?.otaEndpointId,
                 reason: reason,
                 waitSeconds: nil,
@@ -241,16 +261,32 @@ extension OtaWriteQueue {
         )
     }
 
-    static func unavailableError(endpoint: String, reason: String, pending: Int = 0) -> FlutterError {
-        return error(code: "ota_write_unavailable", endpoint: endpoint, reason: reason, waitSeconds: nil, pending: pending)
+    static func unavailableError(
+        endpoint: String,
+        reason: String,
+        pending: Int = 0,
+        channel: String = OtaWriteChannel.ota
+    ) -> FlutterError {
+        return error(code: "\(channel)_write_unavailable", endpoint: endpoint, reason: reason, waitSeconds: nil, pending: pending)
     }
 
-    static func unsupportedError(endpoint: String, reason: String, pending: Int = 0) -> FlutterError {
-        return error(code: "ota_write_unsupported", endpoint: endpoint, reason: reason, waitSeconds: nil, pending: pending)
+    static func unsupportedError(
+        endpoint: String,
+        reason: String,
+        pending: Int = 0,
+        channel: String = OtaWriteChannel.ota
+    ) -> FlutterError {
+        return error(code: "\(channel)_write_unsupported", endpoint: endpoint, reason: reason, waitSeconds: nil, pending: pending)
     }
 
-    static func stalledError(endpoint: String?, reason: String, waitSeconds: TimeInterval, pending: Int) -> FlutterError {
-        return error(code: "ota_write_stalled", endpoint: endpoint, reason: reason, waitSeconds: waitSeconds, pending: pending)
+    static func stalledError(
+        endpoint: String?,
+        reason: String,
+        waitSeconds: TimeInterval,
+        pending: Int,
+        channel: String = OtaWriteChannel.ota
+    ) -> FlutterError {
+        return error(code: "\(channel)_write_stalled", endpoint: endpoint, reason: reason, waitSeconds: waitSeconds, pending: pending)
     }
 }
 
@@ -276,7 +312,7 @@ extension OtaWriteQueue {
                 if shouldCancelStalledBackpressure(reason: "canSend=false") {
                     return
                 }
-                logger?("[ezw_ble][ota] stalled endpoint=\(peripheral.otaEndpointId) reason=canSend=false wait=pending pending=\(pending.count)")
+                logger?("[ezw_ble][\(channel)] stalled endpoint=\(peripheral.otaEndpointId) reason=canSend=false wait=pending pending=\(pending.count)")
                 scheduleBackpressureRetry(after: Self.backpressureRetryInterval)
                 return
             }
@@ -289,14 +325,15 @@ extension OtaWriteQueue {
                     Self.unavailableError(
                         endpoint: peripheral.otaEndpointId,
                         reason: "peripheral released before submit",
-                        pending: pending.count
+                        pending: pending.count,
+                        channel: channel
                     )
                 )
                 continue
             }
             sinceLastDrainSync += 1
             if head.batch == nil {
-                logger?("[ezw_ble][ota] submitted endpoint=\(peripheral.otaEndpointId) char=\(head.target.characteristicUUID) bytes=\(head.data.count) pending=\(pending.count)")
+                logger?("[ezw_ble][\(channel)] submitted endpoint=\(peripheral.otaEndpointId) char=\(head.target.characteristicUUID) bytes=\(head.data.count) pending=\(pending.count)")
             }
             //  - 2.3、CoreBluetooth 已接受本次 writeValue 调用后才向 Dart 回包;
             //  -- WriteWithoutResponse 无设备 ack, 这里的成功只代表已提交给 CoreBluetooth。
@@ -305,7 +342,7 @@ extension OtaWriteQueue {
             //  -- canSendWriteWithoutResponse 在 iPhone 6s/SE 一代等老机型上"报喜不报忧",
             //  -- 突发塞包会触发底层丢包, 这里强制等下一次 peripheralIsReady 回调
             if sinceLastDrainSync >= Self.softDrainEvery {
-                logger?("[ezw_ble][ota] stalled endpoint=\(peripheral.otaEndpointId) reason=softThrottle wait=ready pending=\(pending.count)")
+                logger?("[ezw_ble][\(channel)] stalled endpoint=\(peripheral.otaEndpointId) reason=softThrottle wait=ready pending=\(pending.count)")
                 sinceLastDrainSync = 0
                 markBackpressureWaitStarted()
                 scheduleBackpressureRetry(after: Self.softThrottleRetryInterval)
@@ -322,7 +359,7 @@ private extension OtaWriteQueue {
         guard !pending.isEmpty else {
             return
         }
-        logger?("[ezw_ble][ota] cancelled endpoint=released reason=\(reason) pending=\(pending.count)")
+        logger?("[ezw_ble][\(channel)] cancelled endpoint=released reason=\(reason) pending=\(pending.count)")
         let snapshot = pending
         pending.removeAll()
         sinceLastDrainSync = 0
@@ -330,7 +367,7 @@ private extension OtaWriteQueue {
         completeSnapshot(
             snapshot,
             Self.error(
-                code: "ota_write_unavailable",
+                code: "\(channel)_write_unavailable",
                 endpoint: nil,
                 reason: reason,
                 waitSeconds: nil,
@@ -351,7 +388,7 @@ private extension OtaWriteQueue {
         }
         batch.remaining -= 1
         if batch.remaining <= 0 {
-            logger?("[ezw_ble][ota] batch completed endpoint=\(peripheral?.otaEndpointId ?? "released") pending=\(pending.count)")
+            logger?("[ezw_ble][\(channel)] batch completed endpoint=\(peripheral?.otaEndpointId ?? "released") pending=\(pending.count)")
             batch.settle(nil)
         }
     }
@@ -411,7 +448,7 @@ private extension OtaWriteQueue {
         guard waitSeconds >= Self.backpressureStallTimeout else {
             return false
         }
-        logger?("[ezw_ble][ota] stalled endpoint=\(peripheral?.otaEndpointId ?? "released") reason=\(reason) wait=\(String(format: "%.1f", waitSeconds))s pending=\(pending.count)")
+        logger?("[ezw_ble][\(channel)] stalled endpoint=\(peripheral?.otaEndpointId ?? "released") reason=\(reason) wait=\(String(format: "%.1f", waitSeconds))s pending=\(pending.count)")
         let snapshot = pending
         pending.removeAll()
         sinceLastDrainSync = 0
@@ -422,7 +459,8 @@ private extension OtaWriteQueue {
                 endpoint: peripheral?.otaEndpointId,
                 reason: reason,
                 waitSeconds: waitSeconds,
-                pending: snapshot.count
+                pending: snapshot.count,
+                channel: channel
             )
         )
         return true

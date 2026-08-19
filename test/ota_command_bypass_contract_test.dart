@@ -34,8 +34,12 @@ void main() {
     ).readAsStringSync();
     final manager = File('ios/Classes/ble/BleManager.swift').readAsStringSync();
 
-    expect(queue, contains('ota_write_stalled'));
-    expect(queue, contains('ota_write_cancelled'));
+    // 队列被 OTA 与文件共用后 code 由通道前缀拼出；默认通道仍是 ota，
+    // 所以 OTA 侧的 ota_write_* 分类对 Dart 保持不变。
+    expect(queue, contains('static let ota = "ota"'));
+    expect(queue, contains(r'\(channel)_write_stalled'));
+    expect(queue, contains(r'\(channel)_write_cancelled'));
+    expect(queue, contains('channel: String = OtaWriteChannel.ota'));
     expect(queue, contains('head.target.submit(peripheral, head.data)'));
     expect(manager, contains('OtaWriteQueue.unavailableError'));
     expect(manager, contains('OtaWriteQueue.unsupportedError'));
@@ -78,7 +82,9 @@ void main() {
     expect(device, contains('supportsWriteWithoutResponse'));
     expect(device, contains('submitOtaCharacteristic'));
     expect(device, contains('ERROR_GATT_WRITE_REQUEST_BUSY'));
-    expect(error, contains('ota_write_unavailable'));
-    expect(error, contains('ota_write_unsupported'));
+    expect(error, contains(r'const val OTA = "ota"'));
+    expect(error, contains(r'${channel}_write_unavailable'));
+    expect(error, contains(r'${channel}_write_unsupported'));
+    expect(error, contains('channel: String = BleWriteChannel.OTA'));
   });
 }

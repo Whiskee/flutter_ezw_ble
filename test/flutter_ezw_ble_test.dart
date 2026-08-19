@@ -165,6 +165,15 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
+  Future<void> sendFilePacketBatch(
+    String uuid,
+    List<Uint8List> framedPackets, {
+    int psType = 3,
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
   Future<void> openAppSettings() {
     throw UnimplementedError();
   }

@@ -63,6 +63,8 @@ enum class BleMC {
     SEND_CMD_NO_WAIT,
     /** 一次提交一组已封装 OTA 小包；Future 等最后一包 GATT callback。 */
     SEND_OTA_PACKET_BATCH,
+    /** 一次提交一组已封装文件小包；Future 等最后一包 GATT callback。 */
+    SEND_FILE_PACKET_BATCH,
     /** 标记设备进入升级状态。 */
     ENTER_UPGRADE_STATE,
     /** 标记设备退出升级状态。 */
@@ -290,8 +292,24 @@ enum class BleMC {
                 val jsonMap = arguments as Map<*, *>?
                 val uuid = jsonMap?.get("uuid") as? String ?: ""
                 val psType = jsonMap?.get("psType") as Int? ?: 1
-                val packets = decodeOtaBatchPackets(jsonMap?.get("packets"))
+                val packets = decodeFramedBatchPackets(jsonMap?.get("packets"))
                 BleManager.instance.sendOtaPacketBatch(uuid, packets, psType) { error ->
+                    if (error == null) {
+                        result.success(null)
+                    } else {
+                        result.error(error.code, error.reason, error.details)
+                    }
+                }
+                return
+            }
+            SEND_FILE_PACKET_BATCH -> {
+                // 1. 文件 RAW 批次与 OTA 同样是 already-framed 小包；Future 等最后一包写回调，
+                //    上层据此才能启动固件 8s ACK 计时。
+                val jsonMap = arguments as Map<*, *>?
+                val uuid = jsonMap?.get("uuid") as? String ?: ""
+                val psType = jsonMap?.get("psType") as Int? ?: 3
+                val packets = decodeFramedBatchPackets(jsonMap?.get("packets"))
+                BleManager.instance.sendFilePacketBatch(uuid, packets, psType) { error ->
                     if (error == null) {
                         result.success(null)
                     } else {
@@ -462,12 +480,12 @@ private fun Map<*, *>.toBlePrivateService(): BlePrivateService? {
 }
 
 /**
- * 解码 Dart 一次提交的 OTA framed 小包。
+ * 解码 Dart 一次提交的 OTA / 文件 framed 小包。
  *
  * StandardMessageCodec 通常给出 ByteArray；个别通道实现会给出 ByteBuffer，
  * 这里都转成独立副本，避免原生队列和 Dart 共享可变缓冲区。
  */
-private fun decodeOtaBatchPackets(raw: Any?): List<ByteArray> {
+private fun decodeFramedBatchPackets(raw: Any?): List<ByteArray> {
     val items = raw as? List<*> ?: return emptyList()
     return items.mapNotNull { item ->
         when (item) {

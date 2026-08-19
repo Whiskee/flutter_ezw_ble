@@ -35,12 +35,15 @@ internal fun interface BleOtaWriteScheduler {
 }
 
 /**
- * 单 endpoint Android OTA 写队列。
+ * 单 endpoint、单通道的 Android 无应答批量写队列。
  *
  * Android 的 no-response 写仍然是单槽位 GATT 操作：同步 `SUCCESS` 只表示系统接受提交，
  * 真正释放下一包必须等 `onCharacteristicWrite`。同步 BUSY 是可恢复背压，原包保留到活动
  * 写回调或 watchdog 重试；取消 attempt 后还必须保留旧 callback 的 drain barrier，避免旧回调
  * 完成下一轮写入。其它错误、断连与超时均 fail closed，保证 Dart await 必有终态。
+ *
+ * OTA(psType=1) 与文件(psType=3) 各自持有独立实例，不共享 pending：退出升级只能取消 OTA
+ * attempt，绝不能顺手清掉正在传输的文件批次。[channel] 只用于区分日志与 typed error 前缀。
  */
 internal class BleAndroidOtaWriteQueue(
     private val endpoint: String,
@@ -48,6 +51,7 @@ internal class BleAndroidOtaWriteQueue(
     private val scheduler: BleOtaWriteScheduler,
     private val nowMillis: () -> Long,
     private val logger: (String) -> Unit = {},
+    private val channel: String = BleWriteChannel.OTA,
 ) {
     /** 一批 framed OTA 小包共享一个 Dart Future；成功只在最后一包 callback 后结算。 */
     private class OtaWriteBatch(
@@ -91,7 +95,7 @@ internal class BleAndroidOtaWriteQueue(
     @Synchronized
     fun enqueue(data: ByteArray, completion: (BleOtaWriteError?) -> Unit) {
         pending.addLast(Item(data.copyOf(), completion))
-        logger("[ezw_ble][ota][android] enqueued endpoint=$endpoint bytes=${data.size} pending=$queueDepth")
+        logger("[ezw_ble][$channel][android] enqueued endpoint=$endpoint bytes=${data.size} pending=$queueDepth")
         pump()
     }
 
@@ -104,7 +108,7 @@ internal class BleAndroidOtaWriteQueue(
     @Synchronized
     fun enqueueBatch(packets: List<ByteArray>, completion: (BleOtaWriteError?) -> Unit) {
         if (packets.isEmpty()) {
-            completion(BleOtaWriteError.unavailable(endpoint, "empty batch"))
+            completion(BleOtaWriteError.unavailable(endpoint, "empty batch", channel = channel))
             return
         }
         val batch = OtaWriteBatch(completion, remaining = packets.size)
@@ -112,7 +116,7 @@ internal class BleAndroidOtaWriteQueue(
             pending.addLast(Item(packet.copyOf(), completion = {}, batch = batch))
         }
         logger(
-            "[ezw_ble][ota][android] batch enqueued endpoint=$endpoint " +
+            "[ezw_ble][$channel][android] batch enqueued endpoint=$endpoint " +
                 "packets=${packets.size} bytes=${packets.sumOf { it.size }} pending=$queueDepth",
         )
         pump()
@@ -138,7 +142,7 @@ internal class BleAndroidOtaWriteQueue(
                 cancelledInFlightCallbackPending = false
                 clearWait()
                 logger(
-                    "[ezw_ble][ota][android] drained cancelled callback " +
+                    "[ezw_ble][$channel][android] drained cancelled callback " +
                         "endpoint=$endpoint status=$statusName pending=$queueDepth",
                 )
                 pump()
@@ -150,11 +154,11 @@ internal class BleAndroidOtaWriteQueue(
                 clearWait()
                 if (success) {
                     if (completed.batch == null) {
-                        logger("[ezw_ble][ota][android] completed endpoint=$endpoint status=$statusName pending=$queueDepth")
+                        logger("[ezw_ble][$channel][android] completed endpoint=$endpoint status=$statusName pending=$queueDepth")
                     }
                     completeItem(completed, error = null)
                 } else {
-                    logger("[ezw_ble][ota][android] failed endpoint=$endpoint status=$statusName pending=$queueDepth")
+                    logger("[ezw_ble][$channel][android] failed endpoint=$endpoint status=$statusName pending=$queueDepth")
                     completeItem(
                         completed,
                         BleOtaWriteError.unavailable(
@@ -163,6 +167,7 @@ internal class BleAndroidOtaWriteQueue(
                             pending = queueDepth,
                             status = status,
                             statusName = statusName,
+                            channel = channel,
                         ),
                     )
                 }
@@ -199,13 +204,14 @@ internal class BleAndroidOtaWriteQueue(
         if (snapshot.isEmpty()) {
             return
         }
-        logger("[ezw_ble][ota][android] attempt cancelled endpoint=$endpoint reason=$reason pending=${snapshot.size}")
+        logger("[ezw_ble][$channel][android] attempt cancelled endpoint=$endpoint reason=$reason pending=${snapshot.size}")
         completeSnapshot(
             snapshot,
             BleOtaWriteError.cancelled(
                 endpoint = endpoint,
                 reason = reason,
                 pending = snapshot.size,
+                channel = channel,
             ),
         )
     }
@@ -224,13 +230,14 @@ internal class BleAndroidOtaWriteQueue(
         if (snapshot.isEmpty()) {
             return
         }
-        logger("[ezw_ble][ota][android] cancelled endpoint=$endpoint reason=$reason pending=${snapshot.size}")
+        logger("[ezw_ble][$channel][android] cancelled endpoint=$endpoint reason=$reason pending=${snapshot.size}")
         completeSnapshot(
             snapshot,
             BleOtaWriteError.cancelled(
                 endpoint = endpoint,
                 reason = reason,
                 pending = snapshot.size,
+                channel = channel,
             ),
         )
     }
@@ -266,7 +273,7 @@ internal class BleAndroidOtaWriteQueue(
                     inFlight = head
                     waitStartedAtMillis = nowMillis()
                     lastBackpressure = null
-                    logger("[ezw_ble][ota][android] submitted endpoint=$endpoint bytes=${head.data.size} pending=$queueDepth")
+                    logger("[ezw_ble][$channel][android] submitted endpoint=$endpoint bytes=${head.data.size} pending=$queueDepth")
                     scheduleWatchdog()
                     return
                 }
@@ -275,7 +282,7 @@ internal class BleAndroidOtaWriteQueue(
                     lastBackpressure = submission
                     markWaitStarted()
                     if (!failIfStalled(submission.reason, submission)) {
-                        logger("[ezw_ble][ota][android] backpressure endpoint=$endpoint status=${submission.status} pending=$queueDepth")
+                        logger("[ezw_ble][$channel][android] backpressure endpoint=$endpoint status=${submission.status} pending=$queueDepth")
                         scheduleWatchdog()
                     }
                     return
@@ -283,7 +290,7 @@ internal class BleAndroidOtaWriteQueue(
 
                 BleOtaWriteSubmission.Disposition.REJECTED -> {
                     pending.removeFirst()
-                    logger("[ezw_ble][ota][android] rejected endpoint=$endpoint reason=${submission.reason} pending=$queueDepth")
+                    logger("[ezw_ble][$channel][android] rejected endpoint=$endpoint reason=${submission.reason} pending=$queueDepth")
                     completeItem(
                         head,
                         BleOtaWriteError.unavailable(
@@ -291,6 +298,7 @@ internal class BleAndroidOtaWriteQueue(
                             reason = submission.reason,
                             pending = queueDepth,
                             status = submission.status,
+                            channel = channel,
                         ),
                     )
                 }
@@ -318,7 +326,7 @@ internal class BleAndroidOtaWriteQueue(
         inFlight = null
         pending.clear()
         clearWait()
-        logger("[ezw_ble][ota][android] stalled endpoint=$endpoint reason=$reason wait=${waitedMillis}ms pending=${snapshot.size}")
+        logger("[ezw_ble][$channel][android] stalled endpoint=$endpoint reason=$reason wait=${waitedMillis}ms pending=${snapshot.size}")
         completeSnapshot(
             snapshot,
             BleOtaWriteError.stalled(
@@ -327,6 +335,7 @@ internal class BleAndroidOtaWriteQueue(
                 waitSeconds = waitedMillis / 1_000.0,
                 pending = snapshot.size,
                 status = submission?.status,
+                channel = channel,
             ),
         )
         return true
@@ -347,7 +356,7 @@ internal class BleAndroidOtaWriteQueue(
         batch.remaining -= 1
         if (batch.remaining <= 0) {
             logger(
-                "[ezw_ble][ota][android] batch completed endpoint=$endpoint pending=$queueDepth",
+                "[ezw_ble][$channel][android] batch completed endpoint=$endpoint pending=$queueDepth",
             )
             batch.settle(null)
         }

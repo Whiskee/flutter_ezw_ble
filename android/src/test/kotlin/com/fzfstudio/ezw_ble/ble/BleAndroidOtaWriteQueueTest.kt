@@ -273,15 +273,52 @@ class BleAndroidOtaWriteQueueTest {
         assertEquals(0, queue.queueDepth)
     }
 
+    @Test
+    fun `file channel batch reports file scoped errors and never touches an ota queue`() {
+        val otaCompletions = mutableListOf<BleOtaWriteError?>()
+        val fileCompletions = mutableListOf<BleOtaWriteError?>()
+        val otaQueue = queue(submit = { BleOtaWriteSubmission.accepted() })
+        val fileQueue = queue(
+            submit = { BleOtaWriteSubmission.accepted() },
+            channel = BleWriteChannel.FILE,
+        )
+
+        otaQueue.enqueue(byteArrayOf(0x01)) { otaCompletions.add(it) }
+        fileQueue.enqueueBatch(listOf(byteArrayOf(0x02), byteArrayOf(0x03))) {
+            fileCompletions.add(it)
+        }
+
+        // Leaving OTA cancels only the OTA attempt. A shared queue would settle the file batch
+        // here and abort a transfer the user never cancelled.
+        otaQueue.cancelAttempt("quiteUpgradeState")
+
+        assertEquals("ota_write_cancelled", otaCompletions.single()?.code)
+        assertEquals(emptyList(), fileCompletions)
+        assertEquals(2, fileQueue.queueDepth)
+
+        fileQueue.onCharacteristicWriteComplete(true, true, 0, "GATT_SUCCESS")
+        fileQueue.onCharacteristicWriteComplete(
+            ownsInFlight = true,
+            success = false,
+            status = 133,
+            statusName = "GATT_ERROR",
+        )
+
+        assertEquals("file_write_unavailable", fileCompletions.single()?.code)
+        assertEquals(0, fileQueue.queueDepth)
+    }
+
     private fun queue(
         submit: (ByteArray) -> BleOtaWriteSubmission,
         scheduler: BleOtaWriteScheduler = FakeScheduler(),
         nowMillis: () -> Long = { 0L },
+        channel: String = BleWriteChannel.OTA,
     ): BleAndroidOtaWriteQueue = BleAndroidOtaWriteQueue(
         endpoint = "g2-left",
         submit = submit,
         scheduler = scheduler,
         nowMillis = nowMillis,
+        channel = channel,
     )
 
     private class FakeScheduler : BleOtaWriteScheduler {

@@ -185,6 +185,7 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `sendCmd` | `Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0, bool allowDuringUpgrade = false})` | 写特征值，等待原生层 write 完成。`psType` 是"私有服务类型"，对应 `BlePrivateService.type`（0=基础，1=OTA，2+=自定义）。升级态默认阻断非 OTA 写入；只有上层协议白名单确认的 AUTH、时间同步等恢复控制指令可显式传 `allowDuringUpgrade=true`。 |
 | `sendCmdNoWait` | `Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0})` | OTA 单包连发入口。Android：`psType == 1` 走 per-endpoint `WRITE_TYPE_NO_RESPONSE` 队列；同步 BUSY 保留原包，Future 等本包 `onCharacteristicWrite` 成功后返回，4s 停滞/teardown typed fail，避免固定延时撞 GATT 单槽位。iOS：`psType == 1` 走 `WriteWithoutResponse` + `canSendWriteWithoutResponse` 背压队列（见 `ios/Classes/ble/OtaWriteQueue.swift` 与 `docs/IOS_OTA_NOWAIT_SPEC.md`）。其它 `psType` 保持历史 no-wait 语义。 |
 | `sendOtaPacketBatch` | `Future<void> sendOtaPacketBatch(String uuid, List<Uint8List> framedPackets, {int psType = 1})` | OTA 批次入口。入参是 even_connect 已组好的协议小包，插件不拆 4KB、不改字节。Android 仍保持每 endpoint 一个 GATT write in-flight，由 callback 推进；iOS 一次入队后由 `OtaWriteQueue` 泵送。Future 必须等最后一包真正提交成功才完成。第 N 包失败立即丢掉剩余包并返回 typed error。 |
+| `sendFilePacketBatch` | `Future<void> sendFilePacketBatch(String uuid, List<Uint8List> framedPackets, {int psType = 3})` | 文件批次入口，语义与 OTA 批次相同但**队列实例独立**：`quiteUpgradeState` 只取消 OTA attempt，两者共用 pending 会打断进行中的文件传输；升级态仍 fail closed 拒绝文件写入。文件控制包与 big-package start 继续走 `sendCmd`，只有 RAW 4KB 窗口整批提交。typed error 用 `file_write_*` 前缀。 |
 | `enterUpgradeState` | `Future<void> enterUpgradeState(String uuid)` | 仅允许仍处于真实业务 `connected`、物理链路有效且持有已接受 epoch 的 uuid 进入 OTA；拒绝用缓存制造 `upgrade`。原生侧据此切到 OTA 私有服务、延长断连超时（与 `BleConfig.upgradeSwapTime` 配合）。 |
 | `quiteUpgradeState` | `Future<void> quiteUpgradeState(String uuid)` | 退出 OTA 状态；只有链路仍有效时才恢复 `connected`，断连后到达的旧 OTA 回调只消费 marker，不能复活连接态。 |
 | `openBleSettings` | `Future<void> openBleSettings()` | 跳系统蓝牙开关页。 |
@@ -908,7 +909,19 @@ iOS 端 OTA 通道走单独的 per-peripheral 写队列 `OtaWriteQueue`，目标
 - **fail closed**：OTA 特征不支持 `.writeWithoutResponse`、manager 不可用、device/characteristic 缺失或提交前外设释放时，`sendCmdNoWait(psType == 1)` 返回 typed `FlutterError`（`ota_write_unsupported` / `ota_write_unavailable`），不得回退为看似成功的旧路径。
 - **Android 对齐**：Android `sendCmdNoWait(psType == 1)` 必须保留同步提交状态；`ERROR_GATT_WRITE_REQUEST_BUSY`（旧 API 的 `false` 无法精确分类时也按瞬时背压处理）不得丢包或立即终止，而要保留原包等待当前写回调/watchdog 重试。本包 Future 只在对应 `onCharacteristicWrite` 成功后完成；4s 仍未释放则 `ota_write_stalled`，断连/退出升级/重置则 `ota_write_cancelled`。退出升级但复用同一 GATT session 时，已提交写的旧 callback 必须先经过 drain barrier，期间新的普通命令和 OTA RAW 都不能提交；旧 callback 只释放物理槽，不能完成新 attempt。只有物理 session 已 teardown 且 exact GATT identity 失效后才能丢弃该屏障。非 OTA no-wait 保持历史立即成功语义。
 - **挂起 await 兜底**：断连/蓝牙 OFF/`reset()`/配置撤销/外设释放时 `OtaWriteQueue.cancelAll()` 会对所有 pending 写入回调 `ota_write_cancelled`；蓝牙 OFF 已使全部物理 GATT session 失效，必须在清 upgrade marker 前取消并移除所有 OTA 队列。背压超过 stall 窗口回调 `ota_write_stalled`，details 带 `endpoint/reason/wait/pending`。改这条兜底必须保证**任何路径都不会让 Dart `await` 永远挂着**。
-- **范围外**：`psType == 3`（file）通道、iOS connection interval 协商、`psType == 0`（common）write type 切换均**不在本期范围**，改动前先评估对协议层应答匹配的影响。
+- **范围外**：iOS connection interval 协商、`psType == 0`（common）write type 切换均**不在本期范围**，改动前先评估对协议层应答匹配的影响。
+
+### 12.7 文件通道批量写（`sendFilePacketBatch` + `psType == 3`）
+
+文件 RAW 4KB 窗口复用与 OTA 同构的无应答批量写队列，但**每条通道一个实例**：Android `fileWriteQueues`、iOS `fileWriteQueues`，pending 从不共享。
+
+关键约束（改原生侧前必读）：
+
+- **隔离理由**：`quiteUpgradeState` 会 `cancelAttempt` 整条 OTA 队列。若文件包落进同一实例，一次退出升级就会把用户正在进行的文件传输一起结算成 `cancelled`。反过来 `BleUpgradeCommandPolicy` / `upgradeStateRegistry` 仍然在升级态拒绝 `psType == 3`，文件批次不得借 OTA 通道绕过门禁。
+- **Android 单槽位归属**：普通队列、OTA 批次、文件批次共用同一个 GATT 写槽。`BleGattWriteCallbackOwnerPolicy` 先判已占槽的 OTA，再判已占槽的文件，最后才按普通队列 head 的 psType 匹配；`writeNextCommand` 在任一批次占槽时直接返回。文件控制包与 RAW 都是 `psType = 3`，只有"批次真的占着物理槽"才允许它抢先认领 callback。
+- **iOS 背压共享**：`peripheralIsReady(toSendWriteWithoutResponse:)` 不区分通道，必须同时喂给该外设的两条队列；只唤醒 OTA 会让文件批次只能等 0.1s 兜底重查。
+- **终态清理**：物理 session 失效、`reset()`、蓝牙 OFF 和配置撤销必须同时释放两条通道的 pending，否则 Dart `await` 会永久挂起。`cancelOtaWriteAttempt`（退出升级）是唯一只作用于 OTA 的入口。
+- **typed error 前缀**：队列实例持有 `channel` 标签，code 拼成 `ota_write_*` / `file_write_*`。默认值仍是 `ota`，OTA 侧对 Dart 的分类不变。
 
 ---
 

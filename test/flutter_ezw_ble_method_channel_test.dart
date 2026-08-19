@@ -89,6 +89,50 @@ void main() {
     );
   });
 
+  test('sendFilePacketBatch forwards framed packets on the file channel',
+      () async {
+    MethodCall? capturedCall;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (methodCall) async {
+      capturedCall = methodCall;
+      return null;
+    });
+
+    final packets = <Uint8List>[
+      Uint8List.fromList(<int>[0x03]),
+      Uint8List.fromList(<int>[0x04]),
+    ];
+    await MethodChannelEzwBle().sendFilePacketBatch('left-uuid', packets);
+
+    expect(capturedCall?.method, 'sendFilePacketBatch');
+    expect(capturedCall?.arguments, containsPair('uuid', 'left-uuid'));
+    expect(capturedCall?.arguments, containsPair('psType', 3));
+    expect(capturedCall?.arguments, containsPair('packets', packets));
+  });
+
+  test('sendFilePacketBatch rejects an empty packet list before native', () {
+    expect(
+      () => MethodChannelEzwBle().sendFilePacketBatch(
+        'left-uuid',
+        const <Uint8List>[],
+      ),
+      throwsArgumentError,
+    );
+  });
+
+  test('sendFilePacketBatch refuses to borrow the OTA channel', () {
+    // 文件批次绝不能落进 OTA 队列：quiteUpgradeState 会取消整条 OTA attempt，
+    // 借道会让一次退出升级顺手打断正在进行的文件传输。
+    expect(
+      () => MethodChannelEzwBle().sendFilePacketBatch(
+        'left-uuid',
+        <Uint8List>[Uint8List.fromList(<int>[0x05])],
+        psType: 1,
+      ),
+      throwsArgumentError,
+    );
+  });
+
   test('prepareBusinessConnection forwards exact attempt and decodes status',
       () async {
     MethodCall? capturedCall;

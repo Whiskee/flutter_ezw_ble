@@ -284,6 +284,19 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     throw UnimplementedError('sendOtaPacketBatch() has not been implemented.');
   }
 
+  /// 一次提交一组已经完成 Even 协议封装的文件小包。
+  ///
+  /// 与 [sendOtaPacketBatch] 语义相同但通道独立：原生用另一条队列承载，退出升级只取消 OTA，
+  /// 不会打断正在传输的文件批次；升级态仍然拒绝文件写入。Future 必须等本批最后一包被原生队列
+  /// 真正提交成功后才完成，否则上层 8s 固件 ACK 计时会提前启动。
+  Future<void> sendFilePacketBatch(
+    String uuid,
+    List<Uint8List> framedPackets, {
+    int psType = 3,
+  }) {
+    throw UnimplementedError('sendFilePacketBatch() has not been implemented.');
+  }
+
   /// 进入升级模式
   ///
   /// - param uuid 设备唯一标识

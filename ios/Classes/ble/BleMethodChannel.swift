@@ -55,6 +55,8 @@ enum BleMC: String {
     case sendCmdNoWait
     /// Submit a batch of already-framed OTA packets; Future waits for the last packet.
     case sendOtaPacketBatch
+    /// Submit a batch of already-framed file packets; Future waits for the last packet.
+    case sendFilePacketBatch
     /// Mark a device as entering OTA mode.
     case enterUpgradeState
     /// Mark a device as leaving OTA mode.
@@ -276,18 +278,21 @@ enum BleMC: String {
         case .sendOtaPacketBatch:
             let jsonData: [String: Any] = arguments as? [String: Any] ?? [:]
             let uuid: String = jsonData["uuid"] as? String ?? ""
-            let psType: Int = jsonData["psType"] as? Int ?? 1
-            let packets: [Data]
-            if let typed = jsonData["packets"] as? [FlutterStandardTypedData] {
-                packets = typed.map { $0.data }
-            } else if let raw = jsonData["packets"] as? [Any] {
-                packets = raw.compactMap { ($0 as? FlutterStandardTypedData)?.data }
-            } else {
-                packets = []
-            }
+            let psType: Int = jsonData["psType"] as? Int ?? BlePsTypeValue.ota
             BleManager.shared.sendOtaPacketBatch(
                 uuid: uuid,
-                packets: packets,
+                packets: Self.decodeFramedBatchPackets(jsonData["packets"]),
+                psType: psType,
+                result: result
+            )
+            return
+        case .sendFilePacketBatch:
+            let jsonData: [String: Any] = arguments as? [String: Any] ?? [:]
+            let uuid: String = jsonData["uuid"] as? String ?? ""
+            let psType: Int = jsonData["psType"] as? Int ?? BlePsTypeValue.file
+            BleManager.shared.sendFilePacketBatch(
+                uuid: uuid,
+                packets: Self.decodeFramedBatchPackets(jsonData["packets"]),
                 psType: psType,
                 result: result
             )
@@ -335,5 +340,19 @@ enum BleMC: String {
             break
         }
         result(nil)
+    }
+
+    /// 解码 Dart 一次提交的 OTA / 文件 framed 小包。
+    ///
+    /// StandardMessageCodec 通常给出 `FlutterStandardTypedData`；无法识别的元素直接丢弃，
+    /// 由原生入口的空批次 fail closed 兜底，绝不静默补零。
+    private static func decodeFramedBatchPackets(_ raw: Any?) -> [Data] {
+        if let typed = raw as? [FlutterStandardTypedData] {
+            return typed.map { $0.data }
+        }
+        if let items = raw as? [Any] {
+            return items.compactMap { ($0 as? FlutterStandardTypedData)?.data }
+        }
+        return []
     }
 }

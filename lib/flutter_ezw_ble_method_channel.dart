@@ -250,6 +250,37 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
     });
   }
 
+  /// 把 even_connect 已组好的文件协议小包一次交给原生队列。
+  ///
+  /// 与 OTA 批次共用队列实现但通道实例独立，因此 `quiteUpgradeState` 不会取消文件传输。
+  /// 空列表和非文件通道直接拒绝，避免把未定义语义伪装成成功。
+  @override
+  Future<void> sendFilePacketBatch(
+    String uuid,
+    List<Uint8List> framedPackets, {
+    int psType = 3,
+  }) async {
+    if (framedPackets.isEmpty) {
+      throw ArgumentError.value(
+        framedPackets,
+        'framedPackets',
+        'sendFilePacketBatch requires at least one already-framed file packet',
+      );
+    }
+    if (psType != 3) {
+      throw ArgumentError.value(
+        psType,
+        'psType',
+        'sendFilePacketBatch only supports the file channel (psType=3)',
+      );
+    }
+    await methodChannel.invokeMethod<void>('sendFilePacketBatch', {
+      'uuid': uuid,
+      'packets': framedPackets,
+      'psType': psType,
+    });
+  }
+
   @override
   Future<void> enterUpgradeState(String uuid) =>
       methodChannel.invokeMethod("enterUpgradeState", uuid);

@@ -81,6 +81,9 @@ class BleManager: NSObject {
     //  - OTA WriteWithoutResponse 写队列(key: peripheral.identifier.uuidString)
     //  - 仅在 sendCmdNoWait + psType==1 路径上使用, 详见 docs/IOS_OTA_NOWAIT_SPEC.md §4.2
     private lazy var otaWriteQueues: [String: OtaWriteQueue] = [:]
+    //  - 文件 RAW 批次写队列。与 OTA 同构但实例独立: pending 不共享, 退出升级只取消 OTA,
+    //    不能连带清掉正在传输的文件批次。文件控制包仍走 sendCmd 的即时写路径。
+    private lazy var fileWriteQueues: [String: OtaWriteQueue] = [:]
     //  - 原生自动回连任务，只有业务 connected 后才会加入
     lazy var reconnectTasks: [String: BleReconnectTask] = [:]
     //  - CBCentralManager 使用主队列；同步 retrieve 只允许在 App active 窗口执行，
@@ -314,6 +317,7 @@ extension BleManager {
         var shouldStopOwnedPairingRecoveryScan = false
         endpointKeys.forEach { key in
             otaWriteQueues.removeValue(forKey: key)?.cancelAll(reason: "initConfigs revoked")
+            fileWriteQueues.removeValue(forKey: key)?.cancelAll(reason: "initConfigs revoked")
             pendingConnectionAdmissionTeardowns.removeValue(forKey: key)
             peripheralCancellationWatchdogs.removeValue(forKey: key)?.workItem.cancel()
             if let scanEntry = pairingRecoveryScanTimers.removeValue(forKey: key) {
@@ -1032,7 +1036,7 @@ extension BleManager {
         psType: Int,
         result: @escaping FlutterResult
     ) {
-        guard psType == 1 else {
+        guard psType == BlePsTypeValue.ota else {
             result(OtaWriteQueue.unsupportedError(
                 endpoint: uuid,
                 reason: "batch requires OTA psType=1",
@@ -1040,11 +1044,65 @@ extension BleManager {
             ))
             return
         }
+        submitPacketBatch(
+            uuid: uuid,
+            packets: packets,
+            psType: psType,
+            channel: OtaWriteChannel.ota,
+            existingQueue: { [weak self] in self?.otaWriteQueues[uuid] },
+            storeQueue: { [weak self] queue in self?.otaWriteQueues[uuid] = queue },
+            result: result
+        )
+    }
+
+    /**
+     *  一次提交一组 already-framed 文件小包。
+     *
+     *  - 与 OTA 批次共用队列实现但实例独立: 退出升级不会清掉文件批次, 升级态仍 fail closed;
+     *  - Future 等最后一包被 CoreBluetooth 接受后才完成, 上层据此才能启动固件 8s ACK 计时。
+     */
+    func sendFilePacketBatch(
+        uuid: String,
+        packets: [Data],
+        psType: Int,
+        result: @escaping FlutterResult
+    ) {
+        guard psType == BlePsTypeValue.file else {
+            result(OtaWriteQueue.unsupportedError(
+                endpoint: uuid,
+                reason: "batch requires file psType=3",
+                pending: 0,
+                channel: OtaWriteChannel.file
+            ))
+            return
+        }
+        submitPacketBatch(
+            uuid: uuid,
+            packets: packets,
+            psType: psType,
+            channel: OtaWriteChannel.file,
+            existingQueue: { [weak self] in self?.fileWriteQueues[uuid] },
+            storeQueue: { [weak self] queue in self?.fileWriteQueues[uuid] = queue },
+            result: result
+        )
+    }
+
+    /// 批量写入口的公共准入: 参数、升级 gate、live device 与 no-response 能力都必须 fail closed。
+    private func submitPacketBatch(
+        uuid: String,
+        packets: [Data],
+        psType: Int,
+        channel: String,
+        existingQueue: () -> OtaWriteQueue?,
+        storeQueue: (OtaWriteQueue) -> Void,
+        result: @escaping FlutterResult
+    ) {
         guard !packets.isEmpty else {
             result(OtaWriteQueue.unavailableError(
                 endpoint: uuid,
                 reason: "empty batch",
-                pending: 0
+                pending: 0,
+                channel: channel
             ))
             return
         }
@@ -1052,46 +1110,51 @@ extension BleManager {
             result(OtaWriteQueue.unavailableError(
                 endpoint: uuid,
                 reason: "manager unavailable",
-                pending: 0
+                pending: 0,
+                channel: channel
             ))
             return
         }
         guard upgradeStateRegistry.canSend(endpointId: uuid, psType: psType) else {
-            loggerE(msg: "sendOtaPacketBatch: \(uuid), type=\(psType), cannot send non-OTA commands during upgrade")
+            loggerE(msg: "send \(channel) batch: \(uuid), type=\(psType), cannot send non-OTA commands during upgrade")
             result(OtaWriteQueue.unavailableError(
                 endpoint: uuid,
                 reason: "upgrade gate rejected",
-                pending: 0
+                pending: 0,
+                channel: channel
             ))
             return
         }
         guard let device = connectedDevices.first(where: { device in
             device.peripheral.identifier.uuidString == uuid
         }), let writeChars = device.writeCharsDic[psType] else {
-            loggerE(msg: "sendOtaPacketBatch: \(uuid), type=\(psType), device not found")
+            loggerE(msg: "send \(channel) batch: \(uuid), type=\(psType), device not found")
             result(OtaWriteQueue.unavailableError(
                 endpoint: uuid,
                 reason: "device or characteristic missing",
-                pending: 0
+                pending: 0,
+                channel: channel
             ))
             return
         }
         guard writeChars.properties.contains(.writeWithoutResponse) else {
-            loggerE(msg: "[ezw_ble][ota] unsupported batch uuid=\(uuid) char=\(writeChars.uuid.uuidString) reason=missing writeWithoutResponse")
+            loggerE(msg: "[ezw_ble][\(channel)] unsupported batch uuid=\(uuid) char=\(writeChars.uuid.uuidString) reason=missing writeWithoutResponse")
             result(OtaWriteQueue.unsupportedError(
                 endpoint: uuid,
                 reason: "missing writeWithoutResponse",
-                pending: queueDepthForOta(uuid: uuid)
+                pending: existingQueue()?.queueDepth ?? 0,
+                channel: channel
             ))
             return
         }
-        let queue = otaWriteQueues[uuid] ?? OtaWriteQueue(
+        let queue = existingQueue() ?? OtaWriteQueue(
             peripheral: device.peripheral,
             logger: { [weak self] msg in
                 self?.loggerD(msg: msg)
-            }
+            },
+            channel: channel
         )
-        otaWriteQueues[uuid] = queue
+        storeQueue(queue)
         let target = OtaWriteTarget(
             characteristicUUID: writeChars.uuid.uuidString,
             submit: { peripheral, value in
@@ -1246,9 +1309,11 @@ extension BleManager {
         cancelAllReconnectTasks()
         // resetBle 是中性 runtime teardown：持久 owner/autoReconnect 配置必须保留，
         // 由 Dart 下一次 activate 或 State Restoration 重新建立全新 generation。
-        //  清空所有 OTA 写队列, 通知 Dart 端 await 立即返回
+        //  清空所有 OTA / 文件写队列, 通知 Dart 端 await 立即返回
         otaWriteQueues.values.forEach { $0.cancelAll(reason: "reset") }
         otaWriteQueues.removeAll()
+        fileWriteQueues.values.forEach { $0.cancelAll(reason: "reset") }
+        fileWriteQueues.removeAll()
         loggerD(msg: "Reset: success, preserveStateRestoration=\(preserveStateRestoration)")
     }
     
@@ -2178,9 +2243,12 @@ extension BleManager {
             if !systemAutoReconnectInProgress {
                 centralManager.cancelPeripheralConnection(device.peripheral)
             }
-            //  断连/错误状态: 取消该外设的 OTA 写队列, 避免 Dart 端 await 挂起
+            //  断连/错误状态: 取消该外设的 OTA 与文件写队列, 避免 Dart 端 await 挂起
             let queueKey = device.peripheral.identifier.uuidString
             if let queue = otaWriteQueues.removeValue(forKey: queueKey) {
+                queue.cancelAll(reason: "device state=\(state.rawValue)")
+            }
+            if let queue = fileWriteQueues.removeValue(forKey: queueKey) {
                 queue.cancelAll(reason: "device state=\(state.rawValue)")
             }
             loggerD(msg: "connect-flow: \(uuid)-\(name), state = \(state), cacheEntries=\(cacheIndexes.count), tag = \(fromTag)")
@@ -2548,14 +2616,13 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
     
     /**
      *  WriteWithoutResponse 背压解除回调
-     *  - CoreBluetooth 通知该外设可继续接收无应答写入, 把信号转发到对应的 OTA 写队列继续 pump.
+     *  - CoreBluetooth 通知该外设可继续接收无应答写入, 把信号转发到该外设的两条批量写队列。
+     *  - 回调不区分通道, 两条队列都必须收到: 只喂 OTA 会让文件批次一直等兜底重查计时器。
      */
     func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
         let uuid = peripheral.identifier.uuidString
-        guard let queue = otaWriteQueues[uuid] else {
-            return
-        }
-        queue.onPeripheralReadyToSendWriteWithoutResponse()
+        otaWriteQueues[uuid]?.onPeripheralReadyToSendWriteWithoutResponse()
+        fileWriteQueues[uuid]?.onPeripheralReadyToSendWriteWithoutResponse()
     }
 
     /**
