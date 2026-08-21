@@ -898,7 +898,7 @@ iOS 端 OTA 通道走单独的 per-peripheral 写队列 `OtaWriteQueue`，目标
 
 - **触发条件**：仅 `sendCmdNoWait` + `psType == 1` 且特征声明 `.writeWithoutResponse` property 时启用；其它路径走原有 `WriteWithoutResponse` 即时返回，行为不变。
 - **成功语义**：OTA no-wait 的 Dart Future 成功只表示 iOS 已经调用 `peripheral.writeValue(..., type: .withoutResponse)` 提交给 CoreBluetooth；它不是设备 ACK、CRC 成功或 flash 写入完成。
-- **背压机制**：`pump()` 写包前检查 `peripheral.canSendWriteWithoutResponse`，命中 `false` 即暂停，优先等 `peripheralIsReady(toSendWriteWithoutResponse:)` 回调驱动续写；同时有 watchdog 短周期重查 `canSend`，避免回调缺失时 Dart await 永久挂起。
+- **背压机制**：`pump()` 写包前检查 `peripheral.canSendWriteWithoutResponse`，命中 `false` 即暂停，优先等 `peripheralIsReady(toSendWriteWithoutResponse:)` 回调驱动续写；同时有 watchdog 短周期重查 `canSend`。持续 4 秒只进入一次性 1 秒 grace 并保留原 pending，grace 内 callback/poll 恢复只提交一次；总计 5 秒仍不可写才返回 `ota_write_stalled`。每次等待用内部 episode 隔离旧 timer，ready 在 `canSend` 仍为 false 时不得重置计时，避免 Dart await 被迟到任务或虚假回调永久挂起。
 - **软节流**：每 `softDrainEvery = 64` 包主动让出，等下一次 `peripheralIsReady` 或更保守的 watchdog 重查，防御老机型 `canSendWriteWithoutResponse` "报喜不报忧"。该阈值是配置常量，调参后回归测试。
 - **Dart 侧同步**：`MethodChannelEzwBle.sendCmdNoWait` 已统一走 `methodChannel.invokeMethod`，**不再 fall back 到 `sendCmd`**。改 Dart 入口前先确认原生 `sendCmdNoWait` handler 仍然处理所有 `psType` 分支（OTA + 兜底）。
 - **fail closed**：OTA 特征不支持 `.writeWithoutResponse`、manager 不可用、device/characteristic 缺失或提交前外设释放时，`sendCmdNoWait(psType == 1)` 返回 typed `FlutterError`（`ota_write_unsupported` / `ota_write_unavailable`），不得回退为看似成功的旧路径。

@@ -896,13 +896,15 @@ class RunnerTests: XCTestCase {
     XCTAssertNil(results.first!)
   }
 
-  func testOtaWriteQueueCompletesStalledBackpressureWithTypedFlutterError() {
+  func testOtaWriteQueueKeepsPendingWhenBaseBackpressureThresholdExpires() {
     let peripheral = FakeOtaPeripheral(endpointId: "g2-left", canSend: false)
     let clock = FakeOtaClock()
     let scheduler = FakeOtaScheduler()
     var results: [Any?] = []
+    var logs: [String] = []
     let queue = OtaWriteQueue(
       peripheral: peripheral,
+      logger: { logs.append($0) },
       clock: clock,
       scheduler: scheduler
     )
@@ -916,13 +918,154 @@ class RunnerTests: XCTestCase {
     clock.advance(by: 4.1)
     scheduler.runNext()
 
+    XCTAssertTrue(results.isEmpty)
+    XCTAssertTrue(queue.hasPending)
+    XCTAssertTrue(logs.contains { $0.contains("stage=grace") })
+  }
+
+  func testOtaWriteQueueSubmitsOnceWhenReadyArrivesDuringGrace() {
+    let peripheral = FakeOtaPeripheral(endpointId: "g2-left", canSend: false)
+    let clock = FakeOtaClock()
+    let scheduler = FakeOtaScheduler()
+    var results: [Any?] = []
+    var submitCount = 0
+    var logs: [String] = []
+    let queue = OtaWriteQueue(
+      peripheral: peripheral,
+      logger: { logs.append($0) },
+      clock: clock,
+      scheduler: scheduler
+    )
+
+    queue.enqueue(data: Data([0x03]), target: makeFakeOtaTarget { _ in
+      submitCount += 1
+      return true
+    }) { value in
+      results.append(value)
+    }
+    clock.advance(by: 4.1)
+    scheduler.runNext()
+    clock.advance(by: 0.234)
+    peripheral.canSendWriteWithoutResponse = true
+    queue.onPeripheralReadyToSendWriteWithoutResponse()
+    // 被 ready 取消的 grace watchdog 即使仍留在 fake scheduler，也不能二次结算。
+    scheduler.runNext()
+
+    XCTAssertEqual(submitCount, 1)
+    XCTAssertEqual(results.count, 1)
+    XCTAssertNil(results.first!)
+    XCTAssertFalse(queue.hasPending)
+    XCTAssertTrue(logs.contains {
+      $0.contains("resumed") &&
+        $0.contains("stage=grace") &&
+        $0.contains("source=callback")
+    })
+  }
+
+  func testOtaWriteQueueCompletesStalledBackpressureAfterGraceWithTypedFlutterError() {
+    let peripheral = FakeOtaPeripheral(endpointId: "g2-left", canSend: false)
+    let clock = FakeOtaClock()
+    let scheduler = FakeOtaScheduler()
+    var results: [Any?] = []
+    var logs: [String] = []
+    let queue = OtaWriteQueue(
+      peripheral: peripheral,
+      logger: { logs.append($0) },
+      clock: clock,
+      scheduler: scheduler
+    )
+
+    queue.enqueue(data: Data([0x04]), target: makeFakeOtaTarget { _ in
+      XCTFail("stalled write must not be submitted")
+      return true
+    }) { value in
+      results.append(value)
+    }
+    clock.advance(by: 4.1)
+    scheduler.runNext()
+    clock.advance(by: 1.0)
+    scheduler.runNext()
+
     let error = results.first as? FlutterError
     XCTAssertEqual(error?.code, "ota_write_stalled")
     let details = error?.details as? [String: Any]
     XCTAssertEqual(details?["endpoint"] as? String, "g2-left")
     XCTAssertEqual(details?["reason"] as? String, "canSend=false")
     XCTAssertEqual(details?["pending"] as? Int, 1)
-    XCTAssertGreaterThanOrEqual(details?["wait"] as? TimeInterval ?? 0, 4.0)
+    XCTAssertGreaterThanOrEqual(details?["wait"] as? TimeInterval ?? 0, 5.0)
+    XCTAssertTrue(logs.contains {
+      $0.contains("stage=terminal") && $0.contains("episode=")
+    })
+  }
+
+  func testOtaWriteQueueCancellationDuringGraceRejectsLateReady() {
+    let peripheral = FakeOtaPeripheral(endpointId: "g2-left", canSend: false)
+    let clock = FakeOtaClock()
+    let scheduler = FakeOtaScheduler()
+    var results: [Any?] = []
+    var submitCount = 0
+    let queue = OtaWriteQueue(
+      peripheral: peripheral,
+      clock: clock,
+      scheduler: scheduler
+    )
+
+    queue.enqueue(data: Data([0x05]), target: makeFakeOtaTarget { _ in
+      submitCount += 1
+      return true
+    }) { value in
+      results.append(value)
+    }
+    clock.advance(by: 4.1)
+    scheduler.runNext()
+    queue.cancelAll(reason: "reset")
+    peripheral.canSendWriteWithoutResponse = true
+    queue.onPeripheralReadyToSendWriteWithoutResponse()
+    scheduler.runNext()
+
+    XCTAssertEqual(submitCount, 0)
+    XCTAssertEqual(results.count, 1)
+    XCTAssertEqual((results.first as? FlutterError)?.code, "ota_write_cancelled")
+  }
+
+  func testOtaWriteQueueStaleEpisodeTimerCannotDriveNewPendingWrite() {
+    let peripheral = FakeOtaPeripheral(endpointId: "g2-left", canSend: false)
+    let scheduler = FakeOtaScheduler()
+    var firstResults: [Any?] = []
+    var secondResults: [Any?] = []
+    var secondSubmitCount = 0
+    let queue = OtaWriteQueue(
+      peripheral: peripheral,
+      scheduler: scheduler
+    )
+
+    queue.enqueue(data: Data([0x06]), target: makeFakeOtaTarget { _ in
+      XCTFail("cancelled first episode must not submit")
+      return true
+    }) { value in
+      firstResults.append(value)
+    }
+    queue.cancelAll(reason: "replace")
+    queue.enqueue(data: Data([0x07]), target: makeFakeOtaTarget { _ in
+      secondSubmitCount += 1
+      return true
+    }) { value in
+      secondResults.append(value)
+    }
+
+    // 强制执行已取消的旧 block，验证 episode guard，而不是只依赖 scheduler cancel。
+    scheduler.runNextIgnoringCancellation()
+    XCTAssertEqual((firstResults.first as? FlutterError)?.code, "ota_write_cancelled")
+    XCTAssertTrue(secondResults.isEmpty)
+    XCTAssertEqual(secondSubmitCount, 0)
+    XCTAssertTrue(queue.hasPending)
+
+    peripheral.canSendWriteWithoutResponse = true
+    queue.onPeripheralReadyToSendWriteWithoutResponse()
+
+    XCTAssertEqual(secondSubmitCount, 1)
+    XCTAssertEqual(secondResults.count, 1)
+    XCTAssertNil(secondResults.first!)
   }
 
   func testOtaWriteQueueCompletesCancelledPendingWritesWithTypedFlutterError() {
@@ -1037,5 +1180,13 @@ private final class FakeOtaScheduler: OtaWriteScheduler {
     if !cancellable.isCancelled {
       block()
     }
+  }
+
+  func runNextIgnoringCancellation() {
+    guard !blocks.isEmpty else {
+      return
+    }
+    let (_, block) = blocks.removeFirst()
+    block()
   }
 }

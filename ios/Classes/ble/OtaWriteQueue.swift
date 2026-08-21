@@ -95,8 +95,11 @@ final class OtaWriteQueue {
     private static let backpressureRetryInterval: TimeInterval = 0.1
     //  - 软节流本身用于防突发丢包, 兜底重查要更保守, 避免绕过节流保护。
     private static let softThrottleRetryInterval: TimeInterval = 0.5
-    //  - 原生侧提前用 typed error 释放 pending，让上层分类并终止当前 OTA 写入链路。
+    //  - 4 秒是异常背压的观测阈值；现场日志证明 CoreBluetooth 可能在阈值后数百毫秒
+    //    才发布 ready，因此只进入一次有界宽限，不能在这里提前清掉仍可恢复的 pending。
     private static let backpressureStallTimeout: TimeInterval = 4.0
+    //  - 宽限最多 1 秒；总等待 5 秒仍不可写时继续 fail-closed，避免 Dart await 永久挂起。
+    private static let backpressureGraceTimeout: TimeInterval = 1.0
 
     //  =========== Variables
     //  - 关联外设(弱引用避免循环持有)
@@ -107,6 +110,12 @@ final class OtaWriteQueue {
     private var sinceLastDrainSync: Int = 0
     //  - 进入 canSend=false / 软节流等待的时间
     private var backpressureStartedAt: Date?
+    //  - 同一次背压只允许进入一次 grace，避免 watchdog 每 100ms 重复记录阈值日志。
+    private var backpressureEnteredGrace: Bool = false
+    //  - 当前等待原因仅用于结构化诊断，不能参与是否放行写入的判断。
+    private var backpressureReason: String?
+    //  - 每次建立或清理等待都推进 episode；旧 timer 即使迟到执行也不能驱动新 pending。
+    private var backpressureEpisode: UInt64 = 0
     //  - 兜底重查任务; 只允许一个 pending work item
     private var backpressureRetryWorkItem: OtaWriteCancellable?
     //  - 时钟/调度器注入只服务于真实 XCTest 行为覆盖, 生产路径仍使用系统实现。
@@ -158,9 +167,10 @@ extension OtaWriteQueue {
      *  - OS 通知背压解除, 立即继续抽干队列.
      */
     func onPeripheralReadyToSendWriteWithoutResponse() {
-        logger?("[ezw_ble][ota] ready endpoint=\(peripheral?.otaEndpointId ?? "released") pending=\(pending.count)")
-        clearBackpressureWait()
-        pump()
+        logger?("[ezw_ble][ota] ready endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) pending=\(pending.count)")
+        // ready 回调本身不重置计时；只有 canSend 已真实恢复时 pump 才结束当前 episode，
+        // 否则一次虚假/过早回调会把 5 秒 fail-closed 窗口无限向后延长。
+        pump(resumeSource: "callback")
     }
 
     /**
@@ -170,9 +180,11 @@ extension OtaWriteQueue {
      */
     func cancelAll(reason: String) {
         guard !pending.isEmpty else {
+            sinceLastDrainSync = 0
+            clearBackpressureWait()
             return
         }
-        logger?("[ezw_ble][ota] cancelled endpoint=\(peripheral?.otaEndpointId ?? "released") reason=\(reason) pending=\(pending.count)")
+        logger?("[ezw_ble][ota] cancelled endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) stage=\(backpressureStage) reason=\(reason) pending=\(pending.count)")
         let snapshot = pending
         pending.removeAll()
         sinceLastDrainSync = 0
@@ -204,7 +216,7 @@ extension OtaWriteQueue {
      *  - 2、循环写入直到队列空, 或背压挂起, 或触发软节流阈值;
      *  - 3、每包提交给 CoreBluetooth 后 result(nil), Dart 侧自然按 await 串行发下一包.
      */
-    private func pump() {
+    private func pump(resumeSource: String? = nil) {
         //  1、外设已被释放(异常断连/重置), 清空所有 pending
         guard let peripheral = peripheral else {
             completePendingAsUnavailable(reason: "peripheral released")
@@ -214,13 +226,14 @@ extension OtaWriteQueue {
         while !pending.isEmpty {
             //  - 2.1、CoreBluetooth 暂时不能再吞包, 等下一次 peripheralIsReady 回调
             guard peripheral.canSendWriteWithoutResponse else {
-                if shouldCancelStalledBackpressure(reason: "canSend=false") {
+                markBackpressureWaitStarted(reason: "canSend=false")
+                if shouldCompleteStalledBackpressure(reason: "canSend=false") {
                     return
                 }
-                logger?("[ezw_ble][ota] stalled endpoint=\(peripheral.otaEndpointId) reason=canSend=false wait=pending pending=\(pending.count)")
                 scheduleBackpressureRetry(after: Self.backpressureRetryInterval)
                 return
             }
+            logBackpressureResumeIfNeeded(source: resumeSource ?? "pump")
             clearBackpressureWait()
             //  - 2.2、出队并写入
             let head = pending.removeFirst()
@@ -241,9 +254,8 @@ extension OtaWriteQueue {
             //  -- canSendWriteWithoutResponse 在 iPhone 6s/SE 一代等老机型上"报喜不报忧",
             //  -- 突发塞包会触发底层丢包, 这里强制等下一次 peripheralIsReady 回调
             if sinceLastDrainSync >= Self.softDrainEvery {
-                logger?("[ezw_ble][ota] stalled endpoint=\(peripheral.otaEndpointId) reason=softThrottle wait=ready pending=\(pending.count)")
                 sinceLastDrainSync = 0
-                markBackpressureWaitStarted()
+                markBackpressureWaitStarted(reason: "softThrottle")
                 scheduleBackpressureRetry(after: Self.softThrottleRetryInterval)
                 return
             }
@@ -278,37 +290,54 @@ private extension OtaWriteQueue {
 // MARK: - Backpressure Watchdog
 private extension OtaWriteQueue {
 
-    func markBackpressureWaitStarted() {
+    var backpressureStage: String {
+        return backpressureEnteredGrace ? "grace" : "base"
+    }
+
+    func markBackpressureWaitStarted(reason: String) {
         if backpressureStartedAt == nil {
+            backpressureEpisode &+= 1
             backpressureStartedAt = clock.now
+            backpressureEnteredGrace = false
+            backpressureReason = reason
+            logger?("[ezw_ble][ota] backpressure endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) stage=base reason=\(reason) wait=0.0s pending=\(pending.count)")
         }
     }
 
     func clearBackpressureWait() {
+        if backpressureStartedAt != nil || backpressureRetryWorkItem != nil {
+            // 先推进 token，再取消任务；即使测试调度器或系统队列仍执行旧 block，
+            // captured episode 也无法触碰下一次等待的 work item 或 pending。
+            backpressureEpisode &+= 1
+        }
         backpressureStartedAt = nil
+        backpressureEnteredGrace = false
+        backpressureReason = nil
         backpressureRetryWorkItem?.cancel()
         backpressureRetryWorkItem = nil
     }
 
     func scheduleBackpressureRetry(after interval: TimeInterval) {
-        markBackpressureWaitStarted()
         guard backpressureRetryWorkItem == nil else {
             return
         }
+        let episode = backpressureEpisode
         backpressureRetryWorkItem = scheduler.schedule(after: interval) { [weak self] in
-            guard let self = self else {
+            guard let self = self,
+                  self.backpressureEpisode == episode,
+                  self.backpressureStartedAt != nil else {
                 return
             }
             self.backpressureRetryWorkItem = nil
             guard !self.pending.isEmpty else {
                 return
             }
-            self.pump()
+            self.pump(resumeSource: "poll")
         }
     }
 
-    func shouldCancelStalledBackpressure(reason: String) -> Bool {
-        markBackpressureWaitStarted()
+    /// 4 秒只进入一次 grace，5 秒仍不可写才终止，兼顾迟到 ready 与有界 await。
+    func shouldCompleteStalledBackpressure(reason: String) -> Bool {
         guard let startedAt = backpressureStartedAt else {
             return false
         }
@@ -316,7 +345,15 @@ private extension OtaWriteQueue {
         guard waitSeconds >= Self.backpressureStallTimeout else {
             return false
         }
-        logger?("[ezw_ble][ota] stalled endpoint=\(peripheral?.otaEndpointId ?? "released") reason=\(reason) wait=\(String(format: "%.1f", waitSeconds))s pending=\(pending.count)")
+        let terminalTimeout = Self.backpressureStallTimeout + Self.backpressureGraceTimeout
+        guard waitSeconds >= terminalTimeout else {
+            if !backpressureEnteredGrace {
+                backpressureEnteredGrace = true
+                logger?("[ezw_ble][ota] backpressure endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) stage=grace reason=\(reason) wait=\(String(format: "%.3f", waitSeconds))s pending=\(pending.count)")
+            }
+            return false
+        }
+        logger?("[ezw_ble][ota] stalled endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) stage=terminal reason=\(reason) wait=\(String(format: "%.3f", waitSeconds))s pending=\(pending.count)")
         let snapshot = pending
         pending.removeAll()
         sinceLastDrainSync = 0
@@ -330,6 +367,14 @@ private extension OtaWriteQueue {
             ))
         }
         return true
+    }
+
+    func logBackpressureResumeIfNeeded(source: String) {
+        guard let startedAt = backpressureStartedAt else {
+            return
+        }
+        let waitSeconds = clock.now.timeIntervalSince(startedAt)
+        logger?("[ezw_ble][ota] resumed endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) stage=\(backpressureStage) reason=\(backpressureReason ?? "unknown") source=\(source) wait=\(String(format: "%.3f", waitSeconds))s pending=\(pending.count)")
     }
 }
 
