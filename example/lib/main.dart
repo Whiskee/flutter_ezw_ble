@@ -57,7 +57,7 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
   // App 启动时 `bootstrap` 和生命周期 `resumed` 可能同时重放配置。
   // 用同一个 Future 合并并发 reload，避免重复调用原生 initConfigs 卡住首帧。
   Future<void>? _configReloadFuture;
-  // initConfigs 可能在 iOS restoration / native reconnect 排队时晚于 5s 返回。
+  // initConfigs 可能在 iOS native reconnect 排队时晚于 5s 返回。
   // 用 epoch 只接受最后一次配置下发的异步完成，避免旧 Future 反向覆盖新配置状态。
   int _configInitEpoch = 0;
   String? _activeG2AuthUuid;
@@ -122,7 +122,7 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
     _initPlatformState();
     _listenBleEvents();
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      // 首屏必须先出来。配置恢复、State Restoration 事件 drain、缓存设备恢复都放到
+      // 首屏必须先出来。配置恢复、原生回连事件 drain、缓存设备恢复都放到
       // 首帧之后执行，避免 iOS 安装启动阶段看起来像卡在空白页。
       _initialBootstrapStarted = true;
       unawaited(_bootstrap());
@@ -154,9 +154,9 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
         _addLog('app resumed ignored: bootstrap not finished');
         return;
       }
-      // iOS State Restoration can wake the process before the Flutter tree has
-      // finished bootstrapping. Reloading here makes cached configs available
-      // again, while `_configReloadFuture` prevents duplicate native init.
+      // iOS resume can arrive before bootstrap has finished. Reloading here
+      // makes cached configs available again, while `_configReloadFuture`
+      // prevents duplicate native init.
       unawaited(_reloadCachedBleConfig(reason: 'app resumed'));
     }
   }
@@ -185,7 +185,8 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
       if (_configsReady) {
         _restoreLastDevice();
       } else if (_hasActiveConfigs) {
-        _addLog('restore cached device deferred: configs pending, reason=bootstrap');
+        _addLog(
+            'restore cached device deferred: configs pending, reason=bootstrap');
       }
     } finally {
       _initialBootstrapFinished = true;
@@ -196,7 +197,7 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
   ///
   /// `bootstrap` and `AppLifecycleState.resumed` can overlap on physical iOS
   /// devices. Joining the in-flight Future keeps MethodChannel calls ordered and
-  /// prevents two `initConfigs` calls from racing the restoration pipeline.
+  /// prevents two `initConfigs` calls from racing the reconnect pipeline.
   Future<void> _reloadCachedBleConfig({required String reason}) async {
     final activeReload = _configReloadFuture;
     if (activeReload != null) {
@@ -338,11 +339,11 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
           _failInitConfigs(error);
         }),
       );
-      // Guard the MethodChannel await because State Restoration / native
-      // reconnect bugs otherwise look like a Flutter launch hang.
+      // Guard the MethodChannel await because native reconnect bugs otherwise
+      // look like a Flutter launch hang.
       await initFuture.timeout(
-            const Duration(seconds: 5),
-          );
+        const Duration(seconds: 5),
+      );
       _finishInitConfigs(configs, reason: 'ack');
     } on TimeoutException catch (error) {
       _addLog('initConfigs pending: $error');
@@ -385,7 +386,7 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
     _notifyDetailStateChanged();
   }
 
-  /// Drains native reconnect/restoration breadcrumbs collected before Dart was ready.
+  /// Drains native reconnect breadcrumbs collected before Dart was ready.
   ///
   /// These logs are diagnostic only; reconnect itself is driven by native state
   /// and normal `connectStatus` events.
@@ -414,7 +415,7 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
   Future<void> _startScan() async {
     if (!_configsReady) {
       // Configs are only pushed when missing or dirty. Re-running initConfigs
-      // on every scan makes the logs noisy and can race with restoration work.
+      // on every scan makes the logs noisy and can race with reconnect work.
       await _initConfigs();
     }
     if (!_configsReady) {

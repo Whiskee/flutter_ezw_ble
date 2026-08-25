@@ -29,6 +29,8 @@ data class BleConfig(
     val autoReconnectMaxAttempts: Int = 0,
     /** 是否允许平台 passive autoConnect 能力。 */
     val autoReconnectUseNativePassive: Boolean = true,
+    /** Android 高可靠链路模式；只由明确需要高吞吐且易受遮挡的设备配置开启。 */
+    val androidHighReliabilityMode: Boolean = false,
 ): GsonSerializable() {
 
     companion object {

@@ -18,6 +18,10 @@ BleConnectModel _$BleConnectModelFromJson(Map<String, dynamic> json) =>
           BleConnectSource.unknown,
       sessionGeneration: (json['generation'] as num?)?.toInt() ?? 0,
       attemptGeneration: (json['attemptGeneration'] as num?)?.toInt() ?? 0,
+      nativeTrace: json['nativeTrace'] == null
+          ? null
+          : BleNativeConnectionTrace.fromJson(
+              json['nativeTrace'] as Map<String, dynamic>),
     );
 
 Map<String, dynamic> _$BleConnectModelToJson(BleConnectModel instance) =>
@@ -30,12 +34,12 @@ Map<String, dynamic> _$BleConnectModelToJson(BleConnectModel instance) =>
       'source': _$BleConnectSourceEnumMap[instance.source]!,
       'generation': instance.sessionGeneration,
       'attemptGeneration': instance.attemptGeneration,
+      'nativeTrace': instance.nativeTrace?.toJson(),
     };
 
 const _$BleConnectSourceEnumMap = {
   BleConnectSource.unknown: 'unknown',
   BleConnectSource.autoReconnect: 'autoReconnect',
   BleConnectSource.manualReconnect: 'manualReconnect',
-  BleConnectSource.stateRestoration: 'stateRestoration',
   BleConnectSource.foreground: 'foreground',
 };

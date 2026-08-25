@@ -770,7 +770,12 @@ internal class BleAutoReconnectSupervisor(
         val callback = createConnectCallback(task.uuid, task.source, task.sessionGeneration)
 
         // 5. 常态由 autoConnect=true 保留长期意图；可见目标只在单槽位中直连一次。
-        val gatt = gattFactory.connect(remoteDevice, context(), callback)
+        val gatt = gattFactory.connect(
+            remoteDevice,
+            context(),
+            callback,
+            config.androidHighReliabilityMode,
+        )
 
         // 6. 系统未创建 GATT session 时，按 timeout 进入下一轮调度。
         if (gatt == null) {

@@ -204,10 +204,9 @@ void main() {
       'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleAutoReconnectSupervisor.kt',
     ).readAsStringSync();
 
-    expect(
-        callback,
-        contains(
-            'onSessionTerminal(gatt, BleConnectState.DISCONNECT_FROM_SYS'));
+    expect(callback,
+        contains('terminateSession(gatt, BleConnectState.DISCONNECT_FROM_SYS'));
+    expect(callback, contains('onSessionTerminal(gatt, state, mtu)'));
     expect(manager, contains('BlePostAdmissionTerminalPolicy.resolve'));
     expect(manager, contains('businessConnectedGattSessions'));
     expect(manager, contains('session.gatt === gatt'));
@@ -235,24 +234,16 @@ void main() {
     );
   });
 
-  test('iOS didConnect, already-connected and restoration all enter one gate',
-      () {
+  test('iOS didConnect and already-connected paths enter one gate', () {
     final manager = File('ios/Classes/ble/BleManager.swift').readAsStringSync();
-    final restoration = File('ios/Classes/ble/BleStateRestorationFlow.swift')
-        .readAsStringSync();
-    final reconnect = File(
-      'ios/Classes/ble/BleAutoReconnectCoordinator.swift',
-    ).readAsStringSync();
     final flow = File('ios/Classes/ble/BleConnectionAdmissionFlow.swift')
         .readAsStringSync();
 
     expect(flow, contains('connectionAdmissionGate.onPhysicalConnected'));
     expect(flow, contains('startGrantedGattPipeline'));
     expect(flow, contains('completeBusinessConnectionAdmission'));
-    expect(restoration, contains('escrowStateRestorationPeripheral'));
-    expect(reconnect, contains('activateClaimedStateRestoration'));
-    expect(reconnect, contains('enqueuePhysicalConnectionThroughGate'));
-    expect(manager, contains('willRestoreState'));
+    expect(flow, contains('enqueuePhysicalConnectionThroughGate'));
+    expect(manager, contains('CBCentralManager('));
   });
 
   test(
@@ -475,7 +466,7 @@ void main() {
     expect(reconnect, contains('replaceConnectionCache('));
     expect(flow, contains('peripheral.state == .connected'));
     expect(flow, contains('staleBusinessConnected'));
-    expect(flow, contains('retrieve 或 restoration'));
+    expect(flow, contains('retrieve'));
   });
 
   test('iOS bluetooth-off terminals preserve an epoch-accepted generation', () {
@@ -517,8 +508,7 @@ void main() {
     );
     expect(manager, contains('source: snapshot.source'));
     expect(manager, contains('generation: snapshot.generation'));
-    expect(manager,
-        contains('attemptGeneration: snapshot.attemptGeneration'));
+    expect(manager, contains('attemptGeneration: snapshot.attemptGeneration'));
   });
 
   test('Android bluetooth-off terminals preserve an epoch-accepted generation',
@@ -567,7 +557,8 @@ void main() {
     expect(manager, isNot(contains('checkNotNull(')));
     expect(manager, contains('resolveReconnectOwnerTerminalMetadata'));
     expect(manager, contains('quarantinedDevices'));
-    expect(manager, contains('@Synchronized\n    private fun handleBluetoothStateChanged'));
+    expect(manager,
+        contains('@Synchronized\n    private fun handleBluetoothStateChanged'));
     expect(manager, contains('handleBluetoothStateChanged(state)'));
   });
 
@@ -584,17 +575,19 @@ void main() {
 
     expect(androidPolicy, contains('internal object BleUpgradeStatePolicy'));
     expect(androidManager, contains('BleUpgradeStatePolicy.canEnter'));
-    expect(androidManager, contains('BleUpgradeStatePolicy.canExitToConnected'));
+    expect(
+        androidManager, contains('BleUpgradeStatePolicy.canExitToConnected'));
     expect(androidManager, contains('if (!upgradeDevices.remove(uuid))'));
     expect(androidManager, contains('source = acceptedAdmission.source'));
     expect(androidManager,
         contains('generation = acceptedAdmission.sessionGeneration'));
     expect(iosManager, contains('connectedDevice.isConnected'));
-    expect(iosManager, contains('connectedDevice.peripheral.state == .connected'));
+    expect(
+        iosManager, contains('connectedDevice.peripheral.state == .connected'));
     expect(iosManager, contains('let metadata = metadata else'));
-    expect(iosManager,
-        contains('generation: metadata.sessionGeneration'));
-    expect(iosManager, contains('attemptGeneration: metadata.attemptGeneration'));
+    expect(iosManager, contains('generation: metadata.sessionGeneration'));
+    expect(
+        iosManager, contains('attemptGeneration: metadata.attemptGeneration'));
   });
 
   test('iOS live system disconnect reuses the exact business-connected owner',
@@ -609,8 +602,7 @@ void main() {
     );
     expect(reconnectStore, contains('state == .disconnectFromSys'));
     expect(reconnectStore, contains('task.lastConnectedGeneration'));
-    expect(reconnectStore,
-        contains('task.lastConnectedAttemptGeneration'));
+    expect(reconnectStore, contains('task.lastConnectedAttemptGeneration'));
     expect(
       manager,
       contains('BleTerminalConnectionMetadataPolicy.resolve'),

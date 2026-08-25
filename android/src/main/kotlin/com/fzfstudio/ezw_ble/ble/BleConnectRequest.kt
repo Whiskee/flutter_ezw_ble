@@ -4,7 +4,7 @@
  *
  * Keeps foreground connect request identity and logging in one place. This
  * helper does not decide routing; it makes connect/request logs stable across
- * active connect, reconnect, and restoration-like recovery paths.
+ * active connect and reconnect recovery paths.
  */
 
 package com.fzfstudio.ezw_ble.ble

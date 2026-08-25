@@ -287,6 +287,16 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     throw UnimplementedError('quiteUpgradeState() has not been implemented.');
   }
 
+  /// Enable or disable native connection trace snapshots.
+  ///
+  /// The default native value is false. Disabling must only clear trace/RSSI
+  /// diagnostics and must not disconnect devices or change auto reconnect.
+  Future<void> setConnectionTraceEnabled(bool enabled) {
+    throw UnimplementedError(
+      'setConnectionTraceEnabled(enabled: $enabled) has not been implemented.',
+    );
+  }
+
   /// 打开蓝牙设置页面
   Future<void> openBleSettings() {
     throw UnimplementedError('openBleSettings() has not been implemented.');
@@ -299,21 +309,10 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
 
   /// 重置蓝牙。
   ///
-  /// 冷启动使用 [preserveStateRestoration] 保留 iOS 已交还、但尚未被当前设备
-  /// activation 认领的 peripheral；登出/移除/用户真取消保持默认 hard reset。
-  Future<void> resetBle({bool preserveStateRestoration = false}) {
-    throw UnimplementedError(
-      'resetBle(preserveStateRestoration: $preserveStateRestoration) has not been implemented.',
-    );
-  }
-
-  /// 结束冷启动 State Restoration 认领窗口。
-  ///
-  /// iOS 会取消未被当前业务设备认领的历史 peripheral；Android 为 no-op。
-  Future<void> finalizeStateRestorationClaims() {
-    throw UnimplementedError(
-      'finalizeStateRestorationClaims() has not been implemented.',
-    );
+  /// 这是中性 runtime teardown：释放扫描、连接和发送队列，但保留持久自动回连 owner，
+  /// 等待上层下次普通冷启动恢复流程重新 activate。
+  Future<void> resetBle() {
+    throw UnimplementedError('resetBle() has not been implemented.');
   }
 
   /// 清除连接缓存
@@ -323,7 +322,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
 
   /// 读取并清空原生自动回连/后台恢复期间持久化的事件。
   ///
-  /// 用于 iOS State Restoration 或 Android 原生回连先于 Dart 监听器发生时，
+  /// 用于原生回连先于 Dart 监听器发生时，
   /// 让业务层在启动后补齐 native 侧证据并决定是否继续业务鉴权流程。
   Future<List<Map<String, dynamic>>> drainAutoReconnectEvents() {
     throw UnimplementedError(

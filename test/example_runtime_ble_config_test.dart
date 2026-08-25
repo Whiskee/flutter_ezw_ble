@@ -38,12 +38,15 @@ void main() {
     expect(widgetSource, contains('Paste BleConfig JSON'));
   });
 
-  test('example treats initConfigs timeout as pending instead of config failure', () {
+  test(
+      'example treats initConfigs timeout as pending instead of config failure',
+      () {
     final mainSource = File('example/lib/main.dart').readAsStringSync();
 
     expect(mainSource, contains('int _configInitEpoch'));
     expect(mainSource, contains('initConfigs pending:'));
-    expect(mainSource, contains("_finishInitConfigs(configs, reason: 'late ack')"));
+    expect(mainSource,
+        contains("_finishInitConfigs(configs, reason: 'late ack')"));
     expect(
       mainSource,
       contains('restore cached device deferred: configs pending'),

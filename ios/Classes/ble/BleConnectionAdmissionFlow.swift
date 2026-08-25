@@ -24,7 +24,7 @@ extension BleManager {
     private var manualPendingReplacementThreshold: TimeInterval { 20.0 }
 
     /// 同一 CoreBluetooth UUID 在本进程内只能有一个连接缓存 owner。iOS 在蓝牙恢复、
-    /// retrieve 或 restoration 后可能返回新的 CBPeripheral 实例，不能再用对象引用判重，
+    /// retrieve 后可能返回新的 CBPeripheral 实例，不能再用对象引用判重，
     /// 否则旧实例的 `isConnected=true` 会把实际已经断开的回连短路掉。
     func connectionCacheIndexes(uuid: String, name: String = "") -> [Int] {
         guard uuid.isNotEmpty || name.isNotEmpty else { return [] }
@@ -383,7 +383,6 @@ extension BleManager {
         }
         let key = reconnectKey(uuid: admission.endpointId)
         let autoReconnect = admission.source == .autoReconnect ||
-            admission.source == .stateRestoration ||
             reconnectTasks[key] != nil
         drivePeripheralConnection(
             peripheral,
@@ -475,6 +474,7 @@ extension BleManager {
         // 3、先登记 Gate，再写 current/session 映射，保证随后物理回调可精确归属。
         connectionAdmissionGate.registerAttempt(endpointId: endpointId, generation: generation)
         currentConnectionAdmissions[key] = admission
+        startNativeTrace(endpointId: endpointId)
         peripheralConnectionSessions[admission.sessionId] = BlePeripheralConnectionSession(
             admission: admission,
             peripheral: peripheral,
@@ -529,6 +529,12 @@ extension BleManager {
         // 已建立的链路并重开 GATT；这也是区别“陈旧 pending”与正常慢连接的边界。
         session.hasObservedPhysicalContact = true
         peripheralConnectionSessions[admission.sessionId] = session
+        recordNativeTrace(
+            uuid: admission.endpointId,
+            stage: "connect",
+            result: "success",
+            causeDomain: "CoreBluetooth"
+        )
         pendingPhysicalConnectWatchdogs.takeIfCurrent(admission)?.cancel()
         visiblePendingRecoveryWatchdogs.takeIfCurrent(admission)?.cancel()
         // 3、把 contact 交给 Gate；只有 granted 才开始 GATT/service pipeline。
@@ -557,24 +563,6 @@ extension BleManager {
             peripheralConnectionSessions.removeValue(forKey: admission.sessionId)
             centralManager.cancelPeripheralConnection(peripheral)
         }
-    }
-
-    /// restoration 已连接外设也必须进入同一 Gate。
-    func enqueueRestoredPeripheralThroughGate(
-        _ peripheral: CBPeripheral,
-        config: BleConfig,
-        deviceName: String
-    ) {
-        if currentConnectionAdmission(uuid: peripheral.identifier.uuidString) == nil {
-            _ = registerConnectionAttempt(
-                peripheral: peripheral,
-                config: config,
-                deviceName: deviceName,
-                afterUpgrade: false,
-                source: .stateRestoration
-            )
-        }
-        enqueuePhysicalConnectionThroughGate(peripheral)
     }
 
     /// Gate owner 唯一允许启动 service discovery，此刻才开始连接超时。

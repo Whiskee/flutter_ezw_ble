@@ -110,7 +110,8 @@ void main() {
     expect(activation, isNot(contains('cancelPeripheral(')));
   });
 
-  test('manual takeover of automatic pairing recovery never mutates active source',
+  test(
+      'manual takeover of automatic pairing recovery never mutates active source',
       () {
     final reconnect = File('ios/Classes/ble/BleAutoReconnectCoordinator.swift')
         .readAsStringSync();
@@ -124,13 +125,15 @@ void main() {
     expect(reconnect, contains('centralManager.cancelPeripheralConnection'));
   });
 
-  test('non Code 14 terminal exits specialized recovery before normal reconnect',
+  test(
+      'non Code 14 terminal exits specialized recovery before normal reconnect',
       () {
     final reconnect = File('ios/Classes/ble/BleAutoReconnectCoordinator.swift')
         .readAsStringSync();
     final manager = File('ios/Classes/ble/BleManager.swift').readAsStringSync();
 
-    expect(reconnect, contains('resetPeerPairingRecoveryAfterNonPairingFailure'));
+    expect(
+        reconnect, contains('resetPeerPairingRecoveryAfterNonPairingFailure'));
     expect(manager, contains('nsError?.code != 14'));
     expect(manager, contains('error.code != 14'));
   });

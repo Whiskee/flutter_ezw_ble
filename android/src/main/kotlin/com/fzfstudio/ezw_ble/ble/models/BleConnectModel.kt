@@ -13,4 +13,5 @@ data class BleConnectModel(
     val attemptGeneration: Long = 0L,
     /** Serialized as the legacy session-generation field for old Dart consumers. */
     val generation: Long = sessionGeneration,
+    val nativeTrace: Map<String, Any?>? = null,
 ): GsonSerializable()

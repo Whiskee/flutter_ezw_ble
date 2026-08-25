@@ -3,7 +3,8 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  test('Android receiver release is idempotent across repeated engine teardown', () {
+  test('Android receiver release is idempotent across repeated engine teardown',
+      () {
     final listener = File(
       'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/services/BleStateListener.kt',
     ).readAsStringSync();
@@ -20,7 +21,8 @@ void main() {
     expect(listener, contains('isReceiverRegistered = false'));
 
     // manager 释放后必须丢弃 listener 引用，避免第二次 release 再次触达旧 receiver。
-    expect(manager, contains('private var bleStateListener: BleStateListener? = null'));
+    expect(manager,
+        contains('private var bleStateListener: BleStateListener? = null'));
     expect(manager, contains('bleStateListener?.unregister()'));
     expect(manager, contains('bleStateListener = null'));
   });

@@ -118,16 +118,15 @@ void main() {
       contains('常态保持 `autoConnect=true` 的系统 pending 请求'),
     );
     expect(androidAttemptDispatcher, contains('device.connectGatt('));
-    expect(androidAttemptDispatcher,
-        contains('device.connectGatt(context, true, callback)'));
+    expect(
+      androidAttemptDispatcher,
+      contains('autoConnect = true'),
+    );
     expect(
       androidAttemptDispatcher,
       contains('AndroidBleVisibleDirectGattFactory'),
     );
-    expect(
-      androidAttemptDispatcher,
-      contains('device.connectGatt(context, false, callback)'),
-    );
+    expect(androidAttemptDispatcher, contains('autoConnect = false'));
     expect(androidReconnect, contains('visibleDirectConnectQueue'));
     expect(androidReconnect, contains('beginVisibleDirectReconnect'));
     expect(

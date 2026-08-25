@@ -57,16 +57,16 @@ enum BleMC: String {
     case enterUpgradeState
     /// Mark a device as leaving OTA mode.
     case quiteUpgradeState
+    /// Enable/disable process-local native connection Trace.
+    case setConnectionTraceEnabled
     /// Open system Bluetooth settings.
     case openBleSettings
     /// Open this app's settings page.
     case openAppSettings
     /// Clear persisted connect identity.
     case cleanConnectCache
-    /// Drain native reconnect/restoration events buffered before Dart listeners.
+    /// Drain native reconnect events buffered before Dart listeners.
     case drainAutoReconnectEvents
-    /// Cancel restored peripherals not claimed by the current startup targets.
-    case finalizeStateRestorationClaims
     /// Reset native BLE state.
     case resetBle
     /// Unknown method fallback.
@@ -96,7 +96,7 @@ enum BleMC: String {
             BleEC.logger.emit("[d]-BleChannel::initConfigs received=\(jsonArray.count), decoded=\(configs.count)")
             // 配置本身必须先同步写入 native，再返回 Dart；否则 Dart await 后立刻
             // startScan/connect 时，iOS 仍可能处于空配置。BleManager.initConfigs 内部
-            // 已经把 restoration/reconnect 重放 defer 到下一轮主队列，所以这里不会阻塞首帧。
+            // 已经把 reconnect 重放 defer 到下一轮主队列，所以这里不会阻塞首帧。
             BleManager.shared.initConfigs(configs: configs.map { $0! })
             result(nil)
             return
@@ -233,7 +233,7 @@ enum BleMC: String {
             result(nil)
             return
         case .reconcileBusinessConnections:
-            // iOS 的 CoreBluetooth pending/state-restoration 由现有 coordinator 管理。
+            // iOS 的 CoreBluetooth pending reconnect 由现有 coordinator 管理。
             // 保留显式 no-op 让跨平台 API 对称，不能在此重建 peripheral 或发送假终态。
             result(nil)
             return
@@ -279,25 +279,18 @@ enum BleMC: String {
             let uuid = arguments as? String ?? ""
             BleManager.shared.quiteUpgradeState(uuid: uuid)
             break
+        case .setConnectionTraceEnabled:
+            BleManager.shared.setConnectionTraceEnabled(arguments as? Bool == true)
+            break
         case .cleanConnectCache:
             BleManager.shared.cleanConnectCache()
             break
         case .drainAutoReconnectEvents:
             result(BleManager.shared.drainAutoReconnectEvents())
             return
-        case .finalizeStateRestorationClaims:
-            // 1、当前设备 activation 已逐端点认领完毕；其余 restored peripheral
-            // 属于历史设备，必须显式取消，不能继续占用系统连接或留在内存。
-            BleManager.shared.finalizeStateRestorationClaims()
-            break
         case .resetBle:
-            // 1、冷启动 reset 只清理旧 runtime，不得丢弃 willRestoreState 已交还、
-            // 尚待当前设备 activation 认领的 peripheral；旧 Dart 调用默认仍是 hard reset。
-            let data = arguments as? [String: Any] ?? [:]
-            let preserveStateRestoration = data["preserveStateRestoration"] as? Bool ?? false
-            BleManager.shared.reset(
-                preserveStateRestoration: preserveStateRestoration
-            )
+            // 1、reset 只清理当前 runtime；持久 reconnect owner 保留给下次普通恢复流程。
+            BleManager.shared.reset()
             break
         case .openBleSettings:
             if let url = URL(string: "App-Prefs:root=Bluetooth"), UIApplication.shared.canOpenURL(url) {

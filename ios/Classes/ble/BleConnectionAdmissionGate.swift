@@ -402,7 +402,7 @@ enum BleConnectionAdmissionDecision: Equatable {
 /// iOS 全局 BLE 连接准入 Gate 的纯状态机。
 ///
 /// automatic 节点按 CoreBluetooth callback FIFO；manual 节点只提升等待队列，绝不抢占
-/// active owner。generation + sessionId 一起阻断 restoration/旧 peripheral 的迟到回调。
+/// active owner。generation + sessionId 一起阻断旧 peripheral 的迟到回调。
 final class BleConnectionAdmissionGate {
     private var latestGenerations: [String: Int64] = [:]
     private var manualQueue: [BleConnectionAdmission] = []

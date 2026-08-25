@@ -15,6 +15,7 @@ export 'core/models/ble_config.dart';
 export 'core/models/ble_connect_model.dart';
 export 'core/models/ble_connect_source.dart';
 export 'core/models/ble_connect_state.dart';
+export 'core/models/ble_native_connection_trace.dart';
 export 'core/models/ble_device.dart';
 export 'core/models/ble_match_device.dart';
 export 'core/models/ble_private_service.dart';

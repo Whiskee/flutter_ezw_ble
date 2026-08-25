@@ -5,6 +5,5 @@ enum BleConnectSource {
   unknown,
   autoReconnect,
   manualReconnect,
-  stateRestoration,
   foreground,
 }

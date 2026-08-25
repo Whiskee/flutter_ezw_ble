@@ -1,17 +1,14 @@
 # Native Auto Reconnect Design
 
-This is the active plugin contract for native BLE auto reconnect and iOS
-CoreBluetooth State Preservation / Restoration. Android Companion Device
+This is the active plugin contract for native BLE auto reconnect. Android Companion Device
 Manager is intentionally out of scope for the active implementation; older CDM
 documents in this repo are archived research notes, not current APIs.
 
-For iOS State Preservation / Restoration details, see
-`docs/IOS_STATE_RESTORATION_SPEC.md`. For repository architecture and channel
-contracts, see `ARCHITECTURE.md`.
+For repository architecture and channel contracts, see `ARCHITECTURE.md`.
 
 ## Goal
 
-`flutter_ezw_ble` provides a native auto reconnect supervisor for devices that have already reached the business `connected` state. Android and iOS own reconnect scheduling, cancellation, backoff, and GATT restoration. Dart callers keep the existing `connectStatusEC` flow and only opt in through `BleConfig`.
+`flutter_ezw_ble` provides a native auto reconnect supervisor for devices that have already reached the business `connected` state. Android and iOS own reconnect scheduling, cancellation, backoff, and GATT readiness rebuild. Dart callers keep the existing `connectStatusEC` flow and only opt in through `BleConfig`.
 
 This design is intended for `even_connect` integration: `even_connect` declares which device configs support native auto reconnect, listens to the existing connection stream, sends the G2 business authentication command when `connectFinish` arrives, then calls the exact-attempt `prepareBusinessConnection` / `commitBusinessConnection` pair with that event's `uuid`, `sessionGeneration`, and `attemptGeneration`. `devicePreConnected(uuid)` / `deviceConnected(uuid)` remain as legacy G1/R1 compatibility APIs.
 
@@ -26,6 +23,7 @@ Add these fields to `BleConfig`:
 | `autoReconnect` | `false` | Enables native auto reconnect for devices using this config. |
 | `autoReconnectMaxAttempts` | `0` | Legacy/backoff compatibility field. Native reconnect no longer stops because this count is reached. |
 | `autoReconnectUseNativePassive` | `true` | Allows platform passive reconnect paths when active reconnect cannot see the device. |
+| `androidHighReliabilityMode` | `false` | Uses Android 1M-first, RSSI-adaptive PHY and traffic-aware connection priority for explicitly opted-in configs. |
 
 `autoReconnectUseNativePassive` is now a legacy compatibility field. Reconnect
 activation always uses the platform-native pending/direct path and never falls
@@ -37,11 +35,10 @@ Public methods:
 - `activateAutoReconnectTargets(devices, source)` immediately opens or reuses a
   pending direct connection for every target. `source` is `autoReconnect` or
   `manualReconnect`; manual activation promotes the same pending session rather
-  than opening a duplicate connection. On iOS it first claims a matching State
-  Restoration escrow by stable UUID or unique exact endpoint name: a connected
-  escrow enters the Gate, while an already-connecting escrow only attaches the
-  current admission and does not issue a duplicate `connect`. It returns one acknowledgement per
-  target: `resolved` means native owns a stable UUID/address,
+  than opening a duplicate connection. On iOS it first resolves a matching
+  stable UUID or unique exact endpoint name, then either enters the Gate or
+  attaches the current pending admission without issuing a duplicate `connect`.
+  It returns one acknowledgement per target: `resolved` means native owns a stable UUID/address,
   `identityPending` means iOS owns an exact config/name identity awaiting a
   CoreBluetooth UUID, and `rejected` means no native reconnect owner exists.
   Callers must not treat desired targets as active until an acknowledgement is
@@ -51,8 +48,7 @@ Public methods:
   target's pre-physical passive GATT or pending retry and queues one serialized
   `connectGatt(autoConnect=false)` attempt. It keeps the same autoReconnect
   source and long-lived passive owner after that direct attempt ends. iOS returns
-  `false` because CoreBluetooth pending connect and State Restoration remain
-  authoritative.
+  `false` because CoreBluetooth pending connect remains authoritative.
 - `prepareBusinessConnection(BleBusinessConnectionAttempt)` installs an
   in-memory lease for the exact endpoint/sessionGeneration/attemptGeneration
   that emitted `connectFinish`. Repeating the same token is idempotent and a
@@ -66,6 +62,11 @@ Public methods:
 - `abortBusinessConnection(BleBusinessConnectionAttempt)` removes only an exact
   matching lease. Stale aborts are no-ops and must not disconnect, remove
   persisted autoReconnect intent, or delete a newer prepared token.
+- `setConnectionTraceEnabled(enabled)` gates optional native connection Trace
+  snapshots. The default is `false`. Disabling only clears process-local trace
+  buffers and iOS RSSI timers; it must not disconnect, cancel, or reschedule
+  autoReconnect. Enabling starts with the next real physical attempt and does
+  not reconstruct an already-running connection.
 
 Every reconnect status event carries `source`, `generation`,
 `sessionGeneration`, and `attemptGeneration`. `generation` is retained as the
@@ -74,6 +75,18 @@ serialized compatibility key and always equals the Dart session generation.
 legacy or non-session callers, native falls back `sessionGeneration` to the
 attempt generation. Old payloads decode as `source=unknown`,
 `sessionGeneration=0`, and `attemptGeneration=0`.
+
+When Trace is enabled, each `connectStatus` event may also carry `nativeTrace`.
+The snapshot is process-local and never persisted. A native `attemptId` is a
+UUID generated for one real physical GATT/CoreBluetooth attempt; it is separate
+from `sessionGeneration` and `attemptGeneration`, which remain ownership
+guards. `steps` retain at most 32 entries, de-duplicate repeated
+`stage/result/serviceType`, normalize retained `stepSeq` to a continuous
+snapshot order, and emit `trace/gap` with `droppedCount` on overflow while
+preserving the first record and latest terminal record. Native records
+`attempt`, `scan`, `connect`, `bond`, `service_discovery`,
+`characteristic_discovery`, `cccd`, `mtu`, `gatt_ready`, and `disconnect`
+stages only; `gatt_ready` is not a business `attempt_result`.
 
 ## State Flow
 
@@ -257,7 +270,7 @@ advance it again. A later attempt is allocated from the maximum high-water mark
 observed by either side. This keeps a valid post-cancellation physical callback
 from being rejected as stale after OTA, device switching, or repeated cleanup.
 
-## GATT Restoration Readiness
+## GATT Reconnect Readiness
 
 Native reconnect is successful only after every configured private service is restored:
 
@@ -290,6 +303,17 @@ unresolved target, Android atomically replaces only its exact pre-physical
 passive GATT with one globally serialized `connectGatt(..., autoConnect=false,
 ...)` attempt; this is an acceleration path, not a second owner or a UI state.
 
+All three Android GATT creation paths share the same initial-PHY selector.
+Configs with `androidHighReliabilityMode=true` start on LE 1M instead of forcing
+LE 2M. Android documents that the `connectGatt` PHY argument is ignored when
+`autoConnect=true`, so every real `STATE_CONNECTED` callback for that config
+also requests 1M before adaptive monitoring begins. RSSI is sampled every five
+seconds with hysteresis (`>= -60dBm` may promote to 2M; `<= -70dBm` falls back
+to 1M). Real notify/write traffic keeps connection priority HIGH, while ten
+seconds of inactivity returns it to BALANCED. These are controller preferences
+and diagnostics only: a rejected priority/RSSI/PHY request must not create a
+terminal state, replace the admission owner, or publish business connected.
+
 Each Android passive handle has an exact pre-physical deadline as described
 above. The deadline must compare the GATT object and admission generation before
 closing; a late callback from an expired handle must fail closed and a GATT that
@@ -320,18 +344,9 @@ being reported as reusable, while a real Gate/business owner is never closed.
 iOS uses CoreBluetooth pending connects without an internal scan-first phase.
 After a previously business-connected device disconnects, the app hands a known
 `CBPeripheral` back to CoreBluetooth immediately. That pending `connect` is the
-preserved operation that can wake or relaunch the app later.
-
-`willRestoreState` may arrive before configs and the current account's bound
-targets. The restored peripheral therefore enters a native physical escrow
-instead of the GATT pipeline. Before claim, `didConnect` only holds the physical
-link; it must not discover services, enable notify, emit `noBleConfigFound`, or
-run business AUTH. A terminal callback keeps the system reconnect when
-`isReconnecting=true`; otherwise it re-arms exactly one long-lived pending
-connect. `activateAutoReconnectTargets` is the only claim point. After all G2
-legs and R1 activation calls return, the caller invokes
-`finalizeStateRestorationClaims`; remaining historical/ambiguous escrows are
-cancelled behind the existing late-callback barrier.
+preserved operation while the process is alive. If the process is reclaimed, the
+next app launch starts a new cold-start activation batch instead of claiming an
+old CoreBluetooth peripheral escrow.
 
 The central manager uses the main queue (`queue: nil`), so synchronous
 `retrieveConnectedPeripherals` and `retrievePeripherals` calls are allowed only
@@ -340,9 +355,9 @@ while the host app is active. `willResignActive`, `didEnterBackground`, and
 This prevents a MethodChannel activation during the process-exit grace window
 from blocking the main thread in CoreBluetooth synchronous XPC.
 
-While inactive, restoration escrow and a peripheral already held in the
-process may still use the existing Gate/pending-connect path. A name-only owner
-stays `identityPending` with reason `appInactiveDeferred`; a UUID owner records
+While inactive, only a peripheral already held in the process may still use the
+existing Gate/pending-connect path. A name-only owner stays `identityPending`
+with reason `appInactiveDeferred`; a UUID owner records
 `deferredByAppInactivity`. Neither path emits `noDeviceFound`, advances retry,
 or removes the long-lived owner. On `didBecomeActive`, native revalidates the
 current config, owner key, and session generation before one compensation pass:
@@ -356,7 +371,7 @@ iOS lookup order:
 2. `retrievePeripherals(withIdentifiers:)`.
 3. If a peripheral is known, call `centralManager.connect` immediately with the native reconnect option when available.
 4. If no peripheral is known, keep the task armed and wait for the app's
-   concurrent scan/cache update or a later retrieve/restoration opportunity.
+   concurrent scan/cache update or a later active retrieve opportunity.
 
 After reinstall, a server-restored UUID can be stale while the matching endpoint
 is already system-connected and no longer advertising. The first lookup therefore
@@ -364,13 +379,12 @@ matches either the stable UUID or the exact non-empty endpoint name; when it fin
 a new CoreBluetooth UUID, identity migration must finish before admission is
 registered. The migrated peripheral then uses the existing Gate/GATT pipeline.
 
-iOS 17+ may pass `CBConnectPeripheralOptionEnableAutoReconnect` when available. Lower versions still keep a pending `centralManager.connect` for a known peripheral and rely on CoreBluetooth to complete the connection when the device returns. Apps that need background reconnect must configure `UIBackgroundModes = bluetooth-central` and use CoreBluetooth state restoration.
-
-The iOS plugin must not pass `CBCentralManagerOptionRestoreIdentifierKey` unless
-the host app has declared `UIBackgroundModes = bluetooth-central`. Apple raises
-an `NSException` for that combination. When the mode is missing, the plugin
-falls back to a normal central manager: foreground BLE and pending connects can
-still work while State Restoration background relaunch is disabled.
+iOS 17+ may pass `CBConnectPeripheralOptionEnableAutoReconnect` when available.
+Lower versions still keep a pending `centralManager.connect` for a known
+peripheral and rely on CoreBluetooth to complete the connection when the device
+returns. Hosts keep `UIBackgroundModes = bluetooth-central` for ordinary
+background BLE capability. Process relaunch starts a new cold-start connection
+flow.
 
 Do not start the short connect timeout while the reconnect is only pending in CoreBluetooth; otherwise the app can cancel the preserved connect before the peripheral returns. Start the normal timeout after `didConnect`, then require service discovery, characteristic discovery, CCCD writes, `connectFinish`, G2 AUTH, and final `deviceConnected`.
 
@@ -380,7 +394,7 @@ timeout just because the peripheral stayed away for minutes or hours.
 
 `connectedDevices` is only a per-process business/GATT cache, never the source
 of truth for a physical iOS link. It is keyed by stable CoreBluetooth UUID, not
-the `CBPeripheral` object identity: retrieve/restoration may return a different
+the `CBPeripheral` object identity: retrieve/cache paths may return a different
 object instance for the same UUID. A reconnect may skip `centralManager.connect`
 only when the cache is business-connected **and** that peripheral's physical
 state is `.connected`. On every terminal state all same-UUID cache entries are
@@ -436,9 +450,8 @@ hard cancel reachability without linear memory growth.
    business state but must not create per-endpoint activation sessions.
    Bluetooth available consumes that recovery debt once and submits the
    combined endpoint set.
-   On iOS, wait for every target acknowledgement in this combined batch before
-   calling `finalizeStateRestorationClaims`; finalizing per leg can cancel a
-   restored left/right/R1 endpoint that has not been offered for claim yet.
+   On iOS, the combined batch remains useful for one cold-start session, but
+   there is no finalize step.
 3. Start the app-level scan concurrently, never before direct activation. Stop
    it when all devices connect or at 20 seconds, whichever comes first. A later
    Bluetooth-on recovery trigger may reopen only this scan window for the same

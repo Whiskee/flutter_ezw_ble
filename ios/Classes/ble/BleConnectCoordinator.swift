@@ -212,7 +212,7 @@ extension BleManager {
             if easyConnect.directConnect {
                 if autoReconnectAttempt {
                     // autoReconnect 不再用显式扫描兜底。系统回连依赖 CoreBluetooth
-                    // pending connect / State Restoration；没有 peripheral cache 时交给
+                    // pending connect；没有 peripheral cache 时交给
                     // 回连调度器继续退避，而不是启动前台 scan-then-connect。
                     removeActiveConnectRequest(uuid: newEasyConnect.uuid, name: newEasyConnect.name)
                     handleConnectState(uuid: newEasyConnect.uuid, name: easyConnect.name, state: .noDeviceFound)

@@ -15,40 +15,6 @@ class BleManager: NSObject {
 
     //  使用静态常量来保证实例的唯一性
     static let shared = BleManager()
-    private static let restorationIdentifier = "com.fzfstudio.ezwble.central"
-    private static let bluetoothCentralBackgroundMode = "bluetooth-central"
-    // 缺少后台模式时输出可执行的排障提示，避免开发者误以为 iOS State Restoration 已经生效。
-    private static let stateRestorationMissingBluetoothCentralWarning =
-        "stateRestoration: WARNING disabled because host Info.plist is missing UIBackgroundModes bluetooth-central. " +
-        "If you expect iOS background reconnect or CoreBluetooth State Restoration, add UIBackgroundModes -> bluetooth-central to Runner/Info.plist."
-
-    /**
-     * 当前宿主是否声明了 CoreBluetooth State Restoration 所需的后台模式。
-     *
-     * iOS 会在 `CBCentralManagerOptionRestoreIdentifierKey` 与缺失
-     * `UIBackgroundModes.bluetooth-central` 同时出现时直接抛 NSException。
-     * 插件必须先检查宿主 Info.plist；未声明时降级为普通前台 central manager，
-     * 让 App 至少能正常启动并使用前台 BLE。
-     */
-    private static var canEnableStateRestoration: Bool {
-        let modes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String]
-        return modes?.contains(bluetoothCentralBackgroundMode) == true
-    }
-
-    /**
-     * 构造 CBCentralManager 初始化参数。
-     *
-     * 只有宿主显式声明 `bluetooth-central` 后才传 restore identifier；否则返回 nil，
-     * 避免系统异常，同时保留扫描、连接和前台自动回连能力。
-     */
-    private static func centralManagerOptions() -> [String: Any]? {
-        guard canEnableStateRestoration else {
-            return nil
-        }
-        return [
-            CBCentralManagerOptionRestoreIdentifierKey: restorationIdentifier
-        ]
-    }
     
     //  =========== Constants
     //  - 蓝牙管理工具
@@ -59,7 +25,7 @@ class BleManager: NSObject {
     //  =========== Variables
     //  - 当前蓝牙基础配置，必须实现
     lazy var bleConfigs: [BleConfig] = []
-    //  - 区分“willRestoreState 早于 initConfigs”与“initConfigs 明确传入空配置”。
+    //  - 区分“配置尚未下发”与“initConfigs 明确传入空配置”。
     var hasInitializedBleConfigs = false
     //  - 搜索：纯净搜索模式，只返回单个设备，且只有名称，uuid
     lazy var scanPureModel: Bool = false
@@ -123,8 +89,14 @@ class BleManager: NSObject {
     // the same endpoint replaces the old one, while stale abort/cleanup paths
     // must not remove a newer token.
     let businessConnectionLeases = BleBusinessConnectionLeaseRegistry()
+    // Native Trace 默认关闭。开启后仅记录下一次真实物理 attempt，不改变连接/回连行为。
+    var connectionTraceEnabled = false
+    var nativeConnectionTraces: [String: BleNativeConnectionTraceBuffer] = [:]
+    var nativeTraceRssiTimers: [String: Timer] = [:]
+    var nativeTraceRssiInFlightAttemptIds: [String: String] = [:]
+    /// Trace 专用的前一连接状态，仅用于区分 Bond 恢复超时/取消与普通连接终态。
+    var nativeTraceLastConnectStates: [String: BleConnectState] = [:]
     let reconnectStore = BleReconnectStore()
-    let restorationCoordinator = BleStateRestorationCoordinator()
     //  - 最近一次已输出的扫描配置签名，用于避免每次 startScan 都重复刷配置详情。
     private var lastLoggedScanConfigSignature: String?
     //  =========== Get/Set
@@ -139,26 +111,19 @@ class BleManager: NSObject {
     /**
      * 私有化初始化 BLE 管理器，确保全局只存在一个 CoreBluetooth central manager。
      *
-     * 初始化顺序必须先根据宿主 Info.plist 决定是否启用 State Restoration，再创建
-     * `CBCentralManager`；如果缺少 `bluetooth-central` 却传入 restore identifier，
-     * iOS 会在 App 启动阶段直接抛 NSException，Flutter 层没有机会兜底。
+     * 初始化只创建普通 CBCentralManager。后台 BLE 仍由宿主的
+     * `bluetooth-central` 能力支持普通 pending connect。
      */
     private override init() {
         super.init()
-        let options = BleManager.centralManagerOptions()
         self.centralManager = CBCentralManager(
             delegate: self,
             queue: nil,
-            options: options
+            options: nil
         )
         // 插件可能在 didBecomeActive 之后才初始化；此时允许继承当前 active 事实。
         // 后续所有切换仍只由 UIApplication 生命周期通知更新。
         allowsSynchronousCoreBluetoothLookup = UIApplication.shared.applicationState == .active
-        if options == nil {
-            loggerE(msg: BleManager.stateRestorationMissingBluetoothCentralWarning)
-        } else {
-            loggerD(msg: "stateRestoration: enabled restore id=\(BleManager.restorationIdentifier)")
-        }
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(handleAppWillEnterForeground),
@@ -199,7 +164,7 @@ extension BleManager {
     /**
      *  设置蓝牙配置。
      *
-     *  Flutter 会在启动、热重启、State Restoration 恢复后调用该方法。这里必须只做
+     *  Flutter 会在启动、热重启、普通冷启动恢复后调用该方法。这里必须只做
      *  同步赋值，不能把恢复连接/GATT 初始化放在 MethodChannel 调用栈里执行，否则
      *  Dart 的 `await initConfigs` 会阻塞首帧，表现为 App 停在启动阶段并触发 hang 日志。
      */
@@ -213,9 +178,8 @@ extension BleManager {
         }
         self.bleConfigs = configs
         self.hasInitializedBleConfigs = true
-        // MethodChannel 调用必须尽快返回 Flutter。State Restoration 只在当前设备的
-        // autoReconnect activation 到来后才允许认领，不能在这里只凭 config 类型
-        // 恢复账号历史设备。auto reconnect 补偿仍放到下一轮主队列。
+        // MethodChannel 调用必须尽快返回 Flutter，auto reconnect 补偿放到下一轮主队列，
+        // 避免在 initConfigs 的 await 边界内同步启动 GATT。
         DispatchQueue.main.async { [weak self] in
             // 1、蓝牙已恢复但任务被 poweredOff 暂停时，在配置就绪后补偿恢复。
             self?.resumeReconnectTasksIfBluetoothOn(reason: "initConfigs")
@@ -231,14 +195,6 @@ extension BleManager {
     private func revokeReconnectConfigs(_ configNames: Set<String>) {
         let revokedTasks = reconnectTasks.values.filter { configNames.contains($0.belongConfig) }
         let revokedTargets = reconnectStore.removeTargets(configNames: configNames)
-        // 配置授权撤销必须同时清除尚未被当前账号 claim 的 restoration escrow。
-        revokedTargets.forEach {
-            cancelStateRestorationEscrow(
-                uuid: $0.uuid,
-                name: $0.name,
-                reason: "initConfigs revoked \($0.belongConfig)"
-            )
-        }
         let revokedDevices = connectedDevices.filter { configNames.contains($0.belongConfig.name) }
         let revokedSessions = peripheralConnectionSessions.values.filter {
             configNames.contains($0.config.name)
@@ -343,7 +299,7 @@ extension BleManager {
     }
 
     /**
-     *  读取并清空原生自动回连/State Restoration 期间的持久化事件。
+     *  读取并清空原生自动回连期间的持久化事件。
      */
     func drainAutoReconnectEvents() -> [[String: Any]] {
         reconnectStore.drainEvents()
@@ -1114,7 +1070,6 @@ extension BleManager {
         startConnectInfos.removeAll()
         cancelAllReconnectTasks()
         clearPersistedReconnectTargets()
-        cancelAllStateRestorationEscrow(reason: "cleanConnectCache")
         //  2、取消连接超时计时器。
         connectingTimeoutTimers.forEach { (uuid, name, timer) in
             timer.invalidate()
@@ -1129,7 +1084,7 @@ extension BleManager {
     /**
      * 重置
      */
-    func reset(preserveStateRestoration: Bool = false) {
+    func reset() {
         stopScan()
         cancelAllConnectionAdmissions(reason: "reset")
         businessConnectionLeases.clear()
@@ -1149,19 +1104,17 @@ extension BleManager {
         scanConnectTimeoutTimers.removeAll()
         upgradeStateRegistry.clear()
         preConnectedDevices.removeAll()
-        // 1、冷启动中性 reset 发生在 willRestoreState 与当前设备加载之间。此时只清理
-        // 旧 runtime session，必须保留系统交还的 peripheral，等待当前 target activation
-        // 精确认领；登出、移除设备等 hard reset 仍立即清除 restoration 债务。
-        if !preserveStateRestoration {
-            cancelAllStateRestorationEscrow(reason: "hard reset")
-        }
         cancelAllReconnectTasks()
         // resetBle 是中性 runtime teardown：持久 owner/autoReconnect 配置必须保留，
-        // 由 Dart 下一次 activate 或 State Restoration 重新建立全新 generation。
+        // 由 Dart 下一次普通 cold_start/autoReconnect activate 建立全新 generation。
         //  清空所有 OTA 写队列, 通知 Dart 端 await 立即返回
         otaWriteQueues.values.forEach { $0.cancelAll(reason: "reset") }
         otaWriteQueues.removeAll()
-        loggerD(msg: "Reset: success, preserveStateRestoration=\(preserveStateRestoration)")
+        stopAllNativeTraceRssiSampling()
+        nativeTraceRssiInFlightAttemptIds.removeAll()
+        nativeTraceLastConnectStates.removeAll()
+        nativeConnectionTraces.removeAll()
+        loggerD(msg: "Reset: success")
     }
     
 }
@@ -1275,7 +1228,7 @@ extension BleManager {
     /**
      * Active-only wrapper for CoreBluetooth's synchronous identifier lookup.
      *
-     * Callers retain their existing in-memory/restoration peripheral while inactive; an empty
+     * Callers retain their existing in-memory peripheral while inactive; an empty
      * result here means "deferred", not "device missing", and must not create a terminal state.
      */
     func retrievePeripheralsWhenAppActive(
@@ -1476,21 +1429,208 @@ extension BleManager {
         }?.belongConfig
     }
 
+    /// 打开/关闭进程内 native Trace；关闭只清诊断缓存和 RSSI timer，不改变连接 owner。
+    func setConnectionTraceEnabled(_ enabled: Bool) {
+        connectionTraceEnabled = enabled
+        if !enabled {
+            stopAllNativeTraceRssiSampling()
+            nativeConnectionTraces.removeAll()
+            nativeTraceRssiInFlightAttemptIds.removeAll()
+            nativeTraceLastConnectStates.removeAll()
+        }
+        loggerD(msg: "connection trace enabled=\(enabled)")
+    }
+
+    func startNativeTrace(endpointId: String) {
+        guard connectionTraceEnabled, !endpointId.isEmpty else { return }
+        let key = reconnectKey(uuid: endpointId)
+        let trace = BleNativeConnectionTraceBuffer()
+        trace.record(stage: "attempt", result: "started")
+        nativeConnectionTraces[key] = trace
+        nativeTraceLastConnectStates.removeValue(forKey: key)
+    }
+
+    func recordNativeTrace(
+        uuid: String,
+        stage: String,
+        result: String,
+        serviceType: String? = nil,
+        causeDomain: String? = nil,
+        causeCode: Int? = nil,
+        bondState: String? = nil,
+        writeLimitBytes: Int? = nil,
+        linkTrigger: String? = nil,
+        rssiBucket: String? = nil,
+        phy: String? = nil,
+        priorityAction: String? = nil,
+        actionResult: String? = nil
+    ) {
+        guard connectionTraceEnabled, !uuid.isEmpty else { return }
+        nativeConnectionTraces[reconnectKey(uuid: uuid)]?.record(
+            stage: stage,
+            result: result,
+            serviceType: serviceType,
+            causeDomain: causeDomain,
+            causeCode: causeCode,
+            bondState: bondState,
+            writeLimitBytes: writeLimitBytes,
+            linkTrigger: linkTrigger,
+            rssiBucket: rssiBucket,
+            phy: phy,
+            priorityAction: priorityAction,
+            actionResult: actionResult
+        )
+    }
+
+    func nativeTraceSnapshot(uuid: String) -> BleNativeConnectionTrace? {
+        guard connectionTraceEnabled else { return nil }
+        return nativeConnectionTraces[reconnectKey(uuid: uuid)]?.snapshot()
+    }
+
+    func recordNativeTraceForState(uuid: String, state: BleConnectState) {
+        guard connectionTraceEnabled else { return }
+        let key = reconnectKey(uuid: uuid)
+        let previousState = nativeTraceLastConnectStates[key]
+        nativeTraceLastConnectStates[key] = state
+        switch state {
+        case .connecting:
+            recordNativeTrace(uuid: uuid, stage: "connect", result: "started")
+        case .contactDevice:
+            recordNativeTrace(uuid: uuid, stage: "connect", result: "success", causeDomain: "CoreBluetooth")
+            // CoreBluetooth intentionally exposes no public bond-state API. The
+            // marker follows physical connect and never infers `bonded` from GATT.
+            recordNativeTrace(
+                uuid: uuid,
+                stage: "bond",
+                result: "not_observable",
+                bondState: "not_observable"
+            )
+            recordNativeTrace(
+                uuid: uuid,
+                stage: "link_policy",
+                result: "state_changed",
+                linkTrigger: "platform_capability",
+                phy: "unknown",
+                priorityAction: "unsupported",
+                actionResult: "not_applicable"
+            )
+        case .searchService:
+            recordNativeTrace(uuid: uuid, stage: "service_discovery", result: "started")
+        case .serviceFail:
+            recordNativeTrace(uuid: uuid, stage: "service_discovery", result: "failed")
+        case .searchChars:
+            recordNativeTrace(uuid: uuid, stage: "characteristic_discovery", result: "started")
+        case .charsFail:
+            recordNativeTrace(uuid: uuid, stage: "characteristic_discovery", result: "failed")
+        case .startBinding:
+            recordNativeTrace(
+                uuid: uuid,
+                stage: "bond",
+                result: "started",
+                bondState: "security_recovery"
+            )
+        case .alreadyBound:
+            recordNativeTrace(
+                uuid: uuid,
+                stage: "bond",
+                result: "failed",
+                bondState: "security_recovery"
+            )
+        case .boundFail:
+            recordNativeTrace(
+                uuid: uuid,
+                stage: "bond",
+                result: "failed",
+                bondState: "security_recovery"
+            )
+        case .noDeviceFound:
+            recordNativeTrace(uuid: uuid, stage: "scan", result: "failed")
+        case .connectFinish:
+            recordNativeTrace(uuid: uuid, stage: "gatt_ready", result: "success")
+        case .timeout:
+            if previousState == .startBinding {
+                recordNativeTrace(
+                    uuid: uuid,
+                    stage: "bond",
+                    result: "timeout",
+                    causeDomain: "CoreBluetooth",
+                    bondState: "security_recovery"
+                )
+            } else {
+                recordNativeTrace(uuid: uuid, stage: "connect", result: "timeout", causeDomain: "watchdog")
+            }
+        case .bleError, .systemError:
+            recordNativeTrace(uuid: uuid, stage: "connect", result: "failed")
+        case .disconnectByUser:
+            if previousState == .startBinding {
+                recordNativeTrace(
+                    uuid: uuid,
+                    stage: "bond",
+                    result: "cancelled",
+                    bondState: "security_recovery"
+                )
+            }
+            recordNativeTrace(uuid: uuid, stage: "disconnect", result: "expected")
+            stopNativeTraceRssiSampling(uuid: uuid)
+        case .disconnectFromSys:
+            recordNativeTrace(uuid: uuid, stage: "disconnect", result: "abnormal")
+            stopNativeTraceRssiSampling(uuid: uuid)
+        default:
+            break
+        }
+    }
+
+    func startNativeTraceRssiSampling(peripheral: CBPeripheral) {
+        guard connectionTraceEnabled else { return }
+        let key = reconnectKey(uuid: peripheral.identifier.uuidString)
+        stopNativeTraceRssiSampling(uuid: peripheral.identifier.uuidString)
+        nativeTraceRssiTimers[key] = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { [weak self, weak peripheral] _ in
+            guard let self = self, let peripheral = peripheral else { return }
+            self.readNativeTraceRssi(peripheral: peripheral)
+            self.nativeTraceRssiTimers[key] = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: true) { [weak self, weak peripheral] _ in
+                guard let self = self, let peripheral = peripheral else { return }
+                self.readNativeTraceRssi(peripheral: peripheral)
+            }
+        }
+    }
+
+    func stopNativeTraceRssiSampling(uuid: String) {
+        let key = reconnectKey(uuid: uuid)
+        nativeTraceRssiTimers.removeValue(forKey: key)?.invalidate()
+        nativeTraceRssiInFlightAttemptIds.removeValue(forKey: key)
+    }
+
+    func stopAllNativeTraceRssiSampling() {
+        nativeTraceRssiTimers.values.forEach { $0.invalidate() }
+        nativeTraceRssiTimers.removeAll()
+        nativeTraceRssiInFlightAttemptIds.removeAll()
+    }
+
+    private func readNativeTraceRssi(peripheral: CBPeripheral) {
+        let uuid = peripheral.identifier.uuidString
+        let key = reconnectKey(uuid: uuid)
+        guard connectionTraceEnabled,
+              let trace = nativeConnectionTraces[key],
+              nativeTraceRssiInFlightAttemptIds[key] == nil,
+              currentConnectionAdmission(uuid: uuid) != nil else {
+            return
+        }
+        nativeTraceRssiInFlightAttemptIds[key] = trace.attemptId
+        peripheral.readRSSI()
+    }
+
     /**
      *  处理已经连接的设备
      */
     func handleAlreadyConnected(peripheral: CBPeripheral,  bleConfig: BleConfig, deviceName: String, tag: String = "") {
         // 旧入口仅作为「已有物理链路」适配层，禁止直接 discoverServices。
         if currentConnectionAdmission(uuid: peripheral.identifier.uuidString) == nil {
-            let source: BleConnectSource = tag.contains("stateRestoration")
-                ? .stateRestoration
-                : .foreground
             _ = registerConnectionAttempt(
                 peripheral: peripheral,
                 config: bleConfig,
                 deviceName: deviceName,
                 afterUpgrade: false,
-                source: source
+                source: .foreground
             )
         }
         connectPeripheralAfterCancellationBarrier(peripheral, autoReconnect: false)
@@ -1501,6 +1641,17 @@ extension BleManager {
         //  1、根据条件判断服务是否正常获取
         //  - 1.1、搜索服务出现异常错误
         guard error == nil else {
+            let nsError = error as NSError?
+            recordNativeTrace(
+                uuid: peripheral.identifier.uuidString,
+                stage: "service_discovery",
+                result: "failed",
+                causeDomain: nsError?.domain,
+                causeCode: nsError?.code
+            )
+            if let nsError {
+                recordBondSecurityFailureIfNeeded(peripheral: peripheral, error: nsError)
+            }
             handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .serviceFail, tag: tag)
             loggerD(msg: "didDiscoverServices: \(peripheral.identifier.uuidString), search service fail = \(String(describing: error))")
             return
@@ -1522,6 +1673,7 @@ extension BleManager {
             }
         }
         loggerD(msg: "didDiscoverServices: \(peripheral.identifier.uuidString)-\(peripheral.name ?? ""), total=\(services.count), matched=\(myServices.count), expected=\(bleConfig.privateServices.count), tag=\(tag)")
+        recordNativeTrace(uuid: peripheral.identifier.uuidString, stage: "service_discovery", result: "success")
         handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .searchChars, tag: tag)
         //  - 2.1、遍历发现所有私有服务的读写特征。缓存完整时直接消费缓存特征，避免恢复路径等不到回调。
         myServices.forEach { service in
@@ -1538,6 +1690,17 @@ extension BleManager {
         guard isCurrentConnectionPipeline(peripheral) else { return }
         //  1、处理错误回调
         guard error == nil else {
+            let nsError = error as NSError?
+            recordNativeTrace(
+                uuid: peripheral.identifier.uuidString,
+                stage: "characteristic_discovery",
+                result: "failed",
+                causeDomain: nsError?.domain,
+                causeCode: nsError?.code
+            )
+            if let nsError {
+                recordBondSecurityFailureIfNeeded(peripheral: peripheral, error: nsError)
+            }
             handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .charsFail, tag: tag)
             loggerE(msg: "didDiscoverCharacteristicsFor: \(peripheral.identifier.uuidString), error = \(String(describing: error))")
             return
@@ -1563,6 +1726,12 @@ extension BleManager {
             read.uuid == privateService.readCharUUID
         }
         if writeChars == nil || readChars == nil {
+            recordNativeTrace(
+                uuid: peripheral.identifier.uuidString,
+                stage: "characteristic_discovery",
+                result: "failed",
+                serviceType: "\(privateService.type)"
+            )
             handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .charsFail, tag: tag)
             loggerE(msg: "didDiscoverCharacteristicsFor: \(peripheral.identifier.uuidString), error = Chars not found")
             return
@@ -1575,6 +1744,12 @@ extension BleManager {
             loggerD(msg: "didDiscoverCharacteristicsFor: \(peripheral.identifier.uuidString), psType = \(privateService.type), duplicate chars ignored, tag=\(tag)")
             return
         }
+        recordNativeTrace(
+            uuid: peripheral.identifier.uuidString,
+            stage: "characteristic_discovery",
+            result: "success",
+            serviceType: "\(privateService.type)"
+        )
         updateConnectedDevice(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", writeChars: writeChars, readChars: readChars, psType: privateService.type)
         loggerD(msg: "didDiscoverCharacteristicsFor: \(peripheral.identifier.uuidString), psType = \(privateService.type), write = \(writeChars!.uuid.uuidString), read = \(readChars!.uuid.uuidString), tag=\(tag)")
     }
@@ -1740,6 +1915,14 @@ extension BleManager {
             let state: BleConnectState = (nsError?.code == 14 && (!hasAutoReconnectTask || stoppedForPairingFailure))
                 ? .alreadyBound
                 : .disconnectFromSys
+            recordNativeTrace(
+                uuid: admission.endpointId,
+                stage: state == .alreadyBound ? "bond" : "disconnect",
+                result: state == .alreadyBound ? "failed" : "abnormal",
+                causeDomain: nsError?.domain,
+                causeCode: nsError?.code,
+                bondState: state == .alreadyBound ? "security_recovery" : nil
+            )
             handleConnectState(
                 uuid: admission.endpointId,
                 name: peripheral.name ?? session.deviceName,
@@ -1808,6 +1991,14 @@ extension BleManager {
                 source: attemptSource
             )
             let stoppedForPairingFailure = pairingFailureAction == .stopAttempt
+            recordNativeTrace(
+                uuid: peripheral.identifier.uuidString,
+                stage: stoppedForPairingFailure ? "bond" : "disconnect",
+                result: stoppedForPairingFailure ? "failed" : "abnormal",
+                causeDomain: error.domain,
+                causeCode: error.code,
+                bondState: stoppedForPairingFailure ? "security_recovery" : nil
+            )
             handleConnectState(
                 uuid: peripheral.identifier.uuidString,
                 name: peripheral.name ?? "",
@@ -1831,6 +2022,14 @@ extension BleManager {
             )
         }
         if error.code == 14 {
+            recordNativeTrace(
+                uuid: peripheral.identifier.uuidString,
+                stage: "bond",
+                result: "failed",
+                causeDomain: error.domain,
+                causeCode: error.code,
+                bondState: "security_recovery"
+            )
             handleConnectState(
                 uuid: peripheral.identifier.uuidString,
                 name: peripheral.name ?? "",
@@ -1839,6 +2038,13 @@ extension BleManager {
                 tag: tag
             )
         } else {
+            recordNativeTrace(
+                uuid: peripheral.identifier.uuidString,
+                stage: "disconnect",
+                result: "abnormal",
+                causeDomain: error.domain,
+                causeCode: error.code
+            )
             handleConnectState(
                 uuid: peripheral.identifier.uuidString,
                 name: peripheral.name ?? "",
@@ -1967,6 +2173,15 @@ extension BleManager {
             connectedDevice.isBleFlowCompleted = true
             connectedDevices[connectedIndex] = connectedDevice
             let mtu = getDeviceMTU(peripheral: connectedDevice.peripheral)
+            let writeLimit = connectedDevice.peripheral.maximumWriteValueLength(for: .withoutResponse)
+            recordNativeTrace(
+                uuid: connectedDevice.peripheral.identifier.uuidString,
+                stage: "mtu",
+                result: "not_observable",
+                writeLimitBytes: writeLimit
+            )
+            recordNativeTrace(uuid: connectedDevice.peripheral.identifier.uuidString, stage: "gatt_ready", result: "success")
+            startNativeTraceRssiSampling(peripheral: connectedDevice.peripheral)
             handleConnectState(uuid: connectedDevice.peripheral.identifier.uuidString, name: connectedDevice.peripheral.name ?? name, state: .connectFinish, mtu: mtu, tag: tag)
             loggerD(msg: "connect-flow readiness: \(connectedDevice.peripheral.identifier.uuidString), connect finish, writeCharsCount = \(connectedDevice.writeCharsDic.keys.count), ps = \(bleConfig.privateServices.count), tag=\(tag)")
         }
@@ -2015,6 +2230,7 @@ extension BleManager {
         let eventSource = source ?? terminalMetadata?.source ?? .unknown
         let eventGeneration = generation ?? terminalMetadata?.generation ?? 0
         let eventAttemptGeneration = attemptGeneration ?? terminalMetadata?.attemptGeneration ?? currentAdmission?.generation ?? 0
+        recordNativeTraceForState(uuid: uuid, state: state)
         if currentAdmission == nil,
            source == nil,
            generation == nil,
@@ -2052,7 +2268,7 @@ extension BleManager {
         //  2、设备连接状态为失败或断连就要设置连接设备连接状态为false
         let cacheIndexes = connectionCacheIndexes(uuid: uuid, name: name)
         if state.isError() || state.isDisconnected(), cacheIndexes.isNotEmpty {
-            // 历史版本可能因 retrieve/restoration 返回不同对象而留下同 UUID 多条缓存。
+            // 历史版本可能因 retrieve 返回不同对象而留下同 UUID 多条缓存。
             // 终态必须失效全部条目，不能只更新第一条后让回连看到另一条假已连接记录。
             for index in cacheIndexes {
                 var device = connectedDevices[index]
@@ -2174,6 +2390,37 @@ extension BleManager {
         loggerD(msg: "\(peripheral.identifier.uuidString), mtu = \(attMTU), max write length = \(maxWriteLength)")
         return attMTU
     }
+
+    /// CoreBluetooth exposes security failures, but not the current bond state.
+    /// Keep this evidence list explicit so ordinary GATT failures never become
+    /// false pairing diagnoses.
+    private func isBondSecurityError(_ error: NSError) -> Bool {
+        if error.domain == CBErrorDomain,
+           error.code == CBError.Code.peerRemovedPairingInformation.rawValue {
+            return true
+        }
+        guard error.domain == CBATTErrorDomain else { return false }
+        return [
+            CBATTError.Code.insufficientAuthentication.rawValue,
+            CBATTError.Code.insufficientAuthorization.rawValue,
+            CBATTError.Code.insufficientEncryptionKeySize.rawValue,
+            CBATTError.Code.insufficientEncryption.rawValue,
+        ].contains(error.code)
+    }
+
+    /// Security evidence can arrive from service, characteristic, CCCD, or value callbacks.
+    /// It records pairing recovery without claiming that CoreBluetooth exposes bond state.
+    private func recordBondSecurityFailureIfNeeded(peripheral: CBPeripheral, error: NSError) {
+        guard isBondSecurityError(error) else { return }
+        recordNativeTrace(
+            uuid: peripheral.identifier.uuidString,
+            stage: "bond",
+            result: "failed",
+            causeDomain: error.domain,
+            causeCode: error.code,
+            bondState: "security_recovery"
+        )
+    }
     
     /**
      * 发送连接状态
@@ -2194,7 +2441,8 @@ extension BleManager {
             mtu: mtu,
             source: source,
             generation: generation,
-            attemptGeneration: attemptGeneration
+            attemptGeneration: attemptGeneration,
+            nativeTrace: nativeTraceSnapshot(uuid: uuid)
         )
         let jsonString = try? connectModel.toJsonString() ?? ""
         loggerD(msg: "connectStatus -> Flutter: \(uuid)-\(name), state=\(state.rawValue), mtu=\(mtu), source=\(source.rawValue), generation=\(generation), attemptGeneration=\(attemptGeneration)")
@@ -2279,18 +2527,6 @@ extension BleManager: CBCentralManagerDelegate {
         handleDiscoveredPeripheral(peripheral, advertisementData: advertisementData, rssi: RSSI)
     }
     
-    func centralManager(_ central: CBCentralManager, willRestoreState dict: [String : Any]) {
-        let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] ?? []
-        recordAutoReconnectEvent(
-            type: "ios_will_restore_state",
-            detail: "peripherals=\(peripherals.count), keys=\(Array(dict.keys))"
-        )
-        loggerD(msg: "stateRestoration: willRestoreState id=\(BleManager.restorationIdentifier), peripherals=\(peripherals.count), keys=\(Array(dict.keys))")
-        peripherals.forEach { peripheral in
-            escrowStateRestorationPeripheral(peripheral, source: "willRestoreState")
-        }
-    }
-    
     func centralManager(_ central: CBCentralManager, didUpdateANCSAuthorizationFor peripheral: CBPeripheral) {
         loggerE(msg: "didUpdateANCSAuthorizationFor")
     }
@@ -2302,14 +2538,9 @@ extension BleManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, timestamp: CFAbsoluteTime, isReconnecting: Bool, error: (any Error)?) {
         loggerE(msg: "didDisconnectPeripheral: timestamp = \(timestamp), isReconnecting = \(isReconnecting), error = \(String(describing: error))")
         if consumePeripheralCancellationBarrier(peripheral) { return }
-        if handleStateRestorationEscrowTerminal(
-            peripheral,
-            systemIsReconnecting: isReconnecting,
-            reason: "didDisconnect isReconnecting=\(isReconnecting)"
-        ) { return }
         if isReconnecting {
             // 系统已持有 reconnect 时只结束旧业务 session 并重建 admission；再次 connect/cancel
-            // 会破坏 CoreBluetooth 的自动回连和 State Restoration rendezvous。
+            // 会破坏 CoreBluetooth 的自动回连 rendezvous。
             handleConnectState(
                 uuid: peripheral.identifier.uuidString,
                 name: peripheral.name ?? "",
@@ -2334,7 +2565,6 @@ extension BleManager: CBCentralManagerDelegate {
             loggerD(msg: "admission gate: \(peripheral.identifier.uuidString), stale didConnect blocked by cancellation barrier")
             return
         }
-        if handleStateRestorationEscrowDidConnect(peripheral) { return }
         //  1、检查是否获取到了蓝牙配置
         guard let connectRequest = findActiveConnectRequest(peripheral: peripheral),
               let bleConfig = connectRequest.bleConfig else {
@@ -2351,11 +2581,6 @@ extension BleManager: CBCentralManagerDelegate {
      */
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         if consumePeripheralCancellationBarrier(peripheral) { return }
-        if handleStateRestorationEscrowTerminal(
-            peripheral,
-            systemIsReconnecting: false,
-            reason: "didFailToConnect error=\(String(describing: error))"
-        ) { return }
         handleConnectError(peripheral: peripheral, error: error, formMethod: "didFailToConnect")
     }
 
@@ -2364,11 +2589,6 @@ extension BleManager: CBCentralManagerDelegate {
      */
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         if consumePeripheralCancellationBarrier(peripheral) { return }
-        if handleStateRestorationEscrowTerminal(
-            peripheral,
-            systemIsReconnecting: false,
-            reason: "didDisconnect legacy error=\(String(describing: error))"
-        ) { return }
         handleConnectError(peripheral: peripheral, error: error, formMethod: "didDisconnectPeripheral")
     }
     
@@ -2409,8 +2629,17 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
         let tag = "didUpdateNotification"
         guard isCurrentConnectionPipeline(peripheral) else { return }
         if let error = error {
+            let nsError = error as NSError
+            recordNativeTrace(
+                uuid: peripheral.identifier.uuidString,
+                stage: "cccd",
+                result: "failed",
+                causeDomain: nsError.domain,
+                causeCode: nsError.code
+            )
+            recordBondSecurityFailureIfNeeded(peripheral: peripheral, error: nsError)
             //  配对授权失败
-            if let error = error as NSError?, error.domain == CBATTErrorDomain, error.code == 5 {
+            if isBondSecurityError(nsError) {
                 handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .boundFail, tag: tag)
             }
             loggerE(msg: "update notification state: \(peripheral.identifier.uuidString), error = \(error)")
@@ -2442,6 +2671,7 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
         connectedDevice.notifiedReadCharUUIDs.insert(characteristicUUID)
         connectedDevice.readCharsNotify = connectedDevice.notifiedReadCharUUIDs.count
         connectedDevices[connectedIndex] = connectedDevice
+        recordNativeTrace(uuid: peripheral.identifier.uuidString, stage: "cccd", result: "success")
         tryEmitConnectFinish(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", bleConfig: bleConfig, tag: tag)
 
     }
@@ -2458,11 +2688,32 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
         queue.onPeripheralReadyToSendWriteWithoutResponse()
     }
 
+    /// RSSI samples are trace diagnostics only; they do not emit an independent event.
+    func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
+        let uuid = peripheral.identifier.uuidString
+        let key = reconnectKey(uuid: uuid)
+        let inFlightAttemptId = nativeTraceRssiInFlightAttemptIds.removeValue(forKey: key)
+        guard connectionTraceEnabled,
+              let trace = nativeConnectionTraces[key],
+              trace.attemptId == inFlightAttemptId else {
+            return
+        }
+        if let error = error {
+            let nsError = error as NSError
+            loggerE(msg: "connection trace RSSI: \(uuid), read failed domain=\(nsError.domain), code=\(nsError.code)")
+            return
+        }
+        trace.updateRssi(RSSI.intValue)
+    }
+
     /**
      *  获取设备下发指令数据
      */
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard error == nil else {
+            if let nsError = error as NSError? {
+                recordBondSecurityFailureIfNeeded(peripheral: peripheral, error: nsError)
+            }
             loggerE(msg: "cmd response: \(peripheral.identifier.uuidString), error = \(String(describing: error))")
             return
         }
