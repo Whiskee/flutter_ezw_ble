@@ -1487,7 +1487,12 @@ extension BleManager {
         return nativeConnectionTraces[reconnectKey(uuid: uuid)]?.snapshot()
     }
 
-    func recordNativeTraceForState(uuid: String, state: BleConnectState) {
+    func recordNativeTraceForState(
+        uuid: String,
+        state: BleConnectState,
+        causeDomain: String? = nil,
+        causeCode: Int? = nil
+    ) {
         guard connectionTraceEnabled else { return }
         let key = reconnectKey(uuid: uuid)
         let previousState = nativeTraceLastConnectStates[key]
@@ -1573,7 +1578,13 @@ extension BleManager {
             recordNativeTrace(uuid: uuid, stage: "disconnect", result: "expected")
             stopNativeTraceRssiSampling(uuid: uuid)
         case .disconnectFromSys:
-            recordNativeTrace(uuid: uuid, stage: "disconnect", result: "abnormal")
+            recordNativeTrace(
+                uuid: uuid,
+                stage: "disconnect",
+                result: "abnormal",
+                causeDomain: causeDomain,
+                causeCode: causeCode
+            )
             stopNativeTraceRssiSampling(uuid: uuid)
         default:
             break
@@ -2213,6 +2224,8 @@ extension BleManager {
         peripheralTerminalAcknowledged: Bool = false,
         systemAutoReconnectInProgress: Bool = false,
         suppressReconnectSchedule: Bool = false,
+        traceCauseDomain: String? = nil,
+        traceCauseCode: Int? = nil,
         tag: String = ""
     ) {
         let fromTag = "\(tag.isNotEmpty ? " -- from: \(tag)" : "\"\"")"
@@ -2242,7 +2255,14 @@ extension BleManager {
         let eventSource = source ?? terminalMetadata?.source ?? .unknown
         let eventGeneration = generation ?? terminalMetadata?.generation ?? 0
         let eventAttemptGeneration = attemptGeneration ?? terminalMetadata?.attemptGeneration ?? currentAdmission?.generation ?? 0
-        recordNativeTraceForState(uuid: uuid, state: state)
+        // Cause metadata enriches the existing Trace step only; it must not
+        // participate in CoreBluetooth ownership or reconnect decisions.
+        recordNativeTraceForState(
+            uuid: uuid,
+            state: state,
+            causeDomain: traceCauseDomain,
+            causeCode: traceCauseCode
+        )
         if currentAdmission == nil,
            source == nil,
            generation == nil,
@@ -2506,7 +2526,11 @@ extension BleManager: CBCentralManagerDelegate {
                     state: .disconnectFromSys,
                     source: snapshot.source,
                     generation: snapshot.generation,
-                    attemptGeneration: snapshot.attemptGeneration
+                    attemptGeneration: snapshot.attemptGeneration,
+                    // CBManagerState.poweredOff rawValue is 4. Reuse the one
+                    // disconnect Trace step so analytics never sees a duplicate.
+                    traceCauseDomain: "bluetooth_adapter",
+                    traceCauseCode: CBManagerState.poweredOff.rawValue
                 )
             }
             //  - 1.3、清除缓存

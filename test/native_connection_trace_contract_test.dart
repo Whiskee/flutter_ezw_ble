@@ -71,6 +71,29 @@ void main() {
     );
   });
 
+  test('Bluetooth power-off annotates the single native disconnect step', () {
+    final android =
+        File('android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleManager.kt')
+            .readAsStringSync();
+    final ios = File('ios/Classes/ble/BleManager.swift').readAsStringSync();
+
+    expect(android, contains('traceCauseDomain = "bluetooth_adapter"'));
+    expect(android, contains('traceCauseCode = BluetoothAdapter.STATE_OFF'));
+    expect(
+      android,
+      contains(
+        'recordNativeTraceForState(uuid, state, traceCauseDomain, traceCauseCode)',
+      ),
+    );
+    expect(ios, contains('traceCauseDomain: "bluetooth_adapter"'));
+    expect(
+      ios,
+      contains('traceCauseCode: CBManagerState.poweredOff.rawValue'),
+    );
+    expect(ios, contains('causeDomain: traceCauseDomain'));
+    expect(ios, contains('causeCode: traceCauseCode'));
+  });
+
   test('native trace result vocabulary stays parseable by even_connect', () {
     final nativeSources = <String>[
       File('android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleManager.kt')

@@ -242,7 +242,12 @@ class BleManager private constructor() {
     private fun nativeTraceSnapshot(endpointId: String): JSONObject? =
         if (connectionTraceEnabled) nativeConnectionTraces[reconnectKey(endpointId)]?.snapshot() else null
 
-    private fun recordNativeTraceForState(uuid: String, state: BleConnectState) {
+    private fun recordNativeTraceForState(
+        uuid: String,
+        state: BleConnectState,
+        causeDomain: String? = null,
+        causeCode: Int? = null,
+    ) {
         val previousState = connectedDevices.firstOrNull {
             it.uuid.equals(uuid, ignoreCase = true)
         }?.connectState
@@ -297,7 +302,13 @@ class BleManager private constructor() {
                 }
                 recordNativeTraceStep(uuid, "disconnect", "expected")
             }
-            BleConnectState.DISCONNECT_FROM_SYS -> recordNativeTraceStep(uuid, "disconnect", "abnormal")
+            BleConnectState.DISCONNECT_FROM_SYS -> recordNativeTraceStep(
+                uuid,
+                "disconnect",
+                "abnormal",
+                causeDomain = causeDomain,
+                causeCode = causeCode,
+            )
             else -> Unit
         }
     }
@@ -2481,6 +2492,10 @@ class BleManager private constructor() {
                     source = snapshot.source,
                     generation = snapshot.sessionGeneration,
                     attemptGeneration = snapshot.attemptGeneration,
+                    // Android BluetoothAdapter.STATE_OFF is 10. Attach it to the
+                    // existing terminal step instead of emitting a second disconnect.
+                    traceCauseDomain = "bluetooth_adapter",
+                    traceCauseCode = BluetoothAdapter.STATE_OFF,
                 )
             }
             transportOffCapture.quarantinedDevices.forEach { device ->
@@ -3813,9 +3828,13 @@ class BleManager private constructor() {
         generation: Long = currentAdmissions[reconnectKey(uuid)]?.sessionGeneration ?: 0L,
         attemptGeneration: Long = currentAdmissions[reconnectKey(uuid)]?.generation ?: 0L,
         scheduleAutoReconnect: Boolean = true,
+        traceCauseDomain: String? = null,
+        traceCauseCode: Int? = null,
     ) {
         val key = reconnectKey(uuid)
-        recordNativeTraceForState(uuid, state)
+        // Diagnostic cause metadata is observational only and never participates
+        // in connection ownership, teardown, or reconnect scheduling.
+        recordNativeTraceForState(uuid, state, traceCauseDomain, traceCauseCode)
         val connectedDeviceBeforeState = connectedDevices.firstOrNull {
             it.uuid.equals(uuid, ignoreCase = true)
         }
