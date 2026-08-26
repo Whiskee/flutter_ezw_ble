@@ -68,7 +68,8 @@ void main() {
     expect(decoded.nativeTrace?.steps.last.priorityAction, 'unsupported');
   });
 
-  test('native trace source contracts keep bounded gap snapshots', () {
+  test('native trace source contracts preserve monotonic bounded snapshots',
+      () {
     final androidTrace = File(
       'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleNativeConnectionTrace.kt',
     ).readAsStringSync();
@@ -76,12 +77,19 @@ void main() {
         .readAsStringSync();
 
     expect(androidTrace, contains('const val MAX_STEPS = 32'));
-    expect(androidTrace, contains('normalizedStepSeq = index + 1'));
+    expect(androidTrace,
+        contains('steps.forEach { step -> array.put(step.toJson()) }'));
+    expect(androidTrace, contains('stepSeq = step.stepSeq'));
+    expect(androidTrace, contains('step.copy(stepSeq = nextStepSeq++)'));
+    expect(androidTrace, isNot(contains('normalizedStepSeq')));
     expect(androidTrace, contains('stage = "trace"'));
     expect(androidTrace, contains('result = "gap"'));
     expect(androidTrace, contains('droppedCount = droppedCount'));
     expect(iosTrace, contains('static let maxSteps = 32'));
-    expect(iosTrace, contains('normalized.stepSeq = index + 1'));
+    expect(iosTrace, contains('steps: steps'));
+    expect(iosTrace, contains('stepSeq: step.stepSeq'));
+    expect(iosTrace, contains('terminal.stepSeq = nextStepSeq'));
+    expect(iosTrace, isNot(contains('normalized.stepSeq')));
     expect(iosTrace, contains('stage: "trace"'));
     expect(iosTrace, contains('result: "gap"'));
     expect(iosTrace, contains('droppedCount: droppedCount'));

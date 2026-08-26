@@ -123,7 +123,9 @@ internal class BleNativeConnectionTraceBuffer(
         .put("attemptId", attemptId)
         .put("capturedElapsedMs", (SystemClock.elapsedRealtime() - startedAtMs).coerceAtLeast(0L))
         .put("steps", JSONArray().also { array ->
-            steps.forEachIndexed { index, step -> array.put(step.toJson(normalizedStepSeq = index + 1)) }
+            // Preserve the process-local producer sequence across bounded-buffer
+            // replacement so Dart can distinguish newly retained terminal steps.
+            steps.forEach { step -> array.put(step.toJson()) }
         })
         .also { json ->
             lastRssiDbm?.let { json.put("lastRssiDbm", it) }
@@ -140,7 +142,9 @@ internal class BleNativeConnectionTraceBuffer(
         droppedCount += 1
         val terminal = step.isTerminal
         val gap = BleNativeConnectionTraceStep(
-            stepSeq = nextStepSeq++,
+            // The incoming non-terminal stage is omitted by the bounded buffer,
+            // so its sequence becomes the observable gap sequence.
+            stepSeq = step.stepSeq,
             stage = "trace",
             result = "gap",
             elapsedMs = step.elapsedMs,
@@ -148,7 +152,8 @@ internal class BleNativeConnectionTraceBuffer(
         )
         if (terminal) {
             steps[MAX_STEPS - 2] = gap
-            steps[MAX_STEPS - 1] = step
+            // Keep the terminal after the gap in both array and producer order.
+            steps[MAX_STEPS - 1] = step.copy(stepSeq = nextStepSeq++)
         } else {
             steps[MAX_STEPS - 1] = gap
         }
@@ -180,8 +185,8 @@ internal class BleNativeConnectionTraceBuffer(
                 result == "abnormal" ||
                 result == "expected"
 
-        fun toJson(normalizedStepSeq: Int): JSONObject = JSONObject()
-            .put("stepSeq", normalizedStepSeq)
+        fun toJson(): JSONObject = JSONObject()
+            .put("stepSeq", stepSeq)
             .put("stage", stage)
             .put("result", result)
             .put("elapsedMs", elapsedMs)

@@ -12,7 +12,7 @@ struct BleNativeConnectionTrace: Codable {
     var requestedPriority: String?
 }
 
-/// One retained native stage. `stepSeq` is normalized at snapshot time.
+/// One retained native stage. `stepSeq` stays monotonic for the physical attempt.
 struct BleNativeConnectionTraceStep: Codable {
     var stepSeq: Int
     var stage: String
@@ -87,15 +87,12 @@ final class BleNativeConnectionTraceBuffer {
     }
 
     func snapshot() -> BleNativeConnectionTrace {
-        let normalizedSteps = steps.enumerated().map { index, step in
-            var normalized = step
-            normalized.stepSeq = index + 1
-            return normalized
-        }
         let age = lastRssiAt.map { max(0, Int((ProcessInfo.processInfo.systemUptime - $0) * 1000)) }
         return BleNativeConnectionTrace(
             attemptId: attemptId,
-            steps: normalizedSteps,
+            // Preserve producer sequences across bounded-buffer replacement so
+            // Dart does not mistake a new terminal stage for an old slot.
+            steps: steps,
             capturedElapsedMs: max(0, Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000)),
             lastRssiDbm: lastRssiDbm,
             rssiAgeMs: age,
@@ -111,7 +108,9 @@ final class BleNativeConnectionTraceBuffer {
         }
         droppedCount += 1
         let gap = BleNativeConnectionTraceStep(
-            stepSeq: nextStepSeq,
+            // The incoming non-terminal stage is omitted by the bounded buffer,
+            // so its sequence becomes the observable gap sequence.
+            stepSeq: step.stepSeq,
             stage: "trace",
             result: "gap",
             elapsedMs: step.elapsedMs,
@@ -127,10 +126,13 @@ final class BleNativeConnectionTraceBuffer {
             priorityAction: nil,
             actionResult: nil
         )
-        nextStepSeq += 1
         if isTerminal(step) {
+            var terminal = step
+            terminal.stepSeq = nextStepSeq
+            nextStepSeq += 1
             steps[Self.maxSteps - 2] = gap
-            steps[Self.maxSteps - 1] = step
+            // Keep the terminal after the gap in both array and producer order.
+            steps[Self.maxSteps - 1] = terminal
         } else {
             steps[Self.maxSteps - 1] = gap
         }
