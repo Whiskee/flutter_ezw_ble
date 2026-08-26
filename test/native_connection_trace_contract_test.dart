@@ -85,11 +85,19 @@ void main() {
         'recordNativeTraceForState(uuid, state, traceCauseDomain, traceCauseCode)',
       ),
     );
-    expect(ios, contains('traceCauseDomain: "bluetooth_adapter"'));
     expect(
       ios,
-      contains('traceCauseCode: CBManagerState.poweredOff.rawValue'),
+      contains(
+        'traceCauseDomain: isAdapterPoweredOff ? "bluetooth_adapter" : nil',
+      ),
     );
+    expect(
+      ios,
+      contains(
+        'traceCauseCode: isAdapterPoweredOff ? CBManagerState.poweredOff.rawValue : nil',
+      ),
+    );
+    expect(ios, contains('central.state == .poweredOff'));
     expect(ios, contains('causeDomain: traceCauseDomain'));
     expect(ios, contains('causeCode: traceCauseCode'));
   });

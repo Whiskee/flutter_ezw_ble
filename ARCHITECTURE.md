@@ -222,6 +222,10 @@ enum BleEventChannel {
 | `receiveData` | Map：`{uuid, psType, data:Base64, isSuccess}` | `BleCmd.receiveMap` | 来自原生的特征值数据。**注意 `data` 字段是 Base64**，业务侧拿到的 `BleCmd.data` 已经是 `Uint8List`，背后由 `flutter_ezw_utils.encodeBase64()` 解码。 |
 | `logger` | String，含 `[d]-` / `[e]-` 前缀 | `String` | 仅 iOS 主动 push；业务侧自行根据前缀分级。 |
 
+iOS 的非 `poweredOn` 状态继续沿用既有连接 teardown；但只有公开状态
+`CBManagerState.poweredOff` 才能在断连 Trace 上标记 `bluetooth_adapter/4`。
+`resetting`、`unauthorized`、`unsupported` 和 `unknown` 不得伪装成用户关闭蓝牙。
+
 > **修改提示**：`receiveData` 的 `data` 走 Base64 是为了避开 MethodChannel 二进制流跨 isolate 的成本；新增二进制通道时建议沿用这套约定。
 
 `receiveData` 是纯传输边界，Android、iOS 与 Dart 都必须保留通知 payload 的完整字节序列，不在本层解析、截断或重排。G2 音频流当前可能携带 `200 字节 LC3 + 4 字节方向/角色标签 + 1 字节帧序号`；这些尾部字节由上层 `even_connect` 按协议拆分，再由音频算法解释。本仓回归测试固定覆盖 205 字节帧的 Base64 往返，避免依赖升级时静默丢失方向或说话人元数据。

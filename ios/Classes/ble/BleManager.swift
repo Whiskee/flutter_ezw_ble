@@ -2507,6 +2507,10 @@ extension BleManager: CBCentralManagerDelegate {
         BleEC.bleState.emit(central.state.rawValue)
         //  1、如果蓝牙状态不是开启，则将所有已连接的设备设置为非连接状态
         if central.state != .poweredOn {
+            // CoreBluetooth 的 resetting / unauthorized / unsupported 同样会进入现有
+            // teardown，但它们不是用户关闭 Adapter。只让真实 poweredOff 携带
+            // bluetooth_adapter/4，避免分析侧把权限或协议栈重置误归因为手动关蓝牙。
+            let isAdapterPoweredOff = central.state == .poweredOff
             // admission/task 元数据必须先冻结；后续 Gate teardown 会清空当前 generation。
             let transportOffSnapshots = bluetoothOffConnectionSnapshots()
             pauseReconnectTasksForBluetoothOff()
@@ -2527,10 +2531,9 @@ extension BleManager: CBCentralManagerDelegate {
                     source: snapshot.source,
                     generation: snapshot.generation,
                     attemptGeneration: snapshot.attemptGeneration,
-                    // CBManagerState.poweredOff rawValue is 4. Reuse the one
-                    // disconnect Trace step so analytics never sees a duplicate.
-                    traceCauseDomain: "bluetooth_adapter",
-                    traceCauseCode: CBManagerState.poweredOff.rawValue
+                    // Reuse the one disconnect Trace step so analytics never sees a duplicate.
+                    traceCauseDomain: isAdapterPoweredOff ? "bluetooth_adapter" : nil,
+                    traceCauseCode: isAdapterPoweredOff ? CBManagerState.poweredOff.rawValue : nil
                 )
             }
             //  - 1.3、清除缓存
