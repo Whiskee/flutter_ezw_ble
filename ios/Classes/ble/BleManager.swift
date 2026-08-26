@@ -1584,12 +1584,15 @@ extension BleManager {
         guard connectionTraceEnabled else { return }
         let key = reconnectKey(uuid: peripheral.identifier.uuidString)
         stopNativeTraceRssiSampling(uuid: peripheral.identifier.uuidString)
+        // Freeze the producer attempt into the timer. A replacement attempt may
+        // reuse the same CoreBluetooth UUID but must never inherit this sampler.
+        guard let expectedAttemptId = nativeConnectionTraces[key]?.attemptId else { return }
         nativeTraceRssiTimers[key] = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { [weak self, weak peripheral] _ in
             guard let self = self, let peripheral = peripheral else { return }
-            self.readNativeTraceRssi(peripheral: peripheral)
+            self.readNativeTraceRssi(peripheral: peripheral, expectedAttemptId: expectedAttemptId)
             self.nativeTraceRssiTimers[key] = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: true) { [weak self, weak peripheral] _ in
                 guard let self = self, let peripheral = peripheral else { return }
-                self.readNativeTraceRssi(peripheral: peripheral)
+                self.readNativeTraceRssi(peripheral: peripheral, expectedAttemptId: expectedAttemptId)
             }
         }
     }
@@ -1606,16 +1609,25 @@ extension BleManager {
         nativeTraceRssiInFlightAttemptIds.removeAll()
     }
 
-    private func readNativeTraceRssi(peripheral: CBPeripheral) {
+    private func readNativeTraceRssi(peripheral: CBPeripheral, expectedAttemptId: String) {
         let uuid = peripheral.identifier.uuidString
         let key = reconnectKey(uuid: uuid)
+        // The Gate admission ends at business connected, while the physical
+        // link and its trace remain alive. Continue only for the exact cached
+        // peripheral, and reject an old timer after attempt replacement.
+        let hasExactBusinessOwner = peripheral.state == .connected && connectedDevices.contains { device in
+            device.peripheral === peripheral &&
+                device.isConnected &&
+                device.isBleFlowCompleted
+        }
         guard connectionTraceEnabled,
               let trace = nativeConnectionTraces[key],
+              trace.attemptId == expectedAttemptId,
               nativeTraceRssiInFlightAttemptIds[key] == nil,
-              currentConnectionAdmission(uuid: uuid) != nil else {
+              currentConnectionAdmission(uuid: uuid) != nil || hasExactBusinessOwner else {
             return
         }
-        nativeTraceRssiInFlightAttemptIds[key] = trace.attemptId
+        nativeTraceRssiInFlightAttemptIds[key] = expectedAttemptId
         peripheral.readRSSI()
     }
 

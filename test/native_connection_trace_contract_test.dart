@@ -42,8 +42,20 @@ void main() {
     expect(manager, contains('Timer.scheduledTimer(withTimeInterval: 2.0'));
     expect(manager, contains('Timer.scheduledTimer(withTimeInterval: 15.0'));
     expect(manager, contains('nativeTraceRssiInFlightAttemptIds[key] == nil'));
-    expect(manager,
-        contains('nativeTraceRssiInFlightAttemptIds[key] = trace.attemptId'));
+    expect(
+      manager,
+      contains('nativeTraceRssiInFlightAttemptIds[key] = expectedAttemptId'),
+    );
+    expect(manager, contains('trace.attemptId == expectedAttemptId'));
+    expect(manager, contains('device.peripheral === peripheral'));
+    expect(manager, contains('device.isConnected &&'));
+    expect(manager, contains('device.isBleFlowCompleted'));
+    expect(
+      manager,
+      contains(
+        'currentConnectionAdmission(uuid: uuid) != nil || hasExactBusinessOwner',
+      ),
+    );
     expect(manager, contains('trace.attemptId == inFlightAttemptId'));
     expect(manager, contains('currentConnectionAdmission(uuid: uuid) != nil'));
     expect(manager, contains('peripheral.readRSSI()'));
