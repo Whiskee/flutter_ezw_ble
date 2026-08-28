@@ -99,7 +99,7 @@ void main() {
       'if (status == BluetoothGattStatus.GATT_INSUFFICIENT_AUTHORIZATION)',
     );
     final authorizationBranchEnd = characteristicCallback.indexOf(
-      '\n        // 4.',
+      '\n        // 5.',
       authorizationBranchStart,
     );
     expect(authorizationBranchStart, isNonNegative);

@@ -53,6 +53,15 @@ internal class BleGattSessionCallback(
     private val isBluetoothEnabled: () -> Boolean,
     /** 处理 ATT/GATT 操作返回授权不足；连接状态回调不得调用这个恢复入口。 */
     private val recoverInsufficientAuthorization: (BluetoothGatt, BleDevice) -> Unit,
+    /** 5403 写优先由 exact registry 认领，不能进入普通命令或 OTA 写队列。 */
+    private val securityGateAttempts: BleAndroidSecurityGateAttemptRegistry,
+    /** 用 admission/session/GATT 对象构造本 callback 唯一 Gate owner。 */
+    private val securityGateOwner: (BluetoothGatt) -> BleAndroidSecurityGateOwner,
+    /** 由 endpoint 恢复 episode 把安全失败映射为重试、耗尽或手动失败。 */
+    private val onSecurityGateFailure:
+        (BluetoothGatt, BleDevice, String, Int) -> BleAndroidSecurityRecoveryAction,
+    /** Gate 成功后清除 endpoint 的安全失败预算。 */
+    private val onSecurityGatePassed: (String) -> Unit,
     /** 查询一个 uuid 是否正处于 manager 主动断连流程。 */
     private val consumeDisconnectingState: (String) -> BleConnectState?,
     /** 通知 manager 写入完成，并携带 psType/status 让普通队列与 OTA 背压队列精确认领。 */
@@ -155,7 +164,19 @@ internal class BleGattSessionCallback(
         //    例如 status 8 在这里表示连接超时；只有 descriptor/characteristic 回调里的 8
         //    才能按 GATT_INSUFFICIENT_AUTHORIZATION 解释和记录。
 
-        // 8. 当前 active GATT 在 connecting 阶段收到断连，说明本轮 connectGatt 已经失败。
+        // 8. Gate 写在途时，HCI Authentication Failure/Key Missing 属于安全失败。
+        val gateOwner = securityGateOwner(gatt)
+        if (securityGateAttempts.isInFlight(gateOwner) &&
+            BleAndroidSecurityFailureClassifier.isHciSecurityFailure(status)
+        ) {
+            securityGateAttempts.consumeInFlight(gateOwner)
+            val action = onSecurityGateFailure(gatt, device, "HCI", status)
+            recordTraceStep(address, "security_gate", "failed", null, "HCI", status)
+            terminateSession(gatt, action.toTerminalState(), DEFAULT_MTU)
+            return
+        }
+
+        // 9. 当前 active GATT 在 connecting 阶段收到断连，说明本轮 connectGatt 已经失败。
         //    不能继续静默 keep connecting：G2 第二条腿会等满 timeout，甚至在部分机型上丢失终态。
         //    stale GATT 已在 currentExpectedDeviceForGatt 里过滤，这里可以安全落本轮 timeout。
         if (device.connectState.isConnecting) {
@@ -214,9 +235,37 @@ internal class BleGattSessionCallback(
             return
         }
 
-        // 3. 按配置逐个解析私有服务，任何一个 write/read 缺失都不能宣告 connectFinish。
-        isPrivateServiceReady = true
         recordTraceStep(address, "service_discovery", "success", null, "GATT", status)
+
+        // 3. 可选 5403 必须先以 Write Request 验证系统 Bond；缺失/不支持保留旧固件路径。
+        val securityGate = currentDevice.belongConfig.securityGate
+        if (securityGate != null) {
+            val gateCharacteristic = runCatching {
+                gatt.getService(securityGate.serviceUUID)
+                    ?.getCharacteristic(securityGate.writeCharsUUID)
+            }.getOrNull()
+            val supportsWriteRequest = gateCharacteristic?.let { characteristic ->
+                characteristic.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0
+            } == true
+            if (supportsWriteRequest) {
+                startSecurityGateWrite(gatt, currentDevice, gateCharacteristic)
+                return
+            }
+            recordTraceStep(address, "security_gate", "not_observable", null, null, null)
+            sendLog(
+                BleLoggerTag.d,
+                "Security gate: $address missing or unsupported, continue legacy GATT readiness",
+            )
+        }
+
+        // 4. 没有可执行 Gate 时进入普通 GATT 初始化。
+        startPrivateGattReadiness(gatt, currentDevice)
+    }
+
+    /** Gate 成功或兼容路径唯一允许进入的普通服务/Notify 初始化入口。 */
+    private fun startPrivateGattReadiness(gatt: BluetoothGatt, currentDevice: BleDevice) {
+        val address = gatt.device.address
+        isPrivateServiceReady = true
         currentDevice.belongConfig.privateServices.forEach { privateService ->
             val service = gatt.getService(privateService.serviceUUID)
             val writeChars = service?.getCharacteristic(privateService.writeCharsUUID)
@@ -254,6 +303,47 @@ internal class BleGattSessionCallback(
 
         // 7. 所有 service/characteristic 都存在后，开始串行写 CCCD。
         processNextDescriptor(gatt)
+    }
+
+    /** 同一 exact attempt 只提交一次 5403 有响应写。 */
+    private fun startSecurityGateWrite(
+        gatt: BluetoothGatt,
+        device: BleDevice,
+        characteristic: BluetoothGattCharacteristic,
+    ) {
+        val owner = securityGateOwner(gatt)
+        if (!securityGateAttempts.start(owner, characteristic.uuid)) {
+            sendLog(
+                BleLoggerTag.d,
+                "Security gate: ${device.uuid} duplicate service callback ignored, " +
+                    "passed=${securityGateAttempts.hasPassed(owner)}",
+            )
+            return
+        }
+        characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        recordTraceStep(device.uuid, "security_gate", "started", null, null, null)
+        val accepted = runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeCharacteristic(
+                    characteristic,
+                    byteArrayOf(0),
+                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+                ) == BluetoothStatusCodes.SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                characteristic.value = byteArrayOf(0)
+                @Suppress("DEPRECATION")
+                gatt.writeCharacteristic(characteristic)
+            }
+        }.getOrDefault(false)
+        if (!accepted) {
+            // 同步 BUSY/拒绝不是密钥证据，不消耗安全恢复预算。
+            securityGateAttempts.cancel(owner)
+            recordTraceStep(device.uuid, "security_gate", "failed", null, null, null)
+            terminateSession(gatt, BleConnectState.CHARS_FAIL, DEFAULT_MTU)
+            return
+        }
+        sendLog(BleLoggerTag.d, "Security gate: ${device.uuid} protected write submitted")
     }
 
     /**
@@ -382,7 +472,41 @@ internal class BleGattSessionCallback(
         }
         noteLinkActivity(gatt, device)
 
-        // 3. 业务 connected 后写 characteristic 返回授权不足，说明系统 GATT/bond 视图已拒绝。
+        // 3. Gate registry 优先认领 5403；它绝不能 poll 普通命令或 OTA 队列。
+        val gateOwner = securityGateOwner(gatt)
+        if (characteristic != null &&
+            securityGateAttempts.consume(gateOwner, characteristic.uuid) != null
+        ) {
+            val operationStatus = BluetoothGattStatus.getGattOperationStatusDescription(status)
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                securityGateAttempts.markPassed(gateOwner)
+                onSecurityGatePassed(device.uuid)
+                recordTraceStep(address, "security_gate", "success", null, "GATT", status)
+                sendLog(BleLoggerTag.d, "Security gate: $address write success, begin Notify readiness")
+                startPrivateGattReadiness(gatt, device)
+                return
+            }
+            if (BleAndroidSecurityFailureClassifier.isGattSecurityFailure(status)) {
+                recoverInsufficientAuthorization(gatt, device)
+                val action = onSecurityGateFailure(gatt, device, "GATT", status)
+                recordTraceStep(address, "security_gate", "failed", null, "GATT", status)
+                sendLog(
+                    BleLoggerTag.e,
+                    "Security gate: $address write failed, status=$operationStatus, action=$action",
+                )
+                terminateSession(gatt, action.toTerminalState(), DEFAULT_MTU)
+                return
+            }
+            recordTraceStep(address, "security_gate", "failed", null, "GATT", status)
+            sendLog(
+                BleLoggerTag.e,
+                "Security gate: $address non-security write failure, status=$operationStatus",
+            )
+            terminateSession(gatt, BleConnectState.CHARS_FAIL, DEFAULT_MTU)
+            return
+        }
+
+        // 4. 业务 connected 后写 characteristic 返回授权不足，说明系统 GATT/bond 视图已拒绝。
         //    先恢复本端缓存，再以系统断连终止本 session；不能继续 poll/writeNext 消费发送队列。
         val operationStatus = BluetoothGattStatus.getGattOperationStatusDescription(status)
         if (status == BluetoothGattStatus.GATT_INSUFFICIENT_AUTHORIZATION) {
@@ -392,7 +516,7 @@ internal class BleGattSessionCallback(
             return
         }
 
-        // 4. 其余 characteristic write 状态交给 manager 精确匹配普通/OTA owner；OTA Future
+        // 5. 其余 characteristic write 状态交给 manager 精确匹配普通/OTA owner；OTA Future
         //    只有在这里成功后才完成，不能再把同步提交成功当成 GATT 单槽位已经释放。
         sendLog(BleLoggerTag.d, "Send cmd: $address, write call back is success = ${status == BluetoothGatt.GATT_SUCCESS}, status=$operationStatus")
         onCharacteristicWriteComplete(
@@ -752,7 +876,17 @@ internal class BleGattSessionCallback(
     /** 所有 callback 内终态统一先撤销链路监测，再交回 manager 做 Gate teardown。 */
     private fun terminateSession(gatt: BluetoothGatt, state: BleConnectState, mtu: Int) {
         stopAdaptiveLinkMonitoring()
+        securityGateAttempts.cancel(securityGateOwner(gatt))
         onSessionTerminal(gatt, state, mtu)
+    }
+
+    /** Security Supervisor 动作到连接终态的唯一映射。 */
+    private fun BleAndroidSecurityRecoveryAction.toTerminalState(): BleConnectState = when (this) {
+        BleAndroidSecurityRecoveryAction.RETRY -> BleConnectState.DISCONNECT_FROM_SYS
+        BleAndroidSecurityRecoveryAction.EXHAUSTED -> BleConnectState.SECURITY_RECOVERY_EXHAUSTED
+        BleAndroidSecurityRecoveryAction.MANUAL_FAILURE -> BleConnectState.BOUND_FAIL
+        // exact registry 正常不会把 duplicate 送到这里；保守按普通断连 fail-closed。
+        BleAndroidSecurityRecoveryAction.DUPLICATE_IGNORED -> BleConnectState.DISCONNECT_FROM_SYS
     }
 
     /** 将 Android PHY 常量转换为稳定日志文本，未知值仍保留原始数值。 */
