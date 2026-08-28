@@ -250,6 +250,7 @@ class BleConfig {
   final double connectTimeout;    // 单次连接超时（ms），默认 15000
   final double upgradeSwapTime;   // 升级后启动新固件等待时间（ms），默认 60000，重连时用
   final int    mtu;               // 仅 Android 用，默认 247
+  final BleSecurityGate? securityGate; // iOS G2 5403 保护写门禁，默认 null
   final bool   autoReconnect;     // 是否启用原生自动回连，默认 false
   final int    autoReconnectMaxAttempts;      // 兼容/日志字段，不再作为停止条件
   final bool   autoReconnectUseNativePassive; // 是否允许平台被动回连，默认 true
@@ -413,6 +414,8 @@ G1/G2 共用的"设备硬件信息"模型，20 字节定长，按 `BleDeviceHard
   timeout            连接超时
   bleError           蓝牙错误
   systemError        系统错误
+  securityRecoveryExhausted
+                      iOS 自动安全门禁恢复耗尽；native 资源终态，但不是 UI 错误。
 ```
 
 ### 8.2 状态分组语义（`BleConnectStateExt`）
@@ -425,8 +428,9 @@ G1/G2 共用的"设备硬件信息"模型，20 字节定长，按 `BleDeviceHard
 | `isPureConnected` | 仅 `connected`（不含升级态） |
 | `isDisconnected` | `none / disconnectByUser / disconnectFromSys` |
 | `isDisconnectFromSys` | 系统断连 |
+| `isSecurityRecoveryExhausted` | iOS 自动安全门禁恢复耗尽；需上层显式静默消费 |
 | `isConnectError` | `serviceFail / charsFail / timeout`（可重试错误） |
-| `isError` | 更广义的失败集合（含 bound / ble / system 系列） |
+| `isError` | 更广义的失败集合（含 bound / ble / system 系列）；不包含 `securityRecoveryExhausted` |
 | `isBound` | 仅 `alreadyBound` |
 | `isUpgrade` | 仅 `upgrade` |
 
@@ -523,12 +527,16 @@ CoreBluetooth Code 14 表示系统和 peripheral 的配对信息已不一致。�
 
 蓝牙关闭只暂停任务；蓝牙重新开启后由 Dart 最终 recovery activation 一次恢复任务。Android 每轮 pending `connectGatt(true)` 在未收到 `STATE_CONNECTED` 前受 `connectTimeout`（至少1秒）deadline 保护；deadline、扫描可见性接管和手动提升都必须先把 owner 分类为 pre-physical、Gate admitted、business connected 或 stale。只有 exact pre-physical owner 可正常回收；admitted/business GATT 保留，stale 的 Supervisor/Manager/Gate 引用会精确修复，若 Manager 已有另一条健康 owner 则只丢弃旧引用，禁止重复 GATT。连续 pre-physical deadline 失败按 `1–3 次 1.5s / 4–10 次 5s / 11 次起 30s` 重建，降低长离线耗电和协议栈 register/unregister 压力。上层并行扫描重新看到 exact UUID 时会清零该计数，并以 250ms 防抖重建；已物理连接、已进入 Gate、已取消或蓝牙关闭时提示无效。所有刷新都不上报 Dart/UI timeout，也不停止长期 intent。收到物理 callback 后 deadline 立即取消，获得 Gate 后的 GATT readiness / 业务鉴权仍受独立 `connectTimeout` 保护。iOS 保留系统 pending connect，不使用该 Android deadline。`autoReconnectMaxAttempts` 仅保留兼容和日志意义，**不再作为停止条件**。也就是说，设备离开 30 分钟再回来，只要用户/业务没有主动取消，原生层仍应继续持有或重建回连任务。
 
-回连成功的门槛不是 GATT 物理连接成功，而是全部 `BleConfig.privateServices` 都重新恢复：
+回连成功的门槛不是 GATT 物理连接成功，而是可选 iOS 安全门禁与全部 `BleConfig.privateServices` 都重新恢复：
 
 1. 重新发现所有服务；
-2. 每条私有服务都找到 write/read characteristic；
-3. 每条 read characteristic 都重新打开 notify/CCCD；
-4. 全部成功后才上报 `connectFinish`；G2 等待业务鉴权后用该事件的 exact attempt 两阶段提交进入 `connected`，G1/R1 继续调用兼容 `deviceConnected`。
+2. iOS 若配置 `securityGate` 且发现 5403，先对该保护特征执行一次 `.withResponse` 写入；写成功前不得订阅普通业务 notify，也不得上报 `connectFinish`；
+3. 未发现 5403，或 5403 属性不支持 write-with-response 时，只走旧固件兼容路径，不消耗安全恢复预算；
+4. 每条私有服务都找到 write/read characteristic；
+5. 每条 read characteristic 都重新打开 notify/CCCD；
+6. 全部成功后才上报 `connectFinish`；G2 等待业务鉴权后用该事件的 exact attempt 两阶段提交进入 `connected`，G1/R1 继续调用兼容 `deviceConnected`。
+
+iOS G2 的 Security Gate 只统计真实 5403 保护写安全失败（CBATT 安全错误或 peer pairing removed）。每个 endpoint / recovery episode 最多 5 次实际 gate 尝试，初次失败计为第 1 次；第 1～4 次必须先取消旧 attempt、等待 exact CoreBluetooth callback/barrier，再通过 10 秒新鲜广播窗口和新正 generation 连接。第 5 次发布 `securityRecoveryExhausted` 并停止该 endpoint 自动 owner，不得再产生第 6 次自动连接；该状态不是 `isError` / `isDisconnected`，由 even_connect 静默消费。蓝牙关闭、App inactive/background、扫描未命中和普通连接超时不消耗预算；生命周期恢复只复验仍有效的 exact owner。用户手动点击会清除该 endpoint 的自动耗尽/计数标记，不执行五次静默恢复，首次真实 gate 安全失败仍沿用 `boundFail`。Android 不执行 5403 Security Gate，也不得产生 `securityRecoveryExhausted`。
 
 Android 自动/手动回连统一使用 `connectGatt(autoConnect = true)`；`autoReconnectUseNativePassive` 不再决定是否退回 active/scan-first。pending 阶段的 exact-GATT deadline 只回收未收到物理 callback 的 zombie handle；Gate queued 与业务 pipeline 阶段不会被它关闭。
 
@@ -566,6 +574,7 @@ App 启动
   ├─ ◀ connectStatusEC: contactDevice
   ├─ ◀ connectStatusEC: searchService
   ├─ ◀ connectStatusEC: searchChars
+  ├─ iOS G2 securityGate 5403 .withResponse（成功后才继续普通 notify）
   ├─ ◀ connectStatusEC: startBinding   （仅 initiateBinding=true）
   ├─ ◀ connectStatusEC: connectFinish + mtu + sessionGeneration + attemptGeneration
   │      （G2 由业务层冻结 exact attempt 并完成 AUTH）

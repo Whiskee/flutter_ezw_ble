@@ -1695,14 +1695,25 @@ extension BleManager {
             handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .serviceFail, tag: tag)
             return
         }
-        //  2、只获取需要注册的服务
-        let myServices = services.filter { service in
+        //  2、只获取需要注册的服务。iOS 安全门禁存在时必须先处理 gate service，
+        //  5403 写成功前不得订阅普通业务 notify，避免 AUTH 跑在加密建立之前。
+        let ordinaryServices = services.filter { service in
             bleConfig.privateServices.contains { ps in
                 ps.service == service.uuid.uuidString
-            } || bleConfig.securityGate?.serviceUUID == service.uuid
+            }
         }
         if let securityGate = bleConfig.securityGate,
-           !services.contains(where: { $0.uuid == securityGate.serviceUUID }) {
+           let gateService = services.first(where: { $0.uuid == securityGate.serviceUUID }) {
+            loggerD(msg: "didDiscoverServices: \(peripheral.identifier.uuidString), gate service = \(gateService.uuid.uuidString), charsCached=\(gateService.characteristics?.count ?? 0), tag=\(tag)")
+            recordNativeTrace(uuid: peripheral.identifier.uuidString, stage: "service_discovery", result: "success")
+            handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .searchChars, tag: tag)
+            if let characteristics = gateService.characteristics, characteristics.isNotEmpty {
+                processDiscoveredCharacteristics(peripheral: peripheral, service: gateService, error: nil, tag: "\(tag) gate cached")
+            } else {
+                peripheral.discoverCharacteristics(nil, for: gateService)
+            }
+            return
+        } else if bleConfig.securityGate != nil {
             // Old firmware does not expose EUS_SEC. Mark discovery complete so
             // normal GATT readiness can use the bounded legacy AUTH fallback.
             updateSecurityGateDiscovery(
@@ -1712,21 +1723,47 @@ extension BleManager {
                 tag: "\(tag) gate service missing"
             )
         }
-        loggerD(msg: "didDiscoverServices: \(peripheral.identifier.uuidString)-\(peripheral.name ?? ""), total=\(services.count), matched=\(myServices.count), expected=\(bleConfig.privateServices.count), tag=\(tag)")
+        loggerD(msg: "didDiscoverServices: \(peripheral.identifier.uuidString)-\(peripheral.name ?? ""), total=\(services.count), matched=\(ordinaryServices.count), expected=\(bleConfig.privateServices.count), tag=\(tag)")
         recordNativeTrace(uuid: peripheral.identifier.uuidString, stage: "service_discovery", result: "success")
         handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .searchChars, tag: tag)
-        //  - 2.1、遍历发现所有私有服务的读写特征。缓存完整时直接消费缓存特征，避免恢复路径等不到回调。
-        myServices.forEach { service in
+        discoverOrdinaryPrivateCharacteristics(
+            peripheral: peripheral,
+            services: ordinaryServices,
+            tag: tag
+        )
+    }
+
+    /// Continues ordinary GATT setup only after the optional security gate has
+    /// passed or been proven absent. This keeps business Notify/AUTH behind iOS
+    /// pairing/encryption while preserving old-firmware fallback.
+    private func discoverOrdinaryPrivateCharacteristics(
+        peripheral: CBPeripheral,
+        services: [CBService],
+        tag: String
+    ) {
+        services.forEach { service in
             loggerD(msg: "didDiscoverServices: \(peripheral.identifier.uuidString), service = \(service.uuid.uuidString), charsCached=\(service.characteristics?.count ?? 0), tag=\(tag)")
             if let characteristics = service.characteristics, characteristics.isNotEmpty {
-                processDiscoveredCharacteristics(peripheral: peripheral, service: service, error: nil, tag: "\(tag) cached")
+                processDiscoveredCharacteristics(
+                    peripheral: peripheral,
+                    service: service,
+                    error: nil,
+                    tag: "\(tag) cached",
+                    deferOrdinaryUntilSecurityGate: false
+                )
             } else {
                 peripheral.discoverCharacteristics(nil, for: service)
             }
         }
     }
 
-    func processDiscoveredCharacteristics(peripheral: CBPeripheral, service: CBService, error: Error?, tag: String) {
+    func processDiscoveredCharacteristics(
+        peripheral: CBPeripheral,
+        service: CBService,
+        error: Error?,
+        tag: String,
+        deferOrdinaryUntilSecurityGate: Bool = true
+    ) {
         guard isCurrentConnectionPipeline(peripheral) else { return }
         //  1、处理错误回调
         guard error == nil else {
@@ -1762,6 +1799,15 @@ extension BleManager {
                 characteristic: gateCharacteristic,
                 tag: tag
             )
+            if deferOrdinaryUntilSecurityGate,
+               startSecurityGateIfNeeded(
+                   peripheral: peripheral,
+                   characteristic: gateCharacteristic,
+                   bleConfig: bleConfig,
+                   tag: tag
+               ) {
+                return
+            }
         }
         //  4、不处理不在配置中的普通私有服务。独立 gate service 到这里即完成。
         guard let privateService = bleConfig.privateServices.first(where: { uuid in
@@ -2228,6 +2274,86 @@ extension BleManager {
         tryEmitConnectFinish(uuid: uuid, name: name, bleConfig: device.belongConfig, tag: "\(tag) security gate discovery")
     }
 
+    /// Starts the one protected iOS write that asks CoreBluetooth to establish
+    /// link security. Returning true means this helper has taken ownership of
+    /// the continuation, so the caller must not also process the same service.
+    private func startSecurityGateIfNeeded(
+        peripheral: CBPeripheral,
+        characteristic: CBCharacteristic?,
+        bleConfig: BleConfig,
+        tag: String
+    ) -> Bool {
+        guard bleConfig.securityGate != nil,
+              let characteristic else {
+            loggerD(msg: "security gate: \(peripheral.identifier.uuidString)-\(peripheral.name ?? ""), characteristic missing, use legacy AUTH fallback")
+            if let services = peripheral.services {
+                let ordinaryServices = services.filter { service in
+                    bleConfig.privateServices.contains { ps in
+                        ps.service == service.uuid.uuidString
+                    }
+                }
+                discoverOrdinaryPrivateCharacteristics(
+                    peripheral: peripheral,
+                    services: ordinaryServices,
+                    tag: "\(tag) legacy gate fallback"
+                )
+            }
+            return true
+        }
+        guard let admission = currentConnectionAdmission(uuid: peripheral.identifier.uuidString) else {
+            loggerD(msg: "security gate: \(peripheral.identifier.uuidString), missing current admission")
+            return true
+        }
+        if securityGateAttempts.hasPassed(admission) {
+            return false
+        }
+        if securityGateAttempts.isStarted(for: admission) {
+            return true
+        }
+        guard characteristic.properties.contains(.write) else {
+            loggerE(msg: "security gate: \(peripheral.identifier.uuidString), characteristic does not support write with response")
+            // Unsupported properties are a firmware/config compatibility issue,
+            // not a real CBATT security failure. Do not consume the five-attempt
+            // recovery budget; fall back to ordinary GATT/AUTH readiness.
+            if let connectedIndex = connectedDevices.firstIndex(where: { device in
+                device.peripheral.identifier.uuidString == peripheral.identifier.uuidString ||
+                    device.peripheral.name == peripheral.name
+            }) {
+                var device = connectedDevices[connectedIndex]
+                device.securityGateWriteChar = nil
+                device.securityGateDiscoveryComplete = true
+                connectedDevices[connectedIndex] = device
+            }
+            if let services = peripheral.services {
+                let ordinaryServices = services.filter { service in
+                    bleConfig.privateServices.contains { ps in
+                        ps.service == service.uuid.uuidString
+                    }
+                }
+                discoverOrdinaryPrivateCharacteristics(
+                    peripheral: peripheral,
+                    services: ordinaryServices,
+                    tag: "\(tag) unsupported gate fallback"
+                )
+            }
+            return true
+        }
+        securityGateAttempts.start(
+            admission: admission,
+            characteristicUUID: characteristic.uuid.uuidString
+        )
+        recordNativeTrace(uuid: admission.endpointId, stage: "security_gate", result: "started")
+        // CoreBluetooth owns pairing/encryption. One protected Write Request is
+        // the trigger; retries must use teardown plus a new exact generation.
+        peripheral.writeValue(
+            Data([0]),
+            for: characteristic,
+            type: .withResponse
+        )
+        loggerD(msg: "security gate: \(peripheral.identifier.uuidString), protected write submitted before notify, sessionGeneration=\(admission.sessionGeneration), attemptGeneration=\(admission.generation)")
+        return true
+    }
+
     private func tryEmitConnectFinish(uuid: String, name: String, bleConfig: BleConfig, tag: String) {
         guard let connectedIndex = connectedDevices.firstIndex(where: { device in
             device.peripheral.identifier.uuidString == uuid || device.peripheral.name == name
@@ -2255,34 +2381,7 @@ extension BleManager {
                         return
                     }
                     if !securityGateAttempts.hasPassed(admission) {
-                        if !securityGateAttempts.isStarted(for: admission) {
-                            guard characteristic.properties.contains(.write) else {
-                                loggerE(msg: "security gate: \(uuid)-\(name), characteristic does not support write with response")
-                                handleConnectState(
-                                    uuid: admission.endpointId,
-                                    name: connectedDevice.peripheral.name ?? name,
-                                    state: .boundFail,
-                                    source: admission.source,
-                                    generation: admission.sessionGeneration,
-                                    attemptGeneration: admission.generation,
-                                    tag: "security gate unsupported write"
-                                )
-                                return
-                            }
-                            securityGateAttempts.start(
-                                admission: admission,
-                                characteristicUUID: characteristic.uuid.uuidString
-                            )
-                            recordNativeTrace(uuid: admission.endpointId, stage: "security_gate", result: "started")
-                            // CoreBluetooth owns pairing/encryption. One protected
-                            // Write Request is the trigger; do not poll or retry 0x05.
-                            connectedDevice.peripheral.writeValue(
-                                Data([0]),
-                                for: characteristic,
-                                type: .withResponse
-                            )
-                            loggerD(msg: "security gate: \(uuid)-\(name), protected write submitted, sessionGeneration=\(admission.sessionGeneration), attemptGeneration=\(admission.generation)")
-                        }
+                        loggerD(msg: "security gate: \(uuid)-\(name), waiting protected write")
                         return
                     }
                 } else {
@@ -2320,6 +2419,7 @@ extension BleManager {
         peripheralTerminalAcknowledged: Bool = false,
         systemAutoReconnectInProgress: Bool = false,
         suppressReconnectSchedule: Bool = false,
+        preserveSecurityGateRecovery: Bool = false,
         traceCauseDomain: String? = nil,
         traceCauseCode: Int? = nil,
         tag: String = ""
@@ -2351,6 +2451,8 @@ extension BleManager {
         let eventSource = source ?? terminalMetadata?.source ?? .unknown
         let eventGeneration = generation ?? terminalMetadata?.generation ?? 0
         let eventAttemptGeneration = attemptGeneration ?? terminalMetadata?.attemptGeneration ?? currentAdmission?.generation ?? 0
+        let shouldCloseTransport =
+            state.isError() || state.isDisconnected() || state == .securityRecoveryExhausted
         // Cause metadata enriches the existing Trace step only; it must not
         // participate in CoreBluetooth ownership or reconnect decisions.
         recordNativeTraceForState(
@@ -2395,7 +2497,7 @@ extension BleManager {
         var deferredAdmissionTeardown = false
         //  2、设备连接状态为失败或断连就要设置连接设备连接状态为false
         let cacheIndexes = connectionCacheIndexes(uuid: uuid, name: name)
-        if state.isError() || state.isDisconnected(), cacheIndexes.isNotEmpty {
+        if shouldCloseTransport, cacheIndexes.isNotEmpty {
             // 历史版本可能因 retrieve 返回不同对象而留下同 UUID 多条缓存。
             // 终态必须失效全部条目，不能只更新第一条后让回连看到另一条假已连接记录。
             for index in cacheIndexes {
@@ -2427,7 +2529,8 @@ extension BleManager {
                     admission: currentAdmission,
                     peripheral: device.peripheral,
                     deviceName: device.peripheral.name ?? name,
-                    terminalState: state
+                    terminalState: state,
+                    preserveSecurityGateRecovery: preserveSecurityGateRecovery
                 )
                 deferredAdmissionTeardown = true
             }
@@ -2443,7 +2546,7 @@ extension BleManager {
         }
         // 3. 已收到 didFail/didDisconnect（或外设本就 disconnected）才可以同步释放；
         //    其余终态由 cancellation barrier callback/watchdog 完成 release/start-next。
-        if (state.isError() || state.isDisconnected()),
+        if shouldCloseTransport,
            let currentAdmission = currentAdmission,
            !deferredAdmissionTeardown {
             releaseConnectionAdmissionAndStartNext(currentAdmission, invalidateEndpoint: true)
@@ -2473,7 +2576,7 @@ extension BleManager {
         if state == .connected {
             // 即使业务设备缓存暂时缺失，正常成功也必须释放本轮 Gate owner。
             completeBusinessConnectionAdmission(uuid: uuid)
-        } else if (state.isError() || state.isDisconnected()) && !deferredAdmissionTeardown {
+        } else if shouldCloseTransport && !deferredAdmissionTeardown {
             // admission 已在上方释放；再移除旧 request owner 后才允许创建下一代。
             // 若反过来调度，scheduleReconnect 会命中旧 active request 并永久 defer。
             removeActiveConnectRequest(uuid: uuid, name: name)
@@ -2486,7 +2589,9 @@ extension BleManager {
                 loggerD(msg: "connect-flow: \(uuid)-\(name), native reconnect schedule suppressed, tag=\(fromTag)")
                 return
             }
-            if state != .alreadyBound {
+            if state != .alreadyBound &&
+                state != .securityRecoveryExhausted &&
+                !preserveSecurityGateRecovery {
                 resetPeerPairingRecoveryAfterNonPairingFailure(
                     uuid: uuid,
                     name: name
@@ -2852,6 +2957,39 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             )
             recordBondSecurityFailureIfNeeded(peripheral: peripheral, error: error)
             loggerE(msg: "security gate: \(admission.endpointId), protected write failed domain=\(error.domain), code=\(error.code)")
+            if isBondSecurityError(error) {
+                let recoveryAction = registerSecurityGateFailure(
+                    uuid: admission.endpointId,
+                    name: peripheral.name ?? "",
+                    source: admission.source
+                )
+                if recoveryAction == .retryFreshAdvertisement {
+                    handleConnectState(
+                        uuid: admission.endpointId,
+                        name: peripheral.name ?? "",
+                        state: .disconnectFromSys,
+                        source: admission.source,
+                        generation: admission.sessionGeneration,
+                        attemptGeneration: admission.generation,
+                        preserveSecurityGateRecovery: true,
+                        tag: "security gate write retry"
+                    )
+                    return
+                }
+                if recoveryAction == .securityRecoveryExhausted {
+                    handleConnectState(
+                        uuid: admission.endpointId,
+                        name: peripheral.name ?? "",
+                        state: .securityRecoveryExhausted,
+                        source: admission.source,
+                        generation: admission.sessionGeneration,
+                        attemptGeneration: admission.generation,
+                        suppressReconnectSchedule: true,
+                        tag: "security gate write exhausted"
+                    )
+                    return
+                }
+            }
             handleConnectState(
                 uuid: admission.endpointId,
                 name: peripheral.name ?? "",
@@ -2864,12 +3002,28 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             return
         }
         securityGateAttempts.markPassed(admission)
+        resetSecurityGateRecoveryAfterSuccess(
+            uuid: admission.endpointId,
+            name: peripheral.name ?? ""
+        )
         recordNativeTrace(uuid: admission.endpointId, stage: "security_gate", result: "success")
         guard let config = findBleConfig(
             uuid: peripheral.identifier.uuidString,
             name: peripheral.name ?? ""
         ) else {
             return
+        }
+        if let services = peripheral.services {
+            let ordinaryServices = services.filter { service in
+                config.privateServices.contains { ps in
+                    ps.service == service.uuid.uuidString
+                }
+            }
+            discoverOrdinaryPrivateCharacteristics(
+                peripheral: peripheral,
+                services: ordinaryServices,
+                tag: "security gate write success"
+            )
         }
         loggerD(msg: "security gate: \(admission.endpointId), protected write succeeded, sessionGeneration=\(admission.sessionGeneration), attemptGeneration=\(admission.generation)")
         tryEmitConnectFinish(

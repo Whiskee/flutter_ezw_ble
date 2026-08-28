@@ -287,7 +287,8 @@ extension BleManager {
         admission: BleConnectionAdmission,
         peripheral: CBPeripheral,
         deviceName: String,
-        terminalState: BleConnectState
+        terminalState: BleConnectState,
+        preserveSecurityGateRecovery: Bool = false
     ) {
         guard currentConnectionAdmission(admission) != nil else { return }
         let key = reconnectKey(uuid: admission.endpointId)
@@ -295,7 +296,8 @@ extension BleManager {
             admission: admission,
             peripheral: peripheral,
             deviceName: deviceName,
-            terminalState: terminalState
+            terminalState: terminalState,
+            preserveSecurityGateRecovery: preserveSecurityGateRecovery
         )
         beginPeripheralCancellationBarrier(peripheral)
     }
@@ -342,10 +344,12 @@ extension BleManager {
                 uuid: pending.admission.endpointId,
                 name: pending.deviceName
             )
-            resetPeerPairingRecoveryAfterNonPairingFailure(
-                uuid: pending.admission.endpointId,
-                name: pending.deviceName
-            )
+            if !pending.preserveSecurityGateRecovery {
+                resetPeerPairingRecoveryAfterNonPairingFailure(
+                    uuid: pending.admission.endpointId,
+                    name: pending.deviceName
+                )
+            }
             scheduleReconnect(
                 uuid: pending.admission.endpointId,
                 name: pending.deviceName,

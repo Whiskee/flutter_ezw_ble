@@ -173,6 +173,7 @@ extension BleManager {
         if businessConnected {
             task.pairingRecoveryState = .normal
             task.hasAttemptedPairingRecovery = false
+            task.securityGateFailureCount = 0
             clearStoppedPeerPairingRecovery(
                 belongConfig: config.name,
                 name: device.peripheral.name ?? task.name
@@ -408,6 +409,17 @@ extension BleManager {
             let trimmedName = target.name.trimmingCharacters(in: .whitespacesAndNewlines)
             // 1.2、一次性自动恢复已经结束后不再后台重建 owner。只有下一次手动
             // 点击可以开始新 attempt；这里返回 rejected 只结束当前 batch，不触发 UI。
+            let manualTakesOverStoppedRecovery =
+                source == .manualReconnect && hasStoppedPeerPairingRecovery(target)
+            if source == .manualReconnect {
+                // Manual click starts a fresh user-visible attempt. It consumes
+                // any silent automatic stop marker and resets the 5403 budget
+                // before a new exact generation is admitted.
+                clearStoppedPeerPairingRecovery(
+                    belongConfig: target.belongConfig,
+                    name: trimmedName
+                )
+            }
             if source != .manualReconnect, hasStoppedPeerPairingRecovery(target) {
                 loggerD(msg: "autoReconnect activation rejected: config=\(target.belongConfig), name=\(trimmedName), reason=peerPairingRecoveryStopped")
                 return BleReconnectActivationResult(
@@ -444,7 +456,7 @@ extension BleManager {
                     name: resolvedName,
                     expectedMacSuffix: target.expectedMacSuffix
                 )
-                guard let task = armReconnectTarget(
+                guard var task = armReconnectTarget(
                     resolvedTarget,
                     source: source,
                     sessionGeneration: sessionGeneration
@@ -456,6 +468,12 @@ extension BleManager {
                         source: source,
                         sessionGeneration: sessionGeneration
                     )
+                }
+                if source == .manualReconnect {
+                    task.securityGateFailureCount = 0
+                    task.pairingRecoveryState = .normal
+                    task.hasAttemptedPairingRecovery = false
+                    reconnectTasks[reconnectKey(uuid: task.uuid)] = task
                 }
                 // 将系统已连接 peripheral 放入内部缓存，后续 beginDirectReconnectAttempt
                 // 无论当前是 connected/connecting/disconnected 都复用同一 Gate/GATT 流程。
@@ -533,7 +551,7 @@ extension BleManager {
                 )
             }
             // 2、稳定 UUID 目标先 arm 长期 owner，再进入统一 activation。
-            guard let task = armReconnectTarget(
+            guard var task = armReconnectTarget(
                 target,
                 source: source,
                 sessionGeneration: sessionGeneration
@@ -546,16 +564,29 @@ extension BleManager {
                     sessionGeneration: sessionGeneration
                 )
             }
+            let manualTakesOverExistingFreshWait =
+                source == .manualReconnect &&
+                (task.pairingRecoveryState == .awaitingFreshAdvertisement ||
+                    task.pairingRecoveryState == .waitingFreshAdvertisementRetry)
+            if source == .manualReconnect {
+                task.securityGateFailureCount = 0
+                task.pairingRecoveryState = .normal
+                task.hasAttemptedPairingRecovery = false
+                reconnectTasks[reconnectKey(uuid: task.uuid)] = task
+            }
             // 2.1、历史 Code 14，或仍在自动扫描/间隔等待中的 owner，被手动点击后都
             // 立即切换到新的手动新鲜广播窗口。不得等待自动 5 秒 timer，也不得复用
             // 旧 peripheral；只有这次手动物理 attempt 的真实 Code 14 才能返回 720。
             let takesOverFreshAdvertisementWait =
+                manualTakesOverStoppedRecovery ||
+                manualTakesOverExistingFreshWait ||
                 task.pairingRecoveryState == .awaitingFreshAdvertisement ||
                 task.pairingRecoveryState == .waitingFreshAdvertisementRetry
             if source == .manualReconnect,
                hasStoppedPeerPairingRecovery(target) || takesOverFreshAdvertisementWait {
                 var freshTask = task
                 freshTask.hasAttemptedPairingRecovery = true
+                freshTask.securityGateFailureCount = 0
                 freshTask.pairingRecoveryState = .awaitingFreshAdvertisement
                 let freshKey = reconnectKey(uuid: freshTask.uuid)
                 freshTask.timer?.invalidate()
@@ -1417,9 +1448,73 @@ extension BleManager {
         task.timer = nil
         task.pairingRecoveryState = .normal
         task.hasAttemptedPairingRecovery = false
+        task.securityGateFailureCount = 0
         reconnectTasks[key] = task
         purgeStaleScanCache(uuid: task.uuid, name: task.name)
         loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), non-Code14 terminal exits fresh peripheral recovery")
+    }
+
+    /// Records a real iOS 5403 protected-write security failure for the active
+    /// endpoint. Attempts 1...4 reuse the existing fresh-advertisement recovery;
+    /// attempt 5 silently retires this automatic owner and lets Dart stop UI noise.
+    @discardableResult
+    func registerSecurityGateFailure(
+        uuid: String,
+        name: String,
+        source: BleConnectSource
+    ) -> BlePeerPairingFailureAction? {
+        guard let key = reconnectTasks.first(where: { _, task in
+            isSameConnectTarget(
+                storedUuid: task.uuid,
+                storedName: task.name,
+                uuid: uuid,
+                name: name
+            )
+        })?.key,
+        var task = reconnectTasks[key] else {
+            return nil
+        }
+        if source == .manualReconnect {
+            stopPeerPairingRecoveryTask(task, reason: "manualSecurityGateFailure")
+            return .stopAttempt
+        }
+        task.securityGateFailureCount += 1
+        let failureCount = task.securityGateFailureCount
+        if failureCount >= BlePeerPairingRecoveryPolicy.maxSecurityGateAttempts {
+            loggerE(msg: "securityRecoveryExhausted owner=\(task.uuid), sessionGeneration=\(task.sessionGeneration), attempts=\(failureCount)")
+            stopPeerPairingRecoveryTask(task, reason: "securityRecoveryExhausted")
+            return .securityRecoveryExhausted
+        }
+        task.hasAttemptedPairingRecovery = true
+        task.pairingRecoveryState = .awaitingFreshAdvertisement
+        reconnectTasks[key] = task
+        purgeStaleScanCache(uuid: task.uuid, name: task.name)
+        loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), security gate failure \(failureCount)/\(BlePeerPairingRecoveryPolicy.maxSecurityGateAttempts); wait fresh advertisement")
+        return .retryFreshAdvertisement
+    }
+
+    /// Passing 5403 proves the current automatic episode has repaired security.
+    /// Reset the budget without touching unrelated reconnect ownership.
+    func resetSecurityGateRecoveryAfterSuccess(uuid: String, name: String) {
+        guard let key = reconnectTasks.first(where: { _, task in
+            isSameConnectTarget(
+                storedUuid: task.uuid,
+                storedName: task.name,
+                uuid: uuid,
+                name: name
+            )
+        })?.key,
+        var task = reconnectTasks[key],
+        task.securityGateFailureCount != 0 ||
+            task.pairingRecoveryState != .normal ||
+            task.hasAttemptedPairingRecovery else {
+            return
+        }
+        task.securityGateFailureCount = 0
+        task.pairingRecoveryState = .normal
+        task.hasAttemptedPairingRecovery = false
+        reconnectTasks[key] = task
+        loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), security gate recovery reset after success")
     }
 
     /// 取消某个 owner 的配对恢复扫描。只有该 owner 自己启动的扫描才允许停止，

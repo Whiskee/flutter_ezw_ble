@@ -58,6 +58,93 @@ void main() {
     expect(reconnect, isNot(contains('rearmAutoReconnectAfterUserRepair')));
   });
 
+  test('iOS security gate recovery is capped at five actual failures', () {
+    final manager = File('ios/Classes/ble/BleManager.swift').readAsStringSync();
+    final reconnect = File('ios/Classes/ble/BleAutoReconnectCoordinator.swift')
+        .readAsStringSync();
+    final admissionFlow =
+        File('ios/Classes/ble/BleConnectionAdmissionFlow.swift')
+            .readAsStringSync();
+    final store =
+        File('ios/Classes/ble/BleReconnectStore.swift').readAsStringSync();
+
+    expect(
+      store,
+      contains('static let maxSecurityGateAttempts = 5'),
+    );
+    expect(store, contains('var securityGateFailureCount: Int = 0'));
+    expect(reconnect, contains('func registerSecurityGateFailure('));
+    expect(reconnect, contains('task.securityGateFailureCount += 1'));
+    expect(
+      reconnect,
+      contains(
+        'failureCount >= BlePeerPairingRecoveryPolicy.maxSecurityGateAttempts',
+      ),
+    );
+    expect(reconnect, contains('return .securityRecoveryExhausted'));
+    expect(
+      manager,
+      contains('recoveryAction == .securityRecoveryExhausted'),
+    );
+    expect(
+      manager,
+      contains('state: .securityRecoveryExhausted'),
+    );
+    expect(
+      manager,
+      contains('suppressReconnectSchedule: true'),
+    );
+    expect(
+      manager,
+      contains('preserveSecurityGateRecovery: true'),
+    );
+    expect(
+      manager,
+      contains('!preserveSecurityGateRecovery'),
+    );
+    expect(
+      admissionFlow,
+      contains('preserveSecurityGateRecovery: Bool = false'),
+    );
+    expect(
+      admissionFlow,
+      contains('if !pending.preserveSecurityGateRecovery'),
+    );
+    expect(
+      reconnect,
+      contains('resetSecurityGateRecoveryAfterSuccess'),
+    );
+    expect(reconnect, isNot(contains('maxSecurityGateAttempts = 6')));
+  });
+
+  test('manual activation clears automatic security gate exhaustion budget',
+      () {
+    final reconnect = File('ios/Classes/ble/BleAutoReconnectCoordinator.swift')
+        .readAsStringSync();
+    final activationStart = reconnect.indexOf(
+      'func activateAutoReconnectTargets(',
+    );
+    final activationEnd = reconnect.indexOf(
+      '/// 激活一个已经拥有稳定 UUID 的 task',
+      activationStart,
+    );
+    final activation = reconnect.substring(activationStart, activationEnd);
+
+    expect(
+      activation,
+      contains('source == .manualReconnect && hasStoppedPeerPairingRecovery'),
+    );
+    expect(activation, contains('clearStoppedPeerPairingRecovery('));
+    expect(activation, contains('task.securityGateFailureCount = 0'));
+    expect(activation, contains('task.pairingRecoveryState = .normal'));
+    expect(activation, contains('task.hasAttemptedPairingRecovery = false'));
+    expect(
+      activation,
+      contains('manualTakesOverExistingFreshWait'),
+      reason: 'manual click still preserves existing Code 14 fresh-ad takeover',
+    );
+  });
+
   test('manual or repeated Code 14 stops the attempt and maps actual failure',
       () {
     final reconnect = File('ios/Classes/ble/BleAutoReconnectCoordinator.swift')

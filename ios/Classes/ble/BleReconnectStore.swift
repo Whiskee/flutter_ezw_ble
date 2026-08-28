@@ -30,9 +30,10 @@ enum BlePeerPairingRecoveryWindowAction: Equatable {
 }
 
 /// Code 14 新鲜广播扫描的固定时序。手动路径沿用历史 20 秒窗口；自动路径按产品恢复
-/// 策略使用 10 秒窗口和 5 秒间隔，且没有次数上限。
+/// 策略使用 10 秒窗口和 5 秒间隔；安全门禁失败最多 5 次实际写入。
 enum BlePeerPairingRecoveryPolicy {
     static let retryDelay: TimeInterval = 5
+    static let maxSecurityGateAttempts = 5
 
     static func scanWindow(for source: BleConnectSource) -> TimeInterval {
         source == .manualReconnect ? 20 : 10
@@ -51,6 +52,8 @@ enum BlePeerPairingFailureAction: String {
     case retryFreshAdvertisement
     /// 手动连接失败或自动恢复已经消耗：结束本轮，不保留物理连接 owner。
     case stopAttempt
+    /// 自动安全门禁预算耗尽：静默发布专用终态，并停止该 endpoint 自动 owner。
+    case securityRecoveryExhausted
 }
 
 /**
@@ -89,6 +92,8 @@ struct BleReconnectTask {
     var pairingRecoveryState: BlePeerPairingRecoveryState = .normal
     /// 是否已进入过新鲜 peripheral 恢复；只有该 peripheral 再次 Code 14 才结束 owner。
     var hasAttemptedPairingRecovery: Bool = false
+    /// iOS 5403 保护写失败计数。只统计真实安全错误，不统计蓝牙关闭/后台/扫描 miss。
+    var securityGateFailureCount: Int = 0
 }
 
 /// 发送系统终态时使用的连接来源与代次，二者必须作为同一快照一起继承。
