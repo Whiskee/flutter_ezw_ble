@@ -71,6 +71,12 @@ enum class BleMC {
     CLEAN_CONNECT_CACHE,
     /** 读取并清空原生自动回连/后台恢复事件。 */
     DRAIN_AUTO_RECONNECT_EVENTS,
+    /** iOS State Restoration pending 查询；Android 固定返回 false。 */
+    HAS_PENDING_STATE_RESTORATION,
+    /** iOS CoreBluetooth restoration 启动原因查询；Android 固定返回 false。 */
+    WAS_LAUNCHED_FOR_BLUETOOTH_STATE_RESTORATION,
+    /** iOS 启动恢复认领收尾；Android 无 State Restoration，保持 no-op。 */
+    FINALIZE_STATE_RESTORATION_CLAIMS,
     /** 重置插件蓝牙状态。 */
     RESET_BLE,
     /** 打开系统蓝牙设置页。 */
@@ -304,6 +310,17 @@ enum class BleMC {
             DRAIN_AUTO_RECONNECT_EVENTS -> {
                 // 1. 自动回连事件需要返回给 Dart，因此这里提前 return。
                 return result.success(BleManager.instance.drainAutoReconnectEvents())
+            }
+            HAS_PENDING_STATE_RESTORATION -> {
+                // Android 没有 CoreBluetooth restoration escrow，保持跨平台 API 对称。
+                return result.success(false)
+            }
+            WAS_LAUNCHED_FOR_BLUETOOTH_STATE_RESTORATION -> {
+                // Android 没有 UIApplication bluetoothCentrals launch option。
+                return result.success(false)
+            }
+            FINALIZE_STATE_RESTORATION_CLAIMS -> {
+                // 1. Android 不存在 CoreBluetooth State Restoration；保留跨平台接口对称。
             }
             RESET_BLE -> {
                 // 1. 重置由 BleManager 统一释放扫描、连接、队列和监听资源。

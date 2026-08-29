@@ -190,6 +190,8 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `openBleSettings` | `Future<void> openBleSettings()` | 跳系统蓝牙开关页。 |
 | `openAppSettings` | `Future<void> openAppSettings()` | 跳本 App 权限设置页。 |
 | `resetBle` | `Future<void> resetBle()` | 让原生层重置内部 BLE 栈状态（清队列、断所有连接、清缓存）。 |
+| `hasPendingStateRestoration` | `Future<bool> hasPendingStateRestoration()` | 只读查询 iOS 是否持有待当前账号认领的 restoration escrow；不 claim、不启动 GATT、不发布连接状态，Android 返回 `false`。 |
+| `wasLaunchedForBluetoothStateRestoration` | `Future<bool> wasLaunchedForBluetoothStateRestoration()` | 只读查询当前 iOS 进程是否由匹配 restore identifier 的 `launchOptions.bluetoothCentrals` 拉起；与 pending escrow 独立，Android 返回 `false`。 |
 | `cleanConnectCache` | `Future<void> cleanConnectCache()` | 清"上次连接的设备"等连接缓存，不动 GATT。 |
 
 > **修改提示**：新增 MethodChannel 方法时，三处都要改：① `FlutterEzwBlePlatform`（抽象签名 + 默认 `UnimplementedError`）；② `MethodChannelEzwBle`（`@override` + `methodChannel.invokeMethod`）；③ 原生侧两个平台的 `onMethodCall` 分支。

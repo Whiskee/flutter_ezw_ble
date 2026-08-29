@@ -67,6 +67,12 @@ enum BleMC: String {
     case cleanConnectCache
     /// Drain native reconnect events buffered before Dart listeners.
     case drainAutoReconnectEvents
+    /// Query whether iOS still owns unclaimed State Restoration escrow.
+    case hasPendingStateRestoration
+    /// Query whether CoreBluetooth launched this process for the registered central id.
+    case wasLaunchedForBluetoothStateRestoration
+    /// Cancel restored peripherals not claimed by the current startup targets.
+    case finalizeStateRestorationClaims
     /// Reset native BLE state.
     case resetBle
     /// Unknown method fallback.
@@ -288,9 +294,26 @@ enum BleMC: String {
         case .drainAutoReconnectEvents:
             result(BleManager.shared.drainAutoReconnectEvents())
             return
+        case .hasPendingStateRestoration:
+            // 只读查询用于 Dart 决定是否提前加载账号缓存，不能在这里认领或 finalize。
+            result(BleManager.shared.hasPendingStateRestoration())
+            return
+        case .wasLaunchedForBluetoothStateRestoration:
+            // launch option 与 escrow 生命周期独立；该查询只返回进程启动事实。
+            result(FlutterEzwBlePlugin.wasLaunchedForBluetoothStateRestoration())
+            return
+        case .finalizeStateRestorationClaims:
+            // 1、当前设备 activation 已逐端点认领完毕；其余 restored peripheral
+            // 属于历史设备，必须显式取消，不能继续占用系统连接或留在内存。
+            BleManager.shared.finalizeStateRestorationClaims()
+            break
         case .resetBle:
-            // 1、reset 只清理当前 runtime；持久 reconnect owner 保留给下次普通恢复流程。
-            BleManager.shared.reset()
+            // 冷启动可保留尚待当前账号认领的 restoration escrow；账号退出仍走 hard reset。
+            let data = arguments as? [String: Any] ?? [:]
+            let preserveStateRestoration = data["preserveStateRestoration"] as? Bool ?? false
+            BleManager.shared.reset(
+                preserveStateRestoration: preserveStateRestoration
+            )
             break
         case .openBleSettings:
             if let url = URL(string: "App-Prefs:root=Bluetooth"), UIApplication.shared.canOpenURL(url) {

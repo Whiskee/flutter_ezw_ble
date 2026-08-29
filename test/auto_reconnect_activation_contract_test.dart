@@ -135,6 +135,36 @@ void main() {
     expect(arguments['sessionGeneration'], 37);
   });
 
+  test('pending State Restoration query is read-only and fails closed',
+      () async {
+    MethodCall? captured;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      captured = call;
+      return true;
+    });
+
+    expect(await platform.hasPendingStateRestoration(), isTrue);
+    expect(captured?.method, 'hasPendingStateRestoration');
+    expect(captured?.arguments, isNull);
+  });
+
+  test('Bluetooth restoration launch query is read-only', () async {
+    MethodCall? captured;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      captured = call;
+      return true;
+    });
+
+    expect(
+      await platform.wasLaunchedForBluetoothStateRestoration(),
+      isTrue,
+    );
+    expect(captured?.method, 'wasLaunchedForBluetoothStateRestoration');
+    expect(captured?.arguments, isNull);
+  });
+
   test('removed userRepairRequired acknowledgement fails closed', () async {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (_) async {

@@ -418,11 +418,15 @@ extension BleManager {
                     sessionGeneration: sessionGeneration
                 )
             }
-            // 1.3、冷启动缓存里只有完整名称时，active 窗口可先接管系统已连接对象。
-            // 这保留普通后台 BLE / ANCS 连接能力，但不再依赖跨进程
-            // escrow 或 claim 窗口。
+            // 1.3、SR 可能早于 Dart 当前设备加载，先让当前账号 target 精确认领 escrow；
+            // 没有 escrow 时才在 active 窗口查询系统已连接对象。
+            let claimedRestoration = restorationCoordinator.claimPendingPeripheral(
+                uuid: trimmedUuid,
+                name: trimmedName
+            )
             let systemConnectedPeripheral: CBPeripheral? = {
-                guard trimmedUuid.isEmpty,
+                guard claimedRestoration == nil,
+                      trimmedUuid.isEmpty,
                       allowsSynchronousCoreBluetoothLookup else {
                     return nil
                 }
@@ -433,7 +437,7 @@ extension BleManager {
                     requireUniqueMatch: true
                 )
             }()
-            if let resolvedPeripheral = systemConnectedPeripheral {
+            if let resolvedPeripheral = claimedRestoration?.peripheral ?? systemConnectedPeripheral {
                 let resolvedUuid = resolvedPeripheral.identifier.uuidString
                 let resolvedName = trimmedName.isEmpty
                     ? (resolvedPeripheral.name ?? "")
@@ -449,10 +453,14 @@ extension BleManager {
                     source: source,
                     sessionGeneration: sessionGeneration
                 ) else {
+                    // claim 后若配置同步失效，把对象放回 escrow，由统一 hard reset 收口。
+                    if claimedRestoration != nil {
+                        _ = restorationCoordinator.enqueue(resolvedPeripheral)
+                    }
                     return BleReconnectActivationResult(
                         target: target,
                         state: .rejected,
-                        reason: "nativeArmRejectedAfterSystemConnected",
+                        reason: "nativeArmRejectedAfterRestorationClaim",
                         source: source,
                         sessionGeneration: sessionGeneration
                     )
@@ -473,15 +481,31 @@ extension BleManager {
                     ),
                     resolvedPeripheral
                 ))
-                let resolutionSource = "systemConnected"
-                loggerD(msg: "autoReconnect system-connected claim: config=\(target.belongConfig), requestedUuid=\(trimmedUuid), resolvedUuid=\(resolvedUuid), name=\(resolvedName), state=\(resolvedPeripheral.state.rawValue), sessionGeneration=\(task.sessionGeneration)")
-                activateArmedReconnectTask(task, source: source)
+                let resolutionSource = claimedRestoration != nil
+                    ? "stateRestoration"
+                    : "systemConnected"
+                loggerD(msg: "autoReconnect restoration claim: config=\(target.belongConfig), requestedUuid=\(trimmedUuid), resolvedUuid=\(resolvedUuid), name=\(resolvedName), state=\(resolvedPeripheral.state.rawValue), source=\(resolutionSource), sessionGeneration=\(task.sessionGeneration)")
+                if let claimedRestoration {
+                    activateClaimedStateRestoration(
+                        task: task,
+                        config: config,
+                        claim: claimedRestoration
+                    )
+                    recordAutoReconnectEvent(
+                        type: "ios_restore_escrow_claimed",
+                        uuid: resolvedUuid,
+                        name: resolvedName,
+                        detail: "state=\(claimedRestoration.state), sessionGeneration=\(task.sessionGeneration)"
+                    )
+                } else {
+                    activateArmedReconnectTask(task, source: source)
+                }
                 return BleReconnectActivationResult(
                     // ack 保留 Dart 原始 target identity，避免 batch 在回执期把 name-key
                     // 突然切成 uuid-key；resolvedUuid 作为独立字段供上层记录和回填。
                     target: target,
                     state: .resolved,
-                    reason: "systemConnectedPeripheralClaimed",
+                    reason: "restoredPeripheralClaimed",
                     source: source,
                     sessionGeneration: task.sessionGeneration,
                     resolvedUuid: resolvedUuid,
@@ -682,6 +706,63 @@ extension BleManager {
         }
         loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), manual takeover waits for automatic pairing recovery teardown sessionGeneration=\(task.sessionGeneration)")
         return true
+    }
+
+    /// 把 escrow 的物理状态接入正式 exact owner；connecting 时只挂 admission，避免重复 connect。
+    private func activateClaimedStateRestoration(
+        task: BleReconnectTask,
+        config: BleConfig,
+        claim: BleStateRestorationEscrowClaim
+    ) {
+        let peripheral = claim.peripheral
+        var request = BleEasyConnect(
+            configName: task.belongConfig,
+            uuid: peripheral.identifier.uuidString,
+            name: task.name,
+            afterUpgrade: false,
+            directConnect: true,
+            time: Date().timeIntervalSince1970
+        )
+        request.bleConfig = config
+        upsertActiveConnectRequest(request)
+        peripheral.delegate = self
+        replaceConnectionCache(
+            peripheral: peripheral,
+            config: config,
+            reason: "state restoration escrow claimed"
+        )
+        guard let admission = registerConnectionAttempt(
+            peripheral: peripheral,
+            config: config,
+            deviceName: task.name,
+            afterUpgrade: false,
+            source: task.source == .manualReconnect ? .manualReconnect : .stateRestoration,
+            sessionGeneration: task.sessionGeneration
+        ) else { return }
+
+        switch claim.state {
+        case .connected:
+            if peripheral.state == .connected {
+                enqueuePhysicalConnectionThroughGate(peripheral)
+            } else {
+                connectPeripheralAfterCancellationBarrier(peripheral, autoReconnect: true)
+            }
+        case .pending:
+            if peripheral.state == .connected {
+                enqueuePhysicalConnectionThroughGate(peripheral)
+            } else if peripheral.state == .connecting {
+                startPendingPhysicalConnectWatchdog(
+                    peripheral,
+                    admission: admission,
+                    autoReconnect: true
+                )
+            } else {
+                connectPeripheralAfterCancellationBarrier(peripheral, autoReconnect: true)
+            }
+        case .idle:
+            connectPeripheralAfterCancellationBarrier(peripheral, autoReconnect: true)
+        }
+        loggerD(msg: "stateRestoration: escrow claimed uuid=\(peripheral.identifier.uuidString), state=\(claim.state), physical=\(peripheral.state.rawValue), sessionGeneration=\(task.sessionGeneration)")
     }
 
     /// 扫描仅为已声明的 name-only owner 补齐 UUID，不把普通空 manufacturer 广播暴露给 Dart。

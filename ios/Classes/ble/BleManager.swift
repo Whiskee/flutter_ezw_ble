@@ -15,6 +15,42 @@ class BleManager: NSObject {
 
     //  使用静态常量来保证实例的唯一性
     static let shared = BleManager()
+    // 插件 application delegate 必须用同一个 identifier 校验 bluetoothCentrals
+    // launch option；保持模块内可见，禁止宿主复制字符串形成双重事实源。
+    static let restorationIdentifier = "com.fzfstudio.ezwble.central"
+    private static let bluetoothCentralBackgroundMode = "bluetooth-central"
+    // 缺少后台模式时输出可执行的排障提示，避免开发者误以为 iOS State Restoration 已经生效。
+    private static let stateRestorationMissingBluetoothCentralWarning =
+        "stateRestoration: WARNING disabled because host Info.plist is missing UIBackgroundModes bluetooth-central. " +
+        "If you expect iOS background reconnect or CoreBluetooth State Restoration, add UIBackgroundModes -> bluetooth-central to Runner/Info.plist."
+
+    /**
+     * 当前宿主是否声明了 CoreBluetooth State Restoration 所需的后台模式。
+     *
+     * iOS 会在 `CBCentralManagerOptionRestoreIdentifierKey` 与缺失
+     * `UIBackgroundModes.bluetooth-central` 同时出现时直接抛 NSException。
+     * 插件必须先检查宿主 Info.plist；未声明时降级为普通前台 central manager，
+     * 让 App 至少能正常启动并使用前台 BLE。
+     */
+    private static var canEnableStateRestoration: Bool {
+        let modes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String]
+        return modes?.contains(bluetoothCentralBackgroundMode) == true
+    }
+
+    /**
+     * 构造 CBCentralManager 初始化参数。
+     *
+     * 只有宿主显式声明 `bluetooth-central` 后才传 restore identifier；否则返回 nil，
+     * 避免系统异常，同时保留扫描、连接和前台自动回连能力。
+     */
+    private static func centralManagerOptions() -> [String: Any]? {
+        guard canEnableStateRestoration else {
+            return nil
+        }
+        return [
+            CBCentralManagerOptionRestoreIdentifierKey: restorationIdentifier
+        ]
+    }
     
     //  =========== Constants
     //  - 蓝牙管理工具
@@ -97,6 +133,8 @@ class BleManager: NSObject {
     /// Trace 专用的前一连接状态，仅用于区分 Bond 恢复超时/取消与普通连接终态。
     var nativeTraceLastConnectStates: [String: BleConnectState] = [:]
     let reconnectStore = BleReconnectStore()
+    // CoreBluetooth 恢复对象只能由当前账号的 exact target 认领。
+    let restorationCoordinator = BleStateRestorationCoordinator()
     //  - 最近一次已输出的扫描配置签名，用于避免每次 startScan 都重复刷配置详情。
     private var lastLoggedScanConfigSignature: String?
     //  =========== Get/Set
@@ -116,10 +154,11 @@ class BleManager: NSObject {
      */
     private override init() {
         super.init()
+        let options = BleManager.centralManagerOptions()
         self.centralManager = CBCentralManager(
             delegate: self,
             queue: nil,
-            options: nil
+            options: options
         )
         // 插件可能在 didBecomeActive 之后才初始化；此时允许继承当前 active 事实。
         // 后续所有切换仍只由 UIApplication 生命周期通知更新。
@@ -1063,6 +1102,7 @@ extension BleManager {
      * 清除连接缓存
      */
     func cleanConnectCache() {
+        cancelAllStateRestorationEscrow(reason: "cleanConnectCache")
         cancelAllConnectionAdmissions(reason: "cleanConnectCache")
         businessConnectionLeases.clear()
         //  1、清理当前连接请求和搜索连接信息。
@@ -1084,7 +1124,7 @@ extension BleManager {
     /**
      * 重置
      */
-    func reset() {
+    func reset(preserveStateRestoration: Bool = false) {
         stopScan()
         cancelAllConnectionAdmissions(reason: "reset")
         businessConnectionLeases.clear()
@@ -1104,6 +1144,11 @@ extension BleManager {
         scanConnectTimeoutTimers.removeAll()
         upgradeStateRegistry.clear()
         preConnectedDevices.removeAll()
+        // 冷启动 reset 发生在 willRestoreState 和账号 target 加载之间时保留 escrow；
+        // 登出、解绑和显式清理继续取消全部历史恢复对象。
+        if !preserveStateRestoration {
+            cancelAllStateRestorationEscrow(reason: "hard reset")
+        }
         cancelAllReconnectTasks()
         // resetBle 是中性 runtime teardown：持久 owner/autoReconnect 配置必须保留，
         // 由 Dart 下一次普通 cold_start/autoReconnect activate 建立全新 generation。
@@ -1114,7 +1159,7 @@ extension BleManager {
         nativeTraceRssiInFlightAttemptIds.removeAll()
         nativeTraceLastConnectStates.removeAll()
         nativeConnectionTraces.removeAll()
-        loggerD(msg: "Reset: success")
+        loggerD(msg: "Reset: success, preserveStateRestoration=\(preserveStateRestoration)")
     }
     
 }
@@ -2565,6 +2610,18 @@ extension BleManager: CBCentralManagerDelegate {
         // 1. 保持 delegate 层极薄，扫描领域逻辑全部下沉到 BleScanPipeline。
         handleDiscoveredPeripheral(peripheral, advertisementData: advertisementData, rssi: RSSI)
     }
+
+    func centralManager(_ central: CBCentralManager, willRestoreState dict: [String : Any]) {
+        let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] ?? []
+        recordAutoReconnectEvent(
+            type: "ios_will_restore_state",
+            detail: "peripherals=\(peripherals.count), keys=\(Array(dict.keys))"
+        )
+        loggerD(msg: "stateRestoration: willRestoreState id=\(BleManager.restorationIdentifier), peripherals=\(peripherals.count), keys=\(Array(dict.keys))")
+        peripherals.forEach { peripheral in
+            escrowStateRestorationPeripheral(peripheral, source: "willRestoreState")
+        }
+    }
     
     func centralManager(_ central: CBCentralManager, didUpdateANCSAuthorizationFor peripheral: CBPeripheral) {
         loggerE(msg: "didUpdateANCSAuthorizationFor")
@@ -2577,6 +2634,11 @@ extension BleManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, timestamp: CFAbsoluteTime, isReconnecting: Bool, error: (any Error)?) {
         loggerE(msg: "didDisconnectPeripheral: timestamp = \(timestamp), isReconnecting = \(isReconnecting), error = \(String(describing: error))")
         if consumePeripheralCancellationBarrier(peripheral) { return }
+        if handleStateRestorationEscrowTerminal(
+            peripheral,
+            systemIsReconnecting: isReconnecting,
+            reason: "didDisconnect isReconnecting=\(isReconnecting)"
+        ) { return }
         if isReconnecting {
             // 系统已持有 reconnect 时只结束旧业务 session 并重建 admission；再次 connect/cancel
             // 会破坏 CoreBluetooth 的自动回连 rendezvous。
@@ -2604,6 +2666,7 @@ extension BleManager: CBCentralManagerDelegate {
             loggerD(msg: "admission gate: \(peripheral.identifier.uuidString), stale didConnect blocked by cancellation barrier")
             return
         }
+        if handleStateRestorationEscrowDidConnect(peripheral) { return }
         //  1、检查是否获取到了蓝牙配置
         guard let connectRequest = findActiveConnectRequest(peripheral: peripheral),
               let bleConfig = connectRequest.bleConfig else {
@@ -2620,6 +2683,11 @@ extension BleManager: CBCentralManagerDelegate {
      */
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         if consumePeripheralCancellationBarrier(peripheral) { return }
+        if handleStateRestorationEscrowTerminal(
+            peripheral,
+            systemIsReconnecting: false,
+            reason: "didFailToConnect error=\(String(describing: error))"
+        ) { return }
         handleConnectError(peripheral: peripheral, error: error, formMethod: "didFailToConnect")
     }
 
@@ -2628,6 +2696,11 @@ extension BleManager: CBCentralManagerDelegate {
      */
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         if consumePeripheralCancellationBarrier(peripheral) { return }
+        if handleStateRestorationEscrowTerminal(
+            peripheral,
+            systemIsReconnecting: false,
+            reason: "didDisconnect legacy error=\(String(describing: error))"
+        ) { return }
         handleConnectError(peripheral: peripheral, error: error, formMethod: "didDisconnectPeripheral")
     }
     
