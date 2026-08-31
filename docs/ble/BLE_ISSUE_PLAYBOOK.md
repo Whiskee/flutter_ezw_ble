@@ -17,7 +17,7 @@ Root cause:
 Fix:
 
 - Gate both `retrieveConnectedPeripherals` and `retrievePeripherals` behind App active lifecycle state. Close the gate at `willResignActive`, `didEnterBackground`, and `willTerminate`; reopen only at `didBecomeActive`.
-- Preserve State Restoration escrow and already-held in-memory peripherals. Otherwise keep name-only targets as `identityPending` and UUID targets as deferred owners without `noDeviceFound` or retry advancement.
+- Preserve already-held in-memory peripherals. Otherwise keep name-only targets as `identityPending` and UUID targets as deferred owners without `noDeviceFound` or retry advancement.
 - On `didBecomeActive`, revalidate config authorization, owner identity, and session generation before a single compensation pass. Reuse `resolvePendingReconnectIdentity` and the existing Gate; never revive cancelled/replaced owners.
 - Keep CBCentralManager on its current queue in this emergency fix. A full queue migration is a separate architecture change.
 
@@ -31,59 +31,6 @@ Owner:
 
 - `flutter_ezw_ble` iOS native owns lifecycle containment and exact deferred-owner recovery.
 - even_connect/App keep their existing activation, retry, protocol, and business-connected semantics.
-
-## iOS restoration: one G2 leg disconnects before current targets load
-
-Symptoms:
-
-- `willRestoreState` returns both G2 peripherals, and one leg is already physically connected.
-- Before Flutter loads the current account's bound targets, that leg reports `didDisconnectPeripheral` with `isReconnecting=false`.
-- Native logs then report that it is not the current connected device; the other leg reconnects, while the first leg stays absent until a later manual attempt.
-
-Root cause:
-
-- A restored peripheral is a system-owned physical opportunity, not yet a business owner.
-- The old startup path only cached the object while configs were unavailable. If it disconnected before target activation, normal terminal handling could not find an active request or business cache and therefore did not rebuild a CoreBluetooth pending connect.
-- Matching immediately after `initConfigs` is also unsafe: config type alone cannot prove that a restored endpoint belongs to the current account.
-
-Fix:
-
-- Put every restored peripheral into a UUID-level `idle / pending / connected` physical escrow.
-- Before claim, hold `didConnect` without service discovery, notify, AUTH, or `noBleConfigFound`; on terminal, keep an existing system reconnect or re-arm one long-lived auto-reconnect pending connect.
-- Let `activateAutoReconnectTargets` claim by stable UUID or unique exact endpoint name. Attach the current admission to an existing `.connecting` request instead of opening a duplicate connect.
-- Finalize only after all current G2 legs and R1 targets have returned activation acknowledgements. Cancel unclaimed historical objects behind the late-callback cancellation barrier.
-
-Owner:
-
-- `flutter_ezw_ble` iOS native owns restoration escrow, claim, re-arm, and hard-cancel isolation.
-- even_connect owns submitting the complete current target batch before calling `finalizeStateRestorationClaims`.
-
-## iOS State Restoration crashes without bluetooth-central background mode
-
-Symptoms:
-
-- App crashes on iOS startup or plugin initialization.
-- Xcode shows `NSException` with `State restoration of CBCentralManager is only allowed for applications that have specified the "bluetooth-central" background mode`.
-- There may be no BLE scan/connect logs because the crash happens while creating `CBCentralManager`.
-- With the safe gate in place, hosts that omit the mode should log `stateRestoration: WARNING disabled because host Info.plist is missing UIBackgroundModes bluetooth-central`.
-
-Root cause:
-
-- `CBCentralManagerOptionRestoreIdentifierKey` enables CoreBluetooth State Restoration.
-- Apple requires the host app to declare `UIBackgroundModes = bluetooth-central` before a central manager can be initialized with that restore identifier.
-- Passing the restore identifier unconditionally makes any host app or example without that plist mode crash before normal BLE logic starts.
-
-Fix:
-
-- Gate `CBCentralManagerOptionRestoreIdentifierKey` behind a runtime `Info.plist` check for `UIBackgroundModes.bluetooth-central`.
-- If the mode is missing, initialize `CBCentralManager` without a restore identifier so foreground BLE still works and State Restoration is simply disabled.
-- Keep the missing-mode warning actionable: it must say that iOS background reconnect / CoreBluetooth State Restoration is disabled and that the host should add `UIBackgroundModes -> bluetooth-central` to `Runner/Info.plist`.
-- Add `UIBackgroundModes` / `bluetooth-central` to examples or host apps that need iOS background reconnect and State Restoration.
-
-Owner:
-
-- `flutter_ezw_ble` iOS native owns the safe initialization gate.
-- The host app owns declaring `UIBackgroundModes.bluetooth-central` when it wants State Restoration.
 
 ## Android passive autoReconnect closes the live GATT after business connected
 
@@ -236,28 +183,27 @@ Owner:
 
 - App/example/even_connect orchestration. Native BLE timeouts should still guard one peripheral connection, while the app-level watchdog guards the logical two-leg device.
 
-## CDM / iOS restoration wakes the process but does not mean business connected
+## Platform wake or physical recovery does not mean business connected
 
 Symptoms:
 
 - Android `CompanionDeviceService.onDeviceAppeared` fires, but G2 UI should not immediately show connected.
 - Android logcat shows `Start proc ... for service {...EzwCompanionDeviceService}` after a companion device appears, but manually opening the app later still shows the normal splash screen.
-- iOS `willRestoreState` fires after system relaunch, but receive data/AUTH callbacks may not be available until Flutter listeners attach.
 - Logs show platform wakeup before `connectFinish`.
 
 Root cause:
 
-- Android CDM and iOS CoreBluetooth restoration are process/physical-link recovery layers.
+- Android CDM and native BLE recovery are process/physical-link recovery layers.
 - Android CDM binds the app's `CompanionDeviceService` in the background. It does not launch `MainActivity`, bring the app to the foreground, or restore the previous Flutter route. A later launcher tap can still create a fresh Activity and show the splash screen even though the process was already running in the background.
 - They do not restore private GATT services, CCCD/notify, G2 AUTH, right-leg pipe switch, or time sync by themselves.
 - Flutter EventChannel logs may be absent during a CDM service cold start because no Flutter UI/listener is attached yet. Use system logcat markers (`CDM_CompanionAppBinder`, `Start proc ... for service`, `CDM_CompanionServiceConnector connected=true`) and buffered native reconnect events to prove the wake path.
 
 Fix:
 
-- Treat CDM/restoration as an outer wakeup signal only.
-- Reuse the existing native GATT restoration gate before `connectFinish`.
+- Treat CDM/native recovery as an outer wakeup signal only.
+- Reuse the existing native GATT readiness gate before `connectFinish`.
 - Keep G2 business commands in Dart/even_connect after `connectFinish`.
-- Buffer native restoration logs/status until EventChannel listeners attach.
+- Buffer native recovery logs/status until EventChannel listeners attach.
 - If product requirements demand business connect while no Flutter UI/engine exists, move the required G2 post-`connectFinish` protocol handshake into native code or start a deliberate headless Flutter execution path from the companion service. Do not infer foreground UI launch from CDM service binding.
 
 ## Android CDM wake path must cover modern presence events
@@ -314,20 +260,20 @@ Fix:
 - Mirror native plugin logs to logcat, not only Flutter EventChannel, because CDM can wake only the companion service before Flutter attaches listeners.
 - Preserve Dart/even_connect ownership of post-`connectFinish` AUTH, pipe switch, time sync, and whole-device aggregation.
 
-## iOS restoration/cold launch opens detail but shows disconnected
+## iOS cold launch opens detail but shows disconnected
 
 Symptoms:
 
 - The G2 was business connected before the app was killed or relaunched.
 - After the process appears again, the example restores the cached SN/name/MAC and opens the detail page.
-- The detail page shows `Reconnect` or disconnected even when the platform may have restored a physical CoreBluetooth peripheral.
-- Console may show `connectFinish` or `stateRestoration` before the cached selected device has been restored into Dart state.
+- The detail page shows `Reconnect` or disconnected even when native may already be rebuilding a physical link.
+- Console may show `connectFinish` before the cached selected device has been restored into Dart state.
 
 Root cause:
 
 - Persisted example data stores device identity only, not the business connected state.
 - `_connectStates` is in-memory and empty after process death, so the UI must not assume the cached device is connected.
-- iOS restoration can emit `connectStatus` before `_selectedDevice` is restored. If Dart ignores that early `connectFinish`, G2 AUTH is never sent and `deviceConnected(uuid)` is never called.
+- Native reconnect can emit `connectStatus` before `_selectedDevice` is restored. If Dart ignores that early `connectFinish`, G2 AUTH is never sent and `deviceConnected(uuid)` is never called.
 - `connectFinish` is only the private-service/CCCD readiness gate; the whole G2 is business connected only after both legs finish AUTH and post-auth commands.
 
 Fix:
@@ -359,7 +305,7 @@ Fix:
 - If no selected device exists, restore the persisted G2 identity and start a direct reconnect.
 - If a selected device exists but is not business connected, start a direct reconnect from the detail page state.
 - If the previous connection flow was started while BLE was off/unauthorized, stop that stale flow and restart it after Bluetooth becomes available.
-- Keep iOS native responsible for CoreBluetooth pending connects and State Restoration after the app has submitted a reconnect task. Keep example/even_connect responsible for cached identity replay and G2 business AUTH after `connectFinish`.
+- Keep iOS native responsible for CoreBluetooth pending connects after the app has submitted a reconnect task. Keep example/even_connect responsible for cached identity replay and G2 business AUTH after `connectFinish`.
 
 Owner:
 
@@ -378,7 +324,7 @@ Symptoms:
 Root cause:
 
 - iOS stores a CoreBluetooth peripheral identifier, not the real BLE MAC address.
-- A cached identifier can be stale across cold launch, restoration, reinstall, or CoreBluetooth cache churn. Blind `directConnect=true` can therefore call `central.connect` on a peripheral object that never completes and eventually times out.
+- A cached identifier can be stale across cold launch, reinstall, or CoreBluetooth cache churn. Blind `directConnect=true` can therefore call `central.connect` on a peripheral object that never completes and eventually times out.
 - The iOS scan-then-connect path matched pending requests against `peripheral.name`, but CoreBluetooth often leaves `peripheral.name` empty during scanning. The real discoverable name is in `CBAdvertisementDataLocalNameKey`.
 - Because the first leg timed out before the right leg was requested, the right leg never entered native connect.
 
@@ -464,40 +410,40 @@ Fix:
 - Also kick paused reconnect tasks whenever the app becomes active/enters foreground, configs are reinitialized, or Dart queries `bleState`, if `centralManager.state == .poweredOn`.
 - Log `autoReconnect: resume requested, reason=...` before scheduling attempts so suspend/resume tests have an explicit marker.
 
-## iOS Bluetooth off/on is not a positive CoreBluetooth restoration test
+## iOS Bluetooth off/on is not a positive pending-connect test
 
 Symptoms:
 
 - Logs stop at `bleState: powerOff` / `centralManagerDidUpdateState: State = poweredOff`.
 - Native logs `autoReconnect: pause ... bluetooth off` and `paused because bluetooth is unavailable`.
-- After the app process is frozen with `devicectl device process suspend`, turning iPhone Bluetooth back on does not produce `poweredOn`, `start native pending connect`, `didConnect`, or `willRestoreState`.
+- After the app process is frozen with `devicectl device process suspend`, turning iPhone Bluetooth back on does not produce `poweredOn`, `start native pending connect`, or `didConnect`.
 
 Root cause:
 
 - A CoreBluetooth pending connect can be preserved only while Bluetooth is available and the central has actually called `connect(peripheral, options:)`.
 - When iPhone Bluetooth is powered off, CoreBluetooth cannot hold a meaningful pending BLE connection. The plugin correctly pauses reconnect tasks instead of creating a pending connect against an unavailable radio.
 - `devicectl suspend` is a developer-tool freeze, not normal iOS background suspension. CoreBluetooth is not expected to thaw that process when Bluetooth is turned back on.
-- Bluetooth power-on is not itself the BLE peripheral-return event used by State Preservation / Restoration.
+- Bluetooth power-on is not itself the BLE peripheral-return event used by a pending connect.
 
 Fix:
 
-- For a positive iOS restoration/reconnect test, keep iPhone Bluetooth on and make the G2 leave/return by powering off, moving away, shielding, or otherwise dropping the peripheral link.
+- For a positive iOS pending-reconnect test, keep iPhone Bluetooth on and make the G2 leave/return by powering off, moving away, shielding, or otherwise dropping the peripheral link.
 - Ensure logs show the app created a native pending reconnect while Bluetooth is still powered on: `start native pending connect` and `native pending connect armed without short timeout`.
-- Let iOS background/suspend naturally for wake testing. Treat `devicectl suspend` and `devicectl --kill` as negative/control tests, not proof that real system restoration is broken.
+- Let iOS background/suspend naturally for reconnect testing. Treat `devicectl suspend` and `devicectl --kill` as negative/control tests, not proof that ordinary background reconnect is broken.
 - If testing the Bluetooth off/on path, resume/foreground the app or trigger `bleState` query after Bluetooth is on so the app can run and create a fresh pending connect.
 
 ## iOS native reconnect must be a CoreBluetooth pending connect, not an app timer
 
 Symptoms:
 
-- The device leaves for a long time while the app is backgrounded, suspended, or later restored by the system.
+- The device leaves for a long time while the app is backgrounded or suspended.
 - App-level reconnect timers do not fire while the process is suspended.
 - When the device returns, no immediate reconnect happens unless the user foregrounds the app or manually taps reconnect.
 
 Root cause:
 
-- iOS can preserve and restore CoreBluetooth work only when the central has an active system-owned operation, such as a pending `connectPeripheral`.
-- A `Timer` scheduled inside the app process is not a wake source. Once the app is suspended or system-relaunched, the timer cannot discover the returning device.
+- While the process remains alive, background CoreBluetooth work requires an active system-owned operation such as a pending `connectPeripheral`.
+- A `Timer` scheduled inside the app process is not a wake source. Once the app is suspended, the timer cannot discover the returning device.
 - Short connect timeouts can accidentally cancel the pending CoreBluetooth connect before the peripheral returns.
 
 Fix:
@@ -509,7 +455,7 @@ Fix:
 
 Owner:
 
-- `flutter_ezw_ble` iOS owns the CoreBluetooth pending connect and restoration bridge.
+- `flutter_ezw_ble` iOS owns the CoreBluetooth pending connect while the current process remains alive.
 - App/even_connect owns logical G2 aggregation and post-`connectFinish` business commands.
 
 ## iOS G2 one leg reaches didConnect, then times out at searchService
@@ -524,8 +470,8 @@ Symptoms:
 Root cause:
 
 - This is an iOS native per-peripheral GATT readiness issue, not a G2 AUTH failure.
-- On reconnect/restoration/system-connected paths, CoreBluetooth can already hold a `CBPeripheral.services` cache when `didConnect` arrives.
-- If the plugin only calls `discoverServices(...)` and waits for a fresh callback, a cached/restored peripheral can remain stuck in `searchService` until the connect timeout.
+- On reconnect/system-connected paths, CoreBluetooth can already hold a `CBPeripheral.services` cache when `didConnect` arrives.
+- If the plugin only calls `discoverServices(...)` and waits for a fresh callback, a cached peripheral can remain stuck in `searchService` until the connect timeout.
 - Replaying cached services naively can duplicate characteristic and CCCD callbacks, so notify progress must be counted by unique read characteristic, not raw callback count.
 - CCCD notify callbacks can also arrive before `didDiscoverCharacteristicsFor` has updated the local write/read characteristic dictionaries. If `connectFinish` is checked only inside the notify callback, de-duplicating later callbacks can leave the leg stuck until timeout even though all private services are already ready.
 
@@ -536,7 +482,7 @@ Fix:
 - If cached service characteristics are already present, process them through the same helper as `didDiscoverCharacteristicsFor`; otherwise request characteristic discovery.
 - Deduplicate discovered characteristics and notification-state callbacks so duplicate CoreBluetooth replays cannot over-count CCCD readiness.
 - Emit `connectFinish` from a single readiness gate that is called after both characteristic discovery and notification-state updates. The gate should require all configured write chars, read chars, and unique notified read chars, so callback ordering does not matter.
-- If a read characteristic is already `isNotifying` when characteristics are discovered, count it as notified immediately; restoration/cache paths may not deliver a new enable-notify callback.
+- If a read characteristic is already `isNotifying` when characteristics are discovered, count it as notified immediately; cached paths may not deliver a new enable-notify callback.
 - Keep G2 post-`connectFinish` business commands (`AUTHENTICATION`, pipe switch, time sync) in Dart/even_connect.
 
 Owner:
@@ -661,7 +607,7 @@ Root cause:
 
 - The Android MethodChannel `initConfigs` path used Gson reflection to convert nested `Map` payloads into `BleConfig`.
 - Release/R8 obfuscation can remove or rename generic/signature metadata that Gson relies on, especially for classes extending shared abstract serializer bases.
-- Since `initConfigs` fails, native `bleConfigs` stays empty. Scanning, connecting, and persisted reconnect restoration all become no-op or fail at the config guard.
+- Since `initConfigs` fails, native `bleConfigs` stays empty. Scanning, connecting, and persisted reconnect recovery all become no-op or fail at the config guard.
 
 Fix:
 
@@ -890,7 +836,7 @@ Symptoms:
   while Dart's Future appears successful and the UI remains `Connecting`.
 - Android descriptor writes or MTU requests are rejected synchronously by the
   framework, but no later callback arrives to advance or fail the GATT pipeline.
-- A stale iOS restoration target references a config name that no longer exists
+- A stale iOS reconnect target references a config name that no longer exists
   and crashes during restore.
 - User disconnect/reset/cleanup is followed by an unexpected auto reconnect
   because the persisted reconnect target survived the user action.
@@ -906,14 +852,12 @@ Root cause:
 - Persisted reconnect targets represent explicit business intent. They must be
   removed when the user explicitly disconnects, removes, resets, or cleans
   native connection state.
-- iOS State Restoration can deliver peripherals after configuration has
-  changed. Restoration must validate persisted config names instead of force
-  unwrapping them.
+- iOS native reconnect may run after configuration has changed. Reconnect must validate persisted config names instead of force unwrapping them.
 
 Fix:
 
 - Make iOS `initConfigs` update native configuration before returning success
-  to Dart. Defer restoration replay inside the manager/coordinator, not by
+  to Dart. Defer reconnect replay inside the manager/coordinator, not by
   delaying the config write itself.
 - Return MethodChannel errors for invalid `connectDevice` payloads so callers
   can leave `Connecting` immediately.
@@ -923,7 +867,7 @@ Fix:
   `charsFail`, because private notify readiness is not complete.
 - Treat MTU request rejection as a non-fatal default-MTU completion only after
   private services and CCCD are already ready.
-- Validate iOS restored targets against current configs and remove stale
+- Validate iOS reconnect targets against current configs and remove stale
   persisted targets instead of crashing.
 - Clear persisted reconnect targets on user disconnect, reset, and connection
   cache cleanup.
@@ -1079,7 +1023,7 @@ Owner:
 
 - Example/even_connect owns cached config readiness and cached-device replay.
 - Native `flutter_ezw_ble` owns returning `initConfigs` promptly, but Dart must
-  remain robust when platform work is delayed by restoration or lifecycle order.
+  remain robust when platform work is delayed by lifecycle order.
 
 ## iOS reinstall: stale peripheral UUID plus ANCS system connection
 
@@ -1166,7 +1110,7 @@ Root cause:
 - Exact business commit released the admission Gate after publishing
   `connected`, but the reconnect task retained only the Dart session generation.
 - A later CoreBluetooth terminal callback has no business token of its own, so
-  native restored the session but lost the attempt. Relaxing the Dart guard
+  native retained the session but lost the attempt. Relaxing the Dart guard
   would let an old physical attempt terminate a newer attempt in the same
   session.
 

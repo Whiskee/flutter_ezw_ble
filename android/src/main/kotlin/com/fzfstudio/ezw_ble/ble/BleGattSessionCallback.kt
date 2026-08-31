@@ -4,9 +4,11 @@ import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothStatusCodes
 import android.os.Build
+import android.os.SystemClock
 import com.fzfstudio.ezw_ble.ble.models.BleCmd
 import com.fzfstudio.ezw_ble.ble.models.BleDevice
 import com.fzfstudio.ezw_ble.ble.models.BluetoothGattStatus
@@ -14,6 +16,8 @@ import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
 import com.fzfstudio.ezw_ble.ble.models.enums.BleLoggerTag
 import java.util.LinkedList
 import java.util.Queue
+import java.util.Timer
+import java.util.TimerTask
 
 /**
  * 一条 Android GATT session 的完整回调处理器。
@@ -29,6 +33,18 @@ internal class BleGattSessionCallback(
     private val currentDeviceForGatt: (BluetoothGatt, String) -> BleDevice?,
     /** 将连接阶段推进给 manager，由 manager 统一更新状态和 EventChannel。 */
     private val handleConnectState: (String, String, BleConnectState, Int) -> Unit,
+    /** 记录当前 native attempt 的阶段；Trace 关闭时 manager 会直接 no-op。 */
+    private val recordTraceStep: (String, String, String, String?, String?, Int?) -> Unit,
+    /** MTU 回调附带 ATT 可写载荷上限，避免把协商 MTU 与业务 payload 混为一谈。 */
+    private val recordTraceMtu: (String, String, Int, Int) -> Unit,
+    /** 写入最新 RSSI 诊断快照，不独立上报。 */
+    private val updateTraceRssi: (String, Int) -> Unit,
+    /** 写入 controller 实际 PHY 诊断快照。 */
+    private val updateTracePhy: (String, String?) -> Unit,
+    /** 写入最近一次 Android requested connection priority。 */
+    private val updateTraceRequestedPriority: (String, String?, Boolean) -> Unit,
+    /** 记录 PHY 策略请求、回退和失败；真实 PHY 仍只认 onPhyUpdate。 */
+    private val recordTracePhyPolicy: (String, String, String, String) -> Unit,
     /** 真实物理连接只提交给全局 Gate；Gate owner 才能开始 service discovery。 */
     private val onPhysicalConnected: (BluetoothGatt, BleDevice) -> Unit,
     /** 当前 session 进入终态时，由 manager 先释放 Gate、再清理状态并启动下一条 pipeline。 */
@@ -56,6 +72,36 @@ internal class BleGattSessionCallback(
     /** 当前已提交、正在等待 onDescriptorWrite 的 CCCD 所属私有服务类型。 */
     private var inFlightDescriptorPsType: Int? = null
 
+    /** 高可靠配置的单 session RSSI/空闲优先级监测器；终态必须跟随 callback 一起失效。 */
+    private var adaptiveLinkTimer: Timer? = null
+
+    /** 避免上一次 RSSI callback 未返回时重复提交读取。 */
+    @Volatile
+    private var isRssiReadPending = false
+
+    /** 最近一次成功 RSSI，用于 supervision timeout 日志还原物理劣化前的链路质量。 */
+    @Volatile
+    private var lastRssi: Int? = null
+
+    /** 当前请求的 PHY；RSSI 迟滞区保持此值，避免强弱边缘反复切换。 */
+    @Volatile
+    private var requestedPhy = BluetoothDevice.PHY_LE_1M
+
+    /** controller 实际回调的收发 PHY，仅用于诊断，不参与 owner 判定。 */
+    @Volatile
+    private var activeTxPhy: Int? = null
+
+    @Volatile
+    private var activeRxPhy: Int? = null
+
+    /** 最后一次真实 notify/write 活动；用它在 high 与 balanced priority 之间收敛。 */
+    @Volatile
+    private var lastLinkActivityAtMs = 0L
+
+    /** 避免每个高频音频包都重复 requestConnectionPriority。 */
+    @Volatile
+    private var isHighConnectionPriority = false
+
     /**
      * 监听物理链路连接/断开。
      *
@@ -73,6 +119,8 @@ internal class BleGattSessionCallback(
         //    否则多设备会同时占用 HCI/GATT 初始化通道。
         if (newState == BluetoothProfile.STATE_CONNECTED) {
             val connectedDevice = currentExpectedDeviceForGatt(gatt, "connection connected") ?: return
+            recordTraceStep(address, "connect", "success", null, "HCI", status)
+            startAdaptiveLinkMonitoring(gatt, connectedDevice)
             onPhysicalConnected(gatt, connectedDevice)
             sendLog(
                 BleLoggerTag.d,
@@ -86,7 +134,10 @@ internal class BleGattSessionCallback(
             return
         }
 
-        // 4. 蓝牙关闭时不在这里释放，避免和 BleStateListener 对同一批设备重复断连。
+        // 4. 物理断连后任何 RSSI/PHY/priority 请求都必须停止，不能让旧 callback 持有新 session。
+        stopAdaptiveLinkMonitoring()
+
+        // 5. 蓝牙关闭时不在这里释放，避免和 BleStateListener 对同一批设备重复断连。
         if (!isBluetoothEnabled()) {
             sendLog(
                 BleLoggerTag.e,
@@ -95,35 +146,36 @@ internal class BleGattSessionCallback(
             return
         }
 
-        // 5. 断连会使本 session 的 GATT readiness 失效。
+        // 6. 断连会使本 session 的 GATT readiness 失效。
         isPrivateServiceReady = false
         val device = currentExpectedDeviceForGatt(gatt, "connection disconnected") ?: return
         val connectionStatus = BluetoothGattStatus.getConnectionStatusDescription(status)
 
-        // 6. 连接状态回调中的 status 是 HCI/controller 断连原因，不是 ATT/GATT 操作码。
+        // 7. 连接状态回调中的 status 是 HCI/controller 断连原因，不是 ATT/GATT 操作码。
         //    例如 status 8 在这里表示连接超时；只有 descriptor/characteristic 回调里的 8
         //    才能按 GATT_INSUFFICIENT_AUTHORIZATION 解释和记录。
 
-        // 7. 当前 active GATT 在 connecting 阶段收到断连，说明本轮 connectGatt 已经失败。
+        // 8. 当前 active GATT 在 connecting 阶段收到断连，说明本轮 connectGatt 已经失败。
         //    不能继续静默 keep connecting：G2 第二条腿会等满 timeout，甚至在部分机型上丢失终态。
         //    stale GATT 已在 currentExpectedDeviceForGatt 里过滤，这里可以安全落本轮 timeout。
         if (device.connectState.isConnecting) {
             sendLog(
                 BleLoggerTag.e,
-                "Connect call back: $address disconnected while connecting, fail active connect as timeout, code=$connectionStatus",
+                "Connect call back: $address disconnected while connecting, fail active connect as timeout, code=$connectionStatus, lastRssi=$lastRssi, txPhy=${phyLabel(activeTxPhy)}, rxPhy=${phyLabel(activeRxPhy)}",
             )
-            onSessionTerminal(gatt, BleConnectState.TIMEOUT, DEFAULT_MTU)
+            recordTraceStep(address, "connect", "failed", null, "HCI", status)
+            terminateSession(gatt, BleConnectState.TIMEOUT, DEFAULT_MTU)
             return
         }
 
-        // 8. 释放 native GATT 资源；不 close 会让后续连接占住旧 binder session。
+        // 9. 释放 native GATT 资源；不 close 会让后续连接占住旧 binder session。
         try {
             gatt.close()
         } catch (closeError: Exception) {
             sendLog(BleLoggerTag.e, "Connect call back: $address close gatt exception: ${closeError.message}")
         }
 
-        // 9. 用户/超时主动断连已经有明确状态，不再二次上报系统断连。
+        // 10. 用户/超时主动断连已经有明确状态，不再二次上报系统断连。
         val explicitDisconnectState = consumeDisconnectingState(device.uuid)
         if (explicitDisconnectState != null) {
             sendLog(
@@ -133,12 +185,13 @@ internal class BleGattSessionCallback(
             return
         }
 
-        // 10. 非主动断连统一上报系统断连，由 manager 决定是否调度自动回连。
+        // 11. 非主动断连统一上报系统断连，由 manager 决定是否调度自动回连。
         sendLog(
             BleLoggerTag.e,
-            "Connect call back: $address state = STATE_DISCONNECTED(code:$connectionStatus)",
+            "Connect call back: $address state = STATE_DISCONNECTED(code:$connectionStatus), lastRssi=$lastRssi, txPhy=${phyLabel(activeTxPhy)}, rxPhy=${phyLabel(activeRxPhy)}",
         )
-        onSessionTerminal(gatt, BleConnectState.DISCONNECT_FROM_SYS, DEFAULT_MTU)
+        recordTraceStep(address, "disconnect", "abnormal", null, "HCI", status)
+        terminateSession(gatt, BleConnectState.DISCONNECT_FROM_SYS, DEFAULT_MTU)
     }
 
     /**
@@ -155,27 +208,31 @@ internal class BleGattSessionCallback(
 
         // 2. 服务发现失败直接进入 SERVICE_FAIL，等待上层或自动回连策略处理。
         if (status != BluetoothGatt.GATT_SUCCESS) {
-            onSessionTerminal(gatt, BleConnectState.SERVICE_FAIL, DEFAULT_MTU)
+            recordTraceStep(address, "service_discovery", "failed", null, "GATT", status)
+            terminateSession(gatt, BleConnectState.SERVICE_FAIL, DEFAULT_MTU)
             sendLog(BleLoggerTag.e, "Connect call back: $address, discover service failure")
             return
         }
 
         // 3. 按配置逐个解析私有服务，任何一个 write/read 缺失都不能宣告 connectFinish。
         isPrivateServiceReady = true
+        recordTraceStep(address, "service_discovery", "success", null, "GATT", status)
         currentDevice.belongConfig.privateServices.forEach { privateService ->
             val service = gatt.getService(privateService.serviceUUID)
             val writeChars = service?.getCharacteristic(privateService.writeCharsUUID)
             if (writeChars == null) {
+                recordTraceStep(address, "characteristic_discovery", "failed", privateService.type.toString(), null, null)
                 sendLog(BleLoggerTag.e, "Connect call back: $address, ${privateService.service}, write characteristic not found")
-                onSessionTerminal(gatt, BleConnectState.CHARS_FAIL, DEFAULT_MTU)
+                terminateSession(gatt, BleConnectState.CHARS_FAIL, DEFAULT_MTU)
                 isPrivateServiceReady = false
                 return
             }
 
             val readChars = service.getCharacteristic(privateService.readCharsUUID)
             if (readChars == null) {
+                recordTraceStep(address, "characteristic_discovery", "failed", privateService.type.toString(), null, null)
                 sendLog(BleLoggerTag.e, "Connect call back: $address, ${privateService.service}, read characteristic not found")
-                onSessionTerminal(gatt, BleConnectState.CHARS_FAIL, DEFAULT_MTU)
+                terminateSession(gatt, BleConnectState.CHARS_FAIL, DEFAULT_MTU)
                 isPrivateServiceReady = false
                 return
             }
@@ -188,6 +245,7 @@ internal class BleGattSessionCallback(
             // 5. 缓存当前 session 的读写 characteristic；断连时 BleDevice 会清空这些缓存。
             currentDevice.update(gatt, privateService.type, writeChars, readChars)
         }
+        recordTraceStep(address, "characteristic_discovery", "success", null, null, null)
 
         // 6. 如果任一私有服务失败，等待失败状态处理，不再继续写 descriptor。
         if (!isPrivateServiceReady) {
@@ -228,10 +286,20 @@ internal class BleGattSessionCallback(
         // 3. CCCD 写入失败时必须终止本次 GATT readiness；否则 Dart 侧会一直等
         // connectFinish，而 auto reconnect supervisor 也拿不到可重试的失败终态。
         if (status != BluetoothGatt.GATT_SUCCESS) {
+            // 失败明细必须在清空队列 owner 前冻结，否则 service_type 永远丢失。
+            val failedDescriptorPsType = inFlightDescriptorPsType
             descriptorQueue.clear()
             inFlightDescriptorPsType = null
             isPrivateServiceReady = false
             val operationStatus = BluetoothGattStatus.getGattOperationStatusDescription(status)
+            recordTraceStep(
+                gatt.device.address,
+                "cccd",
+                "failed",
+                failedDescriptorPsType?.toString(),
+                "GATT",
+                status,
+            )
             if (status == BluetoothGattStatus.GATT_INSUFFICIENT_AUTHORIZATION) {
                 // Descriptor write 已进入 GATT readiness 阶段；这里的 8 是 ATT/GATT 授权不足，
                 // 先恢复 cache/bond 视图，再按原失败语义终止为 CHARS_FAIL 触发重试。
@@ -241,12 +309,13 @@ internal class BleGattSessionCallback(
                 BleLoggerTag.e,
                 "Connect call back: ${gatt.device.address} descriptor write failed, status=$operationStatus",
             )
-            onSessionTerminal(gatt, BleConnectState.CHARS_FAIL, DEFAULT_MTU)
+            terminateSession(gatt, BleConnectState.CHARS_FAIL, DEFAULT_MTU)
             return
         }
 
         // 4. 当前 descriptor 已完成，继续写下一个；队列空时会请求 MTU。
         inFlightDescriptorPsType?.let { device.markNotifyReady(it) }
+        recordTraceStep(gatt.device.address, "cccd", "success", inFlightDescriptorPsType?.toString(), "GATT", status)
         inFlightDescriptorPsType = null
         sendLog(BleLoggerTag.d, "Connect call back: ${gatt.device.address} is descriptor write success = ${status == BluetoothGatt.GATT_SUCCESS}")
         processNextDescriptor(gatt)
@@ -271,6 +340,7 @@ internal class BleGattSessionCallback(
 
         // 2. stale GATT 不能回传数据，避免旧 session 的 notify 污染新连接。
         val connectedDevice = currentExpectedDeviceForGatt(gatt, "characteristic changed") ?: return
+        noteLinkActivity(gatt, connectedDevice)
 
         // 3. 根据 read characteristic UUID 反查私有服务类型，保持 Dart 收包 psType 正确。
         val privateService = connectedDevice.belongConfig.privateServices.firstOrNull { service ->
@@ -310,6 +380,7 @@ internal class BleGattSessionCallback(
         if (device == null) {
             return
         }
+        noteLinkActivity(gatt, device)
 
         // 3. 业务 connected 后写 characteristic 返回授权不足，说明系统 GATT/bond 视图已拒绝。
         //    先恢复本端缓存，再以系统断连终止本 session；不能继续 poll/writeNext 消费发送队列。
@@ -317,7 +388,7 @@ internal class BleGattSessionCallback(
         if (status == BluetoothGattStatus.GATT_INSUFFICIENT_AUTHORIZATION) {
             recoverInsufficientAuthorization(gatt, device)
             sendLog(BleLoggerTag.e, "Send cmd: $address, write failed, status=$operationStatus, terminal=DISCONNECT_FROM_SYS")
-            onSessionTerminal(gatt, BleConnectState.DISCONNECT_FROM_SYS, DEFAULT_MTU)
+            terminateSession(gatt, BleConnectState.DISCONNECT_FROM_SYS, DEFAULT_MTU)
             return
         }
 
@@ -351,9 +422,15 @@ internal class BleGattSessionCallback(
         }
 
         // 3. 保留旧行为：MTU 成功/失败都进入连接完成判断。
+        recordTraceMtu(
+            gatt.device.address,
+            if (status == BluetoothGatt.GATT_SUCCESS) "success" else "failed",
+            (mtu - 3).coerceAtLeast(0),
+            status,
+        )
         sendLog(
             BleLoggerTag.d,
-            "Connect call back: ${gatt.device.address} change mtu ${if (status == BluetoothGatt.GATT_SUCCESS) "success" else "fail"}, new mtu value = $mtu, connecting flow is finish",
+            "Connect call back: ${gatt.device.address} change mtu ${if (status == BluetoothGatt.GATT_SUCCESS) "success" else "failed"}, new mtu value = $mtu, connecting flow is finish",
         )
         connectingFlowFinish(gatt, mtu)
     }
@@ -427,8 +504,67 @@ internal class BleGattSessionCallback(
                 BleLoggerTag.e,
                 "Connect call back: ${gatt.device.address} descriptor write request rejected, psType=${item.first}",
             )
-            onSessionTerminal(gatt, BleConnectState.CHARS_FAIL, DEFAULT_MTU)
+            recordTraceStep(gatt.device.address, "cccd", "failed", item.first.toString(), null, null)
+            terminateSession(gatt, BleConnectState.CHARS_FAIL, DEFAULT_MTU)
         }
+    }
+
+    /**
+     * 消费 RSSI 采样并驱动带迟滞的 PHY 选择。
+     *
+     * RSSI 只影响高可靠配置的链路偏好，不参与 GATT ready/业务 connected 判定；读取失败只记
+     * 诊断日志，不能制造连接终态。
+     */
+    override fun onReadRemoteRssi(gatt: BluetoothGatt, rssi: Int, status: Int) {
+        super.onReadRemoteRssi(gatt, rssi, status)
+        isRssiReadPending = false
+        val device = currentExpectedDeviceForGatt(gatt, "remote RSSI") ?: return
+        if (!device.belongConfig.androidHighReliabilityMode) {
+            return
+        }
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            sendLog(
+                BleLoggerTag.e,
+                "Link quality: ${device.uuid}, RSSI read failed, status=${BluetoothGattStatus.getGattOperationStatusDescription(status)}",
+            )
+            return
+        }
+
+        device.rssi = rssi
+        lastRssi = rssi
+        updateTraceRssi(device.uuid, rssi)
+        val targetPhy = AndroidBleAdaptiveLinkPolicy.preferredPhy(requestedPhy, rssi)
+        val isWeak = rssi <= AndroidBleAdaptiveLinkPolicy.FALLBACK_TO_1M_RSSI_DBM
+        sendLog(
+            if (isWeak) BleLoggerTag.e else BleLoggerTag.d,
+            "Link quality: ${device.uuid}, rssi=${rssi}dBm, requestedPhy=${phyLabel(requestedPhy)}, targetPhy=${phyLabel(targetPhy)}, weak=$isWeak",
+        )
+        requestPreferredPhy(gatt, targetPhy)
+    }
+
+    /** 记录 controller 最终采用的 PHY；setPreferredPhy 只是偏好，真实结果以该回调为准。 */
+    override fun onPhyUpdate(gatt: BluetoothGatt, txPhy: Int, rxPhy: Int, status: Int) {
+        super.onPhyUpdate(gatt, txPhy, rxPhy, status)
+        val device = currentExpectedDeviceForGatt(gatt, "PHY update") ?: return
+        if (!device.belongConfig.androidHighReliabilityMode) {
+            return
+        }
+        if (status == BluetoothGatt.GATT_SUCCESS) {
+            activeTxPhy = txPhy
+            activeRxPhy = rxPhy
+            updateTracePhy(device.uuid, phyLabel(txPhy))
+        } else {
+            recordTracePhyPolicy(
+                device.uuid,
+                "phy_update_failed",
+                phyLabel(requestedPhy),
+                "failed",
+            )
+        }
+        sendLog(
+            if (status == BluetoothGatt.GATT_SUCCESS) BleLoggerTag.d else BleLoggerTag.e,
+            "Link quality: ${device.uuid}, PHY update status=${BluetoothGattStatus.getGattOperationStatusDescription(status)}, tx=${phyLabel(txPhy)}, rx=${phyLabel(rxPhy)}",
+        )
     }
 
     /**
@@ -443,6 +579,7 @@ internal class BleGattSessionCallback(
         // 2. 使用配置中的目标 MTU，保持原插件行为。
         val targetMtu = device.belongConfig.mtu
         val requestStarted = gatt.requestMtu(targetMtu)
+        recordTraceStep(gatt.device.address, "mtu", if (requestStarted) "started" else "failed", null, null, null)
         // 3. MTU 不是私有服务 readiness 的硬前置；如果请求本身没发出去，
         // 继续用默认 MTU 完成连接，避免因为不会到来的 onMtuChanged 卡住。
         if (!requestStarted) {
@@ -468,6 +605,7 @@ internal class BleGattSessionCallback(
         val device = currentExpectedDeviceForGatt(gatt, "connect finish") ?: return
         val name = device.name
         // 2. GATT readiness 完成后上报 connectFinish，等待 Dart 业务认证后再进入 connected。
+        recordTraceStep(address, "gatt_ready", "success", null, null, null)
         handleConnectState(address, name, BleConnectState.CONNECT_FINISH, mtu)
         // 3. 建连 hint 不能把已连上的 1M 链路切到 2M；在 GATT ready 后再请求一次。
         //    PHY 回调异步到达，不得挡住 connectFinish。
@@ -497,6 +635,167 @@ internal class BleGattSessionCallback(
             return null
         }
         return currentDeviceForGatt(gatt, stage)
+    }
+
+    /**
+     * 物理链路建立后启动高可靠策略。
+     *
+     * 先用 high priority 覆盖 service/CCCD/AUTH 初始突发，再由 5 秒周期根据真实流量回到
+     * balanced；PHY 从 1M 起步，只有 RSSI 足够强才切 2M。
+     */
+    private fun startAdaptiveLinkMonitoring(gatt: BluetoothGatt, device: BleDevice) {
+        stopAdaptiveLinkMonitoring()
+        if (!device.belongConfig.androidHighReliabilityMode) {
+            return
+        }
+
+        lastLinkActivityAtMs = SystemClock.elapsedRealtime()
+        requestedPhy = BluetoothDevice.PHY_LE_1M
+        requestConnectionPriority(gatt, high = true)
+        requestPreferredPhy(gatt, BluetoothDevice.PHY_LE_1M, force = true)
+        // 首次 RSSI 延后一个周期，避免刚连上时与 service/CCCD 初始化争用 GATT 操作窗口。
+        // daemon Timer 不阻止进程退出；每个 tick 仍校验 exact GATT，旧 session 最迟一周期自清。
+        adaptiveLinkTimer = Timer("ble-link-${device.uuid}", true).also { timer ->
+            timer.scheduleAtFixedRate(
+                object : TimerTask() {
+                    override fun run() {
+                        val currentDevice = currentExpectedDeviceForGatt(gatt, "adaptive link monitor")
+                        if (currentDevice == null || !currentDevice.belongConfig.androidHighReliabilityMode) {
+                            stopAdaptiveLinkMonitoring()
+                            return
+                        }
+                        val useHighPriority = AndroidBleAdaptiveLinkPolicy.shouldUseHighPriority(
+                            nowMs = SystemClock.elapsedRealtime(),
+                            lastActivityAtMs = lastLinkActivityAtMs,
+                        )
+                        requestConnectionPriority(gatt, high = useHighPriority)
+                        requestRemoteRssi(gatt, currentDevice)
+                    }
+                },
+                AndroidBleAdaptiveLinkPolicy.RSSI_MONITOR_INTERVAL_MS,
+                AndroidBleAdaptiveLinkPolicy.RSSI_MONITOR_INTERVAL_MS,
+            )
+        }
+        sendLog(
+            BleLoggerTag.d,
+            "Link quality: ${device.uuid}, adaptive monitor started, initialPhy=1M, interval=${AndroidBleAdaptiveLinkPolicy.RSSI_MONITOR_INTERVAL_MS}ms",
+        )
+    }
+
+    /** 高频收发只更新时间戳；priority 状态变化时才真正调用 framework。 */
+    private fun noteLinkActivity(gatt: BluetoothGatt, device: BleDevice) {
+        if (!device.belongConfig.androidHighReliabilityMode) {
+            return
+        }
+        lastLinkActivityAtMs = SystemClock.elapsedRealtime()
+        requestConnectionPriority(gatt, high = true)
+    }
+
+    /** 在同一 session 内切换 high/balanced；系统拒绝偏好不改变连接状态。 */
+    @Synchronized
+    private fun requestConnectionPriority(gatt: BluetoothGatt, high: Boolean) {
+        if (isHighConnectionPriority == high) {
+            return
+        }
+        val priority = if (high) {
+            BluetoothGatt.CONNECTION_PRIORITY_HIGH
+        } else {
+            BluetoothGatt.CONNECTION_PRIORITY_BALANCED
+        }
+        val accepted = runCatching { gatt.requestConnectionPriority(priority) }.getOrElse { error ->
+            sendLog(BleLoggerTag.e, "Link quality: ${gatt.device.address}, request priority exception=${error.message}")
+            false
+        }
+        // 记录“已请求”而不是臆测 controller 真实参数；即使 framework 同步拒绝，也不能让
+        // 高频音频 notify 对每一包重复调用。下一次 high/balanced 状态切换会自然重试。
+        isHighConnectionPriority = high
+        updateTraceRequestedPriority(
+            gatt.device.address,
+            if (high) "HIGH" else "BALANCED",
+            accepted,
+        )
+        sendLog(
+            if (accepted) BleLoggerTag.d else BleLoggerTag.e,
+            "Link quality: ${gatt.device.address}, request priority=${if (high) "HIGH" else "BALANCED"}, accepted=$accepted",
+        )
+    }
+
+    /** PHY 偏好只在 Android 8+ 可用；controller 可拒绝或覆盖，最终值由 onPhyUpdate 记录。 */
+    @Synchronized
+    private fun requestPreferredPhy(gatt: BluetoothGatt, phy: Int, force: Boolean = false) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || (!force && requestedPhy == phy)) {
+            return
+        }
+        val previousPhy = requestedPhy
+        requestedPhy = phy
+        val phyMask = when (phy) {
+            BluetoothDevice.PHY_LE_2M -> BluetoothDevice.PHY_LE_2M_MASK
+            else -> BluetoothDevice.PHY_LE_1M_MASK
+        }
+        val requested = runCatching {
+            gatt.setPreferredPhy(
+                phyMask,
+                phyMask,
+                BluetoothDevice.PHY_OPTION_NO_PREFERRED,
+            )
+        }.fold(
+            onSuccess = { true },
+            onFailure = { error ->
+                sendLog(BleLoggerTag.e, "Link quality: ${gatt.device.address}, request PHY exception=${error.message}")
+                false
+            },
+        )
+        val trigger = when {
+            phy == BluetoothDevice.PHY_LE_1M && previousPhy == BluetoothDevice.PHY_LE_2M -> "phy_fallback"
+            phy == BluetoothDevice.PHY_LE_2M && previousPhy == BluetoothDevice.PHY_LE_1M -> "phy_promote"
+            else -> "phy_initial"
+        }
+        recordTracePhyPolicy(
+            gatt.device.address,
+            trigger,
+            phyLabel(phy),
+            if (requested) "requested" else "failed",
+        )
+    }
+
+    /** 单次只允许一个 RSSI 请求在途，避免监测与业务 GATT 操作形成额外排队。 */
+    @Synchronized
+    private fun requestRemoteRssi(gatt: BluetoothGatt, device: BleDevice) {
+        if (isRssiReadPending) {
+            return
+        }
+        val accepted = runCatching { gatt.readRemoteRssi() }.getOrElse { error ->
+            sendLog(BleLoggerTag.e, "Link quality: ${device.uuid}, request RSSI exception=${error.message}")
+            false
+        }
+        isRssiReadPending = accepted
+        if (!accepted) {
+            sendLog(BleLoggerTag.e, "Link quality: ${device.uuid}, request RSSI rejected")
+        }
+    }
+
+    /** 停止当前 callback 的监测 owner；重复调用必须幂等。 */
+    @Synchronized
+    private fun stopAdaptiveLinkMonitoring() {
+        adaptiveLinkTimer?.cancel()
+        adaptiveLinkTimer = null
+        isRssiReadPending = false
+        isHighConnectionPriority = false
+    }
+
+    /** 所有 callback 内终态统一先撤销链路监测，再交回 manager 做 Gate teardown。 */
+    private fun terminateSession(gatt: BluetoothGatt, state: BleConnectState, mtu: Int) {
+        stopAdaptiveLinkMonitoring()
+        onSessionTerminal(gatt, state, mtu)
+    }
+
+    /** 将 Android PHY 常量转换为稳定日志文本，未知值仍保留原始数值。 */
+    private fun phyLabel(phy: Int?): String = when (phy) {
+        BluetoothDevice.PHY_LE_1M -> "1M"
+        BluetoothDevice.PHY_LE_2M -> "2M"
+        BluetoothDevice.PHY_LE_CODED -> "CODED"
+        null -> "unknown"
+        else -> "unknown($phy)"
     }
 
     private companion object {

@@ -194,17 +194,17 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
+  Future<void> setConnectionTraceEnabled(bool enabled) {
+    throw UnimplementedError();
+  }
+
+  @override
   Future<void> cleanConnectCache() {
     throw UnimplementedError();
   }
 
   @override
-  Future<void> resetBle({bool preserveStateRestoration = false}) {
-    throw UnimplementedError();
-  }
-
-  @override
-  Future<void> finalizeStateRestorationClaims() {
+  Future<void> resetBle() {
     throw UnimplementedError();
   }
 

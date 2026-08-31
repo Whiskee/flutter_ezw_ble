@@ -13,7 +13,7 @@ import Foundation
 /**
  *  GATT 初始化完成度快照。
  *
- *  自动回连和 State Restoration 都可能拿到已经缓存的 service/characteristic/notify 状态，
+ *  自动回连可能拿到已经缓存的 service/characteristic/notify 状态，
  *  不能依赖单个 delegate 回调顺序来判断连接完成，因此统一在这里做 readiness gate。
  */
 struct BleGattReadiness {

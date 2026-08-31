@@ -120,6 +120,11 @@ class BleManager private constructor() {
     // 同时到达时重复发送 disconnectFromSys。
     private val reconciledBusinessSessions: MutableSet<String> =
         Collections.synchronizedSet(mutableSetOf())
+    // Native Trace 默认关闭。开启后只记录下一次真实物理 attempt，关闭仅清诊断缓存。
+    @Volatile
+    private var connectionTraceEnabled = false
+    private val nativeConnectionTraces: MutableMap<String, BleNativeConnectionTraceBuffer> =
+        Collections.synchronizedMap(mutableMapOf())
     // 业务鉴权 lease 只属于一个 exact session/attempt。prepare 替换同 endpoint 的旧
     // token，abort/cleanup 只能移除匹配 token，避免旧回调删掉新 attempt。
     private val businessConnectionLeases = BleBusinessConnectionLeaseRegistry()
@@ -161,6 +166,156 @@ class BleManager private constructor() {
         val sessionGeneration: Long,
         val attemptGeneration: Long,
     )
+
+    /** Toggle process-local native connection trace snapshots without touching BLE ownership. */
+    @Synchronized
+    fun setConnectionTraceEnabled(enabled: Boolean) {
+        connectionTraceEnabled = enabled
+        if (!enabled) {
+            nativeConnectionTraces.clear()
+        }
+        sendLog(BleLoggerTag.d, "Connection trace enabled=$enabled")
+    }
+
+    @Synchronized
+    private fun startNativeTrace(endpointId: String) {
+        if (!connectionTraceEnabled || endpointId.isBlank()) {
+            return
+        }
+        nativeConnectionTraces[reconnectKey(endpointId)] = BleNativeConnectionTraceBuffer().also { trace ->
+            trace.record("attempt", "started")
+        }
+    }
+
+    @Synchronized
+    private fun recordNativeTraceStep(
+        endpointId: String,
+        stage: String,
+        result: String,
+        serviceType: String? = null,
+        causeDomain: String? = null,
+        causeCode: Int? = null,
+        bondState: String? = null,
+        writeLimitBytes: Int? = null,
+    ) {
+        if (!connectionTraceEnabled || endpointId.isBlank()) {
+            return
+        }
+        nativeConnectionTraces[reconnectKey(endpointId)]
+            ?.record(
+                stage = stage,
+                result = result,
+                serviceType = serviceType,
+                causeDomain = causeDomain,
+                causeCode = causeCode,
+                bondState = bondState,
+                writeLimitBytes = writeLimitBytes,
+            )
+    }
+
+    private fun updateNativeTraceRssi(endpointId: String, rssi: Int) {
+        if (connectionTraceEnabled) {
+            nativeConnectionTraces[reconnectKey(endpointId)]?.updateRssi(rssi)
+        }
+    }
+
+    private fun updateNativeTracePhy(endpointId: String, phy: String?) {
+        if (connectionTraceEnabled) {
+            nativeConnectionTraces[reconnectKey(endpointId)]?.updatePhy(phy)
+        }
+    }
+
+    private fun updateNativeTraceRequestedPriority(endpointId: String, priority: String?, accepted: Boolean) {
+        if (connectionTraceEnabled) {
+            nativeConnectionTraces[reconnectKey(endpointId)]?.updateRequestedPriority(priority, accepted)
+        }
+    }
+
+    private fun recordNativeTracePhyPolicy(
+        endpointId: String,
+        trigger: String,
+        requestedPhy: String,
+        actionResult: String,
+    ) {
+        if (connectionTraceEnabled) {
+            nativeConnectionTraces[reconnectKey(endpointId)]
+                ?.recordPhyPolicy(trigger, requestedPhy, actionResult)
+        }
+    }
+
+    private fun nativeTraceSnapshot(endpointId: String): JSONObject? =
+        if (connectionTraceEnabled) nativeConnectionTraces[reconnectKey(endpointId)]?.snapshot() else null
+
+    private fun recordNativeTraceForState(
+        uuid: String,
+        state: BleConnectState,
+        causeDomain: String? = null,
+        causeCode: Int? = null,
+    ) {
+        val previousState = connectedDevices.firstOrNull {
+            it.uuid.equals(uuid, ignoreCase = true)
+        }?.connectState
+        when (state) {
+            BleConnectState.CONNECTING -> recordNativeTraceStep(uuid, "connect", "started")
+            BleConnectState.START_BINDING -> recordNativeTraceStep(
+                uuid,
+                "bond",
+                "started",
+                bondState = "bonding",
+            )
+            BleConnectState.ALREADY_BOUND -> recordNativeTraceStep(
+                uuid,
+                "bond",
+                "success",
+                bondState = "bonded",
+            )
+            BleConnectState.BOUND_FAIL -> recordNativeTraceStep(
+                uuid,
+                "bond",
+                "failed",
+                bondState = "none",
+            )
+            BleConnectState.SEARCH_SERVICE -> recordNativeTraceStep(uuid, "service_discovery", "started")
+            BleConnectState.SERVICE_FAIL -> recordNativeTraceStep(uuid, "service_discovery", "failed")
+            BleConnectState.SEARCH_CHARS -> recordNativeTraceStep(uuid, "characteristic_discovery", "started")
+            BleConnectState.CHARS_FAIL -> recordNativeTraceStep(uuid, "characteristic_discovery", "failed")
+            BleConnectState.NO_DEVICE_FOUND -> recordNativeTraceStep(uuid, "scan", "failed")
+            BleConnectState.CONNECT_FINISH -> recordNativeTraceStep(uuid, "gatt_ready", "success")
+            BleConnectState.TIMEOUT -> if (previousState == BleConnectState.START_BINDING) {
+                recordNativeTraceStep(
+                    uuid,
+                    "bond",
+                    "timeout",
+                    causeDomain = "AndroidBond",
+                    bondState = "bonding",
+                )
+            } else {
+                recordNativeTraceStep(uuid, "connect", "timeout", causeDomain = "watchdog")
+            }
+            BleConnectState.BLE_ERROR,
+            BleConnectState.SYSTEM_ERROR -> recordNativeTraceStep(uuid, "connect", "failed")
+            BleConnectState.DISCONNECT_BY_USER -> {
+                if (previousState == BleConnectState.START_BINDING) {
+                    recordNativeTraceStep(
+                        uuid,
+                        "bond",
+                        "cancelled",
+                        causeDomain = "AndroidBond",
+                        bondState = "bonding",
+                    )
+                }
+                recordNativeTraceStep(uuid, "disconnect", "expected")
+            }
+            BleConnectState.DISCONNECT_FROM_SYS -> recordNativeTraceStep(
+                uuid,
+                "disconnect",
+                "abnormal",
+                causeDomain = causeDomain,
+                causeCode = causeCode,
+            )
+            else -> Unit
+        }
+    }
 
     //  - 扫描命中后再连接的待处理请求（非 directConnect 且目标未出现在 scanResultTemp 时入队）
     private val pendingScanConnects: MutableList<BlePendingScanConnect> =
@@ -1300,11 +1455,18 @@ class BleManager private constructor() {
             source = BleConnectSource.FOREGROUND,
             afterUpgrade = plan.request.afterUpgrade,
         )
-        val gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            plan.remoteDevice.connectGatt(weakContext?.get(), false, connectCallBack, BluetoothDevice.TRANSPORT_LE, BluetoothDevice.PHY_LE_2M)
-        } else {
-            plan.remoteDevice.connectGatt(weakContext?.get(), false, connectCallBack)
+        // 扫描等待路径在此刻才拥有真实物理 attempt；把已命中的 scan 合并到
+        // 同一个 native attempt，避免生成无法关联 attemptId 的孤立扫描记录。
+        if (plan.request.isWaitingDevice) {
+            recordNativeTraceStep(plan.request.uuid, "scan", "success")
         }
+        val gatt = AndroidBleGattConnector.connect(
+            device = plan.remoteDevice,
+            context = weakContext?.get(),
+            autoConnect = false,
+            callback = connectCallBack,
+            highReliabilityMode = bleDevice.belongConfig.androidHighReliabilityMode,
+        )
 
         // 2. 系统拒绝创建 GATT 时，本 attempt 必须终止并释放 Gate generation。
         if (gatt == null) {
@@ -1321,10 +1483,7 @@ class BleManager private constructor() {
         // 3. GATT 句柄必须立即写回缓存，后续 service/notify 回调都按 uuid 找这条 session。
         bleDevice.update(gatt)
 
-        // 4. RSSI 读取不参与连接成功判定，只作为调试/展示信号值来源。
-        gatt?.readRemoteRssi()
-
-        // 5. Gate 排队时间不计入 connectTimeout；timeout 只在 startGrantedGattPipeline 中启动。
+        // 4. Gate 排队时间不计入 connectTimeout；timeout 只在 startGrantedGattPipeline 中启动。
         handleConnectState(
             plan.request.uuid,
             plan.resolvedName ?: bleDevice.name,
@@ -2240,6 +2399,7 @@ class BleManager private constructor() {
         preConnectedDevices.clear()
         businessConnectionLeases.clear()
         reconciledBusinessSessions.clear()
+        nativeConnectionTraces.clear()
         sendLog(BleLoggerTag.d, "Reset: success")
     }
 
@@ -2490,6 +2650,10 @@ class BleManager private constructor() {
                     source = snapshot.source,
                     generation = snapshot.sessionGeneration,
                     attemptGeneration = snapshot.attemptGeneration,
+                    // Android BluetoothAdapter.STATE_OFF is 10. Attach it to the
+                    // existing terminal step instead of emitting a second disconnect.
+                    traceCauseDomain = "bluetooth_adapter",
+                    traceCauseCode = BluetoothAdapter.STATE_OFF,
                 )
             }
             transportOffCapture.quarantinedDevices.forEach { device ->
@@ -2544,6 +2708,27 @@ class BleManager private constructor() {
                 if (ownsExactGatt) {
                     val owner = candidate ?: return@synchronized
                     exactAdmission = owner
+                    val shouldObserveBond = connectedDevice.belongConfig.initiateBinding ||
+                        oldBondState == SystemBondState.BONDED ||
+                        oldBondState == SystemBondState.BONDING ||
+                        currentBondState == SystemBondState.BONDED ||
+                        currentBondState == SystemBondState.BONDING
+                    if (shouldObserveBond) {
+                        val result = when (currentBondState) {
+                            SystemBondState.BONDING -> "started"
+                            SystemBondState.BONDED -> "success"
+                            SystemBondState.NONE -> "failed"
+                            SystemBondState.UNKNOWN -> null
+                        }
+                        result?.let {
+                            recordNativeTraceStep(
+                                connectedDevice.uuid,
+                                "bond",
+                                it,
+                                bondState = currentBondState.traceValue,
+                            )
+                        }
+                    }
                     action = decideBondBroadcastAction(
                         initiateBinding = connectedDevice.belongConfig.initiateBinding,
                         connectState = connectedDevice.connectState,
@@ -2838,6 +3023,31 @@ class BleManager private constructor() {
                     attemptGeneration = effectiveAdmission.generation,
                 )
             },
+            recordTraceStep = { uuid, stage, result, serviceType, causeDomain, causeCode ->
+                recordNativeTraceStep(uuid, stage, result, serviceType, causeDomain, causeCode)
+            },
+            recordTraceMtu = { uuid, result, writeLimitBytes, status ->
+                recordNativeTraceStep(
+                    uuid,
+                    "mtu",
+                    result,
+                    causeDomain = "GATT",
+                    causeCode = status,
+                    writeLimitBytes = writeLimitBytes,
+                )
+            },
+            updateTraceRssi = { uuid, rssi ->
+                updateNativeTraceRssi(uuid, rssi)
+            },
+            updateTracePhy = { uuid, phy ->
+                updateNativeTracePhy(uuid, phy)
+            },
+            updateTraceRequestedPriority = { uuid, priority, accepted ->
+                updateNativeTraceRequestedPriority(uuid, priority, accepted)
+            },
+            recordTracePhyPolicy = { uuid, trigger, phy, actionResult ->
+                recordNativeTracePhyPolicy(uuid, trigger, phy, actionResult)
+            },
             onPhysicalConnected = { gatt, device ->
                 // 3. 真实 STATE_CONNECTED 只进入 Gate；callback 本身不启动 service discovery。
                 onPhysicalConnected(gatt, device, admission, afterUpgrade)
@@ -2943,6 +3153,7 @@ class BleManager private constructor() {
         )
         connectionAdmissionGate.registerAttempt(endpointId, generation)
         currentAdmissions[key] = admission
+        startNativeTrace(endpointId)
         return admission
     }
 
@@ -3124,6 +3335,15 @@ class BleManager private constructor() {
                 "generation=${admission.generation}, sessionId=${admission.sessionId}, " +
                 "bondState=$bondState, action=$action",
         )
+        if (bondState == SystemBondState.BONDED) {
+            // Public framework state proves only stored link keys, not current GATT readiness.
+            recordNativeTraceStep(
+                admission.endpointId,
+                "bond",
+                "success",
+                bondState = "bonded",
+            )
+        }
         when (action) {
             GateGrantedBondAction.DISCOVER_SERVICES ->
                 startGrantedServiceDiscovery(admission, reason = "gate granted")
@@ -3709,6 +3929,7 @@ class BleManager private constructor() {
         attemptGeneration: Long = 0L,
     ) {
         val legacyGeneration = sessionGeneration.takeIf { it > 0L } ?: attemptGeneration
+        val nativeTrace = nativeTraceSnapshot(uuid)
         mainScope.launch {
             val json = JSONObject()
                 .put("uuid", uuid)
@@ -3719,6 +3940,9 @@ class BleManager private constructor() {
                 .put("generation", legacyGeneration)
                 .put("sessionGeneration", legacyGeneration)
                 .put("attemptGeneration", attemptGeneration)
+                .also { payload ->
+                    nativeTrace?.let { payload.put("nativeTrace", it) }
+                }
                 .toString()
             BleEC.CONNECT_STATUS.event?.success(json)
         }
@@ -3773,8 +3997,13 @@ class BleManager private constructor() {
         generation: Long = currentAdmissions[reconnectKey(uuid)]?.sessionGeneration ?: 0L,
         attemptGeneration: Long = currentAdmissions[reconnectKey(uuid)]?.generation ?: 0L,
         scheduleAutoReconnect: Boolean = true,
+        traceCauseDomain: String? = null,
+        traceCauseCode: Int? = null,
     ) {
         val key = reconnectKey(uuid)
+        // Diagnostic cause metadata is observational only and never participates
+        // in connection ownership, teardown, or reconnect scheduling.
+        recordNativeTraceForState(uuid, state, traceCauseDomain, traceCauseCode)
         val connectedDeviceBeforeState = connectedDevices.firstOrNull {
             it.uuid.equals(uuid, ignoreCase = true)
         }
@@ -3925,6 +4154,15 @@ class BleManager private constructor() {
         BluetoothDevice.BOND_BONDED -> "BOND_BONDED"
         else -> "UNKNOWN($this)"
     }
+
+    /** Stable public bond value used by analytics; UNKNOWN is never reported as evidence. */
+    private val SystemBondState.traceValue: String
+        get() = when (this) {
+            SystemBondState.NONE -> "none"
+            SystemBondState.BONDING -> "bonding"
+            SystemBondState.BONDED -> "bonded"
+            SystemBondState.UNKNOWN -> "unknown"
+        }
 
     /**
      *  移除配对

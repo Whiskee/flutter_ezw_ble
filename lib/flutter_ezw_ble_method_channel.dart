@@ -290,6 +290,10 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       methodChannel.invokeMethod("quiteUpgradeState", uuid);
 
   @override
+  Future<void> setConnectionTraceEnabled(bool enabled) =>
+      methodChannel.invokeMethod("setConnectionTraceEnabled", enabled);
+
+  @override
   Future<void> openBleSettings() async =>
       methodChannel.invokeMethod("openBleSettings");
 
@@ -298,14 +302,7 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       methodChannel.invokeMethod("openAppSettings");
 
   @override
-  Future<void> resetBle({bool preserveStateRestoration = false}) async =>
-      methodChannel.invokeMethod("resetBle", <String, Object?>{
-        "preserveStateRestoration": preserveStateRestoration,
-      });
-
-  @override
-  Future<void> finalizeStateRestorationClaims() async =>
-      methodChannel.invokeMethod("finalizeStateRestorationClaims");
+  Future<void> resetBle() async => methodChannel.invokeMethod("resetBle");
 
   @override
   Future<void> cleanConnectCache() async =>

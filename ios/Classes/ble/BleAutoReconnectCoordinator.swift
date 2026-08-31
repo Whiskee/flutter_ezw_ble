@@ -56,7 +56,7 @@ extension BleManager {
     /**
      *  记录 native 自动回连事件。
      *
-     *  State Restoration 唤醒时 Dart 可能尚未订阅 EventChannel，因此事件先进入持久化缓冲。
+     *  原生自动回连可能早于 Dart 订阅 EventChannel，因此事件先进入持久化缓冲。
      */
     func recordAutoReconnectEvent(type: String, uuid: String = "", name: String = "", detail: String = "") {
         reconnectStore.recordEvent(type: type, uuid: uuid, name: name, detail: detail)
@@ -65,7 +65,7 @@ extension BleManager {
     /**
      *  查询持久化回连目标。
      *
-     *  restoration 只能拿到 CBPeripheral，必须通过持久化目标找回 belongConfig。
+     *  原生回连只能拿到 CBPeripheral 时，必须通过持久化目标找回 belongConfig。
      */
     func persistedReconnectTarget(uuid: String, name: String = "") -> BleReconnectTarget? {
         reconnectStore.target(uuid: uuid, name: name)
@@ -418,17 +418,11 @@ extension BleManager {
                     sessionGeneration: sessionGeneration
                 )
             }
-            // 1.2、覆盖安装/系统唤醒时，willRestoreState 可能早于 Dart 当前设备加载。
-            // 先从暂存 restoration 精确认领；如果 startup reset 发生在 restoration 之后，
-            // 再以配置服务查询系统已连接对象。两条路径都必须完整名称唯一匹配，不能
-            // 凭 R1/G2 前缀恢复账号中的历史设备。
-            let claimedRestoration = restorationCoordinator.claimPendingPeripheral(
-                uuid: trimmedUuid,
-                name: trimmedName
-            )
+            // 1.3、冷启动缓存里只有完整名称时，active 窗口可先接管系统已连接对象。
+            // 这保留普通后台 BLE / ANCS 连接能力，但不再依赖跨进程
+            // escrow 或 claim 窗口。
             let systemConnectedPeripheral: CBPeripheral? = {
-                guard claimedRestoration == nil,
-                      trimmedUuid.isEmpty,
+                guard trimmedUuid.isEmpty,
                       allowsSynchronousCoreBluetoothLookup else {
                     return nil
                 }
@@ -439,7 +433,7 @@ extension BleManager {
                     requireUniqueMatch: true
                 )
             }()
-            if let resolvedPeripheral = claimedRestoration?.peripheral ?? systemConnectedPeripheral {
+            if let resolvedPeripheral = systemConnectedPeripheral {
                 let resolvedUuid = resolvedPeripheral.identifier.uuidString
                 let resolvedName = trimmedName.isEmpty
                     ? (resolvedPeripheral.name ?? "")
@@ -455,20 +449,15 @@ extension BleManager {
                     source: source,
                     sessionGeneration: sessionGeneration
                 ) else {
-                    // 认领后若配置在同一时刻被撤销，把 restoration 对象重新放回暂存区；
-                    // hard reset/config revoke 会在统一清理边界处理，不能静默丢失系统对象。
-                    if claimedRestoration != nil {
-                        _ = restorationCoordinator.enqueue(resolvedPeripheral)
-                    }
                     return BleReconnectActivationResult(
                         target: target,
                         state: .rejected,
-                        reason: "nativeArmRejectedAfterRestorationClaim",
+                        reason: "nativeArmRejectedAfterSystemConnected",
                         source: source,
                         sessionGeneration: sessionGeneration
                     )
                 }
-                // 将精确认领的 peripheral 放入内部缓存，后续 beginDirectReconnectAttempt
+                // 将系统已连接 peripheral 放入内部缓存，后续 beginDirectReconnectAttempt
                 // 无论当前是 connected/connecting/disconnected 都复用同一 Gate/GATT 流程。
                 scanResultTemp.removeAll {
                     $0.0.uuid.caseInsensitiveCompare(resolvedUuid) == .orderedSame
@@ -484,33 +473,15 @@ extension BleManager {
                     ),
                     resolvedPeripheral
                 ))
-                let resolutionSource = claimedRestoration != nil
-                    ? "stateRestoration"
-                    : "systemConnected"
-                loggerD(msg: "autoReconnect restoration claim: config=\(target.belongConfig), requestedUuid=\(trimmedUuid), resolvedUuid=\(resolvedUuid), name=\(resolvedName), state=\(resolvedPeripheral.state.rawValue), source=\(resolutionSource), sessionGeneration=\(task.sessionGeneration)")
-                if let claimedRestoration {
-                    activateClaimedStateRestoration(
-                        task: task,
-                        config: config,
-                        claim: claimedRestoration
-                    )
-                } else {
-                    activateArmedReconnectTask(task, source: source)
-                }
-                if let claimedRestoration {
-                    recordAutoReconnectEvent(
-                        type: "ios_restore_escrow_claimed",
-                        uuid: resolvedUuid,
-                        name: resolvedName,
-                        detail: "state=\(claimedRestoration.state), sessionGeneration=\(task.sessionGeneration)"
-                    )
-                }
+                let resolutionSource = "systemConnected"
+                loggerD(msg: "autoReconnect system-connected claim: config=\(target.belongConfig), requestedUuid=\(trimmedUuid), resolvedUuid=\(resolvedUuid), name=\(resolvedName), state=\(resolvedPeripheral.state.rawValue), sessionGeneration=\(task.sessionGeneration)")
+                activateArmedReconnectTask(task, source: source)
                 return BleReconnectActivationResult(
                     // ack 保留 Dart 原始 target identity，避免 batch 在回执期把 name-key
                     // 突然切成 uuid-key；resolvedUuid 作为独立字段供上层记录和回填。
                     target: target,
                     state: .resolved,
-                    reason: "restoredPeripheralClaimed",
+                    reason: "systemConnectedPeripheralClaimed",
                     source: source,
                     sessionGeneration: task.sessionGeneration,
                     resolvedUuid: resolvedUuid,
@@ -713,64 +684,6 @@ extension BleManager {
         return true
     }
 
-    /// 把 escrow 物理状态接到正式 owner；connecting 只挂 admission，禁止重复 connect。
-    private func activateClaimedStateRestoration(
-        task: BleReconnectTask,
-        config: BleConfig,
-        claim: BleStateRestorationEscrowClaim
-    ) {
-        let peripheral = claim.peripheral
-        var request = BleEasyConnect(
-            configName: task.belongConfig,
-            uuid: peripheral.identifier.uuidString,
-            name: task.name,
-            afterUpgrade: false,
-            directConnect: true,
-            time: Date().timeIntervalSince1970
-        )
-        request.bleConfig = config
-        upsertActiveConnectRequest(request)
-        peripheral.delegate = self
-        replaceConnectionCache(
-            peripheral: peripheral,
-            config: config,
-            reason: "state restoration escrow claimed"
-        )
-        guard let admission = registerConnectionAttempt(
-            peripheral: peripheral,
-            config: config,
-            deviceName: task.name,
-            afterUpgrade: false,
-            source: task.source == .manualReconnect ? .manualReconnect : .stateRestoration,
-            sessionGeneration: task.sessionGeneration
-        ) else { return }
-
-        switch claim.state {
-        case .connected:
-            if peripheral.state == .connected {
-                enqueuePhysicalConnectionThroughGate(peripheral)
-            } else {
-                connectPeripheralAfterCancellationBarrier(peripheral, autoReconnect: true)
-            }
-        case .pending:
-            if peripheral.state == .connected {
-                enqueuePhysicalConnectionThroughGate(peripheral)
-            } else if peripheral.state == .connecting {
-                // escrow 已持有 CoreBluetooth pending connect；只安装观察 watchdog。
-                startPendingPhysicalConnectWatchdog(
-                    peripheral,
-                    admission: admission,
-                    autoReconnect: true
-                )
-            } else {
-                connectPeripheralAfterCancellationBarrier(peripheral, autoReconnect: true)
-            }
-        case .idle:
-            connectPeripheralAfterCancellationBarrier(peripheral, autoReconnect: true)
-        }
-        loggerD(msg: "stateRestoration: escrow claimed uuid=\(peripheral.identifier.uuidString), state=\(claim.state), physical=\(peripheral.state.rawValue), sessionGeneration=\(task.sessionGeneration)")
-    }
-
     /// 扫描仅为已声明的 name-only owner 补齐 UUID，不把普通空 manufacturer 广播暴露给 Dart。
     @discardableResult
     func resolvePendingReconnectIdentity(
@@ -826,11 +739,6 @@ extension BleManager {
      *  disconnect/remove 会调用这里；任务取消后，后续 stale callback 只能打日志，不能恢复连接。
      */
     func cancelReconnectTask(uuid: String, name: String = "") {
-        cancelStateRestorationEscrow(
-            uuid: uuid,
-            name: name,
-            reason: "reconnect owner cancelled"
-        )
         // 用户硬取消/移除设备要同时清理无资源的 Code 14 身份标记；否则再次绑定
         // 同一设备时会被错误当成旧配对恢复。
         let persistedTarget = reconnectStore.target(uuid: uuid, name: name)
@@ -967,8 +875,8 @@ extension BleManager {
         resumeReconnectTasksAfterBluetoothOn()
     }
 
-    /// 返回当前进程已持有的 peripheral；inactive 期间只允许复用这些对象或 restoration
-    /// escrow，禁止通过同步 CoreBluetooth retrieve 获取新对象。
+    /// 返回当前进程已持有的 peripheral；inactive 期间只允许复用这些对象，
+    /// 禁止通过同步 CoreBluetooth retrieve 获取新对象。
     private func inMemoryReconnectPeripheral(_ task: BleReconnectTask) -> CBPeripheral? {
         if let connected = connectedDevices.first(where: { device in
             isSameConnectTarget(
@@ -1000,7 +908,7 @@ extension BleManager {
         })?.1
     }
 
-    /// inactive/background/terminating 只在没有 restoration/内存 peripheral 时 defer。
+    /// inactive/background/terminating 只在没有内存 peripheral 时 defer。
     /// 这不是失败 attempt，不递增 retry，不发布 noDeviceFound，也不删除长期 owner。
     private func shouldDeferReconnectForAppInactivity(_ task: BleReconnectTask) -> Bool {
         !allowsSynchronousCoreBluetoothLookup && inMemoryReconnectPeripheral(task) == nil
@@ -1140,7 +1048,7 @@ extension BleManager {
     /**
      *  App 激活后补偿恢复暂停任务。
      *
-     *  与 willEnterForeground 互补，覆盖从 restoration / push / 普通打开进入 active 的不同路径。
+     *  与 willEnterForeground 互补，覆盖从 push / 普通打开进入 active 的不同路径。
      */
     @objc func handleAppDidBecomeActive() {
         allowsSynchronousCoreBluetoothLookup = true
@@ -1221,8 +1129,8 @@ extension BleManager {
                 // 这里必须真正 defer；否则会创建第二个 pending connect，导致回调归属混乱。
                 return
             }
-            // CoreBluetooth pending connect is the mechanism that lets State Restoration wake the process later.
-            // A short scan/connect timeout would cancel the only system-owned rendezvous point.
+            // CoreBluetooth pending connect is the long-wait reconnect rendezvous.
+            // A short scan/connect timeout would cancel the only system-owned pending point.
             loggerD(msg: "autoReconnect: \(task.uuid), start native pending connect, reason=\(state.rawValue)")
             DispatchQueue.main.async { [weak self] in
                 self?.beginReconnectAttempt(uuid: task.uuid)
@@ -1256,7 +1164,7 @@ extension BleManager {
     /**
      *  执行一次自动回连尝试。
      *
-     *  这里复用 connect(easyConnect:) 是为了让主动连接、自动回连、restoration 最终都进入同一套 GATT pipeline。
+     *  这里复用直连/Gate 流程，让主动连接和自动回连最终进入同一套 GATT pipeline。
      */
     func beginReconnectAttempt(uuid: String) {
         // 1、校验 task/config/蓝牙状态，旧 timer 或取消后的回调直接失效。
@@ -1295,7 +1203,7 @@ extension BleManager {
     /// 构造一条不经扫描前置、不提前起超时的 CoreBluetooth pending connect。
     func beginDirectReconnectAttempt(task: BleReconnectTask, config: BleConfig) {
         // 1、先以真实物理连接状态短路，避免重复建立 GATT。
-        // 不能只看业务缓存 isConnected：断连后 retrieve/restoration 可能保留同 UUID 的
+        // 不能只看业务缓存 isConnected：断连后 retrieve 可能保留同 UUID 的
         // 旧 CBPeripheral 实例。只有物理连接仍在时才短路，否则必须重建系统 pending connect。
         if let connected = businessConnectedCacheDevice(uuid: task.uuid) {
             armReconnectTask(device: connected, source: .autoReconnect, businessConnected: true)
@@ -1855,7 +1763,7 @@ extension BleManager {
             )
             loggerD(msg: "autoReconnect: \(peripheral.identifier.uuidString), CoreBluetooth system auto reconnect enabled")
         } else {
-            // iOS 17 以下仍保留普通 pending connect；State Restoration 可继续持有该请求。
+            // iOS 17 以下仍保留普通 pending connect；下次 App 启动会通过冷启动流程重新激活。
             centralManager.connect(peripheral)
         }
     }

@@ -3,7 +3,7 @@
 //  flutter_ezw_ble
 //
 //  Centralizes connect request log context so foreground connect, reconnect,
-//  and restoration paths can use a stable, grep-friendly log shape.
+//  and reconnect paths can use a stable, grep-friendly log shape.
 //
 
 import Foundation
@@ -14,13 +14,13 @@ import Foundation
  *  这里不承载连接决策，只负责把关键路由输入整理成稳定日志，避免各入口各写一套自然语言日志。
  */
 struct BleConnectRequestLogContext {
-    /// 原生连接目标 UUID，可能来自扫描结果、持久化目标或 CoreBluetooth restored peripheral。
+    /// 原生连接目标 UUID，可能来自扫描结果、持久化目标或进程内已知 peripheral。
     let uuid: String
     /// 原生连接目标名称，用于 UUID 缺失或临时 UUID 阶段的辅助匹配。
     let name: String
     /// Dart 注入的 BLE 配置名，用于定位私有服务规则。
     let configName: String
-    /// 是否要求直接连接；auto reconnect / restoration 通常会走 direct path。
+    /// 是否要求直接连接；auto reconnect 通常会走 direct path。
     let directConnect: Bool
     /// 是否 OTA 后恢复连接，日志保留该字段方便排查升级链路。
     let afterUpgrade: Bool

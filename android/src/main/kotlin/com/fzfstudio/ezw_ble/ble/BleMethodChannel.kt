@@ -69,12 +69,12 @@ enum class BleMC {
     ENTER_UPGRADE_STATE,
     /** 标记设备退出升级状态。 */
     QUITE_UPGRADE_STATE,
+    /** 打开/关闭 native 连接 Trace；默认关闭且不改变连接/回连状态。 */
+    SET_CONNECTION_TRACE_ENABLED,
     /** 清理本地连接缓存。 */
     CLEAN_CONNECT_CACHE,
     /** 读取并清空原生自动回连/后台恢复事件。 */
     DRAIN_AUTO_RECONNECT_EVENTS,
-    /** iOS 启动恢复认领收尾；Android 无 State Restoration，保持 no-op。 */
-    FINALIZE_STATE_RESTORATION_CLAIMS,
     /** 重置插件蓝牙状态。 */
     RESET_BLE,
     /** 打开系统蓝牙设置页。 */
@@ -328,6 +328,10 @@ enum class BleMC {
                 val uuid = arguments as? String ?: ""
                 BleManager.instance.quiteUpgradeState(uuid)
             }
+            SET_CONNECTION_TRACE_ENABLED -> {
+                // 1. Trace 只控制诊断采集；关闭时 manager 仅清 Trace/RSSI 诊断缓存。
+                BleManager.instance.setConnectionTraceEnabled(arguments as? Boolean == true)
+            }
             CLEAN_CONNECT_CACHE -> {
                 // 1. 调试/恢复入口：清理插件侧连接缓存。
                 BleManager.instance.cleanConnectCache()
@@ -335,9 +339,6 @@ enum class BleMC {
             DRAIN_AUTO_RECONNECT_EVENTS -> {
                 // 1. 自动回连事件需要返回给 Dart，因此这里提前 return。
                 return result.success(BleManager.instance.drainAutoReconnectEvents())
-            }
-            FINALIZE_STATE_RESTORATION_CLAIMS -> {
-                // 1. Android 不存在 CoreBluetooth State Restoration；保留跨平台接口对称。
             }
             RESET_BLE -> {
                 // 1. 重置由 BleManager 统一释放扫描、连接、队列和监听资源。

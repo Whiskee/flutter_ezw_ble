@@ -17,6 +17,7 @@ struct BleConnectModel: Codable {
     var source: BleConnectSource = .unknown
     var sessionGeneration: Int64 = 0
     var attemptGeneration: Int64 = 0
+    var nativeTrace: BleNativeConnectionTrace?
 
     /// Backward-compatible alias for older Dart consumers.
     var generation: Int64 { sessionGeneration }
@@ -29,7 +30,8 @@ struct BleConnectModel: Codable {
         source: BleConnectSource = .unknown,
         generation: Int64 = 0,
         sessionGeneration: Int64? = nil,
-        attemptGeneration: Int64 = 0
+        attemptGeneration: Int64 = 0,
+        nativeTrace: BleNativeConnectionTrace? = nil
     ) {
         self.uuid = uuid
         self.name = name
@@ -38,6 +40,7 @@ struct BleConnectModel: Codable {
         self.source = source
         self.sessionGeneration = sessionGeneration ?? generation
         self.attemptGeneration = attemptGeneration
+        self.nativeTrace = nativeTrace
     }
 
     enum CodingKeys: String, CodingKey {
@@ -49,6 +52,7 @@ struct BleConnectModel: Codable {
         case generation
         case sessionGeneration
         case attemptGeneration
+        case nativeTrace
     }
 
     init(from decoder: Decoder) throws {
@@ -62,6 +66,7 @@ struct BleConnectModel: Codable {
             ?? container.decodeIfPresent(Int64.self, forKey: .generation)
             ?? 0
         attemptGeneration = try container.decodeIfPresent(Int64.self, forKey: .attemptGeneration) ?? 0
+        nativeTrace = try container.decodeIfPresent(BleNativeConnectionTrace.self, forKey: .nativeTrace)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -74,6 +79,7 @@ struct BleConnectModel: Codable {
         try container.encode(sessionGeneration, forKey: .generation)
         try container.encode(sessionGeneration, forKey: .sessionGeneration)
         try container.encode(attemptGeneration, forKey: .attemptGeneration)
+        try container.encodeIfPresent(nativeTrace, forKey: .nativeTrace)
     }
 }
 
@@ -82,7 +88,6 @@ enum BleConnectSource: String, Codable {
     case unknown
     case autoReconnect
     case manualReconnect
-    case stateRestoration
     case foreground
 
     init(from decoder: Decoder) throws {

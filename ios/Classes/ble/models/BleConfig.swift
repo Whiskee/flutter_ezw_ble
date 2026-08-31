@@ -24,6 +24,8 @@ struct BleConfig: Codable {
     let autoReconnectMaxAttempts: Int
     //  是否允许平台被动回连能力
     let autoReconnectUseNativePassive: Bool
+    //  Android 专用高可靠链路策略；iOS 仅保留配置协议兼容，不参与 CoreBluetooth 行为
+    let androidHighReliabilityMode: Bool
     
     init(
         name: String,
@@ -34,7 +36,8 @@ struct BleConfig: Codable {
         upgradeSwapTime: TimeInterval = 60000,
         autoReconnect: Bool = false,
         autoReconnectMaxAttempts: Int = 0,
-        autoReconnectUseNativePassive: Bool = true
+        autoReconnectUseNativePassive: Bool = true,
+        androidHighReliabilityMode: Bool = false
     ) {
         self.name = name
         self.scan = scan
@@ -46,6 +49,7 @@ struct BleConfig: Codable {
         self.autoReconnect = autoReconnect
         self.autoReconnectMaxAttempts = autoReconnectMaxAttempts
         self.autoReconnectUseNativePassive = autoReconnectUseNativePassive
+        self.androidHighReliabilityMode = androidHighReliabilityMode
         assert(connectTimeout > 10000, "The timeout period must be greater than 10000ms")
     }
 
@@ -59,6 +63,7 @@ struct BleConfig: Codable {
         case autoReconnect
         case autoReconnectMaxAttempts
         case autoReconnectUseNativePassive
+        case androidHighReliabilityMode
     }
 
     init(from decoder: Decoder) throws {
@@ -72,7 +77,8 @@ struct BleConfig: Codable {
             upgradeSwapTime: try container.decodeIfPresent(TimeInterval.self, forKey: .upgradeSwapTime) ?? 60000,
             autoReconnect: try container.decodeIfPresent(Bool.self, forKey: .autoReconnect) ?? false,
             autoReconnectMaxAttempts: try container.decodeIfPresent(Int.self, forKey: .autoReconnectMaxAttempts) ?? 0,
-            autoReconnectUseNativePassive: try container.decodeIfPresent(Bool.self, forKey: .autoReconnectUseNativePassive) ?? true
+            autoReconnectUseNativePassive: try container.decodeIfPresent(Bool.self, forKey: .autoReconnectUseNativePassive) ?? true,
+            androidHighReliabilityMode: try container.decodeIfPresent(Bool.self, forKey: .androidHighReliabilityMode) ?? false
         )
     }
     

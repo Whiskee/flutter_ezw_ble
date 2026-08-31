@@ -120,26 +120,25 @@ class BleManagerCleanConnectCacheTest {
         weakContextField.isAccessible = true
         weakContextField.set(manager, WeakReference(context))
 
-        val owner = BleDevice(
-            belongConfig = BleConfig.empty().copy(name = "reset-owner", autoReconnect = true),
-            name = "G2_Reset",
-            uuid = "AA:BB:CC:DD:EE:FF",
-            sn = "reset-sn",
-            rssi = 0,
-            connectState = BleConnectState.NONE,
+        val endpoint = "AA:BB:CC:DD:EE:FF"
+        val persistedTargets =
+            """[{"belongConfig":"reset-owner","uuid":"$endpoint","name":"G2_Reset","sn":"reset-sn"}]"""
+        val reconnectPrefs = context.getSharedPreferences(
+            "flutter_ezw_ble_auto_reconnect",
+            Context.MODE_PRIVATE,
         )
-        val store = BleReconnectStore()
-        store.upsertTarget(context, owner)
-        val stale = registerAttempt(manager, owner.uuid)
+        // JVM 的 android.jar 不实现 org.json；直接写真实存储格式即可验证 reset 不删 owner。
+        reconnectPrefs.edit().putString("targets", persistedTargets).apply()
+        val stale = registerAttempt(manager, endpoint)
         val gate = managerField<BleConnectionAdmissionGate>(manager, "connectionAdmissionGate")
 
         Mockito.mockStatic(Log::class.java).use {
             manager.reset()
         }
 
-        assertEquals(listOf(owner.uuid), store.targets(context).map { it.uuid })
+        assertEquals(persistedTargets, reconnectPrefs.getString("targets", null))
         assertEquals(BleConnectionAdmissionDecision.STALE, gate.onPhysicalConnected(stale))
-        store.clearTargets(context)
+        reconnectPrefs.edit().remove("targets").apply()
     }
 
     @Test

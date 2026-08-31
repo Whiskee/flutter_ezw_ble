@@ -28,7 +28,34 @@ internal fun interface BlePassiveGattFactory {
         device: BluetoothDevice,
         context: Context?,
         callback: BleGattSessionCallback,
+        highReliabilityMode: Boolean,
     ): BluetoothGatt?
+}
+
+/**
+ * 三条 Android GATT 创建路径的唯一 PHY 选择入口。
+ *
+ * `autoConnect=true` 时 Android 官方说明 connectGatt 的 phy 参数不生效，但仍传入同一策略值
+ * 维持代码一致；真实 passive 链路会在 STATE_CONNECTED 后由 callback 再请求目标 PHY。
+ */
+internal object AndroidBleGattConnector {
+    fun connect(
+        device: BluetoothDevice,
+        context: Context?,
+        autoConnect: Boolean,
+        callback: BleGattSessionCallback,
+        highReliabilityMode: Boolean,
+    ): BluetoothGatt? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        device.connectGatt(
+            context,
+            autoConnect,
+            callback,
+            BluetoothDevice.TRANSPORT_LE,
+            AndroidBleAdaptiveLinkPolicy.initialConnectPhyMask(highReliabilityMode),
+        )
+    } else {
+        device.connectGatt(context, autoConnect, callback)
+    }
 }
 
 /** 生产环境长期回连 GATT 工厂；常态保持 `autoConnect=true` 的系统 pending 请求。 */
@@ -37,17 +64,14 @@ internal object AndroidBlePassiveGattFactory : BlePassiveGattFactory {
         device: BluetoothDevice,
         context: Context?,
         callback: BleGattSessionCallback,
-    ): BluetoothGatt? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-        device.connectGatt(
-            context,
-            true,
-            callback,
-            BluetoothDevice.TRANSPORT_LE,
-            BluetoothDevice.PHY_LE_2M,
-        )
-    } else {
-        device.connectGatt(context, true, callback)
-    }
+        highReliabilityMode: Boolean,
+    ): BluetoothGatt? = AndroidBleGattConnector.connect(
+        device = device,
+        context = context,
+        autoConnect = true,
+        callback = callback,
+        highReliabilityMode = highReliabilityMode,
+    )
 }
 
 /**
@@ -61,17 +85,14 @@ internal object AndroidBleVisibleDirectGattFactory : BlePassiveGattFactory {
         device: BluetoothDevice,
         context: Context?,
         callback: BleGattSessionCallback,
-    ): BluetoothGatt? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-        device.connectGatt(
-            context,
-            false,
-            callback,
-            BluetoothDevice.TRANSPORT_LE,
-            BluetoothDevice.PHY_LE_2M,
-        )
-    } else {
-        device.connectGatt(context, false, callback)
-    }
+        highReliabilityMode: Boolean,
+    ): BluetoothGatt? = AndroidBleGattConnector.connect(
+        device = device,
+        context = context,
+        autoConnect = false,
+        callback = callback,
+        highReliabilityMode = highReliabilityMode,
+    )
 }
 
 /** 使用 Timer 承载非首轮防抖，并把实际 attempt 交回 manager 指定线程。 */

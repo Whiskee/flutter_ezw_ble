@@ -154,6 +154,13 @@ final class OtaWriteQueue {
 `CBPeripheralDelegate.peripheralIsReady(toSendWriteWithoutResponse:)` 必须接入到
 `OtaWriteQueue.onPeripheralReadyToSendWriteWithoutResponse()`。
 
+生产实现还必须保留有界 watchdog：`canSendWriteWithoutResponse == false` 持续 4 秒时只把
+当前等待标记为一次性 `grace`，继续保留原 pending、ready 回调和 100ms 重查；再等待最多
+1 秒仍不可写，才以 `ota_write_stalled` 结束（总窗口 5 秒）。grace 内一旦 callback 或重查
+确认 `canSend == true`，只提交原 pending 一次并取消 watchdog。每次等待/清理必须推进内部
+episode，使旧 timer 在取消、reset 或新 attempt 建立后不能驱动新 pending。ready 回调不能在
+`canSend` 仍为 false 时重置起始时间，否则虚假/过早 callback 会让 fail-closed 窗口无限延长。
+
 ### 4.3 兜底路径
 
 若该 characteristic 不声明 `.writeWithoutResponse` property(理论上 OTA
@@ -193,9 +200,11 @@ no-wait 路径保持原行为。
 ```
 [ezw_ble][ota] enqueued endpoint=<uuid> bytes=<len> pending=<n>
 [ezw_ble][ota] submitted endpoint=<uuid> char=<charUuid> bytes=<len> pending=<n>
-[ezw_ble][ota] ready endpoint=<uuid> pending=<n>
-[ezw_ble][ota] stalled endpoint=<uuid> reason=<reason> wait=<duration|pending|ready> pending=<n>
-[ezw_ble][ota] cancelled endpoint=<uuid> reason=<reason> pending=<n>
+[ezw_ble][ota] backpressure endpoint=<uuid> episode=<n> stage=<base|grace> reason=<reason> wait=<duration> pending=<n>
+[ezw_ble][ota] ready endpoint=<uuid> episode=<n> pending=<n>
+[ezw_ble][ota] resumed endpoint=<uuid> episode=<n> stage=<base|grace> reason=<reason> source=<callback|poll> wait=<duration> pending=<n>
+[ezw_ble][ota] stalled endpoint=<uuid> episode=<n> stage=terminal reason=<reason> wait=<duration> pending=<n>
+[ezw_ble][ota] cancelled endpoint=<uuid> episode=<n> stage=<base|grace> reason=<reason> pending=<n>
 ```
 
 日志经现有 `logger` EventChannel 上报到 Dart 端 `blePrintEC`(参考 §6 命名约定)。
@@ -260,7 +269,7 @@ live peripheral 与 accepted epoch。这样 Bluetooth OFF 或迟到 OTA exit 都
 - BLE 信号弱场景(走廊外)下 OTA 仍能完成,失败时通过应用层 CRC 检验触发 retry;
 - 升级途中主动断连 → 设备状态机正确回到 `disconnectFromSys`,挂起的 noResponse 写以
   `ota_write_cancelled` 结束,不留 Dart await;
-- 背压超过 native stall 窗口 → 挂起 noResponse 写以 `ota_write_stalled` 结束,details
+- 背压到 4 秒阈值后进入一次性 1 秒 grace；总窗口仍未恢复 → 挂起 noResponse 写以 `ota_write_stalled` 结束,details
   带 `endpoint/reason/wait/pending`;
 - App 退后台 / 锁屏期间不掉包(iOS 后台 BLE 允许 OTA 类长时操作)。
 

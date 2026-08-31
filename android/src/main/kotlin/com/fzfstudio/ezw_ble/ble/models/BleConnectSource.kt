@@ -10,8 +10,6 @@ enum class BleConnectSource(val flutterValue: String) {
     AUTO_RECONNECT("autoReconnect"),
     @SerializedName("manualReconnect")
     MANUAL_RECONNECT("manualReconnect"),
-    @SerializedName("stateRestoration")
-    STATE_RESTORATION("stateRestoration"),
     @SerializedName("foreground")
     FOREGROUND("foreground");
 

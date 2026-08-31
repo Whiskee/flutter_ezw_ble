@@ -210,7 +210,7 @@ extension _G2DemoConnectionFlow on _MyAppState {
   bool _shouldUseDirectReconnect() {
     // Android stores a real Bluetooth address, so direct reconnect is the
     // fastest stable path. iOS stores a CoreBluetooth identifier, which can be
-    // stale after cold launch, restoration, reinstall, or system cache churn;
+    // stale after cold launch, reinstall, or system cache churn;
     // scan-first lets native refresh the identifier from the current broadcast
     // while still allowing retrieveConnectedPeripherals for system-connected
     // devices that are no longer advertising.

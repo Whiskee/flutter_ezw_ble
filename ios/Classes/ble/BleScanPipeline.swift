@@ -629,6 +629,7 @@ extension BleManager {
                 return
             }
         }
+        recordNativeTrace(uuid: peripheral.identifier.uuidString, stage: "scan", result: "success")
 
         // 5. cancellation barrier 可拦住同 UUID 的旧 CoreBluetooth callback，避免新 owner 被旧终态污染。
         handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheralName, state: .connecting, tag: "from search device")

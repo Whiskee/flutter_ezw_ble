@@ -46,8 +46,8 @@ void main() {
     expect(task, contains('visibleDirectConnectRequested'));
     expect(task, contains('pendingVisibleDirectConnect'));
     expect(dispatcher, contains('AndroidBleVisibleDirectGattFactory'));
-    expect(
-        dispatcher, contains('device.connectGatt(context, false, callback)'));
+    expect(dispatcher, contains('AndroidBleGattConnector.connect'));
+    expect(dispatcher, contains('autoConnect = false'));
     expect(reconnect, contains('task.retryScheduleGeneration'));
     expect(reconnect, contains('visibilityWakeEligible = true'));
     expect(

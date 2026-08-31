@@ -1,4 +1,5 @@
 import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
+import 'package:flutter_ezw_ble/core/models/ble_native_connection_trace.dart';
 import 'package:flutter_ezw_ble/core/models/ble_connect_state.dart';
 import 'package:flutter_ezw_ble/core/tools/connect_state_converter.dart';
 import 'package:json_annotation/json_annotation.dart';
@@ -21,6 +22,7 @@ class BleConnectModel {
   final int sessionGeneration;
   @JsonKey(defaultValue: 0)
   final int attemptGeneration;
+  final BleNativeConnectionTrace? nativeTrace;
 
   /// Backward-compatible alias for payloads that used one generation field.
   @JsonKey(includeFromJson: false, includeToJson: false)
@@ -35,6 +37,7 @@ class BleConnectModel {
     int sessionGeneration = 0,
     int? generation,
     this.attemptGeneration = 0,
+    this.nativeTrace,
   }) : sessionGeneration = generation ?? sessionGeneration;
 
   factory BleConnectModel.fromJson(Map<String, dynamic> json) {

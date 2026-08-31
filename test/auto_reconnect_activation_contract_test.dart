@@ -279,7 +279,8 @@ void main() {
     expect(results.single.isAccepted, isTrue);
   });
 
-  test('restoration activation keeps request key and exposes resolved UUID',
+  test(
+      'system-connected activation keeps request key and exposes resolved UUID',
       () async {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (_) async {
@@ -290,11 +291,11 @@ void main() {
           'uuid': '',
           'name': 'EVEN R1_F9B658',
           'state': 'resolved',
-          'reason': 'restoredPeripheralClaimed',
+          'reason': 'systemConnectedPeripheralClaimed',
           'source': 'autoReconnect',
           'sessionGeneration': 7,
           'resolvedUuid': '5FB51C30-E13C-A3B7-F542-796E2CE78830',
-          'resolutionSource': 'stateRestoration',
+          'resolutionSource': 'systemConnected',
         },
       ];
     });
@@ -316,7 +317,7 @@ void main() {
       result.resolvedUuid,
       '5FB51C30-E13C-A3B7-F542-796E2CE78830',
     );
-    expect(result.resolutionSource, 'stateRestoration');
+    expect(result.resolutionSource, 'systemConnected');
     expect(result.sessionGeneration, 7);
     expect(result.state, BleReconnectActivationState.resolved);
   });

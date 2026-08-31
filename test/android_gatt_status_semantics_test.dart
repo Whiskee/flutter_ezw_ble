@@ -67,7 +67,7 @@ void main() {
     expect(
       descriptorCallback,
       contains(
-          'onSessionTerminal(gatt, BleConnectState.CHARS_FAIL, DEFAULT_MTU)'),
+          'terminateSession(gatt, BleConnectState.CHARS_FAIL, DEFAULT_MTU)'),
     );
     expect(
       descriptorCallback,
@@ -88,8 +88,12 @@ void main() {
     expect(
       characteristicCallback,
       contains(
-        'onSessionTerminal(gatt, BleConnectState.DISCONNECT_FROM_SYS, DEFAULT_MTU)',
+        'terminateSession(gatt, BleConnectState.DISCONNECT_FROM_SYS, DEFAULT_MTU)',
       ),
+    );
+    expect(
+      callbackSource,
+      contains('onSessionTerminal(gatt, state, mtu)'),
     );
     final authorizationBranchStart = characteristicCallback.indexOf(
       'if (status == BluetoothGattStatus.GATT_INSUFFICIENT_AUTHORIZATION)',

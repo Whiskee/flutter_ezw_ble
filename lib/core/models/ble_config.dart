@@ -27,6 +27,8 @@ class BleConfig {
   final int autoReconnectMaxAttempts;
   //  是否允许平台被动回连能力
   final bool autoReconnectUseNativePassive;
+  //  Android 高可靠链路模式：以 1M 建链，并按 RSSI/流量动态调整 PHY 与连接优先级
+  final bool androidHighReliabilityMode;
 
   BleConfig(
     this.name,
@@ -39,6 +41,7 @@ class BleConfig {
     this.autoReconnect = false,
     this.autoReconnectMaxAttempts = 0,
     this.autoReconnectUseNativePassive = true,
+    this.androidHighReliabilityMode = false,
   });
 
   factory BleConfig.fromJson(Map<String, dynamic> json) =>

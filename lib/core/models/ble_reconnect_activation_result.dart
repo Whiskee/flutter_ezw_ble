@@ -43,13 +43,13 @@ class BleReconnectActivationResult {
   /// even_connect recovery batch 的逻辑代次；不得与 native Gate attempt 混用。
   final int sessionGeneration;
 
-  /// Native 在 activation 期间通过 State Restoration/系统连接找回的平台 UUID。
+  /// Native 在 activation 期间通过系统连接或进程内缓存找回的平台 UUID。
   ///
   /// [uuid] 必须继续保留 Dart 请求身份供 recovery batch 对账；因此平台身份迁移
   /// 使用独立字段返回，不能在 MethodChannel 回执中直接覆盖 [uuid]。
   final String resolvedUuid;
 
-  /// 平台身份的解析来源，例如 `stateRestoration` 或 `systemConnected`。
+  /// 平台身份的解析来源，例如 `systemConnected` 或 `cache`。
   final String resolutionSource;
 
   /// 除 rejected 外都表示 native 已保留当前连接 owner。

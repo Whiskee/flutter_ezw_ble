@@ -2,7 +2,7 @@
 //  BleReconnectStore.swift
 //  flutter_ezw_ble
 //
-//  Persists reconnect targets and native reconnect/restoration events across
+//  Persists reconnect targets and native reconnect events across
 //  app lifecycle transitions. The data is intentionally small and identity-only;
 //  GATT services and business auth are rebuilt after each physical reconnect.
 //
@@ -559,7 +559,7 @@ final class BleReconnectStore {
     /**
      *  读取并清空 native 事件缓冲。
      *
-     *  State Restoration 可能早于 Dart EventChannel 订阅发生，因此需要 drain 语义让 Dart 恢复后补读。
+     *  原生自动回连可能早于 Dart EventChannel 订阅发生，因此需要 drain 语义让 Dart 恢复后补读。
      */
     func drainEvents() -> [[String: Any]] {
         let events = defaults.array(forKey: eventsKey) as? [[String: Any]] ?? []
@@ -602,7 +602,7 @@ final class BleReconnectStore {
     /**
      *  新增或更新一个持久化目标。
      *
-     *  同一 UUID 或同一 name 只保留最新配置，避免历史目标导致 restoration 误匹配。
+     *  同一 UUID 或同一 name 只保留最新配置，避免历史目标导致回连误匹配。
      */
     func upsert(device: BleConnectedDevice) {
         let uuid = device.peripheral.identifier.uuidString
