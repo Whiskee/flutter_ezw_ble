@@ -7,7 +7,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
-/** R1 Bond-first 与 G2 缺失 5403 fallback 均可脱离 Android callback 单测。 */
+/** Android G2/R1 Bond-first 与缺失 5403 防御性 fallback 均可脱离 callback 单测。 */
 class BondBeforeGattReadyDecisionTest {
 
     @Test

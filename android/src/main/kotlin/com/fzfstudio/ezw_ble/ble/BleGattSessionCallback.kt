@@ -242,8 +242,8 @@ internal class BleGattSessionCallback(
 
         recordTraceStep(address, "service_discovery", "success", null, "GATT", status)
 
-        // 3. 可选 5403 必须先以 Write Request 验证系统 Bond；Android 旧固件缺失或
-        // 不支持有响应写时，先由 exact manager owner 主动 Bond，再回到普通 GATT 初始化。
+        // 3. 可选 5403 必须先以 Write Request 验证系统 Bond。Android G2 的正常顺序
+        // 已由 admission 先完成主动 Bond；这里的缺失 Gate 回调仅保留给旧固件和旧配置兜底。
         val securityGate = currentDevice.belongConfig.securityGate
         if (securityGate != null) {
             val gateCharacteristic = runCatching {

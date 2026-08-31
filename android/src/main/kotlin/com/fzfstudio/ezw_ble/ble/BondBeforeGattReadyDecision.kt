@@ -57,10 +57,10 @@ internal fun decideGateGrantedBondAction(
 }
 
 /**
- * G2 已经完成首次服务发现、但旧固件没有可执行 5403 时的兼容决策。
+ * 已经完成首次服务发现、但旧固件没有可执行 5403 时的防御性兼容决策。
  *
- * 该路径只由配置了 securityGate 的设备调用：已 Bond 可继续普通 Notify；未 Bond
- * 则在同一 admission/GATT 上主动建立系统 Bond，避免旧固件因没有保护写而永远不弹配对。
+ * Android G2 正常配置会在服务发现前完成 Bond，因此通常直接继续普通 Notify；如果
+ * 旧配置或 Bond 竞态仍呈现未配对，才在同一 admission/GATT 上补建系统 Bond。
  */
 internal fun decideMissingSecurityGateBondAction(
     bondState: SystemBondState,
