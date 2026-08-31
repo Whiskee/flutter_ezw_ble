@@ -138,6 +138,11 @@ class BleManager private constructor() {
         val afterUpgrade: Boolean,
         /** bond 成功与 createBond 返回可能竞速；同一 session 只允许提交一次服务发现。 */
         var serviceDiscoveryStarted: Boolean = false,
+        /**
+         * G2 首次服务发现确认 5403 缺失后，旧固件兼容 Bond 暂停普通 Notify。
+         * 只有该 exact session 的成功 Bond 才能清除此标志并重新发现服务。
+         */
+        var legacySecurityGateFallbackBinding: Boolean = false,
     )
 
     /** 业务 connected 已释放 Gate，但物理 GATT 仍长期存活。 */
@@ -2578,6 +2583,7 @@ class BleManager private constructor() {
             var exactAdmission: BleConnectionAdmission? = null
             var action = BondBroadcastAction.IGNORE
             var gateSecurityFailure = false
+            var legacyGateFallbackBinding = false
 
             // 2、与 createBond 使用同一 device monitor，防止 false 返回覆盖同步成功广播。
             synchronized(connectedDevice) {
@@ -2592,7 +2598,9 @@ class BleManager private constructor() {
                 if (ownsExactGatt) {
                     val owner = candidate ?: return@synchronized
                     exactAdmission = owner
+                    legacyGateFallbackBinding = session?.legacySecurityGateFallbackBinding == true
                     val shouldObserveBond = connectedDevice.belongConfig.initiateBinding ||
+                        legacyGateFallbackBinding ||
                         oldBondState == SystemBondState.BONDED ||
                         oldBondState == SystemBondState.BONDING ||
                         currentBondState == SystemBondState.BONDED ||
@@ -2614,7 +2622,10 @@ class BleManager private constructor() {
                         }
                     }
                     action = decideBondBroadcastAction(
-                        initiateBinding = connectedDevice.belongConfig.initiateBinding,
+                        // G2 配置仍为 false；只有已经确认 5403 缺失的 exact session
+                        // 临时获得主动 Bond 广播消费权，不能放宽其它 false-config。
+                        initiateBinding = connectedDevice.belongConfig.initiateBinding ||
+                            legacyGateFallbackBinding,
                         connectState = connectedDevice.connectState,
                         bondState = currentBondState,
                         previousBondState = oldBondState,
@@ -2646,7 +2657,14 @@ class BleManager private constructor() {
             // 4、锁外执行 GATT/终态动作；所有出口都会再次校验 exact token 与 GATT identity。
             when (action) {
                 BondBroadcastAction.DISCOVER_SERVICES -> exactAdmission?.let {
-                    startGrantedServiceDiscovery(it, reason = "bond broadcast success")
+                    if (legacyGateFallbackBinding) {
+                        restartGrantedServiceDiscoveryAfterLegacyBond(
+                            it,
+                            reason = "legacy security gate bond broadcast success",
+                        )
+                    } else {
+                        startGrantedServiceDiscovery(it, reason = "bond broadcast success")
+                    }
                 }
                 BondBroadcastAction.FAIL_BINDING -> exactAdmission?.let { admission ->
                     val gatt = connectedDevice.myGatt ?: return@let
@@ -3006,6 +3024,11 @@ class BleManager private constructor() {
                     autoReconnectSupervisor.resetSecurityRecovery(uuid)
                 }
             },
+            onSecurityGateUnavailable = { gatt, device ->
+                // 旧 G2 固件没有可写 5403 时，只有当前 admission 可以在服务发现后
+                // 主动 Bond；callback 返回前必须决定是否暂停普通 Notify。
+                startLegacyBondAfterMissingSecurityGate(admission, gatt, device)
+            },
             consumeDisconnectingState = { uuid ->
                 // 7. 主动断连/超时断连已带有明确状态，消费后不再上报系统断连。
                 if (consumeOtaRebootDisconnectSuppression(uuid)) {
@@ -3249,7 +3272,7 @@ class BleManager private constructor() {
     /**
      * 在 Gate 内选择主动配对、等待系统配对或直接服务发现。
      *
-     * 1、false-config 与已配对设备不改变既有服务发现路径。
+     * 1、false-config 与已配对设备先进入服务发现；G2 只在发现后确认 5403 不可用时才兼容 Bond。
      * 2、等待/发起配对时先上报 START_BINDING，并持续占有 Gate 与连接 timeout。
      * 3、只有权威成功广播或 createBond 后 framework 已同步进入 BONDED 才恢复服务发现。
      */
@@ -3294,11 +3317,76 @@ class BleManager private constructor() {
         }
     }
 
+    /**
+     * Android G2 旧固件兼容：首次服务发现已证明 5403 缺失或不支持 Write Request 后，
+     * 才允许在同一 exact admission/GATT 上主动系统 Bond。
+     *
+     * 返回 true 表示 callback 必须暂停普通 Notify；Bond 成功后会重新发现服务，第二次
+     * 回调因系统已 BONDED 而直接进入 legacy readiness。已 Bond 的设备无需重复动作。
+     */
+    @Synchronized
+    private fun startLegacyBondAfterMissingSecurityGate(
+        expectedAdmission: BleConnectionAdmission,
+        gatt: BluetoothGatt,
+        device: BleDevice,
+    ): Boolean {
+        val current = currentAdmissionFor(expectedAdmission) ?: return true
+        val session = admittedGattSessions[current.sessionId] ?: return true
+        if (session.gatt !== gatt || session.device !== device || device.myGatt !== gatt ||
+            !connectionAdmissionGate.isActive(current)
+        ) {
+            sendLog(
+                BleLoggerTag.d,
+                "Security gate fallback: endpoint=${expectedAdmission.endpointId}, ignored stale owner",
+            )
+            return true
+        }
+
+        val bondState = systemBondStateOf(gatt.device.bondState)
+        val action = decideMissingSecurityGateBondAction(bondState)
+        sendLog(
+            BleLoggerTag.d,
+            "Security gate fallback: endpoint=${current.endpointId}, source=${current.source.flutterValue}, " +
+                "generation=${current.generation}, sessionId=${current.sessionId}, " +
+                "bondState=$bondState, action=$action",
+        )
+        return when (action) {
+            GateGrantedBondAction.DISCOVER_SERVICES -> {
+                // 已有系统 Bond 时不需要重新 discover；当前 callback 可直接初始化 Notify。
+                autoReconnectSupervisor.resetSecurityRecovery(device.uuid)
+                false
+            }
+            GateGrantedBondAction.WAIT_FOR_BOND -> {
+                synchronized(device) {
+                    session.legacySecurityGateFallbackBinding = true
+                    handleConnectState(
+                        device.uuid,
+                        device.name,
+                        BleConnectState.START_BINDING,
+                        source = current.source,
+                        generation = current.sessionGeneration,
+                        attemptGeneration = current.generation,
+                    )
+                }
+                true
+            }
+            GateGrantedBondAction.START_BOND -> {
+                startGrantedSystemBond(
+                    current,
+                    session,
+                    rediscoverAfterBond = true,
+                )
+                true
+            }
+        }
+    }
+
     /** 主动配对前先发布 START_BINDING，并复查 framework 状态消除 createBond(false) 竞态。 */
     @Synchronized
     private fun startGrantedSystemBond(
         admission: BleConnectionAdmission,
         session: GrantedGattSession,
+        rediscoverAfterBond: Boolean = false,
     ) {
         var resumeServiceDiscovery = false
         var failBinding = false
@@ -3320,6 +3408,7 @@ class BleManager private constructor() {
             }
 
             // 2、状态必须先进入 START_BINDING；快速广播随后才能被 exact guard 接受。
+            session.legacySecurityGateFallbackBinding = rediscoverAfterBond
             handleConnectState(
                 session.device.uuid,
                 session.device.name,
@@ -3349,10 +3438,17 @@ class BleManager private constructor() {
 
         // 3、同步成功复用同一服务发现入口；明确拒绝必须 exact teardown 并释放下一 owner。
         when {
-            resumeServiceDiscovery -> startGrantedServiceDiscovery(
-                admission,
-                reason = "createBond observed bonded",
-            )
+            resumeServiceDiscovery -> if (rediscoverAfterBond) {
+                restartGrantedServiceDiscoveryAfterLegacyBond(
+                    admission,
+                    reason = "legacy security gate createBond observed bonded",
+                )
+            } else {
+                startGrantedServiceDiscovery(
+                    admission,
+                    reason = "createBond observed bonded",
+                )
+            }
             failBinding -> {
                 val recoveryAction = handleSecurityGateFailure(
                     admission,
@@ -3371,6 +3467,42 @@ class BleManager private constructor() {
                 }
             }
         }
+    }
+
+    /**
+     * 旧 G2 固件 fallback Bond 成功后重新发现服务。
+     *
+     * 首次 discovery 已经消费 `serviceDiscoveryStarted`，因此只允许持有 fallback 标志的
+     * exact session 重置该位。同步 createBond 结果与成功广播无论谁先到都只能重启一次。
+     */
+    @Synchronized
+    private fun restartGrantedServiceDiscoveryAfterLegacyBond(
+        expectedAdmission: BleConnectionAdmission,
+        reason: String,
+    ) {
+        val current = currentAdmissionFor(expectedAdmission) ?: return
+        val session = admittedGattSessions[current.sessionId] ?: return
+        if (!connectionAdmissionGate.isActive(current) || session.device.myGatt !== session.gatt) {
+            return
+        }
+        val shouldRestart = synchronized(session) {
+            if (!session.legacySecurityGateFallbackBinding) {
+                false
+            } else {
+                session.legacySecurityGateFallbackBinding = false
+                session.serviceDiscoveryStarted = false
+                true
+            }
+        }
+        if (!shouldRestart) {
+            sendLog(
+                BleLoggerTag.d,
+                "Security gate fallback: endpoint=${current.endpointId}, duplicate bond success ignored",
+            )
+            return
+        }
+        autoReconnectSupervisor.resetSecurityRecovery(current.endpointId)
+        startGrantedServiceDiscovery(current, reason)
     }
 
     /** exact Gate owner 在同一 GATT 上只允许提交一次 service discovery。 */

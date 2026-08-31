@@ -62,6 +62,11 @@ internal class BleGattSessionCallback(
         (BluetoothGatt, BleDevice, String, Int) -> BleAndroidSecurityRecoveryAction,
     /** Gate 成功后清除 endpoint 的安全失败预算。 */
     private val onSecurityGatePassed: (String) -> Unit,
+    /**
+     * Android 旧固件缺少可写 5403 时，把主动 Bond 交回持有 exact admission 的 manager。
+     * 返回 true 表示普通 Notify 必须暂停，等待同一 GATT 完成 Bond 后重新发现服务。
+     */
+    private val onSecurityGateUnavailable: (BluetoothGatt, BleDevice) -> Boolean,
     /** 查询一个 uuid 是否正处于 manager 主动断连流程。 */
     private val consumeDisconnectingState: (String) -> BleConnectState?,
     /** 通知 manager 写入完成，并携带 psType/status 让普通队列与 OTA 背压队列精确认领。 */
@@ -237,7 +242,8 @@ internal class BleGattSessionCallback(
 
         recordTraceStep(address, "service_discovery", "success", null, "GATT", status)
 
-        // 3. 可选 5403 必须先以 Write Request 验证系统 Bond；缺失/不支持保留旧固件路径。
+        // 3. 可选 5403 必须先以 Write Request 验证系统 Bond；Android 旧固件缺失或
+        // 不支持有响应写时，先由 exact manager owner 主动 Bond，再回到普通 GATT 初始化。
         val securityGate = currentDevice.belongConfig.securityGate
         if (securityGate != null) {
             val gateCharacteristic = runCatching {
@@ -254,8 +260,11 @@ internal class BleGattSessionCallback(
             recordTraceStep(address, "security_gate", "not_observable", null, null, null)
             sendLog(
                 BleLoggerTag.d,
-                "Security gate: $address missing or unsupported, continue legacy GATT readiness",
+                "Security gate: $address missing or unsupported, evaluate legacy system bond",
             )
+            if (onSecurityGateUnavailable(gatt, currentDevice)) {
+                return
+            }
         }
 
         // 4. 没有可执行 Gate 时进入普通 GATT 初始化。

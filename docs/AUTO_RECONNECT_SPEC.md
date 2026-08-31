@@ -23,7 +23,7 @@ Add these fields to `BleConfig`:
 | `autoReconnect` | `false` | Enables native auto reconnect for devices using this config. |
 | `autoReconnectMaxAttempts` | `0` | Legacy/backoff compatibility field. Native reconnect no longer stops because this count is reached. |
 | `autoReconnectUseNativePassive` | `true` | Allows platform passive reconnect paths when active reconnect cannot see the device. |
-| `securityGate` | `null` | Optional iOS protected-write gate. G2 uses 5403 to force CoreBluetooth security before ordinary Notify/AUTH. Android ignores it. |
+| `securityGate` | `null` | Optional Android/iOS protected-write gate. G2 uses 5403 to establish/verify link security before ordinary Notify/AUTH; Android falls back to exact-session Bond only when old firmware lacks a writable gate. |
 | `androidHighReliabilityMode` | `false` | Uses Android 1M-first, RSSI-adaptive PHY and traffic-aware connection priority for explicitly opted-in configs. |
 
 `autoReconnectUseNativePassive` is now a legacy compatibility field. Reconnect
@@ -260,8 +260,12 @@ On Android the active Gate also serializes proactive system bonding for configs
 with `initiateBinding=true`. A `BONDING` owner keeps the Gate; `BOND_BONDED`
 resumes service discovery on the exact GATT/session, while an explicit
 `BOND_BONDING -> BOND_NONE` terminates that session before the next owner starts.
-Configs with `initiateBinding=false` skip plugin-owned `createBond()` and enter
-service discovery directly.
+Configs with `initiateBinding=false` enter service discovery directly. For a
+configured Android Security Gate, this remains true for new G2 firmware: the
+5403 protected write owns security establishment. Only after service discovery
+proves that 5403 is absent or lacks Write Request support may the exact active
+session call `createBond()` for legacy firmware, then rediscover services on the
+same GATT before ordinary Notify setup.
 
 Every admission is identified by endpoint + attemptGeneration + session and, at
 the platform boundary, the exact GATT/peripheral object. Status events expose
@@ -277,17 +281,19 @@ from being rejected as stale after OTA, device switching, or repeated cleanup.
 
 ## GATT Reconnect Readiness
 
-Native reconnect is successful only after the optional iOS Security Gate and every configured private service are restored:
+Native reconnect is successful only after the optional Security Gate and every configured private service are restored:
 
 1. Discover all services.
-2. On iOS only, if `BleConfig.securityGate` is configured and the gate
-   characteristic is present, issue exactly one `.withResponse` protected write
+2. On Android or iOS, if `BleConfig.securityGate` is configured and the gate
+   characteristic is present, issue exactly one with-response protected write
    before ordinary private-service discovery/Notify. Do not emit
    `connectFinish` while this write is pending.
-3. If the gate characteristic is absent, use the legacy firmware path and
-   continue ordinary GATT readiness. If the characteristic exists but cannot be
-   written with response, also fall back to ordinary readiness; this is not a
-   security failure and must not consume recovery budget.
+3. If the gate characteristic is absent or cannot be written with response,
+   Android first checks the framework Bond state. `BONDED` continues ordinary
+   readiness; `NONE` starts exact-session `createBond()` and rediscovery;
+   `BONDING` waits for its authoritative broadcast. iOS continues ordinary
+   readiness directly. Gate absence itself is not a security failure and does
+   not consume recovery budget.
 4. For every `BlePrivateService`, find the write characteristic.
 5. For every `BlePrivateService`, find the read characteristic.
 6. Enable notify/CCCD for every read characteristic.
@@ -306,10 +312,10 @@ readCharsNotify == bleConfig.privateServices.count
 
 This prevents multi-service devices from reaching `connectFinish` after only the first notify succeeds.
 
-## iOS G2 Security Gate Recovery
+## G2 Security Gate Recovery
 
-The 5403 protected write is the first breakpoint for iOS bond/LTK mismatch. It
-must run before ordinary Notify subscriptions, G2 AUTH, or `connectFinish` so a
+The 5403 protected write is the first breakpoint for Android/iOS bond or LTK
+mismatch. It must run before ordinary Notify subscriptions, G2 AUTH, or `connectFinish` so a
 failed SMP/security setup cannot masquerade as a business AUTH timeout.
 
 Automatic recovery is scoped by endpoint, recovery episode, positive
@@ -335,9 +341,10 @@ Automatic recovery is scoped by endpoint, recovery episode, positive
   active resumes only exact owners that still match config, endpoint, and
   session generation.
 
-Android never executes the Security Gate and must never emit
-`securityRecoveryExhausted`; Dart still decodes the value so shared clients can
-consume iOS events safely.
+Android and iOS both execute the Security Gate and may emit
+`securityRecoveryExhausted`. Android additionally treats an explicit rejection
+or failure of the legacy missing-5403 `createBond()` fallback as a real security
+attempt; simply detecting missing/unsupported 5403 does not consume the budget.
 
 ## Android Strategy
 

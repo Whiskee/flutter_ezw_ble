@@ -250,7 +250,7 @@ class BleConfig {
   final double connectTimeout;    // 单次连接超时（ms），默认 15000
   final double upgradeSwapTime;   // 升级后启动新固件等待时间（ms），默认 60000，重连时用
   final int    mtu;               // 仅 Android 用，默认 247
-  final BleSecurityGate? securityGate; // iOS G2 5403 保护写门禁，默认 null
+  final BleSecurityGate? securityGate; // Android/iOS G2 5403 保护写门禁，默认 null
   final bool   autoReconnect;     // 是否启用原生自动回连，默认 false
   final int    autoReconnectMaxAttempts;      // 兼容/日志字段，不再作为停止条件
   final bool   autoReconnectUseNativePassive; // 是否允许平台被动回连，默认 true
@@ -527,16 +527,16 @@ CoreBluetooth Code 14 表示系统和 peripheral 的配对信息已不一致。�
 
 蓝牙关闭只暂停任务；蓝牙重新开启后由 Dart 最终 recovery activation 一次恢复任务。Android 每轮 pending `connectGatt(true)` 在未收到 `STATE_CONNECTED` 前受 `connectTimeout`（至少1秒）deadline 保护；deadline、扫描可见性接管和手动提升都必须先把 owner 分类为 pre-physical、Gate admitted、business connected 或 stale。只有 exact pre-physical owner 可正常回收；admitted/business GATT 保留，stale 的 Supervisor/Manager/Gate 引用会精确修复，若 Manager 已有另一条健康 owner 则只丢弃旧引用，禁止重复 GATT。连续 pre-physical deadline 失败按 `1–3 次 1.5s / 4–10 次 5s / 11 次起 30s` 重建，降低长离线耗电和协议栈 register/unregister 压力。上层并行扫描重新看到 exact UUID 时会清零该计数，并以 250ms 防抖重建；已物理连接、已进入 Gate、已取消或蓝牙关闭时提示无效。所有刷新都不上报 Dart/UI timeout，也不停止长期 intent。收到物理 callback 后 deadline 立即取消，获得 Gate 后的 GATT readiness / 业务鉴权仍受独立 `connectTimeout` 保护。iOS 保留系统 pending connect，不使用该 Android deadline。`autoReconnectMaxAttempts` 仅保留兼容和日志意义，**不再作为停止条件**。也就是说，设备离开 30 分钟再回来，只要用户/业务没有主动取消，原生层仍应继续持有或重建回连任务。
 
-回连成功的门槛不是 GATT 物理连接成功，而是可选 iOS 安全门禁与全部 `BleConfig.privateServices` 都重新恢复：
+回连成功的门槛不是 GATT 物理连接成功，而是可选安全门禁与全部 `BleConfig.privateServices` 都重新恢复：
 
 1. 重新发现所有服务；
-2. iOS 若配置 `securityGate` 且发现 5403，先对该保护特征执行一次 `.withResponse` 写入；写成功前不得订阅普通业务 notify，也不得上报 `connectFinish`；
-3. 未发现 5403，或 5403 属性不支持 write-with-response 时，只走旧固件兼容路径，不消耗安全恢复预算；
+2. Android/iOS 若配置 `securityGate` 且发现 5403，先执行一次有响应保护写；写成功前不得订阅普通业务 notify，也不得上报 `connectFinish`；
+3. Android 未发现 5403，或 5403 不支持 Write Request 时，若尚未系统 Bond，则在同一 exact admission/GATT 上主动 `createBond()`，成功后重新发现服务再进入旧固件 GATT readiness；已 Bond 时直接继续。iOS 保持原旧固件兼容路径；缺失/不支持本身不消耗安全恢复预算；
 4. 每条私有服务都找到 write/read characteristic；
 5. 每条 read characteristic 都重新打开 notify/CCCD；
 6. 全部成功后才上报 `connectFinish`；G2 等待业务鉴权后用该事件的 exact attempt 两阶段提交进入 `connected`，G1/R1 继续调用兼容 `deviceConnected`。
 
-iOS G2 的 Security Gate 只统计真实 5403 保护写安全失败（CBATT 安全错误或 peer pairing removed）。每个 endpoint / recovery episode 最多 5 次实际 gate 尝试，初次失败计为第 1 次；第 1～4 次必须先取消旧 attempt、等待 exact CoreBluetooth callback/barrier，再通过 10 秒新鲜广播窗口和新正 generation 连接。第 5 次发布 `securityRecoveryExhausted` 并停止该 endpoint 自动 owner，不得再产生第 6 次自动连接；该状态不是 `isError` / `isDisconnected`，由 even_connect 静默消费。蓝牙关闭、App inactive/background、扫描未命中和普通连接超时不消耗预算；生命周期恢复只复验仍有效的 exact owner。用户手动点击会清除该 endpoint 的自动耗尽/计数标记，不执行五次静默恢复，首次真实 gate 安全失败仍沿用 `boundFail`。Android 不执行 5403 Security Gate，也不得产生 `securityRecoveryExhausted`。
+Android/iOS G2 的 Security Gate 只统计真实 5403 保护写安全失败，以及 Android 旧固件 fallback `createBond()` 的明确拒绝/失败。每个 endpoint / recovery episode 最多 5 次实际安全建立尝试，初次失败计为第 1 次；第 5 次发布 `securityRecoveryExhausted` 并停止该 endpoint 自动 owner，不得再产生第 6 次自动连接；该状态不是 `isError` / `isDisconnected`，由 even_connect 静默消费。蓝牙关闭、扫描未命中、普通连接超时以及缺失/不支持 5403 本身不消耗预算；iOS 生命周期恢复只复验仍有效的 exact owner。用户手动点击会清除该 endpoint 的自动耗尽/计数标记，不执行五次静默恢复，首次真实安全失败仍沿用 `boundFail`。
 
 Android 自动/手动回连统一使用 `connectGatt(autoConnect = true)`；`autoReconnectUseNativePassive` 不再决定是否退回 active/scan-first。pending 阶段的 exact-GATT deadline 只回收未收到物理 callback 的 zombie handle；Gate queued 与业务 pipeline 阶段不会被它关闭。
 
@@ -574,8 +574,8 @@ App 启动
   ├─ ◀ connectStatusEC: contactDevice
   ├─ ◀ connectStatusEC: searchService
   ├─ ◀ connectStatusEC: searchChars
-  ├─ iOS G2 securityGate 5403 .withResponse（成功后才继续普通 notify）
-  ├─ ◀ connectStatusEC: startBinding   （仅 initiateBinding=true）
+  ├─ Android/iOS G2 securityGate 5403 有响应写（成功后才继续普通 notify）
+  ├─ ◀ connectStatusEC: startBinding   （initiateBinding=true，或 Android 旧 G2 缺失 5403 的兼容 Bond）
   ├─ ◀ connectStatusEC: connectFinish + mtu + sessionGeneration + attemptGeneration
   │      （G2 由业务层冻结 exact attempt 并完成 AUTH）
   ├─ prepareBusinessConnection(attempt)        ▶ exact lease + 有界鉴权宽限
@@ -703,7 +703,10 @@ BluetoothGattCallback
   ├─ initiateBinding=true 且 BOND_NONE → startBinding → createBond()
   │    ├─ BOND_BONDED → 同一 Gate/GATT session 恢复 discoverServices
   │    └─ BOND_BONDING → BOND_NONE → exact BOUND_FAIL teardown，释放 Gate
-  ├─ onServicesDiscovered → 找 privateServices
+  ├─ onServicesDiscovered → G2 先检查 5403
+  │    ├─ 存在且支持 Write Request → 写 5403 触发/验证系统安全
+  │    └─ Android 缺失/不支持且 BOND_NONE → exact createBond → 重新 discoverServices
+  ├─ 安全门禁通过/旧固件已 Bond → 找 privateServices
   ├─ 写 CCCD descriptor → 全部 readChars notify enabled
   ├─ requestMtu(config.mtu)
   └─ connectFinish
@@ -745,14 +748,14 @@ connectFinish 上报给 Dart
 
 `onDeviceBondStateChanged(device, bondState, previousBondState)` 只消费系统 bond 结果，不再直接把布尔值映射为业务终态。它必须遵守阶段语义：
 
-- 只有 `initiateBinding=true`、当前为 `START_BINDING`，并且 endpoint + generation + sessionId + GATT 都属于当前 Gate owner，广播才可推进连接。
+- 只有 `initiateBinding=true`，或当前 exact session 已确认 5403 缺失并进入 legacy fallback Bond，且状态为 `START_BINDING`、endpoint + generation + sessionId + GATT 都属于当前 Gate owner，广播才可推进连接。
 - `BOND_BONDED`：在同一 GATT 上恢复服务发现；不得跳过 CCCD/MTU 直接推进 `CONNECT_FINISH`。
 - 明确的 `BOND_BONDING → BOND_NONE`：走 exact `BOUND_FAIL` teardown，关闭当前 GATT、释放 Gate，再启动下一 endpoint。
 - `BOND_BONDING`、重复 `BOND_NONE`、错误 generation、false-config 与其它迟到广播：全部忽略。
 - 当前已经 `CONNECTED/UPGRADE`：迟到的 bond 失败不应覆盖连接成功态。
 - 当前已经 `TIMEOUT/DISCONNECT_FROM_SYS`：bond 失败通常是后续副作用，应避免再次把语义改成 `BOUND_FAIL`，否则上层会把可重试链路误判成 777 终态。
 
-R1 的 Android 系统 bond 与协议 `pairAuth` 是两个独立阶段：先 bond 只解决受保护 GATT 的可访问性，`connectFinish` 后仍必须完成协议认证。G1/G2 保持 `initiateBinding=false`；即使 Android 因访问受保护属性自行触发配对，也不能视为插件主动调用 `createBond()`。
+R1 的 Android 系统 bond 与协议 `pairAuth` 是两个独立阶段：先 bond 只解决受保护 GATT 的可访问性，`connectFinish` 后仍必须完成协议认证。G1/G2 保持 `initiateBinding=false`；G2 仅在首次服务发现已确认 5403 缺失/不支持且系统未 Bond 时，允许同一 exact session 主动 `createBond()` 兼容旧固件，不能把该例外扩展到 Gate 存在的新固件或其它设备。
 
 ### 11.5 Android 连接回调状态码的处理原则
 

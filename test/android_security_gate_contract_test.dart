@@ -40,6 +40,26 @@ void main() {
         store, contains('optJSONObject("securityGate")?.toBleSecurityGate()'));
   });
 
+  test('missing 5403 falls back to exact post-discovery system bonding', () {
+    final unavailable = callback.indexOf('onSecurityGateUnavailable(');
+    final ordinary = callback.indexOf('startPrivateGattReadiness(');
+
+    expect(unavailable, greaterThan(0));
+    expect(ordinary, greaterThan(unavailable));
+    expect(
+      callback,
+      contains('if (onSecurityGateUnavailable(gatt, currentDevice))'),
+    );
+    expect(manager, contains('startLegacyBondAfterMissingSecurityGate('));
+    expect(manager, contains('decideMissingSecurityGateBondAction('));
+    expect(manager, contains('legacySecurityGateFallbackBinding = true'));
+    expect(
+      manager,
+      contains('restartGrantedServiceDiscoveryAfterLegacyBond('),
+    );
+    expect(manager, contains('session.serviceDiscoveryStarted = false'));
+  });
+
   test('automatic exhaustion is a silent exact native terminal', () {
     expect(manager, contains('"securityRecoveryExhausted"'));
     expect(

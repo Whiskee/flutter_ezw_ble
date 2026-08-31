@@ -27,7 +27,7 @@
 - `timeout`、`noDeviceFound`、`serviceFail`、`charsFail` 是单次尝试失败，不是长期回连停止条件；只有用户/业务主动断连、移除、reset、清缓存、配置关闭或插件释放才能取消 reconnect intent。
 - iOS `CBCentralManager(queue: nil)` 的 `retrieveConnectedPeripherals` / `retrievePeripherals` 只允许经 active 生命周期门禁调用；inactive/background/terminating 时只能复用进程内 peripheral，缺失时保留 exact deferred owner，不得制造 `noDeviceFound` 或增加 retry。`didBecomeActive` 补偿必须复验 config、owner 和 session generation。
 - iOS 业务 `connected` 释放 Gate 前必须把已接受的 `sessionGeneration + attemptGeneration` 成对保存在 reconnect owner；随后的 CoreBluetooth `didDisconnect` / 蓝牙关闭终态必须回传该 exact pair。禁止只恢复 session 而把 attempt 降为 0，显式取消、替换、移除 owner 必须同时使该快照不可达。
-- iOS G2 `securityGate`（5403）必须在普通业务 Notify 订阅和 `connectFinish` 前完成一次 `.withResponse` 保护写。只有真实 CBATT 安全错误或 peer pairing removed 才消耗每 endpoint 每 episode 5 次自动恢复预算；第 5 次发布静默 `securityRecoveryExhausted` 并停止该 endpoint 自动 owner，手动点击清预算后第一次安全失败仍走既有 `boundFail`。
+- Android/iOS G2 `securityGate`（5403）必须在普通业务 Notify 订阅和 `connectFinish` 前完成一次有响应保护写。Android G2 保持 `initiateBinding=false`：首次服务发现若存在并支持 Write Request 的 5403，直接由保护写触发系统安全建立；只有确认 5403 缺失/不支持且系统尚未 Bond 时，才允许 exact admission 在同一 GATT 上主动 `createBond()`，成功后重新发现服务。真实 Gate/Bond 安全失败按每 endpoint 每 episode 最多 5 次恢复，第 5 次发布静默 `securityRecoveryExhausted`；手动第一次安全失败仍走 `boundFail`。
 - iOS R1 自动回连首次收到 CoreBluetooth Code 14 后，只能使用新广告中的真实 `CBPeripheral` 恢复：App active 且蓝牙可用时按 10 秒扫描、5 秒静默等待无限循环，扫描 miss 不得删除 owner、发送 Dart 终态或制造 attempt 0；新 peripheral 再次 Code 14 才停止自动 owner并保持静默。手动点击必须 exact 接管并使用独立正 generation，只有当前手动物理 attempt 的真实 Code 14 才能上报 `alreadyBound`；生命周期暂停、共享扫描和迟到 callback 不得跨 owner 生效。
 
 ## 修改规则

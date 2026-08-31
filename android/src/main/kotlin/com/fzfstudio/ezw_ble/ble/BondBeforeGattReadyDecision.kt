@@ -57,6 +57,19 @@ internal fun decideGateGrantedBondAction(
 }
 
 /**
+ * G2 已经完成首次服务发现、但旧固件没有可执行 5403 时的兼容决策。
+ *
+ * 该路径只由配置了 securityGate 的设备调用：已 Bond 可继续普通 Notify；未 Bond
+ * 则在同一 admission/GATT 上主动建立系统 Bond，避免旧固件因没有保护写而永远不弹配对。
+ */
+internal fun decideMissingSecurityGateBondAction(
+    bondState: SystemBondState,
+): GateGrantedBondAction = decideGateGrantedBondAction(
+    initiateBinding = true,
+    bondState = bondState,
+)
+
+/**
  * 消费 bond 广播时只允许 START_BINDING 中的主动配对会话推进。
  *
  * 1、成功广播恢复同一 GATT 的服务发现。
