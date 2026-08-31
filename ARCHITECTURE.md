@@ -530,13 +530,13 @@ CoreBluetooth Code 14 表示系统和 peripheral 的配对信息已不一致。�
 回连成功的门槛不是 GATT 物理连接成功，而是可选安全门禁与全部 `BleConfig.privateServices` 都重新恢复：
 
 1. 重新发现所有服务；
-2. Android/iOS 若配置 `securityGate` 且发现 5403，先执行一次有响应保护写；写成功前不得订阅普通业务 notify，也不得上报 `connectFinish`；
-3. Android 未发现 5403，或 5403 不支持 Write Request 时，若尚未系统 Bond，则在同一 exact admission/GATT 上主动 `createBond()`，成功后重新发现服务再进入旧固件 GATT readiness；已 Bond 时直接继续。iOS 保持原旧固件兼容路径；缺失/不支持本身不消耗安全恢复预算；
+2. Android 若 `initiateBinding=true`，先按系统 Bond 状态决定 `createBond()`、等待权威 Bond 广播或直接发现服务；G2 用该入口作为唯一系统配对弹窗触发点，已 `BOND_BONDED` 时不得重复调用；iOS 不执行此 Android Bond Gate；
+3. Android/iOS 若配置 `securityGate` 且发现 5403，再执行一次有响应保护写；写成功前不得订阅普通业务 notify，也不得上报 `connectFinish`。Android 未发现 5403 或 5403 不支持 Write Request 时直接进入旧固件 readiness；仅为兼容历史持久化的 false-config 或 Bond 状态竞态，未 Bond 的 exact session 才允许走同一 admission/GATT 的防御性补 Bond。缺失/不支持本身不消耗安全恢复预算；
 4. 每条私有服务都找到 write/read characteristic；
 5. 每条 read characteristic 都重新打开 notify/CCCD；
 6. 全部成功后才上报 `connectFinish`；G2 等待业务鉴权后用该事件的 exact attempt 两阶段提交进入 `connected`，G1/R1 继续调用兼容 `deviceConnected`。
 
-Android/iOS G2 的 Security Gate 只统计真实 5403 保护写安全失败，以及 Android 旧固件 fallback `createBond()` 的明确拒绝/失败。每个 endpoint / recovery episode 最多 5 次实际安全建立尝试，初次失败计为第 1 次；第 5 次发布 `securityRecoveryExhausted` 并停止该 endpoint 自动 owner，不得再产生第 6 次自动连接；该状态不是 `isError` / `isDisconnected`，由 even_connect 静默消费。蓝牙关闭、扫描未命中、普通连接超时以及缺失/不支持 5403 本身不消耗预算；iOS 生命周期恢复只复验仍有效的 exact owner。用户手动点击会清除该 endpoint 的自动耗尽/计数标记，不执行五次静默恢复，首次真实安全失败仍沿用 `boundFail`。
+Android/iOS G2 的 Security Gate 只统计真实 5403 保护写安全失败，以及 Android Bond-first 或防御性 fallback `createBond()` 的明确拒绝/失败。每个 endpoint / recovery episode 最多 5 次实际安全建立尝试，初次失败计为第 1 次；第 5 次发布 `securityRecoveryExhausted` 并停止该 endpoint 自动 owner，不得再产生第 6 次自动连接；该状态不是 `isError` / `isDisconnected`，由 even_connect 静默消费。蓝牙关闭、扫描未命中、普通连接超时以及缺失/不支持 5403 本身不消耗预算；iOS 生命周期恢复只复验仍有效的 exact owner。用户手动点击会清除该 endpoint 的自动耗尽/计数标记，不执行五次静默恢复，首次真实安全失败仍沿用 `boundFail`。
 
 Android 自动/手动回连统一使用 `connectGatt(autoConnect = true)`；`autoReconnectUseNativePassive` 不再决定是否退回 active/scan-first。pending 阶段的 exact-GATT deadline 只回收未收到物理 callback 的 zombie handle；Gate queued 与业务 pipeline 阶段不会被它关闭。
 
@@ -755,7 +755,7 @@ connectFinish 上报给 Dart
 - 当前已经 `CONNECTED/UPGRADE`：迟到的 bond 失败不应覆盖连接成功态。
 - 当前已经 `TIMEOUT/DISCONNECT_FROM_SYS`：bond 失败通常是后续副作用，应避免再次把语义改成 `BOUND_FAIL`，否则上层会把可重试链路误判成 777 终态。
 
-R1 的 Android 系统 bond 与协议 `pairAuth` 是两个独立阶段：先 bond 只解决受保护 GATT 的可访问性，`connectFinish` 后仍必须完成协议认证。G1/G2 保持 `initiateBinding=false`；G2 仅在首次服务发现已确认 5403 缺失/不支持且系统未 Bond 时，允许同一 exact session 主动 `createBond()` 兼容旧固件，不能把该例外扩展到 Gate 存在的新固件或其它设备。
+Android G2/R1 的系统 Bond 与后续安全/业务认证是独立阶段：G2/R1 保持 `initiateBinding=true`，未 Bond 时由 `createBond()` 作为唯一系统配对入口；G2 随后仍须写 5403 验证共享密钥，R1 在 `connectFinish` 后仍须完成协议 `pairAuth`。G1 保持 `initiateBinding=false`。G2 缺少 5403 时直接兼容旧固件 readiness；发现服务后的补 Bond 只用于历史 false-config 或 Bond 状态竞态，不是正常新固件流程。
 
 ### 11.5 Android 连接回调状态码的处理原则
 

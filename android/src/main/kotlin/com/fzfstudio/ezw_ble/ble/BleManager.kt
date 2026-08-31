@@ -139,8 +139,8 @@ class BleManager private constructor() {
         /** bond 成功与 createBond 返回可能竞速；同一 session 只允许提交一次服务发现。 */
         var serviceDiscoveryStarted: Boolean = false,
         /**
-         * G2 首次服务发现确认 5403 缺失后，旧固件兼容 Bond 暂停普通 Notify。
-         * 只有该 exact session 的成功 Bond 才能清除此标志并重新发现服务。
+         * 历史 false-config 或 Bond 状态竞态在发现 5403 缺失后补 Bond，并暂停普通 Notify。
+         * 只有该 exact session 的成功 Bond 才能清除此防御性标志并重新发现服务。
          */
         var legacySecurityGateFallbackBinding: Boolean = false,
     )
@@ -2622,8 +2622,8 @@ class BleManager private constructor() {
                         }
                     }
                     action = decideBondBroadcastAction(
-                        // G2 配置仍为 false；只有已经确认 5403 缺失的 exact session
-                        // 临时获得主动 Bond 广播消费权，不能放宽其它 false-config。
+                        // 正常 G2 配置保持 true；legacy 标志只让历史 false-config 或
+                        // Bond 状态竞态的 exact session 临时获得广播消费权。
                         initiateBinding = connectedDevice.belongConfig.initiateBinding ||
                             legacyGateFallbackBinding,
                         connectState = connectedDevice.connectState,
@@ -3272,7 +3272,7 @@ class BleManager private constructor() {
     /**
      * 在 Gate 内选择主动配对、等待系统配对或直接服务发现。
      *
-     * 1、false-config 与已配对设备先进入服务发现；G2 只在发现后确认 5403 不可用时才兼容 Bond。
+     * 1、false-config 与已配对设备直接发现服务；Android G2/R1 未配对时先主动 Bond。
      * 2、等待/发起配对时先上报 START_BINDING，并持续占有 Gate 与连接 timeout。
      * 3、只有权威成功广播或 createBond 后 framework 已同步进入 BONDED 才恢复服务发现。
      */
@@ -3318,8 +3318,8 @@ class BleManager private constructor() {
     }
 
     /**
-     * Android G2 旧固件兼容：首次服务发现已证明 5403 缺失或不支持 Write Request 后，
-     * 才允许在同一 exact admission/GATT 上主动系统 Bond。
+     * Android G2 防御性兼容：首次服务发现已证明 5403 缺失或不支持 Write Request 后，
+     * 若历史 false-config 或 Bond 状态竞态仍呈现未配对，才在同一 exact admission/GATT 上补 Bond。
      *
      * 返回 true 表示 callback 必须暂停普通 Notify；Bond 成功后会重新发现服务，第二次
      * 回调因系统已 BONDED 而直接进入 legacy readiness。已 Bond 的设备无需重复动作。

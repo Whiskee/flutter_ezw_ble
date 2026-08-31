@@ -36,8 +36,8 @@ internal fun systemBondStateOf(rawState: Int): SystemBondState = when (rawState)
 /**
  * 选择 Gate owner 的 bond-first 起点。
  *
- * 1、未启用主动系统配对的 G1/G2 永远直接发现服务。
- * 2、R1 已配对时不重复 createBond；未配对才主动发起。
+ * 1、未启用主动系统配对的配置（如 G1）直接发现服务。
+ * 2、Android G2/R1 已配对时不重复 createBond；未配对才主动发起。
  * 3、系统已在配对或返回未知状态时只等待权威广播/既有超时，不重复触发系统动作。
  */
 internal fun decideGateGrantedBondAction(
