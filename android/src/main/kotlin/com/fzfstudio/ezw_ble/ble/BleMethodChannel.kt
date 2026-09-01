@@ -75,6 +75,8 @@ enum class BleMC {
     HAS_PENDING_STATE_RESTORATION,
     /** iOS CoreBluetooth restoration 启动原因查询；Android 固定返回 false。 */
     WAS_LAUNCHED_FOR_BLUETOOTH_STATE_RESTORATION,
+    /** iOS willRestoreState 进程级事实查询；Android 固定返回 false。 */
+    DID_EXPERIENCE_STATE_RESTORATION_THIS_PROCESS,
     /** iOS 启动恢复认领收尾；Android 无 State Restoration，保持 no-op。 */
     FINALIZE_STATE_RESTORATION_CLAIMS,
     /** 重置插件蓝牙状态。 */
@@ -317,6 +319,10 @@ enum class BleMC {
             }
             WAS_LAUNCHED_FOR_BLUETOOTH_STATE_RESTORATION -> {
                 // Android 没有 UIApplication bluetoothCentrals launch option。
+                return result.success(false)
+            }
+            DID_EXPERIENCE_STATE_RESTORATION_THIS_PROCESS -> {
+                // Android 没有 willRestoreState；保持跨平台查询对称。
                 return result.success(false)
             }
             FINALIZE_STATE_RESTORATION_CLAIMS -> {

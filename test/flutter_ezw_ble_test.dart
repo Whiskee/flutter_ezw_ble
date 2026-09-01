@@ -186,7 +186,27 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
-  Future<void> resetBle() {
+  Future<void> resetBle({bool preserveStateRestoration = false}) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<bool> hasPendingStateRestoration() {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<bool> wasLaunchedForBluetoothStateRestoration() {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<bool> didExperienceStateRestorationThisProcess() {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> finalizeStateRestorationClaims() {
     throw UnimplementedError();
   }
 

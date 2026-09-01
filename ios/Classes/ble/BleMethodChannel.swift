@@ -71,6 +71,8 @@ enum BleMC: String {
     case hasPendingStateRestoration
     /// Query whether CoreBluetooth launched this process for the registered central id.
     case wasLaunchedForBluetoothStateRestoration
+    /// Query whether this process ever received willRestoreState (escrow-independent).
+    case didExperienceStateRestorationThisProcess
     /// Cancel restored peripherals not claimed by the current startup targets.
     case finalizeStateRestorationClaims
     /// Reset native BLE state.
@@ -301,6 +303,10 @@ enum BleMC: String {
         case .wasLaunchedForBluetoothStateRestoration:
             // launch option 与 escrow 生命周期独立；该查询只返回进程启动事实。
             result(FlutterEzwBlePlugin.wasLaunchedForBluetoothStateRestoration())
+            return
+        case .didExperienceStateRestorationThisProcess:
+            // escrow 被 claim/finalize 清空后该事实仍可查；只读，不触发任何恢复动作。
+            result(BleManager.didExperienceStateRestorationThisProcess)
             return
         case .finalizeStateRestorationClaims:
             // 1、当前设备 activation 已逐端点认领完毕；其余 restored peripheral

@@ -77,7 +77,13 @@ Dart 在发起账号级早期恢复前可调用 `hasPendingStateRestoration`。�
 
 系统也可能以 `launchOptions.bluetoothCentrals` 拉起 App，但不再回调 `willRestoreState`，例如 central 会话已经由系统恢复、peripheral escrow 在 Flutter 查询前为空。插件必须独立锁存与自身 restore identifier 精确匹配的启动原因，并通过 `wasLaunchedForBluetoothStateRestoration` 只读暴露；宿主可据此提前加载账号缓存并提交原有 activation，但不得把任意后台启动或普通自动回连当成 SR。
 
-`willRestoreState` 可能早于 Flutter 引擎、MethodChannel、EventChannel、`initConfigs` 和当前账号设备加载。因此回调里只能建立物理 escrow，不能直接执行 Dart 业务、service discovery、notify 或 AUTH，也不能假设配置或当前 owner 已经可用。
+反向的证据竞态同样存在：native 可能在 Dart 首次查询前就 claim/finalize 消费清空 escrow，
+`hasPendingStateRestoration` 因此不足以否定「本进程经历过 SR」。`willRestoreState` 发生的
+事实必须由原生在回调入口一次性锁存，并通过 `didExperienceStateRestorationThisProcess`
+只读暴露；三个查询（pending escrow、launch 原因、进程锁存）互相独立、只读、无副作用，
+Dart 侧应把进程锁存作为首选 SR 证据，pending/launch 查询为辅。
+
+`willRestoreState` 可能早于 Flutter 引擎、MethodChannel、EventChannel、`initConfigs` 和当前账号设备加载。因此回调里只能建立物理 escrow，不能直接执行 Dart 业务、service discovery、notify 或 AUTH，也不能假设配置或当前 owner 已经可用。`willRestoreState` 同样可能早于 `centralManagerDidUpdateState(poweredOn)`：对已断开对象的补 pending connect（rearm）在 central 尚未 poweredOn 时必须挂起登记，`poweredOn` 后补偿执行，不得依赖未承诺的系统行为直接提交 connect。
 
 ## 4. 模块职责
 
@@ -122,11 +128,12 @@ claim 前的 `didConnect` 只把状态更新为 `connected`，不得创建 activ
 
 `activateAutoReconnectTargets` 是唯一 claim 入口：
 
-1. 优先按稳定 UUID 精确匹配；UUID 不可用时只允许唯一完整端点名匹配。
+1. 优先按稳定 UUID 精确匹配；UUID 不可用时只允许唯一完整端点名匹配，且名称必须同时命中目标 config 的 `scan.nameFilters`（与扫描管线同一 contains 语义），防止历史同名设备被跨 config 认领。
 2. escrow 为 `connected` 时，安装当前 session 的 request/cache/admission 后直接提交 Gate。
 3. escrow 为 `pending` 且 peripheral 仍为 `.connecting` 时，只挂 admission 与观察 watchdog，禁止重复 `centralManager.connect`。
 4. peripheral 已 `.disconnected` 时，安装 admission 后只发起一条长期 pending connect。
 5. 未被当前账号 claim 的对象必须等本批所有 G2 双腿/R1 activation 都返回后，再由 `finalizeStateRestorationClaims` 统一取消；每个取消先建立 cancellation barrier，阻止迟到 `didConnect` 复活历史设备。
+6. finalize 只收口「认领窗口快照」内的对象：每次 activation 把当时已知的 escrow 纳入窗口（重复 activation 只扩大窗口），窗口建立后经 `connectionEventDidOccur` 新入队的系统连接对象属于下一轮 activation 的输入，迟到的 finalize 债务不得取消它们；本 runtime 从未发生 activation 时按全量收口。重复 finalize 幂等。
 
 普通、非 escrow 的未知 `didConnect` 保持既有 fail-closed 行为，不能因本机制获得业务 owner。
 
@@ -228,6 +235,8 @@ iOS R1 的 CoreBluetooth Code 14 新鲜广播恢复属于同一个长期 reconne
 - `stateRestoration: willRestoreState`
 - `pending-after-initConfigs`
 - `ios_restore_escrow_rearm`
+- `escrow rearm deferred until poweredOn`
+- `stateRestoration: WARNING disabled`（宿主缺 `bluetooth-central` 的降级警告，NSLog 与 BleEC.logger 双通道发射）
 - `ios_restore_escrow_connected`
 - `ios_restore_escrow_claimed`
 - `ios_restore_unclaimed`

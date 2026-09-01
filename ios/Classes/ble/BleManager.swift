@@ -18,6 +18,11 @@ class BleManager: NSObject {
     // 插件 application delegate 必须用同一个 identifier 校验 bluetoothCentrals
     // launch option；保持模块内可见，禁止宿主复制字符串形成双重事实源。
     static let restorationIdentifier = "com.fzfstudio.ezwble.central"
+    /// 本进程是否发生过 `willRestoreState`。
+    ///
+    /// escrow 可能在 Dart 查询前就被 claim/finalize 消费清空，`hasPendingStateRestoration`
+    /// 因此不足以作为「经历过 SR」的证据；该事实必须独立一次性锁存、只读暴露。
+    private(set) static var didExperienceStateRestorationThisProcess = false
     private static let bluetoothCentralBackgroundMode = "bluetooth-central"
     // 缺少后台模式时输出可执行的排障提示，避免开发者误以为 iOS State Restoration 已经生效。
     private static let stateRestorationMissingBluetoothCentralWarning =
@@ -45,6 +50,10 @@ class BleManager: NSObject {
      */
     private static func centralManagerOptions() -> [String: Any]? {
         guard canEnableStateRestoration else {
+            // 降级必须显式可见：宿主漏配后台模式时 SR 静默失效的排障成本极高。
+            // BleEC 在 EventChannel 未订阅时会缓冲该日志，冷启动早期发射也不丢失。
+            NSLog("%@", stateRestorationMissingBluetoothCentralWarning)
+            BleEC.logger.emit("[e]-\(stateRestorationMissingBluetoothCentralWarning)")
             return nil
         }
         return [
@@ -2700,6 +2709,8 @@ extension BleManager: CBCentralManagerDelegate {
             scanConnectTimeoutTimers.removeAll()
         } else {
             registerForConfiguredConnectionEventsIfNeeded()
+            // willRestoreState 期间被挂起的 escrow rearm 在 poweredOn 后补偿执行。
+            rearmDeferredStateRestorationEscrowsAfterPowerOn()
             resumeConnectionAdmissionGateAfterBluetoothOn()
             resumeReconnectTasksAfterBluetoothOn()
         }
@@ -2718,6 +2729,9 @@ extension BleManager: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, willRestoreState dict: [String : Any]) {
+        // 一次性锁存进程级 SR 事实：escrow 随后可能被 claim/finalize 清空，
+        // Dart 侧仍必须能查询到「本进程经历过 willRestoreState」。
+        BleManager.didExperienceStateRestorationThisProcess = true
         let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] ?? []
         recordAutoReconnectEvent(
             type: "ios_will_restore_state",

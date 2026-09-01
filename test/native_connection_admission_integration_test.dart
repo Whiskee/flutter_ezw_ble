@@ -316,7 +316,9 @@ void main() {
     expect(flow,
         contains('manualPendingReplacementThreshold: TimeInterval { 20.0 }'));
     expect(flow, contains('!session.hasObservedPhysicalContact'));
-    expect(flow, contains('elapsed >= manualPendingReplacementThreshold'));
+    // 阈值判断已按 trigger 分派；manual 触发仍必须落在 20 秒 manual 阈值上。
+    expect(flow, contains('replacementThreshold = manualPendingReplacementThreshold'));
+    expect(flow, contains('elapsed >= replacementThreshold'));
     expect(flow, contains('!hasPeripheralCancellationBarrier(peripheral)'));
     expect(flow,
         contains('deferConnectionAdmissionReleaseUntilPeripheralTerminal('));

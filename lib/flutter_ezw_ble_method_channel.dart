@@ -257,6 +257,13 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       false;
 
   @override
+  Future<bool> didExperienceStateRestorationThisProcess() async =>
+      await methodChannel.invokeMethod<bool>(
+        "didExperienceStateRestorationThisProcess",
+      ) ??
+      false;
+
+  @override
   Future<void> finalizeStateRestorationClaims() async =>
       methodChannel.invokeMethod("finalizeStateRestorationClaims");
 

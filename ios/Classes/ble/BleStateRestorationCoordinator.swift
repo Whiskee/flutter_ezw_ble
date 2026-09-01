@@ -96,6 +96,15 @@ final class BleStateRestorationCoordinator {
     /// 等待当前账号 activation 精确认领的 restored peripherals。
     private var pendingPeripherals: [CBPeripheral] = []
     private let stateMachine = BleStateRestorationEscrowStateMachine()
+    /// 入队单调序号：finalize 只允许收口「认领窗口快照」内的对象。
+    private var escrowSequence: Int64 = 0
+    /// 每个 endpoint 的入队序号（同 identifier 替换时保留原序号，仍属同一逻辑对象）。
+    private var entrySequences: [String: Int64] = [:]
+    /// 认领窗口快照：每次 activation 把已知 escrow 纳入窗口；窗口后新入队对象
+    /// （如 connectionEvent 持续交来的系统连接）不被迟到的 finalize 债务误取消。
+    private var claimWindowSequence: Int64?
+    /// central 尚未 poweredOn 时不得直接 connect；记下 endpoint 等 poweredOn 后补偿 rearm。
+    private var powerOnRearmDeferrals: Set<String> = []
 
     /**
      *  是否存在等待恢复的 peripheral。
@@ -118,11 +127,30 @@ final class BleStateRestorationCoordinator {
             pendingPeripherals[index] = peripheral
         } else {
             pendingPeripherals.append(peripheral)
+            escrowSequence += 1
+            entrySequences[peripheral.identifier.uuidString] = escrowSequence
         }
         return stateMachine.stage(
             endpointId: peripheral.identifier.uuidString,
             peripheralState: peripheral.state
         )
+    }
+
+    /// activation 开始时把当前已知 escrow 全部纳入认领窗口；重复调用只会扩大窗口。
+    func markClaimWindowSnapshot() {
+        claimWindowSequence = max(claimWindowSequence ?? 0, escrowSequence)
+    }
+
+    /// 记录一个等待 poweredOn 的 rearm 债务；重复登记幂等。
+    func deferPowerOnRearm(uuid: String) {
+        powerOnRearmDeferrals.insert(uuid)
+    }
+
+    /// poweredOn 后取出仍在 escrow 中的 rearm 债务对象；不在 escrow 的债务直接丢弃。
+    func takePowerOnRearmDeferrals() -> [CBPeripheral] {
+        let uuids = powerOnRearmDeferrals
+        powerOnRearmDeferrals.removeAll()
+        return pendingPeripherals.filter { uuids.contains($0.identifier.uuidString) }
     }
 
     /// 物理连接在 claim 前完成时只更新 escrow，不进入 GATT readiness。
@@ -156,18 +184,50 @@ final class BleStateRestorationCoordinator {
         // 1、一次性取出并清空缓存；恢复流程决定失败后是否重新入队。
         let peripherals = pendingPeripherals
         pendingPeripherals.removeAll()
+        entrySequences.removeAll()
+        powerOnRearmDeferrals.removeAll()
         stateMachine.reset()
         return peripherals
+    }
+
+    /**
+     *  只取出「认领窗口快照」内的未认领对象，窗口后新入队的 escrow 保留。
+     *
+     *  finalize 是冷启动认领批次的收口债务；connectionEvent 在窗口建立后持续交来的
+     *  系统连接对象属于下一轮 activation 的输入，不得被迟到的 finalize 误取消。
+     *  从未建立窗口（本 runtime 无任何 activation）时按全量 drain 收口。
+     */
+    func drainClaimWindowPeripherals() -> [CBPeripheral] {
+        guard let windowSequence = claimWindowSequence else {
+            return drainPendingPeripherals()
+        }
+        let drained = pendingPeripherals.filter {
+            (entrySequences[$0.identifier.uuidString] ?? 0) <= windowSequence
+        }
+        let drainedIds = Set(drained.map { $0.identifier.uuidString })
+        pendingPeripherals.removeAll { drainedIds.contains($0.identifier.uuidString) }
+        drainedIds.forEach {
+            entrySequences.removeValue(forKey: $0)
+            powerOnRearmDeferrals.remove($0)
+        }
+        stateMachine.remove(endpointIds: drainedIds)
+        return drained
     }
 
     /**
      *  为当前 Dart recovery target 精确认领一个 restored peripheral。
      *
      *  1、优先使用非空 CoreBluetooth UUID；UUID 未命中时只允许完整设备名唯一匹配。
-     *  2、唯一匹配后立即从 pending 集合移除，保证同一 peripheral 只能被一个 owner 消费。
-     *  3、同名多候选时 fail-closed，交回常规扫描解析，避免误连历史设备。
+     *  2、名称兜底额外要求 peripheral 名称命中目标 config 的 nameFilters（与扫描
+     *     管线同一 contains 语义），防止历史同名设备被跨 config 认领。
+     *  3、唯一匹配后立即从 pending 集合移除，保证同一 peripheral 只能被一个 owner 消费。
+     *  4、同名多候选时 fail-closed，交回常规扫描解析，避免误连历史设备。
      */
-    func claimPendingPeripheral(uuid: String, name: String) -> BleStateRestorationEscrowClaim? {
+    func claimPendingPeripheral(
+        uuid: String,
+        name: String,
+        nameFilters: [String] = []
+    ) -> BleStateRestorationEscrowClaim? {
         // 1、规范化输入，避免空格导致已知 UUID 或完整名称无法匹配。
         let normalizedUuid = uuid.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -179,7 +239,15 @@ final class BleStateRestorationCoordinator {
         }
         if matches.isEmpty, !normalizedName.isEmpty {
             matches = pendingPeripherals.enumerated().filter { _, peripheral in
-                peripheral.name?.trimmingCharacters(in: .whitespacesAndNewlines) == normalizedName
+                guard let peripheralName = peripheral.name?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                    peripheralName == normalizedName else {
+                    return false
+                }
+                // 名称兜底必须同时满足目标 config 的 nameFilters；未提供过滤器时
+                // 保持完整名称精确匹配的既有语义。
+                guard !nameFilters.isEmpty else { return true }
+                return nameFilters.contains { peripheralName.contains($0) }
             }
         }
         // 3、只有唯一候选才能认领；歧义时不得猜测设备身份。
@@ -204,6 +272,10 @@ final class BleStateRestorationCoordinator {
         }
         let removedIds = Set(removed.map { $0.identifier.uuidString })
         pendingPeripherals.removeAll { removedIds.contains($0.identifier.uuidString) }
+        removedIds.forEach {
+            entrySequences.removeValue(forKey: $0)
+            powerOnRearmDeferrals.remove($0)
+        }
         stateMachine.remove(endpointIds: removedIds)
         return removed
     }
@@ -214,6 +286,9 @@ final class BleStateRestorationCoordinator {
         // 1、reset/clean 直接丢弃本轮 restoration 债务，不允许旧对象复活连接。
         let peripherals = pendingPeripherals
         pendingPeripherals.removeAll()
+        entrySequences.removeAll()
+        powerOnRearmDeferrals.removeAll()
+        claimWindowSequence = nil
         stateMachine.reset()
         return peripherals
     }

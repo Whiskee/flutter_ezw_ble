@@ -391,6 +391,9 @@ extension BleManager {
         sessionGeneration: Int64 = 0,
         scheduleActiveReconciliation: Bool = true
     ) -> [BleReconnectActivationResult] {
+        // activation 开始即把当前已知 escrow 纳入认领窗口；本批次收口的 finalize
+        // 只允许取消窗口内未认领对象，窗口后新交来的系统连接对象保留给下一轮。
+        restorationCoordinator.markClaimWindowSnapshot()
         // 普通前台冷启动可能只收到一腿 willRestoreState；另一腿即使已在系统层连接，
         // 也不会自动进入当前 CBCentralManager。仅在 active 窗口做有界 exact 对账，
         // 后台 SR 仍只消费 restoration / connection event，绝不执行同步 retrieve。
@@ -439,7 +442,8 @@ extension BleManager {
             // peripheral 可能长期停在 connecting，而 iOS 已用另一个实例持有真实连接。
             let claimedRestoration = restorationCoordinator.claimPendingPeripheral(
                 uuid: trimmedUuid,
-                name: trimmedName
+                name: trimmedName,
+                nameFilters: config.scan.nameFilters
             )
             let systemConnectedPeripheral: CBPeripheral? = {
                 guard allowsSynchronousCoreBluetoothLookup else {
@@ -747,16 +751,21 @@ extension BleManager {
                 self.activeStartupReconciliationTokens.removeValue(forKey: key)
                 return
             }
+            // 延迟重试闭包执行时 App 可能已离开 active 窗口；同步 retrieve 必须经
+            // active-only 包装器，inactive 时返回空视为 deferred，由后续重试或
+            // didBecomeActive 补偿，不得据此产生终态。
             var peripherals: [CBPeripheral] = []
             if let identifier = UUID(uuidString: expectedUuid) {
-                peripherals.append(contentsOf: self.centralManager.retrievePeripherals(
-                    withIdentifiers: [identifier]
+                peripherals.append(contentsOf: self.retrievePeripheralsWhenAppActive(
+                    withIdentifiers: [identifier],
+                    context: "startup reconciliation uuid"
                 ))
             }
             let serviceUUIDs = config.privateServices.map { $0.serviceUUID }
             if !serviceUUIDs.isEmpty {
-                peripherals.append(contentsOf: self.centralManager.retrieveConnectedPeripherals(
-                    withServices: serviceUUIDs
+                peripherals.append(contentsOf: self.retrieveConnectedPeripheralsWhenAppActive(
+                    withServices: serviceUUIDs,
+                    context: "startup reconciliation services"
                 ))
             }
             var seenIdentifiers = Set<UUID>()

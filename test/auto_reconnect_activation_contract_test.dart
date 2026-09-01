@@ -165,6 +165,22 @@ void main() {
     expect(captured?.arguments, isNull);
   });
 
+  test('process-level willRestoreState fact query is read-only', () async {
+    MethodCall? captured;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      captured = call;
+      return true;
+    });
+
+    expect(
+      await platform.didExperienceStateRestorationThisProcess(),
+      isTrue,
+    );
+    expect(captured?.method, 'didExperienceStateRestorationThisProcess');
+    expect(captured?.arguments, isNull);
+  });
+
   test('removed userRepairRequired acknowledgement fails closed', () async {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (_) async {

@@ -68,6 +68,13 @@ extension BleManager {
 
     /// escrow 只调用 CoreBluetooth connect；正式 admission 必须等 Dart target claim。
     private func rearmStateRestorationEscrow(_ peripheral: CBPeripheral, reason: String) {
+        // willRestoreState 早于 centralManagerDidUpdateState(poweredOn) 是常态；
+        // 未 poweredOn 时提交 connect 依赖未承诺的系统行为，挂起等 poweredOn 补偿。
+        guard centralManager.state == .poweredOn else {
+            restorationCoordinator.deferPowerOnRearm(uuid: peripheral.identifier.uuidString)
+            loggerD(msg: "stateRestoration: escrow rearm deferred until poweredOn uuid=\(peripheral.identifier.uuidString), reason=\(reason), state=\(centralManager.state.rawValue)")
+            return
+        }
         connectPeripheral(peripheral, autoReconnect: true)
         recordAutoReconnectEvent(
             type: "ios_restore_escrow_rearm",
@@ -76,6 +83,13 @@ extension BleManager {
             detail: reason
         )
         loggerD(msg: "stateRestoration: escrow rearm uuid=\(peripheral.identifier.uuidString), reason=\(reason)")
+    }
+
+    /// poweredOn 后补偿执行此前被挂起的 escrow rearm；不在 escrow 的债务已被丢弃。
+    func rearmDeferredStateRestorationEscrowsAfterPowerOn() {
+        restorationCoordinator.takePowerOnRearmDeferrals().forEach { peripheral in
+            rearmStateRestorationEscrow(peripheral, reason: "poweredOn compensation")
+        }
     }
 
     /// hard cancel/config revoke 精确清除 escrow，并以 cancellation barrier 阻止迟到 didConnect。
@@ -120,8 +134,9 @@ extension BleManager {
      *  历史设备或歧义身份，必须 fail-closed 并取消系统物理连接。
      */
     func finalizeStateRestorationClaims() {
-        // 1、一次性 drain，保证重复收尾幂等且不会取消稍后进入的新 restoration 回调。
-        let unclaimedPeripherals = restorationCoordinator.drainPendingPeripherals()
+        // 1、只收口「认领窗口快照」内的对象：窗口后经 connectionEvent 持续交来的
+        // 系统连接属于下一轮 activation 输入，迟到的 finalize 债务不得误取消它们。
+        let unclaimedPeripherals = restorationCoordinator.drainClaimWindowPeripherals()
         // 2、未认领对象不得进入业务 Gate；若系统仍连接或正在连接，显式取消物理链路。
         unclaimedPeripherals.forEach { peripheral in
             let uuid = peripheral.identifier.uuidString

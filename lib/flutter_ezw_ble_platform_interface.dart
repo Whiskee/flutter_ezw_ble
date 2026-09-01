@@ -337,6 +337,17 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     );
   }
 
+  /// 本进程是否发生过 iOS `willRestoreState` 回调。
+  ///
+  /// escrow 可能在 Dart 查询前已被 claim/finalize 消费清空，`hasPendingStateRestoration`
+  /// 因此不足以证明「经历过 SR」；该事实由原生一次性锁存、只读暴露，不认领设备、
+  /// 不启动 GATT。Android 固定返回 false。
+  Future<bool> didExperienceStateRestorationThisProcess() {
+    throw UnimplementedError(
+      'didExperienceStateRestorationThisProcess() has not been implemented.',
+    );
+  }
+
   /// 结束冷启动 State Restoration 认领窗口。
   ///
   /// iOS 会取消未被当前业务设备认领的历史 peripheral；Android 为 no-op。
