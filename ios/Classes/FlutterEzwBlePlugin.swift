@@ -18,17 +18,19 @@ public class FlutterEzwBlePlugin: NSObject, FlutterPlugin, FlutterApplicationLif
     public static func captureBluetoothStateRestorationLaunchOptions(
         _ launchOptions: [UIApplication.LaunchOptionsKey: Any]?
     ) {
+        // UIScene 生命周期下 didFinishLaunching 的 launchOptions 恒为 nil，不能再把
+        // bluetoothCentrals 当作重建 restoration manager 的前置条件。每次原生进程
+        // 启动都用同一 restore identifier 立即重建 manager；若系统有保存状态，
+        // willRestoreState 会把 peripheral 交给现有 escrow，等待 Flutter 业务认领。
+        // 这里只做原生同步构造，不启动 Dart 业务，也不会给前台启动增加 await。
+        let _ = BleManager.shared
+
         let centralIdentifiers = launchOptions?[.bluetoothCentrals] as? [String] ?? []
         guard centralIdentifiers.contains(BleManager.restorationIdentifier) else {
             return
         }
 
         launchedForBluetoothStateRestoration = true
-        // CoreBluetooth 只给后台拉起进程一个很短的执行窗口。必须在宿主
-        // didFinishLaunching 的同步调用栈里用同一 identifier 重建 central manager，
-        // 不能等待 Flutter Engine 注册插件；业务初始化变重时，延迟注册会让进程先被
-        // iOS 挂起，willRestoreState、GATT 和后续账号认领都永远没有机会发生。
-        let _ = BleManager.shared
         BleEC.logger.emit(
             "[d]-stateRestoration: app launched for bluetooth central id=\(BleManager.restorationIdentifier)"
         )

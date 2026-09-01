@@ -135,6 +135,16 @@ class BleManager: NSObject {
     let reconnectStore = BleReconnectStore()
     // CoreBluetooth 恢复对象只能由当前账号的 exact target 认领。
     let restorationCoordinator = BleStateRestorationCoordinator()
+    /// 当前进程已注册的 CoreBluetooth connection-event 服务集合。
+    ///
+    /// `initConfigs` 与 `centralManagerDidUpdateState` 都可能先到；用稳定签名保证两条
+    /// 启动路径只注册一次，同时允许配置集合变化后更新匹配范围。
+    private var connectionEventRegistrationSignature = ""
+    /// 前台冷启动系统对象对账的 exact token。
+    ///
+    /// 同一设备的新 activation 会替换旧 token；迟到的查询闭包必须先复验 token 和
+    /// reconnect task generation，不能把旧账号或旧 runtime 的 peripheral 注入新连接。
+    var activeStartupReconciliationTokens: [String: String] = [:]
     //  - 最近一次已输出的扫描配置签名，用于避免每次 startScan 都重复刷配置详情。
     private var lastLoggedScanConfigSignature: String?
     //  =========== Get/Set
@@ -220,9 +230,64 @@ extension BleManager {
         // MethodChannel 调用必须尽快返回 Flutter，auto reconnect 补偿放到下一轮主队列，
         // 避免在 initConfigs 的 await 边界内同步启动 GATT。
         DispatchQueue.main.async { [weak self] in
+            self?.registerForConfiguredConnectionEventsIfNeeded()
             // 1、蓝牙已恢复但任务被 poweredOff 暂停时，在配置就绪后补偿恢复。
             self?.resumeReconnectTasksIfBluetoothOn(reason: "initConfigs")
         }
+    }
+
+    /**
+     *  注册系统级 peripheral 连接事件，补齐没有 `willRestoreState` 对象的 SR 启动。
+     *
+     *  这里只订阅配置声明的私有服务，不同步调用 retrieve，也不直接发布业务连接；
+     *  真正的设备身份、账号 owner 与 GATT/AUTH 仍由 autoReconnect activation 校验。
+     */
+    func registerForConfiguredConnectionEventsIfNeeded() {
+        guard #available(iOS 13.0, *), centralManager.state == .poweredOn else {
+            return
+        }
+        var servicesByIdentifier: [String: CBUUID] = [:]
+        for config in bleConfigs {
+            for service in config.privateServices {
+                servicesByIdentifier[service.serviceUUID.uuidString.uppercased()] = service.serviceUUID
+            }
+        }
+        let identifiers = servicesByIdentifier.keys.sorted()
+        // 新进程的 centralManagerDidUpdateState 早于 Dart initConfigs/activation。此时
+        // reconnectTasks 仍为空，但业务 connected 时持久化的 exact endpoint 已经足够
+        // 注册系统连接事件。这里只扩大物理事件匹配范围，不创建 admission/GATT/AUTH；
+        // 当前账号仍必须在 Dart 就绪后通过 restoration escrow 精确认领 peripheral。
+        let runtimePeripheralIdentifiers = reconnectTasks.values.compactMap {
+            UUID(uuidString: $0.uuid.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        let persistedPeripheralIdentifiers = reconnectStore.targets().compactMap {
+            UUID(uuidString: $0.uuid.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        let peripheralIdentifiers = Array(Set(
+            runtimePeripheralIdentifiers + persistedPeripheralIdentifiers
+        )).sorted { $0.uuidString < $1.uuidString }
+        guard !identifiers.isEmpty || !peripheralIdentifiers.isEmpty else {
+            return
+        }
+        let signature = identifiers.joined(separator: "|") + "#" +
+            peripheralIdentifiers.map(\.uuidString).joined(separator: "|")
+        guard signature != connectionEventRegistrationSignature else {
+            return
+        }
+        var options: [CBConnectionEventMatchingOption: Any] = [:]
+        if !identifiers.isEmpty {
+            options[.serviceUUIDs] = identifiers.compactMap { servicesByIdentifier[$0] }
+        }
+        if !peripheralIdentifiers.isEmpty {
+            options[.peripheralUUIDs] = peripheralIdentifiers
+        }
+        centralManager.registerForConnectionEvents(options: options)
+        connectionEventRegistrationSignature = signature
+        recordAutoReconnectEvent(
+            type: "ios_connection_event_registered",
+            detail: "serviceCount=\(identifiers.count), peripheralCount=\(peripheralIdentifiers.count), persistedCount=\(persistedPeripheralIdentifiers.count)"
+        )
+        loggerD(msg: "connectionEvent registration: serviceCount=\(identifiers.count), peripheralCount=\(peripheralIdentifiers.count), persistedCount=\(persistedPeripheralIdentifiers.count)")
     }
 
     /**
@@ -1734,20 +1799,35 @@ extension BleManager {
             handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .serviceFail, tag: tag)
             return
         }
+        // SR 交还的 CBService/CBCharacteristic 是当前 restored central 的状态快照。
+        // 服务 discovery 仍会重新执行，但已有 characteristic 时必须直接消费；对缓存
+        // characteristic 再调用 discoverCharacteristics 并不保证 CoreBluetooth 重放回调，
+        // 会让 exact admission 永久停在 searchChars。
+        let isStateRestorationAdmission =
+            currentConnectionAdmission(uuid: peripheral.identifier.uuidString)?.source == .stateRestoration
         //  2、只获取需要注册的服务
         let myServices = services.filter { service in
             bleConfig.privateServices.contains { ps in
                 ps.service == service.uuid.uuidString
             }
         }
-        loggerD(msg: "didDiscoverServices: \(peripheral.identifier.uuidString)-\(peripheral.name ?? ""), total=\(services.count), matched=\(myServices.count), expected=\(bleConfig.privateServices.count), tag=\(tag)")
+        loggerD(msg: "didDiscoverServices: \(peripheral.identifier.uuidString)-\(peripheral.name ?? ""), total=\(services.count), matched=\(myServices.count), expected=\(bleConfig.privateServices.count), restorationAdmission=\(isStateRestorationAdmission), tag=\(tag)")
         recordNativeTrace(uuid: peripheral.identifier.uuidString, stage: "service_discovery", result: "success")
         handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .searchChars, tag: tag)
         //  - 2.1、遍历发现所有私有服务的读写特征。缓存完整时直接消费缓存特征，避免恢复路径等不到回调。
         myServices.forEach { service in
             loggerD(msg: "didDiscoverServices: \(peripheral.identifier.uuidString), service = \(service.uuid.uuidString), charsCached=\(service.characteristics?.count ?? 0), tag=\(tag)")
-            if let characteristics = service.characteristics, characteristics.isNotEmpty {
-                processDiscoveredCharacteristics(peripheral: peripheral, service: service, error: nil, tag: "\(tag) cached")
+            if let characteristics = service.characteristics,
+               characteristics.isNotEmpty {
+                let cacheTag = isStateRestorationAdmission
+                    ? "\(tag) restored cached"
+                    : "\(tag) cached"
+                processDiscoveredCharacteristics(
+                    peripheral: peripheral,
+                    service: service,
+                    error: nil,
+                    tag: cacheTag
+                )
             } else {
                 peripheral.discoverCharacteristics(nil, for: service)
             }
@@ -1809,7 +1889,18 @@ extension BleManager {
         }),
            connectedDevice.writeCharsDic[privateService.type]?.uuid == writeChars!.uuid,
            connectedDevice.readCharsDic[privateService.type]?.uuid == readChars!.uuid {
-            loggerD(msg: "didDiscoverCharacteristicsFor: \(peripheral.identifier.uuidString), psType = \(privateService.type), duplicate chars ignored, tag=\(tag)")
+            // 第二次及后续 SR 可能回放同一组缓存 characteristic，此时 notify 已由
+            // CoreBluetooth 保留，不保证再次触发 didUpdateNotificationStateFor。
+            // 重复缓存只能跳过字典替换，不能跳过当前 exact attempt 的 readiness 对账；
+            // updateConnectedDevice 会读取 isNotifying 或重新订阅，并由统一完成闸去重。
+            loggerD(msg: "didDiscoverCharacteristicsFor: \(peripheral.identifier.uuidString), psType = \(privateService.type), duplicate chars reconcile notify readiness, tag=\(tag)")
+            updateConnectedDevice(
+                uuid: peripheral.identifier.uuidString,
+                name: peripheral.name ?? "",
+                writeChars: writeChars,
+                readChars: readChars,
+                psType: privateService.type
+            )
             return
         }
         recordNativeTrace(
@@ -2183,14 +2274,28 @@ extension BleManager {
         //  - 设置读
         if let readChars = readChars {
             connectedDevice.readCharsDic[psType] = readChars
-            //  CoreBluetooth 恢复/缓存路径可能已经处于 notifying，不一定再触发一次回调。
+            let requiresStateRestorationNotifyRearm =
+                currentConnectionAdmission(uuid: uuid)?.source == .stateRestoration
+            // willRestoreState 交还的是当前 restored central 的原生状态。若 characteristic
+            // 已经 notifying，CoreBluetooth 可能不会再次回调 didUpdateNotificationStateFor；
+            // 此时必须先把 restored subscription 计入本 attempt readiness，否则业务层
+            // 永远收不到 connectFinish。额外 setNotifyValue(true) 只做幂等重申，不作为
+            // readiness 的唯一来源；非 restoration 缓存路径保持原有行为。
             if readChars.isNotifying {
                 connectedDevice.notifiedReadCharUUIDs.insert(readChars.uuid.uuidString)
                 connectedDevice.readCharsNotify = connectedDevice.notifiedReadCharUUIDs.count
-                loggerD(msg: "updateConnectedDevice: \(uuid), read char already notifying, char=\(readChars.uuid.uuidString), notifyProgress=\(connectedDevice.readCharsNotify)")
+                if requiresStateRestorationNotifyRearm {
+                    connectedDevice.peripheral.setNotifyValue(true, for: readChars)
+                    loggerD(msg: "stateRestoration: restored notify accepted uuid=\(uuid), char=\(readChars.uuid.uuidString), notifyProgress=\(connectedDevice.readCharsNotify)")
+                } else {
+                    loggerD(msg: "updateConnectedDevice: \(uuid), read char already notifying, char=\(readChars.uuid.uuidString), notifyProgress=\(connectedDevice.readCharsNotify)")
+                }
             } else {
                 //  - 开始订阅读特征变化值，即开启接收设备数据
                 connectedDevice.peripheral.setNotifyValue(true, for: readChars)
+                if requiresStateRestorationNotifyRearm {
+                    loggerD(msg: "stateRestoration: subscribe missing notify uuid=\(uuid), char=\(readChars.uuid.uuidString)")
+                }
             }
         }
         //  - 设置连接状态
@@ -2594,6 +2699,7 @@ extension BleManager: CBCentralManagerDelegate {
             }
             scanConnectTimeoutTimers.removeAll()
         } else {
+            registerForConfiguredConnectionEventsIfNeeded()
             resumeConnectionAdmissionGateAfterBluetoothOn()
             resumeReconnectTasksAfterBluetoothOn()
         }
@@ -2628,7 +2734,26 @@ extension BleManager: CBCentralManagerDelegate {
     }
     
     func centralManager(_ central: CBCentralManager, connectionEventDidOccur event: CBConnectionEvent, for peripheral: CBPeripheral) {
-        loggerE(msg: "connectionEventDidOccur: event = \(event.rawValue)")
+        let uuid = peripheral.identifier.uuidString
+        let name = peripheral.name ?? ""
+        recordAutoReconnectEvent(
+            type: "ios_connection_event",
+            uuid: uuid,
+            name: name,
+            detail: "event=\(event.rawValue), state=\(peripheral.state.rawValue)"
+        )
+        switch event {
+        case .peerConnected:
+            // connection event 只提供物理对象；先进入 escrow，再由现有 exact owner
+            // activation 接入 admission/GATT/AUTH，禁止把系统连接直接投影成业务成功。
+            escrowStateRestorationPeripheral(peripheral, source: "connectionEvent")
+            resumeAutoReconnectFromConnectionEvent(peripheral)
+        case .peerDisconnected:
+            // 业务断连终态仍只由 didDisconnectPeripheral 收口，避免双重 teardown。
+            loggerD(msg: "connectionEvent peer disconnected: uuid=\(uuid), name=\(name)")
+        @unknown default:
+            loggerE(msg: "connectionEventDidOccur: unknown event=\(event.rawValue), uuid=\(uuid)")
+        }
     }
     
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, timestamp: CFAbsoluteTime, isReconnecting: Bool, error: (any Error)?) {

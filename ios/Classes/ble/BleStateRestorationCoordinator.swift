@@ -163,7 +163,7 @@ final class BleStateRestorationCoordinator {
     /**
      *  为当前 Dart recovery target 精确认领一个 restored peripheral。
      *
-     *  1、优先使用非空 CoreBluetooth UUID；UUID 为空时只允许完整设备名唯一匹配。
+     *  1、优先使用非空 CoreBluetooth UUID；UUID 未命中时只允许完整设备名唯一匹配。
      *  2、唯一匹配后立即从 pending 集合移除，保证同一 peripheral 只能被一个 owner 消费。
      *  3、同名多候选时 fail-closed，交回常规扫描解析，避免误连历史设备。
      */
@@ -171,13 +171,16 @@ final class BleStateRestorationCoordinator {
         // 1、规范化输入，避免空格导致已知 UUID 或完整名称无法匹配。
         let normalizedUuid = uuid.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        // 2、UUID 是 iOS peripheral 的最强身份；为空时才退化为完整名称匹配。
-        let matches = pendingPeripherals.enumerated().filter { _, peripheral in
-            if !normalizedUuid.isEmpty {
-                return peripheral.identifier.uuidString.caseInsensitiveCompare(normalizedUuid) == .orderedSame
+        // 2、UUID 是 iOS peripheral 的最强身份；系统重启后 identifier 可能变化，只有
+        // UUID 完全未命中时才允许以完整名称继续匹配，并仍要求最终候选唯一。
+        var matches = pendingPeripherals.enumerated().filter { _, peripheral in
+            !normalizedUuid.isEmpty &&
+                peripheral.identifier.uuidString.caseInsensitiveCompare(normalizedUuid) == .orderedSame
+        }
+        if matches.isEmpty, !normalizedName.isEmpty {
+            matches = pendingPeripherals.enumerated().filter { _, peripheral in
+                peripheral.name?.trimmingCharacters(in: .whitespacesAndNewlines) == normalizedName
             }
-            guard !normalizedName.isEmpty else { return false }
-            return peripheral.name?.trimmingCharacters(in: .whitespacesAndNewlines) == normalizedName
         }
         // 3、只有唯一候选才能认领；歧义时不得猜测设备身份。
         guard matches.count == 1, let match = matches.first else {

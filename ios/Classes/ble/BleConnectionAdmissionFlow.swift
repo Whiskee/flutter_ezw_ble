@@ -6,6 +6,7 @@ import Foundation
 enum BleStalePendingReplacementTrigger: String {
     case manualReconnect
     case visibleAutoReconnect
+    case systemConnectedReconcile
 }
 
 /**
@@ -22,6 +23,10 @@ extension BleManager {
     // 手动接管正常应只提升 pending owner；超过一个辅助扫描窗口仍无任何物理回调时，
     // 才允许通过 cancellation barrier 替换卡住的 CoreBluetooth pending connect。
     private var manualPendingReplacementThreshold: TimeInterval { 20.0 }
+    // App active 且 CoreBluetooth 已明确返回同一 exact target 的 connected peripheral 时，
+    // 旧 pending 已经不是“设备仍不在范围内”，而是陈旧对象阻塞。给原请求一个短窗口
+    // 后只允许一次 barrier replacement；后台没有同步系统连接证据，继续长期 pending。
+    var foregroundSystemConnectedReplacementThreshold: TimeInterval { 3.0 }
 
     /// 同一 CoreBluetooth UUID 在本进程内只能有一个连接缓存 owner。iOS 在蓝牙恢复、
     /// retrieve 后可能返回新的 CBPeripheral 实例，不能再用对象引用判重，
@@ -604,9 +609,12 @@ extension BleManager {
         let cachedPrivateServices = cachedServices.filter { service in
             session.config.privateServices.contains { $0.serviceUUID == service.uuid }
         }
-        loggerD(msg: "admission gate: \(admission.endpointId), start services cached=\(cachedPrivateServices.count)/\(session.config.privateServices.count)")
-        // 3、优先复用完整缓存服务，否则发起 service discovery。
-        if cachedPrivateServices.count == session.config.privateServices.count {
+        let forceStateRestorationGattRebuild = admission.source == .stateRestoration
+        loggerD(msg: "admission gate: \(admission.endpointId), start services cached=\(cachedPrivateServices.count)/\(session.config.privateServices.count), forceRestorationRebuild=\(forceStateRestorationGattRebuild)")
+        // 3、普通连接优先复用完整缓存服务。State Restoration 的缓存图属于上一进程，
+        // 必须重新 discovery，随后每个 read characteristic 也会重新提交 Notify。
+        if !forceStateRestorationGattRebuild,
+           cachedPrivateServices.count == session.config.privateServices.count {
             processDiscoveredServices(peripheral: peripheral, error: nil, tag: "admission cached")
         } else {
             peripheral.discoverServices(services)
@@ -791,7 +799,14 @@ extension BleManager {
             return false
         }
         let elapsed = Date().timeIntervalSince(session.pendingConnectStartedAt)
-        guard elapsed >= manualPendingReplacementThreshold else {
+        let replacementThreshold: TimeInterval
+        switch trigger {
+        case .systemConnectedReconcile where allowsSynchronousCoreBluetoothLookup:
+            replacementThreshold = foregroundSystemConnectedReplacementThreshold
+        default:
+            replacementThreshold = manualPendingReplacementThreshold
+        }
+        guard elapsed >= replacementThreshold else {
             return false
         }
 
@@ -808,10 +823,16 @@ extension BleManager {
         )
         centralManager.cancelPeripheralConnection(peripheral)
         let elapsedDescription = String(format: "%.1f", elapsed)
-        let replacementDescription = trigger == .manualReconnect
-            ? "manual stale pending replacement"
-            : "visible auto reconnect stale pending replacement"
-        loggerD(msg: "admission gate: \(admission.endpointId), \(replacementDescription) trigger=\(trigger.rawValue), generation=\(admission.generation), elapsed=\(elapsedDescription)s")
+        let replacementDescription: String
+        switch trigger {
+        case .manualReconnect:
+            replacementDescription = "manual stale pending replacement"
+        case .visibleAutoReconnect:
+            replacementDescription = "visible auto reconnect stale pending replacement"
+        case .systemConnectedReconcile:
+            replacementDescription = "system-connected stale pending replacement"
+        }
+        loggerD(msg: "admission gate: \(admission.endpointId), \(replacementDescription) trigger=\(trigger.rawValue), generation=\(admission.generation), elapsed=\(elapsedDescription)s, threshold=\(replacementThreshold)s")
         return true
     }
 

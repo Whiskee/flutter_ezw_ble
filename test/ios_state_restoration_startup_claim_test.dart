@@ -117,4 +117,41 @@ void main() {
       reason: '已 pending 的 CoreBluetooth connect 只附着 admission，不得重复 connect',
     );
   });
+
+  test(
+    'cached restored characteristics reconcile notify before duplicate return',
+    () {
+      final manager = File(
+        'ios/Classes/ble/BleManager.swift',
+      ).readAsStringSync();
+
+      final duplicateBranch = manager.indexOf(
+        'duplicate chars reconcile notify readiness',
+      );
+      final duplicateReconcile = manager.indexOf(
+        'updateConnectedDevice(',
+        duplicateBranch,
+      );
+      final duplicateReturn = manager.indexOf(
+        '\n            return',
+        duplicateBranch,
+      );
+
+      expect(duplicateBranch, isNonNegative);
+      expect(duplicateReconcile, greaterThan(duplicateBranch));
+      expect(
+        duplicateReconcile,
+        lessThan(duplicateReturn),
+        reason: '缓存 characteristic 不能绕过当前 restoration attempt 的 notify 对账',
+      );
+      expect(manager, contains('if readChars.isNotifying'));
+      expect(
+        manager,
+        contains(
+          'tryEmitConnectFinish(uuid: uuid, name: name, bleConfig: connectedDevice.belongConfig, tag: "updateConnectedDevice")',
+        ),
+        reason: '缓存 notify 与正常回调必须复用同一个 exact attempt 完成闸',
+      );
+    },
+  );
 }

@@ -388,8 +388,24 @@ extension BleManager {
     func activateAutoReconnectTargets(
         _ targets: [BleReconnectTarget],
         source: BleConnectSource = .autoReconnect,
-        sessionGeneration: Int64 = 0
+        sessionGeneration: Int64 = 0,
+        scheduleActiveReconciliation: Bool = true
     ) -> [BleReconnectActivationResult] {
+        // 普通前台冷启动可能只收到一腿 willRestoreState；另一腿即使已在系统层连接，
+        // 也不会自动进入当前 CBCentralManager。仅在 active 窗口做有界 exact 对账，
+        // 后台 SR 仍只消费 restoration / connection event，绝不执行同步 retrieve。
+        if scheduleActiveReconciliation, source != .manualReconnect {
+            scheduleActiveStartupReconciliation(
+                targets,
+                source: source,
+                sessionGeneration: sessionGeneration
+            )
+            // activation 的 map 会在当前调用栈内 arm task；下一轮主队列再刷新 UUID
+            // connection-event 注册，保证拿到完整的当前账号 owner 集合。
+            DispatchQueue.main.async { [weak self] in
+                self?.registerForConfiguredConnectionEventsIfNeeded()
+            }
+        }
         // 1、逐目标校验配置和身份，保持一次 activation 的目标快照稳定。
         return targets.map { target in
             // 1.1、关闭 autoReconnect 或缺少稳定 identity 时只返回结果，不创建 GATT。
@@ -418,16 +434,15 @@ extension BleManager {
                     sessionGeneration: sessionGeneration
                 )
             }
-            // 1.3、SR 可能早于 Dart 当前设备加载，先让当前账号 target 精确认领 escrow；
-            // 没有 escrow 时才在 active 窗口查询系统已连接对象。
+            // 1.3、SR 可能早于 Dart 当前设备加载，先让当前账号 target 精确认领 escrow。
+            // App active 时仍需对稳定 UUID 查询系统已连接对象：restoration escrow 中的
+            // peripheral 可能长期停在 connecting，而 iOS 已用另一个实例持有真实连接。
             let claimedRestoration = restorationCoordinator.claimPendingPeripheral(
                 uuid: trimmedUuid,
                 name: trimmedName
             )
             let systemConnectedPeripheral: CBPeripheral? = {
-                guard claimedRestoration == nil,
-                      trimmedUuid.isEmpty,
-                      allowsSynchronousCoreBluetoothLookup else {
+                guard allowsSynchronousCoreBluetoothLookup else {
                     return nil
                 }
                 return findPeripheralFromConnected(
@@ -437,7 +452,7 @@ extension BleManager {
                     requireUniqueMatch: true
                 )
             }()
-            if let resolvedPeripheral = claimedRestoration?.peripheral ?? systemConnectedPeripheral {
+            if let resolvedPeripheral = systemConnectedPeripheral ?? claimedRestoration?.peripheral {
                 let resolvedUuid = resolvedPeripheral.identifier.uuidString
                 let resolvedName = trimmedName.isEmpty
                     ? (resolvedPeripheral.name ?? "")
@@ -454,8 +469,8 @@ extension BleManager {
                     sessionGeneration: sessionGeneration
                 ) else {
                     // claim 后若配置同步失效，把对象放回 escrow，由统一 hard reset 收口。
-                    if claimedRestoration != nil {
-                        _ = restorationCoordinator.enqueue(resolvedPeripheral)
+                    if let claimedRestoration {
+                        _ = restorationCoordinator.enqueue(claimedRestoration.peripheral)
                     }
                     return BleReconnectActivationResult(
                         target: target,
@@ -481,11 +496,17 @@ extension BleManager {
                     ),
                     resolvedPeripheral
                 ))
-                let resolutionSource = claimedRestoration != nil
-                    ? "stateRestoration"
-                    : "systemConnected"
+                let resolutionSource = systemConnectedPeripheral != nil
+                    ? "systemConnected"
+                    : "stateRestoration"
                 loggerD(msg: "autoReconnect restoration claim: config=\(target.belongConfig), requestedUuid=\(trimmedUuid), resolvedUuid=\(resolvedUuid), name=\(resolvedName), state=\(resolvedPeripheral.state.rawValue), source=\(resolutionSource), sessionGeneration=\(task.sessionGeneration)")
-                if let claimedRestoration {
+                if systemConnectedPeripheral != nil {
+                    _ = activateArmedReconnectTask(
+                        task,
+                        source: source,
+                        reconcileSystemConnected: true
+                    )
+                } else if let claimedRestoration {
                     activateClaimedStateRestoration(
                         task: task,
                         config: config,
@@ -611,9 +632,282 @@ extension BleManager {
 
     /// 激活一个已经拥有稳定 UUID 的 task；MethodChannel 与扫描身份解析共用此顺序。
     @discardableResult
+    /**
+     *  普通前台冷启动对缺失 peripheral 做有界系统对象对账。
+     *
+     *  该流程不是 GATT retry：它不增加 reconnect attempt，不发布失败终态，只在 App
+     *  active 时把系统已知对象送回既有 exact activation。查询窗口结束后保留原 pending
+     *  connect/scan，避免改变后台 SR、Code 14 或 FlowPolicy 的历史行为。
+     */
+    private func scheduleActiveStartupReconciliation(
+        _ targets: [BleReconnectTarget],
+        source: BleConnectSource,
+        sessionGeneration: Int64
+    ) {
+        guard allowsSynchronousCoreBluetoothLookup else {
+            return
+        }
+        let delays: [TimeInterval] = [0.05, 0.15, 0.3, 0.5, 1, 2, 4]
+        targets.forEach { target in
+            let uuid = target.uuid.trimmingCharacters(in: .whitespacesAndNewlines)
+            let name = target.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !uuid.isEmpty || !name.isEmpty else {
+                return
+            }
+            let key = [
+                target.belongConfig,
+                uuid.lowercased(),
+                name,
+                String(sessionGeneration)
+            ].joined(separator: "|")
+            let token = UUID().uuidString
+            activeStartupReconciliationTokens[key] = token
+            runActiveStartupReconciliation(
+                target: target,
+                source: source,
+                sessionGeneration: sessionGeneration,
+                key: key,
+                token: token,
+                delays: delays,
+                index: 0
+            )
+        }
+    }
+
+    private func runActiveStartupReconciliation(
+        target: BleReconnectTarget,
+        source: BleConnectSource,
+        sessionGeneration: Int64,
+        key: String,
+        token: String,
+        delays: [TimeInterval],
+        index: Int
+    ) {
+        guard index < delays.count else {
+            if activeStartupReconciliationTokens[key] == token {
+                activeStartupReconciliationTokens.removeValue(forKey: key)
+                recordAutoReconnectEvent(
+                    type: "ios_active_startup_reconcile_exhausted",
+                    uuid: target.uuid,
+                    name: target.name,
+                    detail: "sessionGeneration=\(sessionGeneration)"
+                )
+            }
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delays[index]) { [weak self] in
+            guard let self,
+                  self.activeStartupReconciliationTokens[key] == token else {
+                return
+            }
+            guard self.allowsSynchronousCoreBluetoothLookup,
+                  self.centralManager.state == .poweredOn else {
+                self.activeStartupReconciliationTokens.removeValue(forKey: key)
+                self.recordAutoReconnectEvent(
+                    type: "ios_active_startup_reconcile_cancelled",
+                    uuid: target.uuid,
+                    name: target.name,
+                    detail: "reason=appInactiveOrBluetoothUnavailable, sessionGeneration=\(sessionGeneration)"
+                )
+                return
+            }
+            let expectedUuid = target.uuid.trimmingCharacters(in: .whitespacesAndNewlines)
+            let expectedName = target.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let matchingTasks = self.reconnectTasks.values.filter { task in
+                task.belongConfig == target.belongConfig &&
+                    BleReconnectIdentityPolicy.matchesSystemConnectedPeripheral(
+                        taskUuid: task.uuid,
+                        taskName: task.name,
+                        peripheralUuid: expectedUuid,
+                        peripheralName: expectedName
+                    )
+            }
+            guard matchingTasks.count == 1, let task = matchingTasks.first,
+                  sessionGeneration <= 0 || task.sessionGeneration == sessionGeneration else {
+                self.activeStartupReconciliationTokens.removeValue(forKey: key)
+                return
+            }
+            let existingPhysicalSession = self.peripheralConnectionSessions.values.first(where: {
+                BleReconnectIdentityPolicy.matchesSystemConnectedPeripheral(
+                    taskUuid: task.uuid,
+                    taskName: task.name,
+                    peripheralUuid: $0.peripheral.identifier.uuidString,
+                    peripheralName: $0.peripheral.name ?? ""
+                )
+            })
+            // 已收到真实 didConnect/contact 的 pipeline 不再参与启动对账；尚未接触物理层的
+            // pending 则继续查询系统 connected 对象，避免长期 owner 把前台冷启动拖到 60 秒。
+            if existingPhysicalSession?.hasObservedPhysicalContact == true {
+                self.activeStartupReconciliationTokens.removeValue(forKey: key)
+                return
+            }
+            guard let config = self.bleConfigs.first(where: {
+                $0.name == target.belongConfig && $0.autoReconnect
+            }) else {
+                self.activeStartupReconciliationTokens.removeValue(forKey: key)
+                return
+            }
+            var peripherals: [CBPeripheral] = []
+            if let identifier = UUID(uuidString: expectedUuid) {
+                peripherals.append(contentsOf: self.centralManager.retrievePeripherals(
+                    withIdentifiers: [identifier]
+                ))
+            }
+            let serviceUUIDs = config.privateServices.map { $0.serviceUUID }
+            if !serviceUUIDs.isEmpty {
+                peripherals.append(contentsOf: self.centralManager.retrieveConnectedPeripherals(
+                    withServices: serviceUUIDs
+                ))
+            }
+            var seenIdentifiers = Set<UUID>()
+            let uniquePeripherals = peripherals.filter {
+                seenIdentifiers.insert($0.identifier).inserted
+            }
+            let uuidMatches = uniquePeripherals.filter {
+                !expectedUuid.isEmpty &&
+                    $0.identifier.uuidString.caseInsensitiveCompare(expectedUuid) == .orderedSame
+            }
+            let nameMatches = uniquePeripherals.filter {
+                !expectedName.isEmpty &&
+                    $0.name?.trimmingCharacters(in: .whitespacesAndNewlines) == expectedName
+            }
+            let identityMatches = uuidMatches.isEmpty ? nameMatches : uuidMatches
+            // 当前已有无物理接触的 pending 时，普通 disconnected/connecting retrieve
+            // 仍是同一个长期 owner，不足以触发替换；只有系统明确 connected 才是接管证据。
+            let matches = existingPhysicalSession == nil
+                ? identityMatches
+                : identityMatches.filter { $0.state == .connected }
+            if matches.count == 1, let peripheral = matches.first {
+                if let existingPhysicalSession,
+                   existingPhysicalSession.peripheral !== peripheral {
+                    let elapsed = Date().timeIntervalSince(
+                        existingPhysicalSession.pendingConnectStartedAt
+                    )
+                    if elapsed < self.foregroundSystemConnectedReplacementThreshold {
+                        self.runActiveStartupReconciliation(
+                            target: target,
+                            source: source,
+                            sessionGeneration: sessionGeneration,
+                            key: key,
+                            token: token,
+                            delays: delays,
+                            index: index + 1
+                        )
+                        return
+                    }
+                }
+                self.activeStartupReconciliationTokens.removeValue(forKey: key)
+                if existingPhysicalSession != nil {
+                    // 直接走现有 activation，让 systemConnectedReconcile 在 exact
+                    // admission/barrier 内替换旧对象；不能先塞 restoration escrow，
+                    // 否则 resumeConnectionEvent 会因同 UUID session 已存在而静默忽略。
+                    let resolvedTarget = BleReconnectTarget(
+                        belongConfig: target.belongConfig,
+                        uuid: peripheral.identifier.uuidString,
+                        name: peripheral.name ?? expectedName,
+                        expectedMacSuffix: target.expectedMacSuffix
+                    )
+                    let result = self.activateAutoReconnectTargets(
+                        [resolvedTarget],
+                        source: source,
+                        sessionGeneration: sessionGeneration,
+                        scheduleActiveReconciliation: false
+                    ).first
+                    self.recordAutoReconnectEvent(
+                        type: "ios_active_startup_reconcile_takeover",
+                        uuid: peripheral.identifier.uuidString,
+                        name: peripheral.name ?? expectedName,
+                        detail: "attempt=\(index + 1), state=\(peripheral.state.rawValue), result=\(String(describing: result?.state)), sessionGeneration=\(task.sessionGeneration)"
+                    )
+                    return
+                }
+                self.escrowStateRestorationPeripheral(
+                    peripheral,
+                    source: "activeColdStartReconciliation"
+                )
+                self.recordAutoReconnectEvent(
+                    type: "ios_active_startup_reconcile_resolved",
+                    uuid: peripheral.identifier.uuidString,
+                    name: peripheral.name ?? expectedName,
+                    detail: "attempt=\(index + 1), state=\(peripheral.state.rawValue), sessionGeneration=\(task.sessionGeneration)"
+                )
+                self.resumeAutoReconnectFromConnectionEvent(peripheral)
+                return
+            }
+            self.runActiveStartupReconciliation(
+                target: target,
+                source: source,
+                sessionGeneration: sessionGeneration,
+                key: key,
+                token: token,
+                delays: delays,
+                index: index + 1
+            )
+        }
+    }
+
+    /**
+     *  系统 connection event 到达后，尝试唤醒已经存在的 exact reconnect owner。
+     *
+     *  事件早于 Dart target 时只保留 restoration escrow，后续正常 activation 会认领；
+     *  事件晚于 target 时按 UUID 或唯一完整名称找到同一 owner，并复用原 activation，
+     *  从而保留 source/session generation、admission Gate 与 GATT/AUTH 约束。
+     */
+    func resumeAutoReconnectFromConnectionEvent(_ peripheral: CBPeripheral) {
+        let uuid = peripheral.identifier.uuidString
+        let name = peripheral.name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if peripheralConnectionSessions.values.contains(where: {
+            $0.peripheral.identifier == peripheral.identifier
+        }) {
+            recordAutoReconnectEvent(
+                type: "ios_connection_event_ignored",
+                uuid: uuid,
+                name: name,
+                detail: "reason=physicalSessionExists"
+            )
+            return
+        }
+        let candidates = reconnectTasks.values.filter { task in
+            task.uuid.caseInsensitiveCompare(uuid) == .orderedSame ||
+                (!name.isEmpty && task.name == name)
+        }
+        guard candidates.count == 1, let task = candidates.first else {
+            recordAutoReconnectEvent(
+                type: "ios_connection_event_deferred",
+                uuid: uuid,
+                name: name,
+                detail: "candidateCount=\(candidates.count)"
+            )
+            return
+        }
+        let expectedMacSuffix = persistedReconnectTarget(
+            uuid: task.uuid,
+            name: task.name
+        )?.expectedMacSuffix ?? ""
+        let target = BleReconnectTarget(
+            belongConfig: task.belongConfig,
+            uuid: uuid,
+            name: name.isEmpty ? task.name : name,
+            expectedMacSuffix: expectedMacSuffix
+        )
+        let results = activateAutoReconnectTargets(
+            [target],
+            source: task.source,
+            sessionGeneration: task.sessionGeneration,
+            scheduleActiveReconciliation: false
+        )
+        recordAutoReconnectEvent(
+            type: "ios_connection_event_activation",
+            uuid: uuid,
+            name: target.name,
+            detail: "result=\(String(describing: results.first?.state)), sessionGeneration=\(task.sessionGeneration)"
+        )
+    }
+
     private func activateArmedReconnectTask(
         _ task: BleReconnectTask,
-        source: BleConnectSource
+        source: BleConnectSource,
+        reconcileSystemConnected: Bool = false
     ) -> Bool {
         let deferredByAppInactivity = shouldDeferReconnectForAppInactivity(task)
         // 1、已有 admission 时优先判断是否可安全复用当前 pending session。
@@ -625,6 +919,15 @@ extension BleManager {
             return deferredByAppInactivity
         }
         if let current = currentConnectionAdmission(uuid: task.uuid) {
+            if reconcileSystemConnected,
+               source != .manualReconnect,
+               current.sessionGeneration == task.sessionGeneration {
+                // active 前台已经确认系统持有该 peripheral。仍复用当前 task/session，
+                // 只让 direct reconnect 在 exact admission 下认领或替换陈旧对象。
+                loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), reconcile system-connected peripheral with exact session=\(task.sessionGeneration)")
+                beginReconnectAttempt(uuid: task.uuid)
+                return deferredByAppInactivity
+            }
             let pendingTeardown = pendingConnectionAdmissionTeardowns[key]
             let currentIsPendingTeardown = pendingTeardown.map {
                 $0.admission.generation == current.generation &&
@@ -1133,10 +1436,40 @@ extension BleManager {
      */
     @objc func handleAppDidBecomeActive() {
         allowsSynchronousCoreBluetoothLookup = true
+        // inactive activation 只保留 exact owner，CoreBluetooth 的 system-connected
+        // peripheral 可能在 didBecomeActive 之后才可查询。先冻结本次 deferred 快照，
+        // 恢复 owner 后为每个仍同代的端点重启有界对账，避免一次瞬时 retrieve 未命中
+        // 后只连接主腿，并把这个不完整物理状态继续保存到下一次 SR。
+        let deferredSnapshot = reconnectTasks.values.filter { $0.deferredByAppInactivity }
         // name-only owner 先尝试接管 ANCS/system-connected identity，再恢复 UUID owner；
         // 两条路径都复用原有 pending/Gate，不增加 MethodChannel 状态或 retry。
         resolveAppInactivePendingIdentities()
         resumeAppInactiveDeferredReconnects()
+        deferredSnapshot.forEach { deferred in
+            let key = reconnectKey(uuid: deferred.uuid)
+            guard let current = reconnectTasks[key],
+                  current.sessionGeneration == deferred.sessionGeneration,
+                  current.belongConfig == deferred.belongConfig,
+                  bleConfigs.contains(where: {
+                      $0.name == current.belongConfig && $0.autoReconnect
+                  }) else {
+                return
+            }
+            let expectedMacSuffix = reconnectStore.target(
+                uuid: current.uuid,
+                name: current.name
+            )?.expectedMacSuffix ?? ""
+            scheduleActiveStartupReconciliation(
+                [BleReconnectTarget(
+                    belongConfig: current.belongConfig,
+                    uuid: current.uuid,
+                    name: current.name,
+                    expectedMacSuffix: expectedMacSuffix
+                )],
+                source: current.source,
+                sessionGeneration: current.sessionGeneration
+            )
+        }
         resumeReconnectTasksIfBluetoothOn(reason: "didBecomeActive")
     }
 
@@ -1364,7 +1697,7 @@ extension BleManager {
         let key = reconnectKey(uuid: activeTask.uuid)
         if let current = currentConnectionAdmission(uuid: activeTask.uuid) {
             let pendingTeardown = pendingConnectionAdmissionTeardowns[key]
-            let currentIsPendingTeardown = pendingTeardown.map {
+            var currentIsPendingTeardown = pendingTeardown.map {
                 $0.admission.generation == current.generation &&
                     $0.admission.sessionId == current.sessionId
             } == true
@@ -1377,6 +1710,28 @@ extension BleManager {
             if activeTask.source == .manualReconnect,
                replaceStalePendingManualAttemptIfNeeded(peripheral) {
                 loggerD(msg: "autoReconnect: \(activeTask.uuid)-\(activeTask.name), direct manual stale pending replacement requested")
+            }
+            if !currentIsPendingTeardown,
+               activeTask.source != .manualReconnect,
+               current.sessionGeneration == activeTask.sessionGeneration,
+               let session = peripheralConnectionSessions[current.sessionId],
+               !session.hasObservedPhysicalContact,
+               peripheral.state == .connected {
+                if session.peripheral === peripheral {
+                    loggerD(msg: "autoReconnect: \(activeTask.uuid)-\(activeTask.name), current pending object is now system-connected; enter exact Gate")
+                    enqueuePhysicalConnectionThroughGate(peripheral)
+                    return
+                }
+                // retrieveConnectedPeripherals 可能返回同 UUID 的新 CBPeripheral 实例。
+                // 旧 pending 必须先走既有 20 秒/no-contact/barrier 边界，随后新实例
+                // 才能注册下一 native attempt；禁止并行 GATT 或直接发布业务成功。
+                if replaceStalePendingAttemptIfNeeded(
+                    session.peripheral,
+                    trigger: .systemConnectedReconcile
+                ) {
+                    currentIsPendingTeardown = true
+                    loggerD(msg: "autoReconnect: \(activeTask.uuid)-\(activeTask.name), system-connected peripheral replaces stale pending object")
+                }
             }
             let barrierBlocking = hasPeripheralCancellationBarrier(peripheral)
 
