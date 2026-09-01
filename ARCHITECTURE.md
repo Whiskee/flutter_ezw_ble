@@ -784,7 +784,7 @@ connect(easyConnect)
   │    ├─ retrieveConnectedPeripherals(privateServices + ANCS) 判断系统已连接
   │    ├─ isConnected && isBleFlowCompleted → handleAlreadyConnected 重放状态
   │    ├─ directConnect → 使用缓存 peripheral 直接 connect
-  │    └─ needsScanBeforeReconnect 且非系统已连接 → scan 5s 刷新 CoreBT 缓存
+  │    └─ needsScanBeforeReconnect 且非系统已连接 → scan 10s 刷新 CoreBT 缓存
   ├─ scanResultTemp 命中 → 可按本轮扫描结果连接
   ├─ findPeripheralFromConnected 命中 → 系统/蓝牙设置页已连接，直接 connect
   ├─ retrievePeripherals(uuid) 命中
