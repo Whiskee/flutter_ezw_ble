@@ -238,4 +238,25 @@ void main() {
       expect(reconnect, contains('nameFilters: config.scan.nameFilters'));
     },
   );
+
+  test(
+    'connection event never re-escrows a peripheral already owned by an active '
+    'connect request (2026-09-02 device: claimed leg held 21 s before GATT)',
+    () {
+      final manager = File('ios/Classes/ble/BleManager.swift').readAsStringSync();
+      final handler = manager.substring(
+        manager.indexOf('connectionEventDidOccur event: CBConnectionEvent'),
+        manager.indexOf('didDisconnectPeripheral peripheral: CBPeripheral, timestamp'),
+      );
+      final ownerGuard = handler.indexOf(
+        'findActiveConnectRequest(peripheral: peripheral) != nil',
+      );
+      final escrow = handler.indexOf(
+        'escrowStateRestorationPeripheral(peripheral, source: "connectionEvent")',
+      );
+      expect(ownerGuard, isNonNegative);
+      expect(escrow, greaterThan(ownerGuard));
+      expect(handler, contains('reason=activeConnectRequest'));
+    },
+  );
 }

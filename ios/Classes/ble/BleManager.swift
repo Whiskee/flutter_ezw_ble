@@ -2758,6 +2758,22 @@ extension BleManager: CBCentralManagerDelegate {
         )
         switch event {
         case .peerConnected:
+            // 已有 exact owner 的 pending attempt（claim 后 admission 已提交 central.connect）
+            // 时，系统 connection event 只是该 attempt 物理完成的前奏，紧随的 didConnect
+            // 必须走 findActiveConnectRequest → Gate。此处若再入 escrow，didConnect 会被
+            // 当成 claim 前的 "hold before claim" 吞掉，直到 60 s pending watchdog 才发现
+            // （2026-09-02 真机 SR：左腿系统连上后 21 s 才进 GATT，题词 / Dashboard 因
+            // 单腿未连失败）。watchdog 仍是丢回调时的兜底，此处不改变它。
+            if findActiveConnectRequest(peripheral: peripheral) != nil {
+                recordAutoReconnectEvent(
+                    type: "ios_connection_event_ignored",
+                    uuid: uuid,
+                    name: name,
+                    detail: "reason=activeConnectRequest"
+                )
+                loggerD(msg: "connectionEvent peer connected: uuid=\(uuid), name=\(name), active connect request owns it, skip escrow")
+                return
+            }
             // connection event 只提供物理对象；先进入 escrow，再由现有 exact owner
             // activation 接入 admission/GATT/AUTH，禁止把系统连接直接投影成业务成功。
             escrowStateRestorationPeripheral(peripheral, source: "connectionEvent")

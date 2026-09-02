@@ -280,3 +280,7 @@ iOS R1 的 CoreBluetooth Code 14 新鲜广播恢复属于同一个长期 reconne
 - 连续 1000 次 cancel watchdog 漏回调仍只有一个 debt counter slot；迟到 debt 不吞业务 connected 后的真实断连。
 - UUID 连续漂移仍只保留两个 alias，旧 UI owner 可真取消，历史 Gate identity 不增长。
 - UI 一分钟超时不停止 pending connect；点击取消会停止且在下一次手动点击前不会恢复。
+
+## connection event 与已认领 attempt（2026-09-02 真机修正）
+
+`centralManager(_:connectionEventDidOccur:for:)` 的 `peerConnected` 只在该 peripheral **没有** active connect request 时才进入 escrow；claim 后 admission 已提交 `central.connect` 的腿，系统 connection event 只是同一 attempt 物理完成的前奏，随后的 `didConnect` 必须经 `findActiveConnectRequest` 直接进入 admission Gate。若再入 escrow，`didConnect` 会被 `handleStateRestorationEscrowDidConnect` 当作 claim 前的 hold 吞掉，直到 60 s pending physical watchdog 观察到 `.connected` 才补进 Gate（真机：左腿系统连上后 21 s 才开始 GATT）。命中时记录 `ios_connection_event_ignored reason=activeConnectRequest`；watchdog 仍保留为丢回调兜底。
