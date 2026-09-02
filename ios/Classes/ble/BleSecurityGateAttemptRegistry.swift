@@ -5,6 +5,13 @@ struct BleSecurityGateAttempt: Equatable {
     let characteristicUUID: String
 }
 
+/// Observable producer of one consumed Security Gate failure. The trigger is
+/// diagnostic only; both cases enter the same exact-attempt recovery policy.
+enum BleSecurityGateFailureTrigger: String {
+    case callbackFailure
+    case timeout
+}
+
 /// Tracks the single protected write that gates connectFinish for one exact
 /// physical attempt. CoreBluetooth write callbacks do not carry our session
 /// token, so every consume path must compare generation and session.
@@ -39,6 +46,26 @@ final class BleSecurityGateAttemptRegistry {
         let key = endpointKey(endpointId)
         guard let attempt = attempts[key],
               let currentAdmission,
+              isSameAttempt(attempt.admission, currentAdmission),
+              attempt.characteristicUUID.caseInsensitiveCompare(characteristicUUID) == .orderedSame else {
+            return nil
+        }
+        attempts.removeValue(forKey: key)
+        return attempt
+    }
+
+    /// Atomically consumes the protected write when the connection deadline
+    /// expires while that exact attempt is still waiting for CoreBluetooth.
+    /// The callback and timeout paths share this single take point so a late
+    /// `didWriteValueFor` can never charge the replacement generation again.
+    func consumeTimeout(
+        characteristicUUID: String?,
+        currentAdmission: BleConnectionAdmission?
+    ) -> BleSecurityGateAttempt? {
+        guard let currentAdmission,
+              let characteristicUUID else { return nil }
+        let key = endpointKey(currentAdmission.endpointId)
+        guard let attempt = attempts[key],
               isSameAttempt(attempt.admission, currentAdmission),
               attempt.characteristicUUID.caseInsensitiveCompare(characteristicUUID) == .orderedSame else {
             return nil

@@ -116,6 +116,7 @@ extension BleManager {
      */
     func clearPersistedReconnectTargets() {
         reconnectStore.clearTargets()
+        reconnectStore.clearSecurityRecoveryRecords()
         stoppedPeerPairingRecoveryKeys.removeAll()
     }
 
@@ -250,6 +251,16 @@ extension BleManager {
         source: BleConnectSource,
         sessionGeneration: Int64 = 0
     ) -> BleReconnectTask? {
+        // A cold-start automatic arm must honor the durable fifth-failure latch
+        // before it recreates either a reconnect target or a CoreBluetooth owner.
+        if source != .manualReconnect,
+           reconnectStore.securityRecoveryRecord(
+               belongConfig: target.belongConfig,
+               name: target.name
+           )?.exhausted == true {
+            loggerD(msg: "autoReconnect: \(target.uuid)-\(target.name), arm rejected reason=securityRecoveryExhaustedPersisted")
+            return nil
+        }
         let persistedCanonical = reconnectStore.target(uuid: "", name: target.name)
         let canonicalUuid = BleReconnectTargetIdentityPolicy.canonicalUuid(
             callerUuid: target.uuid,
@@ -306,6 +317,18 @@ extension BleManager {
             name: effectiveTarget.name,
             source: source
         )
+        if source != .manualReconnect,
+           let persistedRecovery = reconnectStore.securityRecoveryRecord(
+               belongConfig: effectiveTarget.belongConfig,
+               name: effectiveTarget.name
+           ) {
+            // Process recreation restores the monotonic episode budget; a new
+            // Dart batch cannot silently turn attempt 4 back into attempt 0.
+            task.securityGateFailureCount = max(
+                task.securityGateFailureCount,
+                persistedRecovery.failureCount
+            )
+        }
         let previousSessionGeneration = task.sessionGeneration
         task.name = effectiveTarget.name.isEmpty ? task.name : effectiveTarget.name
         task.source = BleReconnectSourcePolicy.onArm(
@@ -352,7 +375,11 @@ extension BleManager {
         ) else {
             return false
         }
-        return stoppedPeerPairingRecoveryKeys.contains(key)
+        return stoppedPeerPairingRecoveryKeys.contains(key) ||
+            reconnectStore.securityRecoveryRecord(
+                belongConfig: target.belongConfig,
+                name: target.name
+            )?.exhausted == true
     }
 
     private func clearStoppedPeerPairingRecovery(belongConfig: String, name: String) {
@@ -360,6 +387,10 @@ extension BleManager {
             return
         }
         stoppedPeerPairingRecoveryKeys.remove(key)
+        reconnectStore.removeSecurityRecoveryRecord(
+            belongConfig: belongConfig,
+            name: name
+        )
     }
 
     /// 结束当前 Code 14 恢复 owner，但保留一个无资源的身份标记。后续自动 activation
@@ -411,6 +442,10 @@ extension BleManager {
             // 点击可以开始新 attempt；这里返回 rejected 只结束当前 batch，不触发 UI。
             let manualTakesOverStoppedRecovery =
                 source == .manualReconnect && hasStoppedPeerPairingRecovery(target)
+            let hasPersistedSecurityExhaustion = reconnectStore.securityRecoveryRecord(
+                belongConfig: target.belongConfig,
+                name: trimmedName
+            )?.exhausted == true
             if source == .manualReconnect {
                 // Manual click starts a fresh user-visible attempt. It consumes
                 // any silent automatic stop marker and resets the 5403 budget
@@ -421,11 +456,14 @@ extension BleManager {
                 )
             }
             if source != .manualReconnect, hasStoppedPeerPairingRecovery(target) {
-                loggerD(msg: "autoReconnect activation rejected: config=\(target.belongConfig), name=\(trimmedName), reason=peerPairingRecoveryStopped")
+                let rejectionReason = hasPersistedSecurityExhaustion
+                    ? "securityRecoveryExhaustedPersisted"
+                    : "peerPairingRecoveryStopped"
+                loggerD(msg: "autoReconnect activation rejected: config=\(target.belongConfig), name=\(trimmedName), reason=\(rejectionReason)")
                 return BleReconnectActivationResult(
                     target: target,
                     state: .rejected,
-                    reason: "peerPairingRecoveryStopped",
+                    reason: rejectionReason,
                     source: source,
                     sessionGeneration: sessionGeneration
                 )
@@ -784,6 +822,9 @@ extension BleManager {
                 stoppedPeerPairingRecoveryKeys.filter { !$0.hasSuffix(suffix) }
             )
         }
+        // Exhaustion removes the reconnect target before publishing its final
+        // state, so a later unbind may only have endpoint UUID/name available.
+        reconnectStore.removeSecurityRecoveryRecord(uuid: uuid, name: name)
         if !name.isEmpty {
             pendingReconnectIdentities = pendingReconnectIdentities.filter {
                 $0.value.name != name
@@ -1448,10 +1489,9 @@ extension BleManager {
         task.timer = nil
         task.pairingRecoveryState = .normal
         task.hasAttemptedPairingRecovery = false
-        task.securityGateFailureCount = 0
         reconnectTasks[key] = task
         purgeStaleScanCache(uuid: task.uuid, name: task.name)
-        loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), non-Code14 terminal exits fresh peripheral recovery")
+        loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), non-Code14 terminal exits fresh peripheral recovery; security gate budget preserved=\(task.securityGateFailureCount)")
     }
 
     /// Records a real iOS 5403 protected-write security failure for the active
@@ -1474,14 +1514,41 @@ extension BleManager {
         var task = reconnectTasks[key] else {
             return nil
         }
-        if source == .manualReconnect {
+        let action = BlePeerPairingRecoveryPolicy.actionAfterSecurityGateFailure(
+            source: source,
+            failureCount: task.securityGateFailureCount + 1
+        )
+        if action == .stopAttempt {
             stopPeerPairingRecoveryTask(task, reason: "manualSecurityGateFailure")
             return .stopAttempt
         }
-        task.securityGateFailureCount += 1
+        let persistedFailureCount = reconnectStore.securityRecoveryRecord(
+            belongConfig: task.belongConfig,
+            name: task.name
+        )?.failureCount ?? 0
+        task.securityGateFailureCount = min(
+            max(task.securityGateFailureCount, persistedFailureCount) + 1,
+            BlePeerPairingRecoveryPolicy.maxSecurityGateAttempts
+        )
         let failureCount = task.securityGateFailureCount
-        if failureCount >= BlePeerPairingRecoveryPolicy.maxSecurityGateAttempts {
+        // Persist before any cancellation or owner mutation so a process exit
+        // cannot reopen an already consumed attempt on the next cold start.
+        reconnectStore.upsertSecurityRecoveryRecord(
+            belongConfig: task.belongConfig,
+            name: task.name,
+            uuid: task.uuid,
+            failureCount: failureCount
+        )
+        let automaticAction = BlePeerPairingRecoveryPolicy.actionAfterSecurityGateFailure(
+            source: source,
+            failureCount: failureCount
+        )
+        if automaticAction == .securityRecoveryExhausted {
             loggerE(msg: "securityRecoveryExhausted owner=\(task.uuid), sessionGeneration=\(task.sessionGeneration), attempts=\(failureCount)")
+            // The durable stop record remains after the physical target is
+            // retired; only success, manual activation, unbind, or target reset
+            // may clear it.
+            reconnectStore.remove(uuid: task.uuid, name: task.name)
             stopPeerPairingRecoveryTask(task, reason: "securityRecoveryExhausted")
             return .securityRecoveryExhausted
         }
@@ -1514,6 +1581,10 @@ extension BleManager {
         task.pairingRecoveryState = .normal
         task.hasAttemptedPairingRecovery = false
         reconnectTasks[key] = task
+        clearStoppedPeerPairingRecovery(
+            belongConfig: task.belongConfig,
+            name: task.name
+        )
         loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), security gate recovery reset after success")
     }
 

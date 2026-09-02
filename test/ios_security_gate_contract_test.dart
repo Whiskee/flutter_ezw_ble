@@ -79,6 +79,14 @@ void main() {
       contains('lhs.sessionGeneration == rhs.sessionGeneration'),
     );
     expect(registry, isNot(contains('asyncAfter')));
+    expect(registry, contains('func consumeTimeout('));
+    expect(manager, contains('securityGateAttempts.consumeTimeout('));
+    expect(
+      manager,
+      contains('characteristicUUID: currentConfig.securityGate?.writeChars'),
+    );
+    expect(manager, contains('handleSecurityGateFailure('));
+    expect(manager, contains('trigger: .timeout'));
   });
 
   test('unsupported iOS security gate write falls back without exhausting', () {

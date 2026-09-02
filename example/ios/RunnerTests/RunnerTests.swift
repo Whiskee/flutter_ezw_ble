@@ -28,6 +28,284 @@ class RunnerTests: XCTestCase {
     )
   }
 
+  func testSecurityGateFailurePolicyStopsAutomaticAttemptFiveAndManualAttemptOne() {
+    for failureCount in 1..<BlePeerPairingRecoveryPolicy.maxSecurityGateAttempts {
+      XCTAssertEqual(
+        BlePeerPairingRecoveryPolicy.actionAfterSecurityGateFailure(
+          source: .autoReconnect,
+          failureCount: failureCount
+        ),
+        .retryFreshAdvertisement
+      )
+    }
+    XCTAssertEqual(
+      BlePeerPairingRecoveryPolicy.actionAfterSecurityGateFailure(
+        source: .autoReconnect,
+        failureCount: BlePeerPairingRecoveryPolicy.maxSecurityGateAttempts
+      ),
+      .securityRecoveryExhausted
+    )
+    XCTAssertEqual(
+      BlePeerPairingRecoveryPolicy.actionAfterSecurityGateFailure(
+        source: .manualReconnect,
+        failureCount: 1
+      ),
+      .stopAttempt
+    )
+  }
+
+  func testAutomaticSecurityGateFailureFiveRetiresOwnerAndRejectsAttemptSix() {
+    let manager = BleManager.shared
+    let originalConfigs = manager.bleConfigs
+    let configName = "security-recovery-\(UUID().uuidString)"
+    let target = BleReconnectTarget(
+      belongConfig: configName,
+      uuid: UUID().uuidString,
+      name: "Even G2_L_\(UUID().uuidString)"
+    )
+    defer {
+      manager.cancelReconnectTask(uuid: target.uuid, name: target.name)
+      manager.reconnectStore.remove(uuid: target.uuid, name: target.name)
+      manager.bleConfigs = originalConfigs
+    }
+    manager.bleConfigs = [makeConfig(name: configName, autoReconnect: true)]
+    XCTAssertNotNil(manager.armReconnectTarget(
+      target,
+      source: .autoReconnect,
+      sessionGeneration: 901
+    ))
+
+    for failureCount in 1..<BlePeerPairingRecoveryPolicy.maxSecurityGateAttempts {
+      XCTAssertEqual(
+        manager.registerSecurityGateFailure(
+          uuid: target.uuid,
+          name: target.name,
+          source: .autoReconnect
+        ),
+        .retryFreshAdvertisement,
+        "attempt \(failureCount) must keep the exact automatic owner"
+      )
+    }
+    XCTAssertEqual(
+      manager.registerSecurityGateFailure(
+        uuid: target.uuid,
+        name: target.name,
+        source: .autoReconnect
+      ),
+      .securityRecoveryExhausted
+    )
+    XCTAssertNil(manager.reconnectStore.target(uuid: target.uuid, name: target.name))
+
+    let attemptSix = manager.activateAutoReconnectTargets(
+      [target],
+      source: .autoReconnect,
+      sessionGeneration: 902
+    ).first
+    XCTAssertEqual(attemptSix?.state, .rejected)
+    XCTAssertEqual(attemptSix?.reason, "securityRecoveryExhaustedPersisted")
+    XCTAssertNil(manager.reconnectTasks[target.uuid.lowercased()])
+  }
+
+  func testSecurityGateTimeoutAndCallbackCanConsumeExactAttemptOnlyOnce() {
+    let registry = BleSecurityGateAttemptRegistry()
+    let first = BleConnectionAdmission(
+      endpointId: "g2-left",
+      generation: 1,
+      sessionId: 101,
+      source: .autoReconnect,
+      sessionGeneration: 11
+    )
+    registry.start(admission: first, characteristicUUID: "5403")
+
+    XCTAssertNil(registry.consumeTimeout(
+      characteristicUUID: "5404",
+      currentAdmission: first
+    ))
+    XCTAssertEqual(registry.consumeTimeout(
+      characteristicUUID: "5403",
+      currentAdmission: first
+    )?.admission, first)
+    XCTAssertNil(registry.consumeTimeout(
+      characteristicUUID: "5403",
+      currentAdmission: first
+    ))
+    XCTAssertNil(registry.complete(
+      endpointId: first.endpointId,
+      characteristicUUID: "5403",
+      currentAdmission: first
+    ))
+
+    let replacement = BleConnectionAdmission(
+      endpointId: first.endpointId,
+      generation: 2,
+      sessionId: 102,
+      source: .autoReconnect,
+      sessionGeneration: 11
+    )
+    registry.start(admission: replacement, characteristicUUID: "5403")
+    XCTAssertNil(registry.consumeTimeout(
+      characteristicUUID: "5403",
+      currentAdmission: first
+    ))
+    XCTAssertEqual(
+      registry.complete(
+        endpointId: replacement.endpointId,
+        characteristicUUID: "5403",
+        currentAdmission: replacement
+      )?.admission,
+      replacement
+    )
+  }
+
+  func testSecurityRecoveryBudgetPersistsAndKeepsPeerEndpointsIndependent() {
+    let suite = "flutter_ezw_ble.security_recovery.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let leftName = "Even G2_L_260827"
+    let rightName = "Even G2_R_260827"
+    let store = BleReconnectStore(defaults: defaults)
+    store.upsertSecurityRecoveryRecord(
+      belongConfig: "g2",
+      name: leftName,
+      uuid: "left-uuid",
+      failureCount: 4
+    )
+    store.upsertSecurityRecoveryRecord(
+      belongConfig: "g2",
+      name: rightName,
+      uuid: "right-uuid",
+      failureCount: 2
+    )
+
+    let relaunchedStore = BleReconnectStore(defaults: defaults)
+    XCTAssertEqual(
+      relaunchedStore.securityRecoveryRecord(belongConfig: "G2", name: leftName)?.failureCount,
+      4
+    )
+    XCTAssertEqual(
+      relaunchedStore.securityRecoveryRecord(belongConfig: "g2", name: rightName)?.failureCount,
+      2
+    )
+    relaunchedStore.upsertSecurityRecoveryRecord(
+      belongConfig: "g2",
+      name: leftName,
+      uuid: "left-uuid",
+      failureCount: 5
+    )
+    XCTAssertEqual(
+      relaunchedStore.securityRecoveryRecord(belongConfig: "g2", name: leftName)?.exhausted,
+      true
+    )
+    XCTAssertEqual(
+      relaunchedStore.securityRecoveryRecord(belongConfig: "g2", name: rightName)?.failureCount,
+      2
+    )
+
+    relaunchedStore.removeSecurityRecoveryRecord(belongConfig: "g2", name: leftName)
+    XCTAssertNil(relaunchedStore.securityRecoveryRecord(belongConfig: "g2", name: leftName))
+    XCTAssertEqual(
+      relaunchedStore.securityRecoveryRecord(belongConfig: "g2", name: rightName)?.failureCount,
+      2
+    )
+  }
+
+  func testSecurityRecoveryRejectsCorruptDefaultEntries() {
+    let suite = "flutter_ezw_ble.security_recovery_corrupt.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    defaults.set(
+      [[
+        "belongConfig": "g2",
+        "name": "Even G2_L_260827",
+        "lastUuid": "left-uuid",
+        "failureCount": "5",
+        "exhausted": "false"
+      ]],
+      forKey: "flutter_ezw_ble.reconnect.security_recovery"
+    )
+
+    XCTAssertTrue(BleReconnectStore(defaults: defaults).securityRecoveryRecords().isEmpty)
+  }
+
+  func testExhaustedSecurityRecoverySurvivesReconnectTargetRetirement() {
+    let suite = "flutter_ezw_ble.security_recovery_retire.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let store = BleReconnectStore(defaults: defaults)
+    let target = BleReconnectTarget(
+      belongConfig: "g2",
+      uuid: "left-uuid",
+      name: "Even G2_L_260827"
+    )
+    store.upsert(target: target)
+    store.upsertSecurityRecoveryRecord(
+      belongConfig: target.belongConfig,
+      name: target.name,
+      uuid: target.uuid,
+      failureCount: 5
+    )
+    store.remove(uuid: target.uuid, name: target.name)
+
+    let relaunchedStore = BleReconnectStore(defaults: defaults)
+    XCTAssertNil(relaunchedStore.target(uuid: target.uuid, name: target.name))
+    XCTAssertEqual(
+      relaunchedStore.securityRecoveryRecord(
+        belongConfig: target.belongConfig,
+        name: target.name
+      )?.exhausted,
+      true
+    )
+  }
+
+  func testSecurityRecoveryTargetReplacementClearsOnlyChangedStableIdentity() {
+    let suite = "flutter_ezw_ble.security_recovery_replace.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let store = BleReconnectStore(defaults: defaults)
+    let oldTarget = BleReconnectTarget(
+      belongConfig: "g2-old",
+      uuid: "left-uuid",
+      name: "Even G2_L_260827"
+    )
+    let peerTarget = BleReconnectTarget(
+      belongConfig: "g2",
+      uuid: "right-uuid",
+      name: "Even G2_R_260827"
+    )
+    store.upsert(target: oldTarget)
+    store.upsert(target: peerTarget)
+    store.upsertSecurityRecoveryRecord(
+      belongConfig: oldTarget.belongConfig,
+      name: oldTarget.name,
+      uuid: oldTarget.uuid,
+      failureCount: 4
+    )
+    store.upsertSecurityRecoveryRecord(
+      belongConfig: peerTarget.belongConfig,
+      name: peerTarget.name,
+      uuid: peerTarget.uuid,
+      failureCount: 3
+    )
+
+    store.upsert(target: BleReconnectTarget(
+      belongConfig: "g2-new",
+      uuid: oldTarget.uuid,
+      name: "Even G2_L_260828"
+    ))
+
+    XCTAssertNil(store.securityRecoveryRecord(
+      belongConfig: oldTarget.belongConfig,
+      name: oldTarget.name
+    ))
+    XCTAssertEqual(
+      store.securityRecoveryRecord(
+        belongConfig: peerTarget.belongConfig,
+        name: peerTarget.name
+      )?.failureCount,
+      3
+    )
+  }
+
   func testBusinessConnectionStaleAbortDoesNotRemoveReplacementLease() {
     let registry = BleBusinessConnectionLeaseRegistry()
     let attemptA = businessAttempt(generation: 1)

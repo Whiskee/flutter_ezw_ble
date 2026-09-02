@@ -26,7 +26,7 @@ struct BleConfig: Codable {
     let autoReconnectUseNativePassive: Bool
     //  Android 专用高可靠链路策略；iOS 仅保留配置协议兼容，不参与 CoreBluetooth 行为
     let androidHighReliabilityMode: Bool
-    //  可选安全门禁；iOS 使用受保护写特征触发系统安全建立，Android 忽略该配置。
+    //  可选安全门禁；两端都在普通 Notify 前使用受保护写验证当前共享密钥。
     let securityGate: BleSecurityGate?
     
     init(

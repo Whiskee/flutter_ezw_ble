@@ -38,7 +38,8 @@ void main() {
       isNot(contains(
           'stopPeerPairingRecoveryTask(current, reason: "freshAdvertisementTimeout")')),
     );
-    expect(reconnect, contains('reason: "peerPairingRecoveryStopped"'));
+    expect(reconnect, contains('"peerPairingRecoveryStopped"'));
+    expect(reconnect, contains('reason: rejectionReason'));
     expect(reconnect, contains('reason: "freshPairingRecoveryStarted"'));
     expect(reconnect, contains('advertisedMac: String'));
     expect(reconnect, contains('expectedMacSuffix'));
@@ -74,12 +75,12 @@ void main() {
     );
     expect(store, contains('var securityGateFailureCount: Int = 0'));
     expect(reconnect, contains('func registerSecurityGateFailure('));
-    expect(reconnect, contains('task.securityGateFailureCount += 1'));
+    expect(reconnect, contains('upsertSecurityRecoveryRecord('));
+    expect(reconnect, contains('persistedFailureCount) + 1'));
+    expect(reconnect, contains('actionAfterSecurityGateFailure('));
     expect(
       reconnect,
-      contains(
-        'failureCount >= BlePeerPairingRecoveryPolicy.maxSecurityGateAttempts',
-      ),
+      contains('automaticAction == .securityRecoveryExhausted'),
     );
     expect(reconnect, contains('return .securityRecoveryExhausted'));
     expect(
@@ -113,6 +114,30 @@ void main() {
     expect(
       reconnect,
       contains('resetSecurityGateRecoveryAfterSuccess'),
+    );
+    final nonPairingResetStart = reconnect.indexOf(
+      'func resetPeerPairingRecoveryAfterNonPairingFailure(',
+    );
+    final securityFailureStart = reconnect.indexOf(
+      'func registerSecurityGateFailure(',
+      nonPairingResetStart,
+    );
+    final nonPairingReset = reconnect.substring(
+      nonPairingResetStart,
+      securityFailureStart,
+    );
+    expect(
+      nonPairingReset,
+      isNot(contains('securityGateFailureCount = 0')),
+      reason: 'ordinary terminal states must preserve the recovery episode',
+    );
+    expect(
+      reconnect,
+      contains('securityRecoveryExhaustedPersisted'),
+    );
+    expect(
+      store,
+      contains('flutter_ezw_ble.reconnect.security_recovery'),
     );
     expect(reconnect, isNot(contains('maxSecurityGateAttempts = 6')));
   });

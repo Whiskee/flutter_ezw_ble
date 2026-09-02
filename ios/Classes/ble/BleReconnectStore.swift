@@ -44,6 +44,20 @@ enum BlePeerPairingRecoveryPolicy {
     ) -> BlePeerPairingRecoveryWindowAction {
         source == .manualReconnect ? .finishManualAttempt : .retryAfterDelay
     }
+
+    /// Resolves the terminal action after one exact 5403 attempt has failed.
+    /// Manual attempts never enter the silent automatic retry budget.
+    static func actionAfterSecurityGateFailure(
+        source: BleConnectSource,
+        failureCount: Int
+    ) -> BlePeerPairingFailureAction {
+        if source == .manualReconnect {
+            return .stopAttempt
+        }
+        return failureCount >= maxSecurityGateAttempts
+            ? .securityRecoveryExhausted
+            : .retryFreshAdvertisement
+    }
 }
 
 /// 当前 Code 14 回调对本次 attempt 的处置动作。
@@ -452,6 +466,78 @@ struct BleReconnectTarget {
     }
 }
 
+/// Durable iOS 5403 recovery episode keyed by stable config + full device name.
+/// CoreBluetooth identifiers may change after pairing repair, so UUID is kept
+/// only as an exact removal hint and never participates in the durable key.
+struct BleSecurityRecoveryRecord: Equatable {
+    let belongConfig: String
+    let name: String
+    let lastUuid: String
+    let failureCount: Int
+    let exhausted: Bool
+
+    init?(
+        belongConfig: String,
+        name: String,
+        lastUuid: String,
+        failureCount: Int,
+        exhausted: Bool
+    ) {
+        let normalizedConfig = belongConfig.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedConfig.isEmpty,
+              !normalizedName.isEmpty,
+              (1...BlePeerPairingRecoveryPolicy.maxSecurityGateAttempts).contains(failureCount),
+              exhausted == (failureCount >= BlePeerPairingRecoveryPolicy.maxSecurityGateAttempts) else {
+            return nil
+        }
+        self.belongConfig = normalizedConfig
+        self.name = normalizedName
+        self.lastUuid = lastUuid.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.failureCount = failureCount
+        self.exhausted = exhausted
+    }
+
+    /// Invalid or partially written UserDefaults entries fail closed by being
+    /// dropped instead of becoming a valid-looking shared recovery owner.
+    init?(raw: [String: String]) {
+        guard let belongConfig = raw["belongConfig"],
+              let name = raw["name"],
+              let failureCountRaw = raw["failureCount"],
+              let failureCount = Int(failureCountRaw),
+              let exhaustedRaw = raw["exhausted"] else {
+            return nil
+        }
+        let exhausted: Bool
+        switch exhaustedRaw.lowercased() {
+        case "true": exhausted = true
+        case "false": exhausted = false
+        default: return nil
+        }
+        self.init(
+            belongConfig: belongConfig,
+            name: name,
+            lastUuid: raw["lastUuid"] ?? "",
+            failureCount: failureCount,
+            exhausted: exhausted
+        )
+    }
+
+    var identityKey: String {
+        "\(belongConfig.lowercased())|\(name.lowercased())"
+    }
+
+    var raw: [String: String] {
+        [
+            "belongConfig": belongConfig,
+            "name": name,
+            "lastUuid": lastUuid,
+            "failureCount": String(failureCount),
+            "exhausted": String(exhausted)
+        ]
+    }
+}
+
 /// 空 UUID 的 iOS 目标由名称身份 owner 暂存，等待扫描补齐 CoreBluetooth UUID。
 struct BlePendingReconnectIdentity {
     let belongConfig: String
@@ -551,6 +637,10 @@ final class BleReconnectStore {
     private let targetsKey = "flutter_ezw_ble.reconnect.targets"
     /// native 被系统唤醒但 Dart 尚未监听时的事件缓冲 key。
     private let eventsKey = "flutter_ezw_ble.reconnect.events"
+    /// iOS 5403 automatic recovery budget survives process recreation and is
+    /// stored separately from reconnect targets so exhaustion can remove the
+    /// physical owner without losing the durable stop fact.
+    private let securityRecoveryKey = "flutter_ezw_ble.reconnect.security_recovery"
     /// 注入 defaults 便于未来做 store 级测试。
     private let defaults: UserDefaults
 
@@ -604,6 +694,79 @@ final class BleReconnectStore {
         }
     }
 
+    /// Returns the durable recovery state for one stable endpoint identity.
+    func securityRecoveryRecord(
+        belongConfig: String,
+        name: String
+    ) -> BleSecurityRecoveryRecord? {
+        guard let identityKey = securityRecoveryIdentityKey(
+            belongConfig: belongConfig,
+            name: name
+        ) else {
+            return nil
+        }
+        return securityRecoveryRecords().first { $0.identityKey == identityKey }
+    }
+
+    /// Persists the new count before teardown/reconnect scheduling. Invalid
+    /// identities are intentionally ignored rather than sharing a fallback key.
+    func upsertSecurityRecoveryRecord(
+        belongConfig: String,
+        name: String,
+        uuid: String,
+        failureCount: Int
+    ) {
+        guard let record = BleSecurityRecoveryRecord(
+            belongConfig: belongConfig,
+            name: name,
+            lastUuid: uuid,
+            failureCount: failureCount,
+            exhausted: failureCount >= BlePeerPairingRecoveryPolicy.maxSecurityGateAttempts
+        ) else {
+            return
+        }
+        let next = securityRecoveryRecords().filter {
+            $0.identityKey != record.identityKey
+        } + [record]
+        saveSecurityRecoveryRecords(next)
+    }
+
+    /// Clears a repaired/manual/unbound endpoint without touching its peer leg.
+    func removeSecurityRecoveryRecord(
+        belongConfig: String,
+        name: String
+    ) {
+        guard let identityKey = securityRecoveryIdentityKey(
+            belongConfig: belongConfig,
+            name: name
+        ) else {
+            return
+        }
+        saveSecurityRecoveryRecords(
+            securityRecoveryRecords().filter { $0.identityKey != identityKey }
+        )
+    }
+
+    /// Exact removal fallback for exhaustion, where the reconnect target has
+    /// already been retired before a later user unbind reaches native code.
+    func removeSecurityRecoveryRecord(uuid: String, name: String = "") {
+        let normalizedUuid = uuid.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedUuid.isEmpty || !normalizedName.isEmpty else { return }
+        saveSecurityRecoveryRecords(
+            securityRecoveryRecords().filter { record in
+                // Prefer the exact last CoreBluetooth identity. Name fallback is
+                // reserved for name-only owners so a supplied UUID can never
+                // broaden one-leg cleanup to another config with the same name.
+                if !normalizedUuid.isEmpty {
+                    return record.lastUuid.caseInsensitiveCompare(normalizedUuid) != .orderedSame
+                }
+                return normalizedName.isEmpty ||
+                    record.name.caseInsensitiveCompare(normalizedName) != .orderedSame
+            }
+        )
+    }
+
     /**
      *  新增或更新一个持久化目标。
      *
@@ -616,6 +779,13 @@ final class BleReconnectStore {
         }
         let name = device.peripheral.name ?? ""
         let existingTargets = targets()
+        clearReplacedSecurityRecoveryRecords(
+            existingTargets: existingTargets,
+            matchingUuid: uuid,
+            matchingName: name,
+            replacementConfig: device.belongConfig.name,
+            replacementName: name
+        )
         // live CBPeripheral 不携带广播 MAC；业务 connected 回写 UUID 时必须保留
         // Dart 绑定缓存曾提供的 suffix，供日后 Code 14 新鲜广播做附加身份校验。
         let expectedMacSuffix = existingTargets.first { target in
@@ -642,7 +812,15 @@ final class BleReconnectStore {
         guard !target.uuid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return
         }
-        let next = targets()
+        let existingTargets = targets()
+        clearReplacedSecurityRecoveryRecords(
+            existingTargets: existingTargets,
+            matchingUuid: target.uuid,
+            matchingName: target.name,
+            replacementConfig: target.belongConfig,
+            replacementName: target.name
+        )
+        let next = existingTargets
             .filter { stored in
                 stored.uuid.caseInsensitiveCompare(target.uuid) != .orderedSame &&
                     (target.name.isEmpty || stored.name != target.name)
@@ -659,7 +837,15 @@ final class BleReconnectStore {
         guard !target.uuid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return
         }
-        let next = targets().filter { stored in
+        let existingTargets = targets()
+        clearReplacedSecurityRecoveryRecords(
+            existingTargets: existingTargets,
+            matchingUuid: oldUuid,
+            matchingName: oldName,
+            replacementConfig: target.belongConfig,
+            replacementName: target.name
+        )
+        let next = existingTargets.filter { stored in
             let isOld = stored.uuid.caseInsensitiveCompare(oldUuid) == .orderedSame ||
                 (!oldName.isEmpty && stored.name == oldName)
             let isNew = stored.uuid.caseInsensitiveCompare(target.uuid) == .orderedSame ||
@@ -693,6 +879,9 @@ final class BleReconnectStore {
         let existing = targets()
         let removed = existing.filter { configNames.contains($0.belongConfig) }
         saveTargets(existing.filter { !configNames.contains($0.belongConfig) })
+        saveSecurityRecoveryRecords(
+            securityRecoveryRecords().filter { !configNames.contains($0.belongConfig) }
+        )
         return removed
     }
 
@@ -705,6 +894,12 @@ final class BleReconnectStore {
         defaults.removeObject(forKey: targetsKey)
     }
 
+    /// Explicit remove-all/reset clears both reconnect authorization and the
+    /// recovery episode that was scoped to those targets.
+    func clearSecurityRecoveryRecords() {
+        defaults.removeObject(forKey: securityRecoveryKey)
+    }
+
     /**
      *  读取全部有效目标。
      *
@@ -715,6 +910,13 @@ final class BleReconnectStore {
             .compactMap(BleReconnectTarget.init(raw:))
     }
 
+    /// Testable decoder also ensures corrupted legacy/default entries never
+    /// become a valid recovery latch after an application update.
+    func securityRecoveryRecords() -> [BleSecurityRecoveryRecord] {
+        (defaults.array(forKey: securityRecoveryKey) as? [[String: String]] ?? [])
+            .compactMap(BleSecurityRecoveryRecord.init(raw:))
+    }
+
     /**
      *  保存目标列表。
      *
@@ -722,5 +924,54 @@ final class BleReconnectStore {
      */
     private func saveTargets(_ targets: [BleReconnectTarget]) {
         defaults.set(targets.map(\.raw), forKey: targetsKey)
+    }
+
+    private func saveSecurityRecoveryRecords(_ records: [BleSecurityRecoveryRecord]) {
+        if records.isEmpty {
+            defaults.removeObject(forKey: securityRecoveryKey)
+        } else {
+            defaults.set(records.map(\.raw), forKey: securityRecoveryKey)
+        }
+    }
+
+    private func securityRecoveryIdentityKey(
+        belongConfig: String,
+        name: String
+    ) -> String? {
+        let config = belongConfig.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let deviceName = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !config.isEmpty, !deviceName.isEmpty else { return nil }
+        return "\(config)|\(deviceName)"
+    }
+
+    /// A UUID/name replacement represents a new endpoint when its stable
+    /// config + full-name key changes. Retire only the replaced endpoint's
+    /// episode; a UUID-only migration with the same stable key preserves it.
+    private func clearReplacedSecurityRecoveryRecords(
+        existingTargets: [BleReconnectTarget],
+        matchingUuid: String,
+        matchingName: String,
+        replacementConfig: String,
+        replacementName: String
+    ) {
+        let replacementKey = securityRecoveryIdentityKey(
+            belongConfig: replacementConfig,
+            name: replacementName
+        )
+        existingTargets.filter { stored in
+            stored.uuid.caseInsensitiveCompare(matchingUuid) == .orderedSame ||
+                (!matchingName.isEmpty && stored.name == matchingName)
+        }.forEach { stored in
+            let oldKey = securityRecoveryIdentityKey(
+                belongConfig: stored.belongConfig,
+                name: stored.name
+            )
+            if oldKey != nil, oldKey != replacementKey {
+                removeSecurityRecoveryRecord(
+                    belongConfig: stored.belongConfig,
+                    name: stored.name
+                )
+            }
+        }
     }
 }

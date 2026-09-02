@@ -1887,6 +1887,22 @@ extension BleManager {
             })?.isConnected != true else {
                 return
             }
+            if let admission,
+               let currentAdmission = self.currentConnectionAdmission(admission),
+               self.securityGateAttempts.consumeTimeout(
+                   characteristicUUID: currentConfig.securityGate?.writeChars,
+                   currentAdmission: currentAdmission
+               ) != nil {
+                // The protected write owned this deadline. Consume it before
+                // teardown so a late CoreBluetooth callback cannot charge the
+                // same or replacement generation a second time.
+                self.handleSecurityGateFailure(
+                    admission: currentAdmission,
+                    name: name,
+                    trigger: .timeout
+                )
+                return
+            }
             //  预连接(协议层鉴权进行中)：给一次有界宽限期，而不是永久豁免。
             //  永久豁免会导致 Dart 端鉴权流程异常/挂起(deviceConnected 永不到达)时，
             //  设备永久停在 connectFinish，App UI 一直显示"连接中"且无法自愈。
@@ -2930,6 +2946,85 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
         queue.onPeripheralReadyToSendWriteWithoutResponse()
     }
 
+    /// Routes a consumed 5403 failure through one policy regardless of whether
+    /// CoreBluetooth returned a security error or never returned the write
+    /// callback. Ownership was already atomically consumed by the registry.
+    private func handleSecurityGateFailure(
+        admission: BleConnectionAdmission,
+        name: String,
+        trigger: BleSecurityGateFailureTrigger,
+        error: NSError? = nil
+    ) {
+        let belongConfig = reconnectTasks.values.first(where: { task in
+            isSameConnectTarget(
+                storedUuid: task.uuid,
+                storedName: task.name,
+                uuid: admission.endpointId,
+                name: name
+            )
+        })?.belongConfig ?? ""
+        let recoveryAction = registerSecurityGateFailure(
+            uuid: admission.endpointId,
+            name: name,
+            source: admission.source
+        )
+        let persistedFailureCount = reconnectStore.securityRecoveryRecord(
+            belongConfig: belongConfig,
+            name: name
+        )?.failureCount
+        recordNativeTrace(
+            uuid: admission.endpointId,
+            stage: "security_gate",
+            result: trigger == .timeout ? "timeout" : "failed",
+            causeDomain: error?.domain ?? (trigger == .timeout ? "CoreBluetooth" : nil),
+            causeCode: error?.code,
+            actionResult: recoveryAction?.rawValue
+        )
+        loggerE(msg: "security gate: \(admission.endpointId), result=\(trigger.rawValue), attempts=\(persistedFailureCount.map { String($0) } ?? "manual"), action=\(recoveryAction?.rawValue ?? "boundFail"), sessionGeneration=\(admission.sessionGeneration), attemptGeneration=\(admission.generation)")
+
+        if recoveryAction == .retryFreshAdvertisement {
+            handleConnectState(
+                uuid: admission.endpointId,
+                name: name,
+                state: .disconnectFromSys,
+                source: admission.source,
+                generation: admission.sessionGeneration,
+                attemptGeneration: admission.generation,
+                preserveSecurityGateRecovery: true,
+                traceCauseDomain: error?.domain ?? trigger.rawValue,
+                traceCauseCode: error?.code,
+                tag: "security gate \(trigger.rawValue) retry"
+            )
+            return
+        }
+        if recoveryAction == .securityRecoveryExhausted {
+            handleConnectState(
+                uuid: admission.endpointId,
+                name: name,
+                state: .securityRecoveryExhausted,
+                source: admission.source,
+                generation: admission.sessionGeneration,
+                attemptGeneration: admission.generation,
+                suppressReconnectSchedule: true,
+                traceCauseDomain: error?.domain ?? trigger.rawValue,
+                traceCauseCode: error?.code,
+                tag: "security gate \(trigger.rawValue) exhausted"
+            )
+            return
+        }
+        handleConnectState(
+            uuid: admission.endpointId,
+            name: name,
+            state: .boundFail,
+            source: admission.source,
+            generation: admission.sessionGeneration,
+            attemptGeneration: admission.generation,
+            traceCauseDomain: error?.domain ?? trigger.rawValue,
+            traceCauseCode: error?.code,
+            tag: "security gate \(trigger.rawValue)"
+        )
+    }
+
     /// Completes only the protected write registered for the exact active
     /// peripheral/session/attempt. Other write-with-response callbacks are left
     /// untouched, and stale callbacks cannot unblock a replacement attempt.
@@ -2948,48 +3043,25 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             return
         }
         if let error = error as NSError? {
+            recordBondSecurityFailureIfNeeded(peripheral: peripheral, error: error)
+            loggerE(msg: "security gate: \(admission.endpointId), protected write failed domain=\(error.domain), code=\(error.code)")
+            if isBondSecurityError(error) {
+                handleSecurityGateFailure(
+                    admission: admission,
+                    name: peripheral.name ?? "",
+                    trigger: .callbackFailure,
+                    error: error
+                )
+                return
+            }
             recordNativeTrace(
                 uuid: admission.endpointId,
                 stage: "security_gate",
                 result: "failed",
                 causeDomain: error.domain,
-                causeCode: error.code
+                causeCode: error.code,
+                actionResult: "boundFail"
             )
-            recordBondSecurityFailureIfNeeded(peripheral: peripheral, error: error)
-            loggerE(msg: "security gate: \(admission.endpointId), protected write failed domain=\(error.domain), code=\(error.code)")
-            if isBondSecurityError(error) {
-                let recoveryAction = registerSecurityGateFailure(
-                    uuid: admission.endpointId,
-                    name: peripheral.name ?? "",
-                    source: admission.source
-                )
-                if recoveryAction == .retryFreshAdvertisement {
-                    handleConnectState(
-                        uuid: admission.endpointId,
-                        name: peripheral.name ?? "",
-                        state: .disconnectFromSys,
-                        source: admission.source,
-                        generation: admission.sessionGeneration,
-                        attemptGeneration: admission.generation,
-                        preserveSecurityGateRecovery: true,
-                        tag: "security gate write retry"
-                    )
-                    return
-                }
-                if recoveryAction == .securityRecoveryExhausted {
-                    handleConnectState(
-                        uuid: admission.endpointId,
-                        name: peripheral.name ?? "",
-                        state: .securityRecoveryExhausted,
-                        source: admission.source,
-                        generation: admission.sessionGeneration,
-                        attemptGeneration: admission.generation,
-                        suppressReconnectSchedule: true,
-                        tag: "security gate write exhausted"
-                    )
-                    return
-                }
-            }
             handleConnectState(
                 uuid: admission.endpointId,
                 name: peripheral.name ?? "",
