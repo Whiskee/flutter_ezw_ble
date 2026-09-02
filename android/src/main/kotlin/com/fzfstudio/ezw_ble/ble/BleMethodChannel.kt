@@ -104,8 +104,8 @@ enum class BleMC {
                 return result.success("Android ${android.os.Build.VERSION.RELEASE}")
             }
             BLE_STATE -> {
-                // 1. 蓝牙状态由 BleManager 统一缓存，避免在 channel 层重复读系统状态。
-                return result.success(BleManager.instance.currentBleState)
+                // 主动查询必须穿透初始化缓存，权限弹窗返回后同一 Activity 也能立即得到新状态。
+                return result.success(BleManager.instance.refreshBleState("methodChannel.bleState"))
             }
             INIT_CONFIGS -> {
                 // 1. Dart 传入的是 List<Map>，这里转换成原生配置模型。
