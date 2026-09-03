@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:flutter_ezw_ble/core/models/ble_private_service.dart';
 import 'package:flutter_ezw_ble/core/models/ble_scan.dart';
+import 'package:flutter_ezw_ble/core/models/ble_security_gate.dart';
 import 'package:json_annotation/json_annotation.dart';
 
 part 'ble_config.g.dart';
@@ -29,6 +30,8 @@ class BleConfig {
   final bool autoReconnectUseNativePassive;
   //  Android 高可靠链路模式：以 1M 建链，并按 RSSI/流量动态调整 PHY 与连接优先级
   final bool androidHighReliabilityMode;
+  //  iOS 可选安全门禁：受保护写特征触发系统配对/加密后，才上报 connectFinish。
+  final BleSecurityGate? securityGate;
 
   BleConfig(
     this.name,
@@ -42,6 +45,7 @@ class BleConfig {
     this.autoReconnectMaxAttempts = 0,
     this.autoReconnectUseNativePassive = true,
     this.androidHighReliabilityMode = false,
+    this.securityGate,
   });
 
   factory BleConfig.fromJson(Map<String, dynamic> json) =>
@@ -53,6 +57,10 @@ class BleConfig {
     final map = toJson();
     map["privateServices"] = privateServices.map((e) => e.toJson()).toList();
     map["scan"] = scan.customToJson();
+    final securityGate = this.securityGate;
+    if (securityGate != null) {
+      map["securityGate"] = securityGate.toJson();
+    }
     return map;
   }
 

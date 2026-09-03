@@ -26,6 +26,8 @@ struct BleConfig: Codable {
     let autoReconnectUseNativePassive: Bool
     //  Android 专用高可靠链路策略；iOS 仅保留配置协议兼容，不参与 CoreBluetooth 行为
     let androidHighReliabilityMode: Bool
+    //  可选安全门禁；两端都在普通 Notify 前使用受保护写验证当前共享密钥。
+    let securityGate: BleSecurityGate?
     
     init(
         name: String,
@@ -37,7 +39,8 @@ struct BleConfig: Codable {
         autoReconnect: Bool = false,
         autoReconnectMaxAttempts: Int = 0,
         autoReconnectUseNativePassive: Bool = true,
-        androidHighReliabilityMode: Bool = false
+        androidHighReliabilityMode: Bool = false,
+        securityGate: BleSecurityGate? = nil
     ) {
         self.name = name
         self.scan = scan
@@ -50,6 +53,7 @@ struct BleConfig: Codable {
         self.autoReconnectMaxAttempts = autoReconnectMaxAttempts
         self.autoReconnectUseNativePassive = autoReconnectUseNativePassive
         self.androidHighReliabilityMode = androidHighReliabilityMode
+        self.securityGate = securityGate
         assert(connectTimeout > 10000, "The timeout period must be greater than 10000ms")
     }
 
@@ -64,6 +68,7 @@ struct BleConfig: Codable {
         case autoReconnectMaxAttempts
         case autoReconnectUseNativePassive
         case androidHighReliabilityMode
+        case securityGate
     }
 
     init(from decoder: Decoder) throws {
@@ -78,7 +83,8 @@ struct BleConfig: Codable {
             autoReconnect: try container.decodeIfPresent(Bool.self, forKey: .autoReconnect) ?? false,
             autoReconnectMaxAttempts: try container.decodeIfPresent(Int.self, forKey: .autoReconnectMaxAttempts) ?? 0,
             autoReconnectUseNativePassive: try container.decodeIfPresent(Bool.self, forKey: .autoReconnectUseNativePassive) ?? true,
-            androidHighReliabilityMode: try container.decodeIfPresent(Bool.self, forKey: .androidHighReliabilityMode) ?? false
+            androidHighReliabilityMode: try container.decodeIfPresent(Bool.self, forKey: .androidHighReliabilityMode) ?? false,
+            securityGate: try container.decodeIfPresent(BleSecurityGate.self, forKey: .securityGate)
         )
     }
     

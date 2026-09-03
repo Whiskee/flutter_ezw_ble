@@ -29,6 +29,7 @@
 - iOS State Restoration 只能恢复进程内 BLE 工作和 CoreBluetooth peripheral；私有服务、notify/CCCD、业务认证指令必须重新执行，不承诺把 App UI 拉到前台。
 - iOS `CBCentralManager(queue: nil)` 的 `retrieveConnectedPeripherals` / `retrievePeripherals` 只允许经 active 生命周期门禁调用；inactive/background/terminating 时只能复用 restoration/内存 peripheral，缺失时保留 exact deferred owner，不得制造 `noDeviceFound` 或增加 retry。`didBecomeActive` 补偿必须复验 config、owner 和 session generation。
 - iOS 业务 `connected` 释放 Gate 前必须把已接受的 `sessionGeneration + attemptGeneration` 成对保存在 reconnect owner；随后的 CoreBluetooth `didDisconnect` / 蓝牙关闭终态必须回传该 exact pair。禁止只恢复 session 而把 attempt 降为 0，显式取消、替换、移除 owner 必须同时使该快照不可达。
+- Android/iOS G2 `securityGate`（5403）必须在普通业务 Notify 订阅和 `connectFinish` 前完成一次有响应保护写。Android G2 必须配置 `initiateBinding=true`：exact admission 先通过 `createBond()` 唯一拉起系统配对，Bond 完成后再发现服务并写 5403 验证当前链路密钥，避免主动 Bond 与受保护写分别触发配对弹窗；已 Bond 设备不得重复 `createBond()`，5403 缺失/不支持时按旧固件路径继续普通 readiness。真实 Gate/Bond 安全失败按每 endpoint 每 episode 最多 5 次恢复，第 5 次发布静默 `securityRecoveryExhausted`；手动第一次安全失败仍走 `boundFail`。
 - iOS R1 自动回连首次收到 CoreBluetooth Code 14 后，只能使用新广告中的真实 `CBPeripheral` 恢复：App active 且蓝牙可用时按 10 秒扫描、5 秒静默等待无限循环，扫描 miss 不得删除 owner、发送 Dart 终态或制造 attempt 0；新 peripheral 再次 Code 14 才停止自动 owner并保持静默。手动点击必须 exact 接管并使用独立正 generation，只有当前手动物理 attempt 的真实 Code 14 才能上报 `alreadyBound`；生命周期暂停、共享扫描和迟到 callback 不得跨 owner 生效。
 
 ## 修改规则

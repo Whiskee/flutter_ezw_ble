@@ -133,6 +133,9 @@ enum BleConnectState: String, Codable {
     case bleError
     //  错误：系统错误
     case systemError
+    // iOS 自动安全恢复耗尽。它是 native 资源终态，但不是 App 可见错误；
+    // Dart/even_connect 会显式消费该状态并保持 UI 静默。
+    case securityRecoveryExhausted
     //  连接成功：
     //  - 由于不同设备连接成功标准不通，所以不主动返回连接成功
     //  - 提供了setConnected，由用户告知是否连接成功

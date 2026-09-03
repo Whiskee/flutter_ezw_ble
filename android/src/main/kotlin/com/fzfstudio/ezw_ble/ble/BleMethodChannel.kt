@@ -8,6 +8,7 @@ import com.fzfstudio.ezw_ble.ble.models.BleConfig
 import com.fzfstudio.ezw_ble.ble.models.BleConnectSource
 import com.fzfstudio.ezw_ble.ble.models.BlePrivateService
 import com.fzfstudio.ezw_ble.ble.models.BleScan
+import com.fzfstudio.ezw_ble.ble.models.BleSecurityGate
 import com.fzfstudio.ezw_ble.ble.models.BleSnRule
 import com.fzfstudio.ezw_utils.extension.toUpperSnakeCase
 import io.flutter.plugin.common.MethodChannel
@@ -107,8 +108,8 @@ enum class BleMC {
                 return result.success("Android ${android.os.Build.VERSION.RELEASE}")
             }
             BLE_STATE -> {
-                // 1. 蓝牙状态由 BleManager 统一缓存，避免在 channel 层重复读系统状态。
-                return result.success(BleManager.instance.currentBleState)
+                // 主动查询必须穿透初始化缓存，权限弹窗返回后同一 Activity 也能立即得到新状态。
+                return result.success(BleManager.instance.refreshBleState("methodChannel.bleState"))
             }
             INIT_CONFIGS -> {
                 // 1. Dart 传入的是 List<Map>，这里转换成原生配置模型。
@@ -394,6 +395,7 @@ private fun Map<*, *>.toBleConfig(): BleConfig? {
         name = name,
         scan = scan,
         privateServices = privateServices,
+        securityGate = (get("securityGate") as? Map<*, *>)?.toBleSecurityGate(),
         initiateBinding = get("initiateBinding") as? Boolean ?: false,
         connectTimeout = get("connectTimeout").toDoubleOrDefault(15000.0),
         upgradeSwapTime = get("upgradeSwapTime").toDoubleOrDefault(60000.0),
@@ -401,7 +403,18 @@ private fun Map<*, *>.toBleConfig(): BleConfig? {
         autoReconnect = get("autoReconnect") as? Boolean ?: false,
         autoReconnectMaxAttempts = get("autoReconnectMaxAttempts").toIntOrDefault(0),
         autoReconnectUseNativePassive = get("autoReconnectUseNativePassive") as? Boolean ?: true,
+        androidHighReliabilityMode = get("androidHighReliabilityMode") as? Boolean ?: false,
     )
+}
+
+/** 可选门禁缺字段时按未配置处理，保持旧固件连接路径。 */
+private fun Map<*, *>.toBleSecurityGate(): BleSecurityGate? {
+    val service = get("service") as? String ?: return null
+    val writeChars = get("writeChars") as? String ?: return null
+    if (service.isBlank() || writeChars.isBlank()) {
+        return null
+    }
+    return BleSecurityGate(service = service, writeChars = writeChars)
 }
 
 /**

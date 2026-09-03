@@ -43,6 +43,8 @@ enum class BleConnectState {
     BLE_ERROR,
     //  - 系统错误
     SYSTEM_ERROR,
+    //  自动安全恢复五次耗尽；这是静默终态，不属于通用连接错误。
+    SECURITY_RECOVERY_EXHAUSTED,
     //  已连接
     CONNECTED,
     //  升级状态

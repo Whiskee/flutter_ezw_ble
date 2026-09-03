@@ -46,6 +46,9 @@ struct BlePendingConnectionAdmissionTeardown {
     let peripheral: CBPeripheral
     let deviceName: String
     let terminalState: BleConnectState
+    /// Synthetic 5403 retry disconnects must keep the Security Gate failure
+    /// budget while the CoreBluetooth cancellation barrier drains the old ACL.
+    let preserveSecurityGateRecovery: Bool
 }
 
 /// pre-didConnect watchdog 只负责选择超时后的资源策略，不改变 Flutter 的一分钟 UI 超时。

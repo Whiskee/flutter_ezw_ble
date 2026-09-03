@@ -158,7 +158,7 @@ extension BleManager {
                     }
                     self.connect(easyConnect: easyConnect)
                 }
-                loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), scan 5s before reconnect to refresh CoreBT cache")
+                loggerD(msg: "connect-flow: \(newEasyConnect.uuid)-\(newEasyConnect.name), scan 10s before reconnect to refresh CoreBT cache")
                 return
             } else if device.needsScanBeforeReconnect {
                 // directConnect 或系统已连接路径无需扫描刷新，清掉标记后继续直连。

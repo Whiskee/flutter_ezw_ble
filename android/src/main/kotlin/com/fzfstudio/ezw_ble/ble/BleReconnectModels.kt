@@ -68,7 +68,83 @@ internal data class BleReconnectTask(
     var source: BleConnectSource = BleConnectSource.AUTO_RECONNECT,
     /** Dart reconnect batch generation forwarded unchanged on status callbacks. */
     var sessionGeneration: Long = 0L,
+    /** 当前恢复 episode 已消费的真实安全建立 attempt 数；只由安全失败推进。 */
+    var securityFailureCount: Int = 0,
+    /** 最近一次已计数的 native attempt generation，阻止 Bond/GATT 双回调重复扣预算。 */
+    var lastCountedSecurityAttemptGeneration: Long = 0L,
 )
+
+/** 单次安全失败对当前连接 attempt 的处置。 */
+internal enum class BleAndroidSecurityRecoveryAction {
+    RETRY,
+    EXHAUSTED,
+    MANUAL_FAILURE,
+    DUPLICATE_IGNORED,
+}
+
+/**
+ * Android 受保护写及配对失败的五次预算策略。
+ *
+ * 该策略不持有 GATT；Supervisor 只把 exact source/attempt generation 交给它，因而同一
+ * attempt 的 Bond 广播、写回调和 HCI 原因即使同时到达也只消费一次。
+ */
+internal object BleAndroidSecurityRecoveryPolicy {
+    const val MAX_AUTOMATIC_ATTEMPTS = 5
+
+    fun record(
+        source: BleConnectSource,
+        attemptGeneration: Long,
+        currentCount: Int,
+        lastCountedAttemptGeneration: Long,
+    ): Pair<BleAndroidSecurityRecoveryAction, Int> {
+        if (source != BleConnectSource.AUTO_RECONNECT) {
+            return BleAndroidSecurityRecoveryAction.MANUAL_FAILURE to currentCount
+        }
+        if (attemptGeneration <= 0L || attemptGeneration == lastCountedAttemptGeneration) {
+            return BleAndroidSecurityRecoveryAction.DUPLICATE_IGNORED to currentCount
+        }
+        val nextCount = (currentCount + 1).coerceAtMost(MAX_AUTOMATIC_ATTEMPTS)
+        val action = if (nextCount >= MAX_AUTOMATIC_ATTEMPTS) {
+            BleAndroidSecurityRecoveryAction.EXHAUSTED
+        } else {
+            BleAndroidSecurityRecoveryAction.RETRY
+        }
+        return action to nextCount
+    }
+}
+
+/** 安全 Gate 回调中的错误域必须按 ATT/GATT 与 HCI 分开解释。 */
+internal object BleAndroidSecurityFailureClassifier {
+    fun isGattSecurityFailure(status: Int): Boolean = status == 5 ||
+        status == 8 ||
+        status == 12 ||
+        status == 15
+
+    fun isHciSecurityFailure(status: Int): Boolean = status == 5 || status == 6
+}
+
+/** BONDED -> NONE 广播根据物理阶段选择快重建、计数或忽略。 */
+internal enum class BleBondRemovalAction {
+    FAST_REBUILD_PRE_PHYSICAL,
+    COUNT_SECURITY_FAILURE,
+    IGNORE,
+}
+
+internal object BleBondRemovalPolicy {
+    fun resolve(
+        previousBonded: Boolean,
+        currentNone: Boolean,
+        hasPrePhysicalOwner: Boolean,
+        securityStageActive: Boolean,
+        businessConnected: Boolean,
+    ): BleBondRemovalAction = when {
+        !previousBonded || !currentNone -> BleBondRemovalAction.IGNORE
+        businessConnected -> BleBondRemovalAction.IGNORE
+        securityStageActive -> BleBondRemovalAction.COUNT_SECURITY_FAILURE
+        hasPrePhysicalOwner -> BleBondRemovalAction.FAST_REBUILD_PRE_PHYSICAL
+        else -> BleBondRemovalAction.IGNORE
+    }
+}
 
 /**
  * 对外只读的长期回连 owner 快照。
