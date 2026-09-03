@@ -84,6 +84,9 @@ final class BleStateRestorationEscrowStateMachine {
 struct BleStateRestorationEscrowClaim {
     let peripheral: CBPeripheral
     let state: BleStateRestorationEscrowState
+    /// escrow 期间系统对该 peripheral 发出过 `peerConnected` connection event 的时刻；
+    /// claim 时对象仍为 `.connecting` 说明 restored pending 请求可能已不再绑定该链路。
+    var peerConnectedObservedAt: Date? = nil
 }
 
 /**
@@ -105,6 +108,8 @@ final class BleStateRestorationCoordinator {
     private var claimWindowSequence: Int64?
     /// central 尚未 poweredOn 时不得直接 connect；记下 endpoint 等 poweredOn 后补偿 rearm。
     private var powerOnRearmDeferrals: Set<String> = []
+    /// escrow 期间收到系统 `peerConnected` 但对象仍非 `.connected` 的 endpoint 及时刻。
+    private var peerConnectedObservations: [String: Date] = [:]
 
     /**
      *  是否存在等待恢复的 peripheral。
@@ -141,6 +146,21 @@ final class BleStateRestorationCoordinator {
         claimWindowSequence = max(claimWindowSequence ?? 0, escrowSequence)
     }
 
+    /// 记录 escrow 期间的系统 `peerConnected` 证据；只对仍在 escrow 的对象登记。
+    func notePeerConnectedObservation(uuid: String, at date: Date = Date()) {
+        guard pendingPeripherals.contains(where: {
+            $0.identifier.uuidString.caseInsensitiveCompare(uuid) == .orderedSame
+        }) else {
+            return
+        }
+        peerConnectedObservations[uuid] = date
+    }
+
+    /// 系统 `peerDisconnected` 或 escrow terminal 后，旧的 peerConnected 证据不得再驱动 claim 宽限。
+    func clearPeerConnectedObservation(uuid: String) {
+        peerConnectedObservations.removeValue(forKey: uuid)
+    }
+
     /// 记录一个等待 poweredOn 的 rearm 债务；重复登记幂等。
     func deferPowerOnRearm(uuid: String) {
         powerOnRearmDeferrals.insert(uuid)
@@ -169,6 +189,8 @@ final class BleStateRestorationCoordinator {
         guard pendingPeripherals.contains(where: { $0.identifier == peripheral.identifier }) else {
             return .ignore
         }
+        // 链路已终止，此前的 peerConnected 证据随之失效。
+        peerConnectedObservations.removeValue(forKey: peripheral.identifier.uuidString)
         return stateMachine.didTerminate(
             endpointId: peripheral.identifier.uuidString,
             systemIsReconnecting: systemIsReconnecting
@@ -186,6 +208,7 @@ final class BleStateRestorationCoordinator {
         pendingPeripherals.removeAll()
         entrySequences.removeAll()
         powerOnRearmDeferrals.removeAll()
+        peerConnectedObservations.removeAll()
         stateMachine.reset()
         return peripherals
     }
@@ -209,6 +232,7 @@ final class BleStateRestorationCoordinator {
         drainedIds.forEach {
             entrySequences.removeValue(forKey: $0)
             powerOnRearmDeferrals.remove($0)
+            peerConnectedObservations.removeValue(forKey: $0)
         }
         stateMachine.remove(endpointIds: drainedIds)
         return drained
@@ -259,7 +283,13 @@ final class BleStateRestorationCoordinator {
             return nil
         }
         pendingPeripherals.remove(at: match.offset)
-        return BleStateRestorationEscrowClaim(peripheral: peripheral, state: state)
+        let peerConnectedObservedAt = peerConnectedObservations
+            .removeValue(forKey: peripheral.identifier.uuidString)
+        return BleStateRestorationEscrowClaim(
+            peripheral: peripheral,
+            state: state,
+            peerConnectedObservedAt: peerConnectedObservedAt
+        )
     }
 
     /// 精确移除 hard-cancel/config revoke 命中的 escrow owner。
@@ -275,6 +305,7 @@ final class BleStateRestorationCoordinator {
         removedIds.forEach {
             entrySequences.removeValue(forKey: $0)
             powerOnRearmDeferrals.remove($0)
+            peerConnectedObservations.removeValue(forKey: $0)
         }
         stateMachine.remove(endpointIds: removedIds)
         return removed
@@ -288,6 +319,7 @@ final class BleStateRestorationCoordinator {
         pendingPeripherals.removeAll()
         entrySequences.removeAll()
         powerOnRearmDeferrals.removeAll()
+        peerConnectedObservations.removeAll()
         claimWindowSequence = nil
         stateMachine.reset()
         return peripherals

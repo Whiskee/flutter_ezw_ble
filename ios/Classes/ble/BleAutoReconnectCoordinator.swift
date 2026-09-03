@@ -1137,6 +1137,14 @@ extension BleManager {
                     admission: admission,
                     autoReconnect: true
                 )
+                if claim.peerConnectedObservedAt != nil {
+                    // escrow 期间系统已宣告 peerConnected，restored pending 请求却没有完成：
+                    // 60 秒观察 watchdog 只会 keep，必须另给有界宽限后替换失效请求。
+                    armPeerConnectedContactGrace(
+                        peripheral,
+                        reason: "stateRestoration claim after peerConnected"
+                    )
+                }
             } else {
                 connectPeripheralAfterCancellationBarrier(peripheral, autoReconnect: true)
             }
@@ -1713,6 +1721,9 @@ extension BleManager {
             startPairingRecoveryDiscoveryIfNeeded(task)
             return
         }
+        // retrieveConnectedPeripherals 命中说明 iOS 已持有该外设的系统链路；exact
+        // pending attempt 若仍无物理接触，其对象状态永远不会自行变成 `.connected`。
+        var systemConnectedTakeover = false
         let cachedPeripheral: CBPeripheral? = {
             // Code 14 后必须优先消费本轮 didDiscover 写入的 peripheral，而不是先从
             // retrievePeripherals 取回刚被 iOS 拒绝的旧缓存对象。
@@ -1737,6 +1748,7 @@ extension BleManager {
                 serviceUUIDs: config.privateServices.map { $0.serviceUUID }
             ) {
                 loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), system-connected identity takeover current=\(systemConnected.identifier.uuidString)")
+                systemConnectedTakeover = true
                 return systemConnected
             }
             if let identifier = UUID(uuidString: task.uuid),
@@ -1796,22 +1808,39 @@ extension BleManager {
                activeTask.source != .manualReconnect,
                current.sessionGeneration == activeTask.sessionGeneration,
                let session = peripheralConnectionSessions[current.sessionId],
-               !session.hasObservedPhysicalContact,
-               peripheral.state == .connected {
-                if session.peripheral === peripheral {
-                    loggerD(msg: "autoReconnect: \(activeTask.uuid)-\(activeTask.name), current pending object is now system-connected; enter exact Gate")
-                    enqueuePhysicalConnectionThroughGate(peripheral)
-                    return
-                }
-                // retrieveConnectedPeripherals 可能返回同 UUID 的新 CBPeripheral 实例。
-                // 旧 pending 必须先走既有 20 秒/no-contact/barrier 边界，随后新实例
-                // 才能注册下一 native attempt；禁止并行 GATT 或直接发布业务成功。
-                if replaceStalePendingAttemptIfNeeded(
-                    session.peripheral,
-                    trigger: .systemConnectedReconcile
-                ) {
+               !session.hasObservedPhysicalContact {
+                if peripheral.state == .connected {
+                    if session.peripheral === peripheral {
+                        loggerD(msg: "autoReconnect: \(activeTask.uuid)-\(activeTask.name), current pending object is now system-connected; enter exact Gate")
+                        enqueuePhysicalConnectionThroughGate(peripheral)
+                        return
+                    }
+                    // retrieveConnectedPeripherals 可能返回同 UUID 的新 CBPeripheral 实例。
+                    // 旧 pending 必须先走既有 20 秒/no-contact/barrier 边界，随后新实例
+                    // 才能注册下一 native attempt；禁止并行 GATT 或直接发布业务成功。
+                    if replaceStalePendingAttemptIfNeeded(
+                        session.peripheral,
+                        trigger: .systemConnectedReconcile
+                    ) {
+                        currentIsPendingTeardown = true
+                        loggerD(msg: "autoReconnect: \(activeTask.uuid)-\(activeTask.name), system-connected peripheral replaces stale pending object")
+                    }
+                } else if systemConnectedTakeover,
+                          systemConnectedStalledReplacementAt[key].map({
+                              Date().timeIntervalSince($0) >= systemConnectedStalledReplacementMinInterval
+                          }) ?? true,
+                          replaceStalePendingAttemptIfNeeded(
+                              session.peripheral,
+                              trigger: .systemConnectedReconcile
+                          ) {
+                    // iOS 已持有系统链路（设置页 / ANCS），但本 central 视角对象仍是
+                    // `.connecting` / `.disconnected` 且长期没有 didConnect：这是 restored /
+                    // 陈旧 pending 请求失效，不是设备不在范围内。此前这里静默 return，
+                    // 造成系统显示已连接而 App 永远不连（2026-09-03 真机戒指）。
+                    // 最小间隔限制替换节奏，避免 App 重试把它变成 cancel/connect 风暴。
+                    systemConnectedStalledReplacementAt[key] = Date()
                     currentIsPendingTeardown = true
-                    loggerD(msg: "autoReconnect: \(activeTask.uuid)-\(activeTask.name), system-connected peripheral replaces stale pending object")
+                    loggerD(msg: "autoReconnect: \(activeTask.uuid)-\(activeTask.name), system-connected peripheral replaces stalled pending connect state=\(peripheral.state.rawValue)")
                 }
             }
             let barrierBlocking = hasPeripheralCancellationBarrier(peripheral)

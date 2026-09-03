@@ -130,7 +130,7 @@ claim 前的 `didConnect` 只把状态更新为 `connected`，不得创建 activ
 
 1. 优先按稳定 UUID 精确匹配；UUID 不可用时只允许唯一完整端点名匹配，且名称必须同时命中目标 config 的 `scan.nameFilters`（与扫描管线同一 contains 语义），防止历史同名设备被跨 config 认领。
 2. escrow 为 `connected` 时，安装当前 session 的 request/cache/admission 后直接提交 Gate。
-3. escrow 为 `pending` 且 peripheral 仍为 `.connecting` 时，只挂 admission 与观察 watchdog，禁止重复 `centralManager.connect`。
+3. escrow 为 `pending` 且 peripheral 仍为 `.connecting` 时，只挂 admission 与观察 watchdog，禁止重复 `centralManager.connect`；但若 escrow 期间系统已对该对象发出过 `peerConnected` connection event（`claim.peerConnectedObservedAt != nil`），必须同时武装 10 秒 contact grace（见 §「peerConnected 后仍无 didConnect」）。
 4. peripheral 已 `.disconnected` 时，安装 admission 后只发起一条长期 pending connect。
 5. 未被当前账号 claim 的对象必须等本批所有 G2 双腿/R1 activation 都返回后，再由 `finalizeStateRestorationClaims` 统一取消；每个取消先建立 cancellation barrier，阻止迟到 `didConnect` 复活历史设备。
 6. finalize 只收口「认领窗口快照」内的对象：每次 activation 把当时已知的 escrow 纳入窗口（重复 activation 只扩大窗口），窗口建立后经 `connectionEventDidOccur` 新入队的系统连接对象属于下一轮 activation 的输入，迟到的 finalize 债务不得取消它们；本 runtime 从未发生 activation 时按全量收口。重复 finalize 幂等。
@@ -284,3 +284,15 @@ iOS R1 的 CoreBluetooth Code 14 新鲜广播恢复属于同一个长期 reconne
 ## connection event 与已认领 attempt（2026-09-02 真机修正）
 
 `centralManager(_:connectionEventDidOccur:for:)` 的 `peerConnected` 只在该 peripheral **没有** active connect request 时才进入 escrow；claim 后 admission 已提交 `central.connect` 的腿，系统 connection event 只是同一 attempt 物理完成的前奏，随后的 `didConnect` 必须经 `findActiveConnectRequest` 直接进入 admission Gate。若再入 escrow，`didConnect` 会被 `handleStateRestorationEscrowDidConnect` 当作 claim 前的 hold 吞掉，直到 60 s pending physical watchdog 观察到 `.connected` 才补进 Gate（真机：左腿系统连上后 21 s 才开始 GATT）。命中时记录 `ios_connection_event_ignored reason=activeConnectRequest`；watchdog 仍保留为丢回调兜底。
+
+
+## peerConnected 后仍无 didConnect：contact grace 与系统连接对账（2026-09-03 真机修正）
+
+真机现象：R1 在 State Restoration 中以 `.connecting` 交还（escrow `keepPending`），启动瞬间系统即发出 `peerConnected`（iOS 设置页显示戒指已连接，bluetoothd 设备标志 `Connections`），但 restored pending 请求 26 分钟没有 `didConnect`；60 秒 pending physical watchdog 在 `observeLongLivedAutoReconnect` 模式下只 keep。用户打开 App 后 `findPeripheralFromConnected` 命中，`beginDirectReconnectAttempt` 却因 exact pending 对象不是 `.connected` 而静默 `return`，App 每次重试都重复「reconcile → attempt → identity takeover」三行日志、永不 connect。
+
+结论：restored / 长期 pending 请求不是链路的可靠 owner；系统链路可能属于 ANCS、设置页或其它 central。两条修复：
+
+1. **contact grace**：exact pending attempt 收到系统 `peerConnected`（`connectionEventDidOccur` 已有 active request 的分支，或 claim 时 `peerConnectedObservedAt != nil`）后武装 `peerConnectedContactGraceTimeout`（10 s）。正常 `didConnect` 经 `enqueuePhysicalConnectionThroughGate` 取消它；到期仍无 `hasObservedPhysicalContact` 时，若对象已 `.connected` 直接进 Gate，否则以 `.peerConnectedWithoutContact` trigger（不叠加 pending 时长门槛）走 `replaceStalePendingAttemptIfNeeded`：cancel 旧请求、exact teardown、由同一 reconnect owner 经 `beginReconnectAttempt` 注册下一代并在 barrier 释放后重新 `connect`。只有存在长期 reconnect task 的 admission 才武装宽限；普通前台手动 attempt 继续沿用 60 秒 `recycleForegroundAttempt`。后台同样生效（cancel/connect 不依赖 active 的同步 retrieve 门禁）。武装只写 `admission gate: …, peer connected without contact, arm 10s grace` 日志（正常回连的 connection event 也先于 didConnect 到达，不写持久化事件环）；真正到期替换记 `ios_peer_connected_pending_replaced`。escrow 中的 peerConnected 证据在系统 `peerDisconnected` 或 escrow terminal 时作废，不得驱动之后的 claim 宽限。
+2. **前台系统连接对账**：`beginDirectReconnectAttempt` 的 exact-session 对账在 `retrieveConnectedPeripherals` 命中（`systemConnectedTakeover`）且 pending 对象非 `.connected` 时，不再静默返回，而是按同一 `.systemConnectedReconcile` trigger（active 3 秒门槛）替换失效 pending，再注册新一代 connect；同一 endpoint 的这类替换最小间隔 15 秒（`systemConnectedStalledReplacementMinInterval`），App 重试或 didBecomeActive 对账的高频调用不得把它变成 cancel/connect 风暴。`.connected` 分支（同对象进 Gate / 新实例替换）保持不变。
+
+不变量：所有替换仍经 cancellation barrier 与 exact admission 释放；不得把系统 already-connected 直接投影成业务 connected；不得为此增加 Dart 侧重试或改变 5 次 Bond 恢复预算。

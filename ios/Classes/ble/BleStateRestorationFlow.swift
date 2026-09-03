@@ -30,6 +30,11 @@ extension BleManager {
         if action == .rearm {
             rearmStateRestorationEscrow(peripheral, reason: "willRestoreState disconnected")
         }
+        // 系统 peerConnected 却仍是 `.connecting` 的 restored 对象：链路可能属于 ANCS /
+        // 设置页等其它 owner，claim 后必须给 didConnect 一个有界宽限，而不是无限 keepPending。
+        if source == "connectionEvent", action == .keepPending {
+            restorationCoordinator.notePeerConnectedObservation(uuid: peripheral.identifier.uuidString)
+        }
     }
 
     /// claim 前到达的 didConnect 只保留物理链路，不发现服务、不上报 noBleConfigFound。

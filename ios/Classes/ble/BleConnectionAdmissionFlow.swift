@@ -7,6 +7,9 @@ enum BleStalePendingReplacementTrigger: String {
     case manualReconnect
     case visibleAutoReconnect
     case systemConnectedReconcile
+    /// 系统已对该 peripheral 发出 `peerConnected` connection event，但 exact pending
+    /// attempt 在宽限期内始终没有 `didConnect`：restored / 长期 pending 请求已失效。
+    case peerConnectedWithoutContact
 }
 
 /**
@@ -27,6 +30,15 @@ extension BleManager {
     // 旧 pending 已经不是“设备仍不在范围内”，而是陈旧对象阻塞。给原请求一个短窗口
     // 后只允许一次 barrier replacement；后台没有同步系统连接证据，继续长期 pending。
     var foregroundSystemConnectedReplacementThreshold: TimeInterval { 3.0 }
+    // 系统 `peerConnected` connection event 是链路已建立的直接证据；正常情况下同一
+    // attempt 的 `didConnect` 会在 1 秒内到达。超过该宽限仍无物理接触，说明 restored /
+    // 长期 pending 请求已经不再绑定这条系统链路（2026-09-03 真机：戒指 SR 后系统显示
+    // 已连接，App 26 分钟无 didConnect），必须经 barrier 取消并重新 connect。
+    var peerConnectedContactGraceTimeout: TimeInterval { 10.0 }
+    // 前台系统连接对账对同一 endpoint 的失效 pending 替换最小间隔：一次新 connect
+    // 对已持有系统链路的外设本应立即完成，若仍未完成也只按此节奏重试，不跟随
+    // App 重试或 didBecomeActive 对账的高频调用。
+    var systemConnectedStalledReplacementMinInterval: TimeInterval { 15.0 }
 
     /// 同一 CoreBluetooth UUID 在本进程内只能有一个连接缓存 owner。iOS 在蓝牙恢复、
     /// retrieve 后可能返回新的 CBPeripheral 实例，不能再用对象引用判重，
@@ -158,6 +170,85 @@ extension BleManager {
         )
         centralManager.cancelPeripheralConnection(peripheral)
         loggerD(msg: "admission gate: \(admission.endpointId), pending watchdog cleanup generation=\(admission.generation), state=\(peripheral.state.rawValue)")
+    }
+
+    /**
+     *  系统 `peerConnected` 证据下的物理接触宽限。
+     *
+     *  connection event 说明 iOS 已经为该 peripheral 建立链路（设置页显示已连接），
+     *  但 exact pending attempt 仍可能永远收不到 `didConnect`：State Restoration 交还
+     *  的 `.connecting` 对象只是上一进程请求的快照，系统链路可能属于 ANCS / 设置页
+     *  等其它 owner。宽限期内正常 `didConnect` 会经 `enqueuePhysicalConnectionThroughGate`
+     *  取消本 watchdog；到期仍无接触才按 barrier 边界替换失效的 pending 请求。
+     *  后台同样适用：cancel / connect 不依赖 App active 的同步 retrieve 门禁。
+     */
+    func armPeerConnectedContactGrace(_ peripheral: CBPeripheral, reason: String) {
+        guard let admission = currentConnectionAdmission(uuid: peripheral.identifier.uuidString),
+              let session = peripheralConnectionSessions[admission.sessionId],
+              session.peripheral === peripheral,
+              !session.hasObservedPhysicalContact,
+              peripheral.state != .connected,
+              // 只有长期 reconnect owner 才能在替换后重新注册下一代；普通前台手动
+              // attempt 没有 owner，继续沿用 60 秒 recycleForegroundAttempt 边界。
+              reconnectTasks[reconnectKey(uuid: admission.endpointId)] != nil else {
+            return
+        }
+        let workItem = DispatchWorkItem { [weak self, weak peripheral] in
+            guard let self = self, let peripheral = peripheral else { return }
+            self.expirePeerConnectedContactGrace(
+                peripheral,
+                expectedAdmission: admission
+            )
+        }
+        // 同一 admission 重复收到 connection event 只刷新宽限，不叠加多个 timer。
+        peerConnectedContactGraceWatchdogs
+            .replace(admission: admission, workItem: workItem)?
+            .cancel()
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + peerConnectedContactGraceTimeout,
+            execute: workItem
+        )
+        // 正常回连的 connection event 都会先于 didConnect 到达；武装只写日志，
+        // 持久化事件环只记录真正到期替换，避免冲掉其它诊断事件。
+        loggerD(msg: "admission gate: \(admission.endpointId), peer connected without contact, arm \(Int(peerConnectedContactGraceTimeout))s grace generation=\(admission.generation), reason=\(reason)")
+    }
+
+    /// 只允许 exact generation/session 消费宽限到期；旧 work item 不得替换新代。
+    private func expirePeerConnectedContactGrace(
+        _ peripheral: CBPeripheral,
+        expectedAdmission: BleConnectionAdmission
+    ) {
+        guard peerConnectedContactGraceWatchdogs.takeIfCurrent(expectedAdmission) != nil,
+              let admission = currentConnectionAdmission(expectedAdmission),
+              let session = peripheralConnectionSessions[admission.sessionId],
+              session.peripheral === peripheral,
+              !session.hasObservedPhysicalContact else {
+            return
+        }
+        if peripheral.state == .connected {
+            // 状态已更新但 delegate 回调丢失：与 pending watchdog 一致，直接交给同一 Gate。
+            loggerD(msg: "admission gate: \(admission.endpointId), contact grace observed connected generation=\(admission.generation)")
+            enqueuePhysicalConnectionThroughGate(peripheral)
+            return
+        }
+        guard centralManager.state == .poweredOn else {
+            return
+        }
+        guard replaceStalePendingAttemptIfNeeded(
+            peripheral,
+            trigger: .peerConnectedWithoutContact
+        ) else {
+            return
+        }
+        recordAutoReconnectEvent(
+            type: "ios_peer_connected_pending_replaced",
+            uuid: admission.endpointId,
+            name: session.deviceName,
+            detail: "generation=\(admission.generation), state=\(peripheral.state.rawValue)"
+        )
+        // 旧 admission 已进入 exact teardown；同一 owner 立即注册下一代，新的
+        // central.connect 会在 barrier 释放（cancel 终态或 2 秒 watchdog）后真正执行。
+        beginReconnectAttempt(uuid: admission.endpointId)
     }
 
     func hasPeripheralCancellationBarrier(_ peripheral: CBPeripheral) -> Bool {
@@ -549,6 +640,7 @@ extension BleManager {
         )
         pendingPhysicalConnectWatchdogs.takeIfCurrent(admission)?.cancel()
         visiblePendingRecoveryWatchdogs.takeIfCurrent(admission)?.cancel()
+        peerConnectedContactGraceWatchdogs.takeIfCurrent(admission)?.cancel()
         // 3、把 contact 交给 Gate；只有 granted 才开始 GATT/service pipeline。
         switch connectionAdmissionGate.onPhysicalConnected(admission) {
         case .granted:
@@ -637,6 +729,7 @@ extension BleManager {
         guard let current = currentConnectionAdmission(expected) else { return nil }
         pendingPhysicalConnectWatchdogs.takeIfCurrent(current)?.cancel()
         visiblePendingRecoveryWatchdogs.takeIfCurrent(current)?.cancel()
+        peerConnectedContactGraceWatchdogs.takeIfCurrent(current)?.cancel()
         currentConnectionAdmissions.removeValue(forKey: reconnectKey(uuid: current.endpointId))
         peripheralConnectionSessions.removeValue(forKey: current.sessionId)
         businessConnectionLeases.remove(endpointKey: reconnectKey(uuid: current.endpointId))
@@ -811,6 +904,9 @@ extension BleManager {
         switch trigger {
         case .systemConnectedReconcile where allowsSynchronousCoreBluetoothLookup:
             replacementThreshold = foregroundSystemConnectedReplacementThreshold
+        case .peerConnectedWithoutContact:
+            // 宽限已由 contact grace watchdog 单独计时，这里不再叠加 pending 时长门槛。
+            replacementThreshold = 0
         default:
             replacementThreshold = manualPendingReplacementThreshold
         }
@@ -823,6 +919,7 @@ extension BleManager {
         // 新 central.connect 必须等 didFail/didDisconnect 或 barrier watchdog 后才真正执行。
         pendingPhysicalConnectWatchdogs.takeIfCurrent(admission)?.cancel()
         visiblePendingRecoveryWatchdogs.takeIfCurrent(admission)?.cancel()
+        peerConnectedContactGraceWatchdogs.takeIfCurrent(admission)?.cancel()
         deferConnectionAdmissionReleaseUntilPeripheralTerminal(
             admission: admission,
             peripheral: peripheral,
@@ -839,6 +936,8 @@ extension BleManager {
             replacementDescription = "visible auto reconnect stale pending replacement"
         case .systemConnectedReconcile:
             replacementDescription = "system-connected stale pending replacement"
+        case .peerConnectedWithoutContact:
+            replacementDescription = "peer-connected stalled pending replacement"
         }
         loggerD(msg: "admission gate: \(admission.endpointId), \(replacementDescription) trigger=\(trigger.rawValue), generation=\(admission.generation), elapsed=\(elapsedDescription)s, threshold=\(replacementThreshold)s")
         return true
@@ -863,6 +962,8 @@ extension BleManager {
         peripheralCancellationWatchdogs.removeAll()
         pendingPhysicalConnectWatchdogs.removeAll().forEach { $0.cancel() }
         visiblePendingRecoveryWatchdogs.removeAll().forEach { $0.cancel() }
+        peerConnectedContactGraceWatchdogs.removeAll().forEach { $0.cancel() }
+        systemConnectedStalledReplacementAt.removeAll()
         peripheralCancellationBarrierGate.reset()
         deferredPeripheralReconnectRegistry.removeAll()
         pendingConnectionAdmissionTeardowns.removeAll()

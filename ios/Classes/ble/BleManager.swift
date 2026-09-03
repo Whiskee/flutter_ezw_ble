@@ -128,6 +128,12 @@ class BleManager: NSObject {
     //  - 辅助扫描命中只为 exact 长期 pending owner 提供一次受控恢复机会；
     //    与 60 秒观测 watchdog 分离，避免重复提示把恢复窗口向后顺延。
     let visiblePendingRecoveryWatchdogs = BleVisiblePendingRecoveryWatchdogRegistry()
+    //  - 系统 peerConnected connection event 后仍无 didConnect 的 exact pending attempt
+    //    只给一次有界宽限；到期经 barrier 替换失效的 restored / 长期 pending 请求。
+    let peerConnectedContactGraceWatchdogs = BlePendingPhysicalConnectWatchdogRegistry()
+    //  - 前台系统连接对账替换失效 pending 的最近时刻；App 重试节奏不得把它变成
+    //    每 3 秒一次的 cancel/connect 风暴。
+    var systemConnectedStalledReplacementAt: [String: Date] = [:]
     let deferredPeripheralReconnectRegistry = BleDeferredPeripheralReconnectRegistry()
     var pendingConnectionAdmissionTeardowns: [String: BlePendingConnectionAdmissionTeardown] = [:]
     // Business-auth leases are exact session/attempt tokens. A new prepare for
@@ -398,6 +404,8 @@ extension BleManager {
         }
         pendingPhysicalConnectWatchdogs.remove(endpointIds: endpointIds).forEach { $0.cancel() }
         visiblePendingRecoveryWatchdogs.remove(endpointIds: endpointIds).forEach { $0.cancel() }
+        peerConnectedContactGraceWatchdogs.remove(endpointIds: endpointIds).forEach { $0.cancel() }
+        endpointIds.forEach { systemConnectedStalledReplacementAt.removeValue(forKey: reconnectKey(uuid: $0)) }
         deferredPeripheralReconnectRegistry.remove(endpointIds: endpointIds)
         peripheralCancellationBarrierGate.discard(endpointIds: endpointIds)
         securityGateAttempts.cancel(endpointIds: endpointIds)
@@ -2990,6 +2998,10 @@ extension BleManager: CBCentralManagerDelegate {
                     detail: "reason=activeConnectRequest"
                 )
                 loggerD(msg: "connectionEvent peer connected: uuid=\(uuid), name=\(name), active connect request owns it, skip escrow")
+                // 系统已建立链路却迟迟没有 didConnect 时，restored / 长期 pending 请求已失效
+                // （2026-09-03 真机：戒指 SR 后系统显示已连接、App 26 分钟无 didConnect）。
+                // 宽限内正常 didConnect 会取消它；到期才经 barrier 替换并重新 connect。
+                armPeerConnectedContactGrace(peripheral, reason: "connectionEvent peerConnected")
                 return
             }
             // connection event 只提供物理对象；先进入 escrow，再由现有 exact owner
@@ -2998,6 +3010,8 @@ extension BleManager: CBCentralManagerDelegate {
             resumeAutoReconnectFromConnectionEvent(peripheral)
         case .peerDisconnected:
             // 业务断连终态仍只由 didDisconnectPeripheral 收口，避免双重 teardown。
+            // escrow 中尚未认领对象的 peerConnected 证据随链路终止一起作废。
+            restorationCoordinator.clearPeerConnectedObservation(uuid: uuid)
             loggerD(msg: "connectionEvent peer disconnected: uuid=\(uuid), name=\(name)")
         @unknown default:
             loggerE(msg: "connectionEventDidOccur: unknown event=\(event.rawValue), uuid=\(uuid)")
