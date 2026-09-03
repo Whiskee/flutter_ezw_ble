@@ -36,8 +36,8 @@ internal fun systemBondStateOf(rawState: Int): SystemBondState = when (rawState)
 /**
  * 选择 Gate owner 的 bond-first 起点。
  *
- * 1、未启用主动系统配对的 G1/G2 永远直接发现服务。
- * 2、R1 已配对时不重复 createBond；未配对才主动发起。
+ * 1、未启用主动系统配对的配置（如 G1）直接发现服务。
+ * 2、Android G2/R1 已配对时不重复 createBond；未配对才主动发起。
  * 3、系统已在配对或返回未知状态时只等待权威广播/既有超时，不重复触发系统动作。
  */
 internal fun decideGateGrantedBondAction(
@@ -55,6 +55,19 @@ internal fun decideGateGrantedBondAction(
         SystemBondState.BONDED -> GateGrantedBondAction.DISCOVER_SERVICES
     }
 }
+
+/**
+ * 已经完成首次服务发现、但旧固件没有可执行 5403 时的防御性兼容决策。
+ *
+ * Android G2 正常配置会在服务发现前完成 Bond，因此通常直接继续普通 Notify；如果
+ * 旧配置或 Bond 竞态仍呈现未配对，才在同一 admission/GATT 上补建系统 Bond。
+ */
+internal fun decideMissingSecurityGateBondAction(
+    bondState: SystemBondState,
+): GateGrantedBondAction = decideGateGrantedBondAction(
+    initiateBinding = true,
+    bondState = bondState,
+)
 
 /**
  * 消费 bond 广播时只允许 START_BINDING 中的主动配对会话推进。

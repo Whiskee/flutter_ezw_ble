@@ -15,6 +15,8 @@ data class BleConfig(
     val scan: BleScan,
     /** GATT 初始化需要发现并注册 notify 的私有服务列表。 */
     val privateServices: List<BlePrivateService>,
+    /** 可选的受保护写门禁；存在时必须在普通 Notify/CCCD 之前完成。 */
+    val securityGate: BleSecurityGate? = null,
     /** 是否由原生主动发起系统 bonding。 */
     val initiateBinding: Boolean,
     /** 前台连接/GATT readiness 超时时间，单位毫秒。 */
@@ -39,7 +41,15 @@ data class BleConfig(
          *
          * 空配置只用于占位/默认值，不应该参与真实扫描或连接。
          */
-        fun empty(): BleConfig = BleConfig("", BleScan.empty(), listOf(), true, 15000.0, 60000.0, 247)
+        fun empty(): BleConfig = BleConfig(
+            name = "",
+            scan = BleScan.empty(),
+            privateServices = listOf(),
+            initiateBinding = true,
+            connectTimeout = 15000.0,
+            upgradeSwapTime = 60000.0,
+            mtu = 247,
+        )
     }
 
     /**

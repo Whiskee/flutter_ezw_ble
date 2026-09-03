@@ -154,6 +154,8 @@ internal class BleAutoReconnectSupervisor(
             if (device.connectState.isConnected) {
                 task.attempt = 0
                 task.consecutivePrePhysicalTimeouts = 0
+                task.securityFailureCount = 0
+                task.lastCountedSecurityAttemptGeneration = 0L
                 invalidateRetrySchedule(task)
                 task.pendingPhysicalDeadline?.cancel()
                 task.pendingPhysicalDeadline = null
@@ -177,6 +179,11 @@ internal class BleAutoReconnectSupervisor(
         // 1、登记/刷新长期目标；这一步不创建第二条 GATT。
         arm(device, source, sessionGeneration)
         val task = reconnectTasks[reconnectKey(device.uuid)] ?: return 0L
+        // 用户点击连接开启新的安全恢复 episode；该 attempt 首次安全失败直接交给 boundFail。
+        if (source == BleConnectSource.MANUAL_RECONNECT) {
+            task.securityFailureCount = 0
+            task.lastCountedSecurityAttemptGeneration = 0L
+        }
         // 1.1、只有显式 activation 才能消费 Bluetooth On 恢复屏障。
         // 此时 sessionAction 会在任何新 GATT 创建前完成 session 安装或 exact rebind。
         task.pausedByBluetoothOff = false
@@ -281,6 +288,8 @@ internal class BleAutoReconnectSupervisor(
     fun promotePendingAttempt(uuid: String): Boolean {
         // 1、只有同一 uuid 已有 pending attempt 才允许提升；没有 owner 交给新 activation。
         val task = reconnectTasks[reconnectKey(uuid)] ?: return false
+        task.securityFailureCount = 0
+        task.lastCountedSecurityAttemptGeneration = 0L
         if (task.passiveGatt == null && task.timer == null) {
             return false
         }
@@ -522,6 +531,105 @@ internal class BleAutoReconnectSupervisor(
     }
 
     /**
+     * 消费一次 exact 安全建立失败。
+     *
+     * 自动来源按 endpoint episode 计数，手动/前台来源不进入五次循环；同一 native attempt
+     * 的多个系统证据只返回一次有效动作。
+     */
+    @Synchronized
+    fun recordSecurityFailure(
+        uuid: String,
+        source: BleConnectSource,
+        attemptGeneration: Long,
+    ): BleAndroidSecurityRecoveryAction {
+        val task = reconnectTasks[reconnectKey(uuid)]
+        if (source != BleConnectSource.AUTO_RECONNECT || task == null) {
+            return BleAndroidSecurityRecoveryAction.MANUAL_FAILURE
+        }
+        val (action, nextCount) = BleAndroidSecurityRecoveryPolicy.record(
+            source = source,
+            attemptGeneration = attemptGeneration,
+            currentCount = task.securityFailureCount,
+            lastCountedAttemptGeneration = task.lastCountedSecurityAttemptGeneration,
+        )
+        if (action != BleAndroidSecurityRecoveryAction.DUPLICATE_IGNORED) {
+            task.securityFailureCount = nextCount
+            task.lastCountedSecurityAttemptGeneration = attemptGeneration
+        }
+        sendLog(
+            if (action == BleAndroidSecurityRecoveryAction.EXHAUSTED) BleLoggerTag.e else BleLoggerTag.d,
+            "Security recovery: $uuid, source=${source.flutterValue}, " +
+                "attemptGeneration=$attemptGeneration, count=${task.securityFailureCount}, action=$action",
+        )
+        return action
+    }
+
+    /** Gate 成功证明共享密钥可用，结束当前 endpoint 的恢复 episode。 */
+    @Synchronized
+    fun resetSecurityRecovery(uuid: String) {
+        reconnectTasks[reconnectKey(uuid)]?.let { task ->
+            task.securityFailureCount = 0
+            task.lastCountedSecurityAttemptGeneration = 0L
+        }
+    }
+
+    /**
+     * 系统设置移除配对时回收仍在等待物理 callback 的 exact GATT。
+     *
+     * 该动作不是安全失败：它只替代原 20 秒 physical deadline，并在 250ms 防抖后用新
+     * callback/generation 建链。已进入 admission 或业务 connected 的 owner 由 manager 拒绝。
+     */
+    fun rebuildAfterPrePhysicalBondRemoval(uuid: String): Boolean {
+        val expectedGatt = synchronized(this) {
+            val task = reconnectTasks[reconnectKey(uuid)] ?: return false
+            if (task.passiveGatt == null || task.pendingPhysicalDeadline == null) {
+                return false
+            }
+            task.passiveGatt
+        } ?: return false
+
+        val disposition = invalidatePendingPassiveGatt(uuid, expectedGatt)
+        if (disposition != BlePendingOwnerDisposition.INVALIDATED &&
+            disposition != BlePendingOwnerDisposition.REPAIRED_STALE_OWNER
+        ) {
+            if (disposition == BlePendingOwnerDisposition.STALE_OWNER_DROPPED) {
+                clearRecycledPendingOwner(uuid, expectedGatt)
+            }
+            return false
+        }
+
+        val scheduleGeneration = synchronized(this) {
+            val task = reconnectTasks[reconnectKey(uuid)] ?: return false
+            if (task.passiveGatt !== expectedGatt) {
+                return false
+            }
+            task.pendingPhysicalDeadline?.cancel()
+            task.pendingPhysicalDeadline = null
+            invalidateRetrySchedule(task)
+            task.passiveGatt = null
+            task.passiveStartedAtMs = 0L
+            task.pendingVisibleDirectConnect = false
+            task.visibleDirectConnectRequested = false
+            val next = nextScheduleGeneration(task.retryScheduleGeneration)
+            task.retryScheduleGeneration = next
+            task.timer = attemptDispatcher.dispatch(
+                task.uuid,
+                BlePassiveReconnectDelayPolicy.VISIBLE_WAKE_DEBOUNCE_MS,
+                next,
+            )
+            next
+        }
+        releaseVisibleDirectConnectSlot(uuid)
+        sendLog(
+            BleLoggerTag.d,
+            "Security recovery: $uuid, BONDED->NONE recycled pre-physical GATT, " +
+                "rebuild after ${BlePassiveReconnectDelayPolicy.VISIBLE_WAKE_DEBOUNCE_MS}ms, " +
+                "scheduleGeneration=$scheduleGeneration",
+        )
+        return true
+    }
+
+    /**
      * 冻结指定 endpoint 的长期回连 owner 元数据。
      *
      * 1. 对账层只能依赖这份不可变快照判断 owner 是否仍存在。
@@ -552,6 +660,7 @@ internal class BleAutoReconnectSupervisor(
         retryDelayOverrideMs: Long? = null,
         reason: String = state.toString(),
         visibilityWakeEligible: Boolean = false,
+        forceVisibleDirectConnect: Boolean = false,
     ) {
         // 1. 非回连状态直接忽略。
         if (!shouldScheduleReconnect(state)) {
@@ -607,7 +716,7 @@ internal class BleAutoReconnectSupervisor(
         }
         // 直连收到失败终态时必须交还物理槽位；否则后续已可见 endpoint 会永久停在队列。
         task.pendingVisibleDirectConnect = false
-        task.visibleDirectConnectRequested = false
+        task.visibleDirectConnectRequested = forceVisibleDirectConnect
         releaseVisibleDirectConnectSlot(uuid)
 
         // 7. 首轮立即开始；普通终态保留 1.5s 防抖，连续 pre-physical deadline
@@ -621,7 +730,7 @@ internal class BleAutoReconnectSupervisor(
         task.retryScheduleGeneration = scheduleGeneration
         // 只有 pre-physical deadline 的 backoff 可被扫描命中唤醒；service/char 等
         // post-physical 失败仍按原终态节奏执行，不能被广告可见信号越权加速。
-        task.pendingPassiveRetry = delayMs > 0L && visibilityWakeEligible
+        task.pendingPassiveRetry = delayMs > 0L && visibilityWakeEligible && !forceVisibleDirectConnect
         task.timer = attemptDispatcher.dispatch(task.uuid, delayMs, scheduleGeneration)
         sendLog(BleLoggerTag.d, "Auto reconnect: $uuid, schedule passive retry after ${delayMs}ms, reason=$reason")
     }

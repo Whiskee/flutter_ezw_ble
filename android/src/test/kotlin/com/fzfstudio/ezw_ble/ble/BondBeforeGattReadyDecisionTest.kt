@@ -7,7 +7,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
-/** R1 系统配对必须先于 GATT readiness，且所有分支都可脱离 Android callback 单测。 */
+/** Android G2/R1 Bond-first 与缺失 5403 防御性 fallback 均可脱离 callback 单测。 */
 class BondBeforeGattReadyDecisionTest {
 
     @Test
@@ -37,6 +37,26 @@ class BondBeforeGattReadyDecisionTest {
         assertEquals(
             GateGrantedBondAction.WAIT_FOR_BOND,
             decideGateGrantedBondAction(true, SystemBondState.UNKNOWN),
+        )
+    }
+
+    @Test
+    fun `missing G2 security gate bonds only when framework is not already bonded`() {
+        assertEquals(
+            GateGrantedBondAction.START_BOND,
+            decideMissingSecurityGateBondAction(SystemBondState.NONE),
+        )
+        assertEquals(
+            GateGrantedBondAction.WAIT_FOR_BOND,
+            decideMissingSecurityGateBondAction(SystemBondState.BONDING),
+        )
+        assertEquals(
+            GateGrantedBondAction.DISCOVER_SERVICES,
+            decideMissingSecurityGateBondAction(SystemBondState.BONDED),
+        )
+        assertEquals(
+            GateGrantedBondAction.WAIT_FOR_BOND,
+            decideMissingSecurityGateBondAction(SystemBondState.UNKNOWN),
         )
     }
 

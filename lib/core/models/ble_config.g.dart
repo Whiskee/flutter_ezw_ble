@@ -23,6 +23,10 @@ BleConfig _$BleConfigFromJson(Map<String, dynamic> json) => BleConfig(
           json['autoReconnectUseNativePassive'] as bool? ?? true,
       androidHighReliabilityMode:
           json['androidHighReliabilityMode'] as bool? ?? false,
+      securityGate: json['securityGate'] == null
+          ? null
+          : BleSecurityGate.fromJson(
+              json['securityGate'] as Map<String, dynamic>),
     );
 
 Map<String, dynamic> _$BleConfigToJson(BleConfig instance) => <String, dynamic>{
@@ -37,4 +41,5 @@ Map<String, dynamic> _$BleConfigToJson(BleConfig instance) => <String, dynamic>{
       'autoReconnectMaxAttempts': instance.autoReconnectMaxAttempts,
       'autoReconnectUseNativePassive': instance.autoReconnectUseNativePassive,
       'androidHighReliabilityMode': instance.androidHighReliabilityMode,
+      'securityGate': instance.securityGate,
     };

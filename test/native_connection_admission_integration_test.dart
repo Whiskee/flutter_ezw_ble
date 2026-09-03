@@ -185,7 +185,13 @@ void main() {
     expect(manager, contains('session.gatt.device.createBond()'));
     expect(manager, contains('connectionAdmissionGate.isActive(current)'));
     expect(manager, contains('startGrantedServiceDiscovery'));
-    expect(manager, contains('state = BleConnectState.BOUND_FAIL'));
+    expect(manager, contains('handleSecurityGateFailure('));
+    expect(
+      manager,
+      contains(
+        'BleAndroidSecurityRecoveryAction.MANUAL_FAILURE -> BleConnectState.BOUND_FAIL',
+      ),
+    );
     expect(listener, contains('BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE'));
     expect(
         listener, isNot(contains('bondState == BluetoothDevice.BOND_BONDING')));

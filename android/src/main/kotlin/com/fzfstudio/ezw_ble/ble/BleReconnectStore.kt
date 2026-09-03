@@ -5,6 +5,7 @@ import com.fzfstudio.ezw_ble.ble.models.BleConfig
 import com.fzfstudio.ezw_ble.ble.models.BleDevice
 import com.fzfstudio.ezw_ble.ble.models.BlePrivateService
 import com.fzfstudio.ezw_ble.ble.models.BleScan
+import com.fzfstudio.ezw_ble.ble.models.BleSecurityGate
 import com.fzfstudio.ezw_ble.ble.models.BleSnRule
 import org.json.JSONArray
 import org.json.JSONObject
@@ -268,6 +269,7 @@ internal class BleReconnectStore {
             put("privateServices", JSONArray().apply {
                 privateServices.forEach { service -> put(service.toPersistedJson()) }
             })
+            put("securityGate", securityGate?.toPersistedJson())
             put("initiateBinding", initiateBinding)
             put("connectTimeout", connectTimeout)
             put("upgradeSwapTime", upgradeSwapTime)
@@ -275,7 +277,14 @@ internal class BleReconnectStore {
             put("autoReconnect", autoReconnect)
             put("autoReconnectMaxAttempts", autoReconnectMaxAttempts)
             put("autoReconnectUseNativePassive", autoReconnectUseNativePassive)
+            put("androidHighReliabilityMode", androidHighReliabilityMode)
         }
+    }
+
+    /** 门禁属于 native 进程恢复连接的必要配置，不能只保留在 Dart 内存中。 */
+    private fun BleSecurityGate.toPersistedJson(): JSONObject = JSONObject().apply {
+        put("service", service)
+        put("writeChars", writeChars)
     }
 
     /**
@@ -347,6 +356,7 @@ internal class BleReconnectStore {
             name = optString("name"),
             scan = scanJson.toBleScan(),
             privateServices = services,
+            securityGate = optJSONObject("securityGate")?.toBleSecurityGate(),
             initiateBinding = optBoolean("initiateBinding", false),
             connectTimeout = optDouble("connectTimeout", 15000.0),
             upgradeSwapTime = optDouble("upgradeSwapTime", 60000.0),
@@ -354,7 +364,18 @@ internal class BleReconnectStore {
             autoReconnect = optBoolean("autoReconnect", false),
             autoReconnectMaxAttempts = optInt("autoReconnectMaxAttempts", 0),
             autoReconnectUseNativePassive = optBoolean("autoReconnectUseNativePassive", true),
+            androidHighReliabilityMode = optBoolean("androidHighReliabilityMode", false),
         )
+    }
+
+    /** 损坏或旧快照中的空门禁按未配置处理，继续兼容旧固件。 */
+    private fun JSONObject.toBleSecurityGate(): BleSecurityGate? {
+        val service = optString("service")
+        val writeChars = optString("writeChars")
+        if (service.isBlank() || writeChars.isBlank()) {
+            return null
+        }
+        return BleSecurityGate(service = service, writeChars = writeChars)
     }
 
     /**

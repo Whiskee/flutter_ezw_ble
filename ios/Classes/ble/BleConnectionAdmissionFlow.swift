@@ -292,7 +292,8 @@ extension BleManager {
         admission: BleConnectionAdmission,
         peripheral: CBPeripheral,
         deviceName: String,
-        terminalState: BleConnectState
+        terminalState: BleConnectState,
+        preserveSecurityGateRecovery: Bool = false
     ) {
         guard currentConnectionAdmission(admission) != nil else { return }
         let key = reconnectKey(uuid: admission.endpointId)
@@ -300,7 +301,8 @@ extension BleManager {
             admission: admission,
             peripheral: peripheral,
             deviceName: deviceName,
-            terminalState: terminalState
+            terminalState: terminalState,
+            preserveSecurityGateRecovery: preserveSecurityGateRecovery
         )
         beginPeripheralCancellationBarrier(peripheral)
     }
@@ -347,10 +349,12 @@ extension BleManager {
                 uuid: pending.admission.endpointId,
                 name: pending.deviceName
             )
-            resetPeerPairingRecoveryAfterNonPairingFailure(
-                uuid: pending.admission.endpointId,
-                name: pending.deviceName
-            )
+            if !pending.preserveSecurityGateRecovery {
+                resetPeerPairingRecoveryAfterNonPairingFailure(
+                    uuid: pending.admission.endpointId,
+                    name: pending.deviceName
+                )
+            }
             scheduleReconnect(
                 uuid: pending.admission.endpointId,
                 name: pending.deviceName,
@@ -476,6 +480,9 @@ extension BleManager {
             source: source,
             sessionGeneration: sessionGeneration > 0 ? sessionGeneration : generation
         )
+        // A reused CBPeripheral may retain discovered characteristics, but a
+        // successful protected write never crosses a physical attempt boundary.
+        securityGateAttempts.cancel(endpointIds: [endpointId])
         // 3、先登记 Gate，再写 current/session 映射，保证随后物理回调可精确归属。
         connectionAdmissionGate.registerAttempt(endpointId: endpointId, generation: generation)
         currentConnectionAdmissions[key] = admission
@@ -633,6 +640,7 @@ extension BleManager {
         currentConnectionAdmissions.removeValue(forKey: reconnectKey(uuid: current.endpointId))
         peripheralConnectionSessions.removeValue(forKey: current.sessionId)
         businessConnectionLeases.remove(endpointKey: reconnectKey(uuid: current.endpointId))
+        securityGateAttempts.cancel(admission: current)
         // 2、根据终态是完成还是硬取消，选择 complete 或 cancelEndpoint 推进 Gate。
         return invalidateEndpoint
             ? connectionAdmissionGate.cancelEndpoint(current.endpointId)
@@ -850,6 +858,7 @@ extension BleManager {
         // Bluetooth OFF invalidates every exact prepare token while preserving
         // paused long-lived autoReconnect tasks for poweredOn recovery.
         businessConnectionLeases.clear()
+        securityGateAttempts.removeAll()
         peripheralCancellationWatchdogs.values.forEach { $0.workItem.cancel() }
         peripheralCancellationWatchdogs.removeAll()
         pendingPhysicalConnectWatchdogs.removeAll().forEach { $0.cancel() }

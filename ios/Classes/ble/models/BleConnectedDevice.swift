@@ -17,6 +17,11 @@ struct BleConnectedDevice {
     var isConnected: Bool = false
     var readCharsNotify: Int = 0
     var notifiedReadCharUUIDs: Set<String> = []
+    /// Optional protected write characteristic used once before connectFinish.
+    var securityGateWriteChar: CBCharacteristic?
+    /// True only after the configured gate service's characteristic list has
+    /// been inspected, so cached/out-of-order discovery cannot fall back early.
+    var securityGateDiscoveryComplete: Bool = false
     /// BLE物理连接流程是否已完成（所有特征订阅确认后设置为true，断连/错误时重置为false）
     var isBleFlowCompleted: Bool = false
     /// 异常断连后需要先扫描再重连（disconnectFromSys时置true，重连时消费一次）
@@ -41,6 +46,8 @@ struct BleConnectedDevice {
             readCharsNotify: readCharsNotify,
             notifiedReadCharUUIDs: notifiedReadCharUUIDs
         )
+        device.securityGateWriteChar = securityGateWriteChar
+        device.securityGateDiscoveryComplete = securityGateDiscoveryComplete
         device.isBleFlowCompleted = isBleFlowCompleted
         device.needsScanBeforeReconnect = needsScanBeforeReconnect
         return device

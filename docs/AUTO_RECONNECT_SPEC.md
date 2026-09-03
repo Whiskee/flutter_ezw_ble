@@ -23,6 +23,7 @@ Add these fields to `BleConfig`:
 | `autoReconnect` | `false` | Enables native auto reconnect for devices using this config. |
 | `autoReconnectMaxAttempts` | `0` | Legacy/backoff compatibility field. Native reconnect no longer stops because this count is reached. |
 | `autoReconnectUseNativePassive` | `true` | Allows platform passive reconnect paths when active reconnect cannot see the device. |
+| `securityGate` | `null` | Optional Android/iOS protected-write gate. G2 uses 5403 to establish/verify link security before ordinary Notify/AUTH; Android falls back to exact-session Bond only when old firmware lacks a writable gate. |
 | `androidHighReliabilityMode` | `false` | Uses Android 1M-first, RSSI-adaptive PHY and traffic-aware connection priority for explicitly opted-in configs. |
 
 `autoReconnectUseNativePassive` is now a legacy compatibility field. Reconnect
@@ -106,6 +107,10 @@ connected
 No new EventChannel is required. Automatic reconnect must not emit `connecting`
 before a physical callback. Existing terminal states (`timeout`, `serviceFail`,
 `charsFail`, `noDeviceFound`) describe one attempt and do not delete the task.
+`securityRecoveryExhausted` is the only new silent terminal: it closes native
+resources and retires one iOS endpoint's automatic Security Gate owner after
+five real protected-write security failures, but it is not an error or
+disconnected state for generic UI mapping.
 
 ## Reconnect Task Lifecycle
 
@@ -255,8 +260,12 @@ On Android the active Gate also serializes proactive system bonding for configs
 with `initiateBinding=true`. A `BONDING` owner keeps the Gate; `BOND_BONDED`
 resumes service discovery on the exact GATT/session, while an explicit
 `BOND_BONDING -> BOND_NONE` terminates that session before the next owner starts.
-Configs with `initiateBinding=false` skip plugin-owned `createBond()` and enter
-service discovery directly.
+Android G2 uses this Bond-first path so `createBond()` is the only pairing-dialog
+trigger. After Bond completes, the 5403 protected write verifies the current link
+key before ordinary Notify. Already-bonded devices skip `createBond()` and still
+execute 5403. Configs with `initiateBinding=false` enter service discovery
+directly; the missing-5403 post-discovery Bond path remains only as a defensive
+fallback for legacy persisted configs or a concurrent Bond-state change.
 
 Every admission is identified by endpoint + attemptGeneration + session and, at
 the platform boundary, the exact GATT/peripheral object. Status events expose
@@ -272,13 +281,24 @@ from being rejected as stale after OTA, device switching, or repeated cleanup.
 
 ## GATT Reconnect Readiness
 
-Native reconnect is successful only after every configured private service is restored:
+Native reconnect is successful only after the optional Security Gate and every configured private service are restored:
 
 1. Discover all services.
-2. For every `BlePrivateService`, find the write characteristic.
-3. For every `BlePrivateService`, find the read characteristic.
-4. Enable notify/CCCD for every read characteristic.
-5. Emit `connectFinish` only after all configured services pass.
+2. On Android or iOS, if `BleConfig.securityGate` is configured and the gate
+   characteristic is present, issue exactly one with-response protected write
+   before ordinary private-service discovery/Notify. Do not emit
+   `connectFinish` while this write is pending.
+3. If the gate characteristic is absent or cannot be written with response,
+   normally Bond-first Android G2 is already `BONDED` and continues ordinary
+   readiness for old firmware. The defensive fallback still handles `NONE` with
+   exact-session `createBond()` and rediscovery, and `BONDING` by waiting for its
+   authoritative broadcast. iOS continues ordinary readiness directly. Gate
+   absence itself is not a security failure and does not consume recovery budget.
+4. For every `BlePrivateService`, find the write characteristic.
+5. For every `BlePrivateService`, find the read characteristic.
+6. Enable notify/CCCD for every read characteristic.
+7. Emit `connectFinish` only after Security Gate has passed or fallen back and
+   all configured services pass.
 
 If any service, characteristic, or notify setup fails, native emits the existing failure state and schedules the next reconnect attempt.
 
@@ -291,6 +311,43 @@ readCharsNotify == bleConfig.privateServices.count
 ```
 
 This prevents multi-service devices from reaching `connectFinish` after only the first notify succeeds.
+
+## G2 Security Gate Recovery
+
+The 5403 protected write is the first shared-key validation breakpoint for
+Android/iOS bond or LTK mismatch. Android may first complete the explicit system
+Bond Gate; both platforms must still run 5403 before ordinary Notify
+subscriptions, G2 AUTH, or `connectFinish` so a failed security setup cannot
+masquerade as a business AUTH timeout.
+
+Automatic recovery is scoped by endpoint, recovery episode, positive
+`sessionGeneration`, and positive `attemptGeneration`:
+
+- Only actual Security Gate failures count: CBATT security errors from the
+  5403 write and peer-pairing-removed equivalents. Bluetooth off, App
+  inactive/background, scan misses, ordinary connection timeout, and missing or
+  unsupported 5403 do not consume the budget.
+- The first failed 5403 write is attempt 1. Attempts 1 through 4 cancel the old
+  attempt, wait for the exact CoreBluetooth callback/barrier, purge stale scan
+  cache, open a 10-second fresh-advertisement scan window, then connect using a
+  new exact generation. A 5-second silent wait is used only when the fresh scan
+  window misses.
+- The fifth real 5403 security failure publishes
+  `securityRecoveryExhausted`, removes that endpoint's automatic owner, and
+  must not create a sixth automatic connection.
+- Passing 5403, target change, unbind, or a user manual connect clears the
+  counter and stopped marker for that endpoint. Manual connect does not run the
+  five-attempt silent loop; its first final Security Gate failure maps to the
+  existing `boundFail` path so the app can show the current repair dialog.
+- App inactive/background pauses retrieve, scan, and connection work. Returning
+  active resumes only exact owners that still match config, endpoint, and
+  session generation.
+
+Android and iOS both execute the Security Gate and may emit
+`securityRecoveryExhausted`. Android additionally treats an explicit rejection
+or failure of Bond-first `createBond()` (or the defensive missing-5403 fallback)
+as a real security attempt; simply detecting missing/unsupported 5403 does not
+consume the budget.
 
 ## Android Strategy
 

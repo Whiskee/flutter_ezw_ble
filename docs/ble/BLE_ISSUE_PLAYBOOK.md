@@ -532,15 +532,16 @@ Root cause:
 
 - CDM association, Android BLE bond, and G2 protocol `AUTHENTICATION` are three separate layers.
 - Uninstalling the app does not necessarily remove system Bluetooth bonds. If `BluetoothDevice.bondState == BOND_BONDED`, Android will not show a pairing dialog again.
-- `BleConfig.initiateBinding` controls whether the plugin proactively calls `BluetoothDevice.createBond()` after GATT/CCCD/MTU setup. If it is false, Android only shows a pairing dialog when the Bluetooth stack itself needs security for an accessed characteristic.
+- `BleConfig.initiateBinding` controls whether the exact Android admission proactively calls `BluetoothDevice.createBond()` before service discovery. If it is false, Android only shows a pairing dialog when the Bluetooth stack itself needs security for an accessed characteristic.
 - Some BLE pair flows are Just Works or OEM-managed and may complete without a visible confirmation UI.
 - G2 `AUTHENTICATION` is a protocol command over the private service after `connectFinish`; it can send and return `authMgr.secAuth == true` even when there is no visible Android pairing dialog in that session.
 
 Fix:
 
-- Keep the G2 demo and even_connect defaults at `initiateBinding: false`
-  unless the product explicitly requires Android system bonding. Do not use
-  this switch to fix protocol `AUTHENTICATION` failures or reconnect races.
+- The current G2 firmware contract explicitly requires `initiateBinding: true`:
+  exact `createBond()` is the sole pairing-dialog trigger, then 5403 validates
+  the established key before Notify/AUTH. Do not add another pairing request
+  from the page or treat G2 protocol `AUTHENTICATION` as the system Bond result.
 - Check `dumpsys bluetooth_manager` for `Bonded devices` and `Bond Events` before concluding that pairing did not happen.
 - Check native logs for `start create bond`, `bond state`, `BleDevice: Send cmd ... is success`, `G2 receive ... cmd=0x4`, and `authSecAuth=true`.
 - To force a fresh pairing dialog, remove both the BLE bond and the CDM association; reinstalling the app alone is not sufficient.
@@ -687,8 +688,9 @@ Symptoms:
 
 Root cause:
 
-- This is not a bond failure when `AUTHENTICATION` later succeeds or when
-  `initiateBinding=false` is the intended G2 configuration.
+- This is not a bond failure when `AUTHENTICATION` later succeeds; the current
+  G2 configuration uses `initiateBinding=true`, but two-leg GATT serialization
+  remains independent from whether the system Bond Gate succeeded.
 - `connectDevice(...)` only means the native request was submitted; its Future
   does not mean GATT/CCCD/AUTH/business connection has finished.
 - Android `BleManager` currently has global descriptor and send queues. If two

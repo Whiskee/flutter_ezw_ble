@@ -38,6 +38,8 @@ enum BleConnectState {
   bleError,
   //  系统错误
   systemError,
+  //  iOS 自动安全恢复耗尽（非 App 可见错误）
+  securityRecoveryExhausted,
   //  已连接
   connected,
   //  升级状态
@@ -87,6 +89,8 @@ extension BleConnectStateExt on BleConnectState {
         return BleConnectState.bleError;
       case "systemError":
         return BleConnectState.systemError;
+      case "securityRecoveryExhausted":
+        return BleConnectState.securityRecoveryExhausted;
       case "connected":
         return BleConnectState.connected;
       case "upgrade":
@@ -127,6 +131,10 @@ extension BleConnectStateExt on BleConnectState {
 
   //  是否系统断连
   bool get isDisconnectFromSys => this == BleConnectState.disconnectFromSys;
+
+  //  iOS 自动安全门禁恢复已静默耗尽。
+  bool get isSecurityRecoveryExhausted =>
+      this == BleConnectState.securityRecoveryExhausted;
 
   //  是否连接错误
   bool get isConnectError =>
