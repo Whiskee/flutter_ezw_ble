@@ -386,6 +386,10 @@ class BleManager private constructor() {
     private var scanPureMode: Boolean = false
     //  - 蓝牙搜索回调
     private var scanCallback: ScanCallback? = null
+    /** 每次系统确认启动扫描后递增，用于拒绝上一轮迟到的 onScanFailed。 */
+    private var scanGenerationSeed = 0L
+    /** 当前确实运行中的扫描 generation；0 表示没有有效扫描窗口。 */
+    private var activeScanGeneration = 0L
     //  - 当前蓝牙状态,默认无状态
     private var bleState: Int = 0
     //  - 当前蓝牙权限,默认无权限
@@ -795,16 +799,26 @@ class BleManager private constructor() {
     /**
      *  开启扫描
      */
-    fun startScan(pureModel: Boolean = false) {
+    fun startScan(pureModel: Boolean = false): Map<String, Any> {
         val state = try {
             refreshBleState("startScan")
         } catch (error: Exception) {
             if (isScanning) stopScan() else clearLocalScanState()
             sendLog(BleLoggerTag.e, "Start scan: state refresh failed, error=${error.javaClass.simpleName}")
-            return
+            return scanStartResult(started = false, reason = "stateRefreshFailed")
         }
-        if (state != 5 || !checkBleConfigIsConfigured() || isScanning) {
-            return
+        if (state != 5) {
+            return scanStartResult(started = false, reason = "bleUnavailable")
+        }
+        if (!checkBleConfigIsConfigured()) {
+            return scanStartResult(started = false, reason = "notConfigured")
+        }
+        if (isScanning) {
+            return scanStartResult(
+                started = true,
+                generation = activeScanGeneration,
+                reason = "alreadyRunning",
+            )
         }
         val scanner = try {
             bluetoothAdapter.bluetoothLeScanner
@@ -812,29 +826,70 @@ class BleManager private constructor() {
             clearLocalScanState()
             runCatching { refreshBleState("startScan.scannerFailure") }
             sendLog(BleLoggerTag.e, "Start scan: scanner query failed, error=${error.javaClass.simpleName}")
-            return
+            return scanStartResult(started = false, reason = "scannerQueryFailed")
         }
         if (scanner == null) {
             clearLocalScanState()
             runCatching { refreshBleState("startScan.scannerNull") }
             sendLog(BleLoggerTag.e, "Start scan: scanner is null, status=$currentBleState")
-            return
+            return scanStartResult(started = false, reason = "scannerUnavailable")
         }
 
-        val callback = createScanCallBack()
+        val generation = ++scanGenerationSeed
+        val callback = createScanCallBack(generation)
         try {
             scanner.startScan(null, scanSettings, callback)
             // 只有系统调用成功后才发布本地 scanning；失败路径不能留下伪扫描窗口。
             scanCallback = callback
             scanPureMode = pureModel
             isScanning = true
+            activeScanGeneration = generation
             scanResultTemp.clear()
-            sendLog(BleLoggerTag.d, "Start scan: success")
+            sendLog(BleLoggerTag.d, "Start scan: success, generation=$generation")
+            return scanStartResult(
+                started = true,
+                generation = generation,
+                reason = "started",
+            )
         } catch (error: Exception) {
             clearLocalScanState()
             runCatching { refreshBleState("startScan.systemFailure") }
             sendLog(BleLoggerTag.e, "Start scan: system call failed, error=${error.javaClass.simpleName}, status=$currentBleState")
+            return scanStartResult(started = false, reason = "systemCallFailed")
         }
+    }
+
+    /** 生成跨平台统一的扫描启动结果，失败不得携带伪造的正 generation。 */
+    private fun scanStartResult(
+        started: Boolean,
+        generation: Long = 0L,
+        reason: String,
+        errorCode: Int? = null,
+    ): Map<String, Any> = buildMap {
+        put("started", started)
+        put("generation", if (started) generation else 0L)
+        put("reason", reason)
+        errorCode?.let { put("errorCode", it) }
+    }
+
+    /** Android 可能在 startScan 返回后才异步失败，只允许当前 generation 清理运行态。 */
+    private fun handleScanFailed(generation: Long, errorCode: Int) {
+        if (!isScanning || activeScanGeneration != generation) {
+            sendLog(
+                BleLoggerTag.d,
+                "Start scan: ignore stale failure, generation=$generation, active=$activeScanGeneration, error=$errorCode",
+            )
+            return
+        }
+        clearLocalScanState()
+        BleEC.SCAN_STATE.event?.success(
+            mapOf(
+                "started" to false,
+                "generation" to generation,
+                "reason" to "asyncFailure",
+                "errorCode" to errorCode,
+            ),
+        )
     }
 
     /**
@@ -862,6 +917,7 @@ class BleManager private constructor() {
         scanCallback = null
         scanPureMode = false
         isScanning = false
+        activeScanGeneration = 0L
     }
 
     /**
@@ -2938,7 +2994,7 @@ class BleManager private constructor() {
      * 扫描解析、SN 规则、scan response 补 SN、matchCount 聚合和 scan-then-connect 命中都由
      * `BleScanPipeline` 负责；manager 只注入当前缓存和状态机回调。
      */
-    private fun createScanCallBack(): ScanCallback =
+    private fun createScanCallBack(generation: Long): ScanCallback =
         BleScanPipeline(
             bleConfigs = {
                 // 1. 扫描管线始终读取 manager 当前配置，支持 initConfigs 后立即生效。
@@ -2961,8 +3017,12 @@ class BleManager private constructor() {
                 // 5. EventChannel 输出保持在 manager，避免 pipeline 关心 Flutter JSON 结构。
                 sendMatchDevices(sn, devices)
             },
+            onScanFailed = { errorCode ->
+                // 6. Android 异步失败按创建 callback 时冻结的 generation 精确收口。
+                handleScanFailed(generation, errorCode)
+            },
             sendLog = { tag, message ->
-                // 6. 所有扫描日志仍使用 BleManager 统一前缀。
+                // 7. 所有扫描日志仍使用 BleManager 统一前缀。
                 sendLog(tag, message)
             },
         )

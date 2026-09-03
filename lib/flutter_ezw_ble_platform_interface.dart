@@ -5,6 +5,7 @@ import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
 import 'package:flutter_ezw_ble/core/models/ble_device.dart';
 import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_business_connection_attempt.dart';
+import 'package:flutter_ezw_ble/core/models/ble_scan_start_result.dart';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
 import 'flutter_ezw_ble_method_channel.dart';
@@ -58,7 +59,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   ///
   /// - param turnOnPureModel 是否开启纯模式
   ///
-  Future<void> startScan({bool turnOnPureModel = false}) {
+  Future<BleScanStartResult> startScan({bool turnOnPureModel = false}) {
     throw UnimplementedError(
       'startScan(turnOnPureModel: $turnOnPureModel) has not been implemented.',
     );

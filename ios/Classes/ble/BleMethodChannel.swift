@@ -103,8 +103,8 @@ enum BleMC: String {
         case .startScan:
             let jsonData: [String: Any] = arguments as? [String: Any] ?? [:]
             let turnOnPureModel = jsonData["turnOnPureModel"] as? Bool ?? false
-            BleManager.shared.startScan(pureModel: turnOnPureModel)
-            break
+            result(BleManager.shared.startScan(pureModel: turnOnPureModel))
+            return
         case .stopScan:
             BleManager.shared.stopScan()
             break

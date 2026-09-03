@@ -121,7 +121,9 @@ enum class BleMC {
                 // 1. 只解析扫描纯净模式开关，具体扫描状态由 BleManager 控制。
                 val jsonMap = arguments as Map<*, *>?
                 val turnOnPureModel = jsonMap?.get("turnOnPureModel") as? Boolean ?: false
-                BleManager.instance.startScan(pureModel = turnOnPureModel)
+                return result.success(
+                    BleManager.instance.startScan(pureModel = turnOnPureModel),
+                )
             }
             STOP_SCAN -> {
                 // 1. 停止扫描不需要额外参数。

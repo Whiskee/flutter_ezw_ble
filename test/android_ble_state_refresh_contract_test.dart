@@ -40,6 +40,19 @@ void main() {
     );
     expect(source, contains('catch (error: Exception)'));
     expect(source, contains('clearLocalScanState()'));
+    expect(source, contains('generation = generation'));
+    expect(channelSource, contains('return result.success('));
+  });
+
+  test('async scan failure clears and reports the exact generation', () {
+    final pipelineSource = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleScanPipeline.kt',
+    ).readAsStringSync();
+
+    expect(pipelineSource, contains('onScanFailed(errorCode)'));
+    expect(managerSource, contains('activeScanGeneration != generation'));
+    expect(managerSource, contains('BleEC.SCAN_STATE.event?.success('));
+    expect(managerSource, contains('"reason" to "asyncFailure"'));
   });
 
   test('stop scan always releases local state after permission revocation', () {

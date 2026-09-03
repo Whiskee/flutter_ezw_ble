@@ -20,6 +20,8 @@ enum BleEC: String, CaseIterable {
     case bleState
     //  扫描结果
     case scanResult
+    //  扫描运行态；与 Android EventChannel 名称保持一致。
+    case scanState
     //  连接状态
     case connectStatus
     //  接收数据
