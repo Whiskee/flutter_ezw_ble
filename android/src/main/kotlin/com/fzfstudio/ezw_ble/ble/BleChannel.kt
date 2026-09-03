@@ -31,6 +31,8 @@ enum class BleEC {
     BLE_STATE,
     //  扫描结果
     SCAN_RESULT,
+    //  扫描运行态；异步失败携带 exact generation，避免旧 callback 误杀新扫描。
+    SCAN_STATE,
     //  连接状态
     CONNECT_STATUS,
     //  接收数据

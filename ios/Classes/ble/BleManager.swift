@@ -65,6 +65,8 @@ class BleManager: NSObject {
     lazy var scanPureModel: Bool = false
     //  - 搜素：获取结果临时缓存(DeviceInfo, 蓝牙对象)
     lazy var scanResultTemp: [(BleDevice, CBPeripheral)] = []
+    /// Dart 用该 generation 区分连续扫描窗口；零表示原生未确认启动。
+    private var scanGenerationSeed: Int64 = 0
     //  - 当前连接请求缓存，用于原生回调反查 bleConfig
     lazy var activeConnectRequests: [BleEasyConnect] = []
     //  - 发起连接信息(所属蓝牙配置名称，UUID，设备名称, 发起时间， 是否是升级状态)
@@ -358,9 +360,12 @@ extension BleManager {
      *
      * [param] pureModel 是否开启纯净模式（只返回设备名称，UUID）
      */
-    func startScan(pureModel: Bool = false) {
-        guard checkIsFunctionCanBeCalled() else {
-            return
+    func startScan(pureModel: Bool = false) -> [String: Any] {
+        guard currentBleState == 5 else {
+            return scanStartResult(started: false, reason: "bleUnavailable")
+        }
+        guard checkBleConfigIsConfigured() else {
+            return scanStartResult(started: false, reason: "notConfigured")
         }
         //  是否开启纯净模式
         scanPureModel = pureModel
@@ -369,6 +374,13 @@ extension BleManager {
         //  清空缓存
         scanResultTemp.removeAll()
         centralManager.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+        guard centralManager.isScanning else {
+            scanPureModel = false
+            loggerE(msg: "startScan: CoreBluetooth did not enter scanning state")
+            return scanStartResult(started: false, reason: "systemCallFailed")
+        }
+        scanGenerationSeed += 1
+        let generation = scanGenerationSeed
         // 生成本次扫描所使用的配置快照。搜索无结果时，首先要确认 native 真的拿到了
         // Dart 缓存配置；但同一配置重复开始扫描时只打印一次，避免日志噪声盖过扫描决策日志。
         let configSummary = bleConfigs.map { config in
@@ -379,7 +391,25 @@ extension BleManager {
             lastLoggedScanConfigSignature = configSignature
             loggerD(msg: "startScan/config: pure=\(pureModel), state=\(centralManager.state.label), configs=[\(configSummary)]")
         }
-        loggerD(msg: "startScan")
+        loggerD(msg: "startScan: generation=\(generation)")
+        return scanStartResult(
+            started: true,
+            generation: generation,
+            reason: "started"
+        )
+    }
+
+    /// 生成与 Android 一致的 MethodChannel 扫描启动结果。
+    private func scanStartResult(
+        started: Bool,
+        generation: Int64 = 0,
+        reason: String
+    ) -> [String: Any] {
+        return [
+            "started": started,
+            "generation": started ? generation : 0,
+            "reason": reason,
+        ]
     }
     
     /**
