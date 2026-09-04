@@ -128,6 +128,11 @@ class BleManager private constructor() {
     // 业务鉴权 lease 只属于一个 exact session/attempt。prepare 替换同 endpoint 的旧
     // token，abort/cleanup 只能移除匹配 token，避免旧回调删掉新 attempt。
     private val businessConnectionLeases = BleBusinessConnectionLeaseRegistry()
+    // 5403 Gate 与普通命令队列分离；对象身份和正 session/attempt 共同隔离迟到回调。
+    private val securityGateAttempts = BleAndroidSecurityGateAttemptRegistry()
+    // 安全失败先在 exact callback 中冻结“目标是否可见”，待旧 admission teardown 后再调度。
+    private val pendingSecurityRetryVisibility: MutableMap<String, Boolean> =
+        Collections.synchronizedMap(mutableMapOf())
 
     /** Gate 排队期间保留真实 GATT；只有获得准入后才启动 timeout 和 service discovery。 */
     private data class GrantedGattSession(
@@ -137,6 +142,11 @@ class BleManager private constructor() {
         val afterUpgrade: Boolean,
         /** bond 成功与 createBond 返回可能竞速；同一 session 只允许提交一次服务发现。 */
         var serviceDiscoveryStarted: Boolean = false,
+        /**
+         * 历史 false-config 或 Bond 状态竞态在发现 5403 缺失后补 Bond，并暂停普通 Notify。
+         * 只有该 exact session 的成功 Bond 才能清除此防御性标志并重新发现服务。
+         */
+        var legacySecurityGateFallbackBinding: Boolean = false,
     )
 
     /** 业务 connected 已释放 Gate，但物理 GATT 仍长期存活。 */
@@ -380,6 +390,10 @@ class BleManager private constructor() {
     private var scanPureMode: Boolean = false
     //  - 蓝牙搜索回调
     private var scanCallback: ScanCallback? = null
+    /** 每次系统确认启动扫描后递增，用于拒绝上一轮迟到的 onScanFailed。 */
+    private var scanGenerationSeed = 0L
+    /** 当前确实运行中的扫描 generation；0 表示没有有效扫描窗口。 */
+    private var activeScanGeneration = 0L
     //  - 当前蓝牙状态,默认无状态
     private var bleState: Int = 0
     //  - 当前蓝牙权限,默认无权限
@@ -407,7 +421,7 @@ class BleManager private constructor() {
         ) {
             weakContext = WeakReference(context.applicationContext)
             restorePersistedConfigsIfNeeded()
-            checkBluetoothPermission()
+            runCatching { refreshBleState("init.reuse") }
             return
         }
         mainScope = MainScope()
@@ -419,13 +433,13 @@ class BleManager private constructor() {
             context.getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
         }
         //  主动查询蓝牙工具状态
-        bleState = if (bluetoothAdapter.isEnabled) 5 else 4
+        bleState = if (isBluetoothEnabled()) 5 else 4
         //  注册监听：蓝牙状态
         bleStateListener = BleStateListener(context).also {
             it.register(createBleStateListener())
         }
         restorePersistedConfigsIfNeeded()
-        checkBluetoothPermission()
+        runCatching { refreshBleState("init") }
         // 手机控制器不支持 2M 时，setPreferredPhy 会以 SUCCESS 返回但仍停在 1M；
         // 先记录本机能力，才能把「没切成」归因到手机还是外设。
         BleAndroidPreferredPhy.logAdapterCapability(
@@ -436,38 +450,58 @@ class BleManager private constructor() {
     }
 
     /**
-     * 检查是否有蓝牙权限
+     * 在每个外部操作边界重新读取系统权限和蓝牙开关。
+     *
+     * 权限可能在 Activity 不重建的情况下被系统弹窗或设置页改变，不能把初始化时的值
+     * 当成长期事实。事件只在有效状态变化时发布，避免 resumed/startScan 连续刷新制造重复通知。
      */
-    fun checkBluetoothPermission() {
-        weakContext?.get()?.let {
-            // 1、蓝牙权限
-            // Android 12 (API 31) 及以上使用 BLUETOOTH_SCAN 和 BLUETOOTH_CONNECT 权限
-            blePermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                it.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED &&
-                        it.checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
-            }
-            // 在 Android 12 之前使用 BLUETOOTH_ADMIN 权限
-            else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                it.checkSelfPermission(Manifest.permission.BLUETOOTH_ADMIN) == PackageManager.PERMISSION_GRANTED
-            }
-            // 在较旧版本中，不检查权限，因为 BLUETOOTH_ADMIN 是从 API 23 开始引入的
-            else {
-                true
-            }
-            sendLog(BleLoggerTag.d, "Ble status listener: permission = $blePermission")
-            //  2、位置信息权限
-            bleLocation = if (Build.VERSION.SDK_INT in Build.VERSION_CODES.M..Build.VERSION_CODES.R) {
-                it.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED &&
-                        it.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
-            }
-            // Android 12+ 使用 BLUETOOTH_SCAN/CONNECT；如果 manifest 声明 neverForLocation，
-            // 插件不能再强制要求位置权限，否则合法的现代 BLE 配置会被误判为 noLocation。
-            else {
-                true
-            }
-            BleEC.BLE_STATE.event?.success(currentBleState)
-            sendLog(BleLoggerTag.d, "Ble status listener: location = $bleLocation, status = $currentBleState")
+    fun refreshBleState(reason: String): Int = refreshBleState(reason, eventBaseline = null)
+
+    @Synchronized
+    private fun refreshBleState(reason: String, eventBaseline: Int?): Int {
+        val context = weakContext?.get()
+            ?: throw IllegalStateException("BleManager context is unavailable")
+        val previousState = eventBaseline ?: currentBleState
+
+        // Android 12+ 的 isEnabled 本身需要 CONNECT 权限，所以先刷新权限，再读 adapter。
+        blePermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            context.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED &&
+                    context.checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            context.checkSelfPermission(Manifest.permission.BLUETOOTH_ADMIN) == PackageManager.PERMISSION_GRANTED
+        } else {
+            true
         }
+        bleLocation = if (Build.VERSION.SDK_INT in Build.VERSION_CODES.M..Build.VERSION_CODES.R) {
+            context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED &&
+                    context.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        } else {
+            // Android 12+ 使用 SCAN/CONNECT；neverForLocation 配置不得被位置权限误判拦截。
+            true
+        }
+        try {
+            if (blePermission) {
+                bleState = if (bluetoothAdapter.isEnabled) 5 else 4
+            }
+        } catch (error: Exception) {
+            sendLog(
+                BleLoggerTag.e,
+                "Ble state refresh: reason=$reason failed, error=${error.javaClass.simpleName}, " +
+                        "lastStatus=$currentBleState",
+            )
+            throw error
+        }
+
+        val refreshedState = currentBleState
+        if (refreshedState != previousState) {
+            BleEC.BLE_STATE.event?.success(refreshedState)
+        }
+        sendLog(
+            BleLoggerTag.d,
+            "Ble state refresh: reason=$reason, permission=$blePermission, " +
+                    "location=$bleLocation, status=$refreshedState, changed=${refreshedState != previousState}",
+        )
+        return refreshedState
     }
 
     /// 查找已连接的设备
@@ -670,6 +704,8 @@ class BleManager private constructor() {
         // 2. 清除尚未物理连接的扫描/命令/鉴权上下文，避免延迟任务重新打开 GATT。
         pendingScanConnects.removeAll { it.belongConfig in configNames }
         endpointIds.forEach { endpointId ->
+            securityGateAttempts.cancelEndpoint(endpointId)
+            pendingSecurityRetryVisibility.remove(reconnectKey(endpointId))
             cancelScanRefresh(endpointId)
             preConnectedDevices.remove(endpointId)
             sendCmdQueues.remove(reconnectKey(endpointId))
@@ -800,42 +836,125 @@ class BleManager private constructor() {
     /**
      *  开启扫描
      */
-    fun startScan(pureModel: Boolean = false) {
-        if (!checkIsFunctionCanBeCalled() || isScanning) {
+    fun startScan(pureModel: Boolean = false): Map<String, Any> {
+        val state = try {
+            refreshBleState("startScan")
+        } catch (error: Exception) {
+            if (isScanning) stopScan() else clearLocalScanState()
+            sendLog(BleLoggerTag.e, "Start scan: state refresh failed, error=${error.javaClass.simpleName}")
+            return scanStartResult(started = false, reason = "stateRefreshFailed")
+        }
+        if (state != 5) {
+            return scanStartResult(started = false, reason = "bleUnavailable")
+        }
+        if (!checkBleConfigIsConfigured()) {
+            return scanStartResult(started = false, reason = "notConfigured")
+        }
+        if (isScanning) {
+            return scanStartResult(
+                started = true,
+                generation = activeScanGeneration,
+                reason = "alreadyRunning",
+            )
+        }
+        val scanner = try {
+            bluetoothAdapter.bluetoothLeScanner
+        } catch (error: Exception) {
+            clearLocalScanState()
+            runCatching { refreshBleState("startScan.scannerFailure") }
+            sendLog(BleLoggerTag.e, "Start scan: scanner query failed, error=${error.javaClass.simpleName}")
+            return scanStartResult(started = false, reason = "scannerQueryFailed")
+        }
+        if (scanner == null) {
+            clearLocalScanState()
+            runCatching { refreshBleState("startScan.scannerNull") }
+            sendLog(BleLoggerTag.e, "Start scan: scanner is null, status=$currentBleState")
+            return scanStartResult(started = false, reason = "scannerUnavailable")
+        }
+
+        val generation = ++scanGenerationSeed
+        val callback = createScanCallBack(generation)
+        try {
+            scanner.startScan(null, scanSettings, callback)
+            // 只有系统调用成功后才发布本地 scanning；失败路径不能留下伪扫描窗口。
+            scanCallback = callback
+            scanPureMode = pureModel
+            isScanning = true
+            activeScanGeneration = generation
+            scanResultTemp.clear()
+            sendLog(BleLoggerTag.d, "Start scan: success, generation=$generation")
+            return scanStartResult(
+                started = true,
+                generation = generation,
+                reason = "started",
+            )
+        } catch (error: Exception) {
+            clearLocalScanState()
+            runCatching { refreshBleState("startScan.systemFailure") }
+            sendLog(BleLoggerTag.e, "Start scan: system call failed, error=${error.javaClass.simpleName}, status=$currentBleState")
+            return scanStartResult(started = false, reason = "systemCallFailed")
+        }
+    }
+
+    /** 生成跨平台统一的扫描启动结果，失败不得携带伪造的正 generation。 */
+    private fun scanStartResult(
+        started: Boolean,
+        generation: Long = 0L,
+        reason: String,
+        errorCode: Int? = null,
+    ): Map<String, Any> = buildMap {
+        put("started", started)
+        put("generation", if (started) generation else 0L)
+        put("reason", reason)
+        errorCode?.let { put("errorCode", it) }
+    }
+
+    /** Android 可能在 startScan 返回后才异步失败，只允许当前 generation 清理运行态。 */
+    private fun handleScanFailed(generation: Long, errorCode: Int) {
+        if (!isScanning || activeScanGeneration != generation) {
+            sendLog(
+                BleLoggerTag.d,
+                "Start scan: ignore stale failure, generation=$generation, active=$activeScanGeneration, error=$errorCode",
+            )
             return
         }
-        //  1、是否开启纯净搜索模式
-        scanPureMode = pureModel
-        //  2、执行搜索先优先执行停止搜索
-        stopScan()
-        //  3、执行搜索
-        isScanning = true
-        //  4、移除历史记录
-        scanResultTemp.clear()
-        //  5、创建搜索回调
-        scanCallback = createScanCallBack()
-        //  6、开始搜索
-        bluetoothAdapter.bluetoothLeScanner?.startScan(null, scanSettings, scanCallback)
-        sendLog(BleLoggerTag.d, "Start scan: success")
+        clearLocalScanState()
+        BleEC.SCAN_STATE.event?.success(
+            mapOf(
+                "started" to false,
+                "generation" to generation,
+                "reason" to "asyncFailure",
+                "errorCode" to errorCode,
+            ),
+        )
     }
 
     /**
      *  停止扫描
      */
     fun stopScan(isStartScan: Boolean = false) {
-        if (!checkIsFunctionCanBeCalled()) {
-            return
+        val callback = scanCallback
+        try {
+            if (callback == null) {
+                sendLog(BleLoggerTag.d, "Stop scan: scan call back is null")
+                return
+            }
+            bluetoothAdapter.bluetoothLeScanner?.stopScan(callback)
+            sendLog(BleLoggerTag.d, if (isStartScan) "Stop scan: checking if scan is already running, stopping it first if necessary" else "Stop scan: success")
+        } catch (error: Exception) {
+            sendLog(BleLoggerTag.e, "Stop scan: system call failed, error=${error.javaClass.simpleName}")
+        } finally {
+            // 撤权后 stopScan 可能抛 SecurityException；本地 owner 仍必须无条件释放。
+            clearLocalScanState()
         }
-        if (scanCallback == null) {
-            sendLog(BleLoggerTag.d, "Stop scan: scan call back is null")
-            return
-        }
-        //  停止时关闭纯净模式
+    }
+
+    /** 只清理本地扫描投影，不触碰扫描 owner、连接恢复或 FlowPolicy。 */
+    private fun clearLocalScanState() {
+        scanCallback = null
         scanPureMode = false
         isScanning = false
-        bluetoothAdapter.bluetoothLeScanner?.stopScan(scanCallback)
-        scanCallback = null
-        sendLog(BleLoggerTag.d, if (isStartScan) "Stop scan: checking if scan is already running, stopping it first if necessary" else "Stop scan: success")
+        activeScanGeneration = 0L
     }
 
     /**
@@ -1540,6 +1659,34 @@ class BleManager private constructor() {
                 }
                 // 4、宽限到期仍未连接时进入 timeout，收口 UI 和 native session。
                 sendLog(BleLoggerTag.e, "Start connect: $uuid, connect time out${if (isAuthGrace) " (auth grace expired)" else ""}")
+                // 4.1、主动配对或 5403 写在途的 timeout 属于安全建立失败；普通 ACL/GATT
+                // timeout 不消费五次预算。
+                val exactDevice = device
+                val exactGatt = exactDevice?.myGatt
+                if (admission != null && exactDevice != null && exactGatt != null) {
+                    val securityStageTimedOut =
+                        exactDevice.connectState == BleConnectState.START_BINDING ||
+                            securityGateAttempts.isInFlight(securityGateOwner(admission, exactGatt))
+                    if (securityStageTimedOut) {
+                        securityGateAttempts.consumeInFlight(securityGateOwner(admission, exactGatt))
+                        val recoveryAction = handleSecurityGateFailure(
+                            admission,
+                            exactGatt,
+                            exactDevice,
+                            "AndroidSecurityTimeout",
+                            0,
+                        )
+                        if (recoveryAction != BleAndroidSecurityRecoveryAction.DUPLICATE_IGNORED) {
+                            terminateConnectionAdmission(
+                                expectedAdmission = admission,
+                                gatt = exactGatt,
+                                fallbackName = name,
+                                state = recoveryAction.toConnectState(),
+                            )
+                        }
+                        return
+                    }
+                }
                 // 4.1、先记录 timeout 断连状态，避免随后系统回调重复落终态。
                 disconnectingDevices.removeAll {
                     it.first == uuid
@@ -1868,6 +2015,8 @@ class BleManager private constructor() {
         // 2. 取消该 endpoint 所有未来 runtime 入口，但刻意不调用 removePersistedReconnectTarget。
         taskEndpoints.forEach { autoReconnectSupervisor.cancel(it, reason = "neutral releaseDevice") }
         endpointIds.forEach { endpointId ->
+            securityGateAttempts.cancelEndpoint(endpointId)
+            pendingSecurityRetryVisibility.remove(reconnectKey(endpointId))
             clearLivenessReconcileMarkers(endpointId)
             cancelScanRefresh(endpointId)
             preConnectedDevices.remove(endpointId)
@@ -2349,6 +2498,8 @@ class BleManager private constructor() {
         val admissionGattHandles = admittedGattSessions.values.map { it.gatt }
         val businessGattHandles = businessConnectedGattSessions.values.map { it.gatt }
         connectionAdmissionGate.invalidateAllAndReset()
+        securityGateAttempts.clear()
+        pendingSecurityRetryVisibility.clear()
         currentAdmissions.clear()
         admittedGattSessions.clear()
         businessConnectedGattSessions.clear()
@@ -2602,6 +2753,7 @@ class BleManager private constructor() {
      */
     @Synchronized
     private fun handleBluetoothStateChanged(state: Int) {
+        val previousState = currentBleState
         // 1、将稳定 OFF/ON 映射为插件状态；过渡态不推进 teardown/resume。
         bleState = when (state) {
             BluetoothAdapter.STATE_OFF -> 4
@@ -2631,6 +2783,8 @@ class BleManager private constructor() {
 
             // 3、句柄 teardown 后暂停 Gate，并一次失效全部 attempt/session callback。
             connectionAdmissionGate.suspendAndReset()
+            securityGateAttempts.clear()
+            pendingSecurityRetryVisibility.clear()
             currentAdmissions.clear()
             admittedGattSessions.clear()
             businessConnectedGattSessions.clear()
@@ -2667,7 +2821,7 @@ class BleManager private constructor() {
             autoReconnectSupervisor.resumeAfterBluetoothOn()
         }
         sendLog(BleLoggerTag.d, "Ble statue listener: Original state = $state, to even state = $bleState")
-        checkBluetoothPermission()
+        runCatching { refreshBleState("bluetoothStateChanged", previousState) }
     }
 
     /**
@@ -2694,6 +2848,8 @@ class BleManager private constructor() {
             val oldBondState = systemBondStateOf(previousBondState)
             var exactAdmission: BleConnectionAdmission? = null
             var action = BondBroadcastAction.IGNORE
+            var gateSecurityFailure = false
+            var legacyGateFallbackBinding = false
 
             // 2、与 createBond 使用同一 device monitor，防止 false 返回覆盖同步成功广播。
             synchronized(connectedDevice) {
@@ -2708,7 +2864,9 @@ class BleManager private constructor() {
                 if (ownsExactGatt) {
                     val owner = candidate ?: return@synchronized
                     exactAdmission = owner
+                    legacyGateFallbackBinding = session?.legacySecurityGateFallbackBinding == true
                     val shouldObserveBond = connectedDevice.belongConfig.initiateBinding ||
+                        legacyGateFallbackBinding ||
                         oldBondState == SystemBondState.BONDED ||
                         oldBondState == SystemBondState.BONDING ||
                         currentBondState == SystemBondState.BONDED ||
@@ -2730,11 +2888,17 @@ class BleManager private constructor() {
                         }
                     }
                     action = decideBondBroadcastAction(
-                        initiateBinding = connectedDevice.belongConfig.initiateBinding,
+                        // 正常 G2 配置保持 true；legacy 标志只让历史 false-config 或
+                        // Bond 状态竞态的 exact session 临时获得广播消费权。
+                        initiateBinding = connectedDevice.belongConfig.initiateBinding ||
+                            legacyGateFallbackBinding,
                         connectState = connectedDevice.connectState,
                         bondState = currentBondState,
                         previousBondState = oldBondState,
                     )
+                    gateSecurityFailure = oldBondState == SystemBondState.BONDED &&
+                        currentBondState == SystemBondState.NONE &&
+                        securityGateAttempts.isInFlight(securityGateOwner(owner, session.gatt))
                 }
                 sendLog(
                     BleLoggerTag.d,
@@ -2744,20 +2908,72 @@ class BleManager private constructor() {
                 )
             }
 
-            // 3、锁外执行 GATT/终态动作；两个出口都会再次校验 exact token 与 GATT identity。
+            // 3、未进入物理 admission 的 BONDED->NONE 立即回收 pending GATT，不等 20 秒。
+            val removalAction = BleBondRemovalPolicy.resolve(
+                previousBonded = oldBondState == SystemBondState.BONDED,
+                currentNone = currentBondState == SystemBondState.NONE,
+                hasPrePhysicalOwner = exactAdmission == null,
+                securityStageActive = gateSecurityFailure,
+                businessConnected = connectedDevice.connectState.isConnected,
+            )
+            if (removalAction == BleBondRemovalAction.FAST_REBUILD_PRE_PHYSICAL) {
+                autoReconnectSupervisor.rebuildAfterPrePhysicalBondRemoval(connectedDevice.uuid)
+            }
+
+            // 4、锁外执行 GATT/终态动作；所有出口都会再次校验 exact token 与 GATT identity。
             when (action) {
                 BondBroadcastAction.DISCOVER_SERVICES -> exactAdmission?.let {
-                    startGrantedServiceDiscovery(it, reason = "bond broadcast success")
+                    if (legacyGateFallbackBinding) {
+                        restartGrantedServiceDiscoveryAfterLegacyBond(
+                            it,
+                            reason = "legacy security gate bond broadcast success",
+                        )
+                    } else {
+                        startGrantedServiceDiscovery(it, reason = "bond broadcast success")
+                    }
                 }
                 BondBroadcastAction.FAIL_BINDING -> exactAdmission?.let { admission ->
-                    terminateConnectionAdmission(
-                        expectedAdmission = admission,
-                        gatt = connectedDevice.myGatt,
-                        fallbackName = connectedDevice.name,
-                        state = BleConnectState.BOUND_FAIL,
+                    val gatt = connectedDevice.myGatt ?: return@let
+                    val recoveryAction = handleSecurityGateFailure(
+                        admission,
+                        gatt,
+                        connectedDevice,
+                        "AndroidBond",
+                        bondState,
                     )
+                    if (recoveryAction != BleAndroidSecurityRecoveryAction.DUPLICATE_IGNORED) {
+                        terminateConnectionAdmission(
+                            expectedAdmission = admission,
+                            gatt = gatt,
+                            fallbackName = connectedDevice.name,
+                            state = recoveryAction.toConnectState(),
+                        )
+                    }
                 }
                 BondBroadcastAction.IGNORE -> Unit
+            }
+            if (removalAction == BleBondRemovalAction.COUNT_SECURITY_FAILURE &&
+                action == BondBroadcastAction.IGNORE
+            ) {
+                exactAdmission?.let { admission ->
+                    val gatt = connectedDevice.myGatt ?: return@let
+                    securityGateAttempts.consumeInFlight(securityGateOwner(admission, gatt))
+                    val recoveryAction = handleSecurityGateFailure(
+                        admission,
+                        gatt,
+                        connectedDevice,
+                        "AndroidBond",
+                        bondState,
+                    )
+                    if (recoveryAction != BleAndroidSecurityRecoveryAction.DUPLICATE_IGNORED) {
+                        terminateConnectionAdmission(
+                            expectedAdmission = admission,
+                            gatt = gatt,
+                            fallbackName = connectedDevice.name,
+                            state = recoveryAction.toConnectState(),
+                        )
+                    }
+                }
             }
         }
     }
@@ -2936,7 +3152,7 @@ class BleManager private constructor() {
      * 扫描解析、SN 规则、scan response 补 SN、matchCount 聚合和 scan-then-connect 命中都由
      * `BleScanPipeline` 负责；manager 只注入当前缓存和状态机回调。
      */
-    private fun createScanCallBack(): ScanCallback =
+    private fun createScanCallBack(generation: Long): ScanCallback =
         BleScanPipeline(
             bleConfigs = {
                 // 1. 扫描管线始终读取 manager 当前配置，支持 initConfigs 后立即生效。
@@ -2959,8 +3175,12 @@ class BleManager private constructor() {
                 // 5. EventChannel 输出保持在 manager，避免 pipeline 关心 Flutter JSON 结构。
                 sendMatchDevices(sn, devices)
             },
+            onScanFailed = { errorCode ->
+                // 6. Android 异步失败按创建 callback 时冻结的 generation 精确收口。
+                handleScanFailed(generation, errorCode)
+            },
             sendLog = { tag, message ->
-                // 6. 所有扫描日志仍使用 BleManager 统一前缀。
+                // 7. 所有扫描日志仍使用 BleManager 统一前缀。
                 sendLog(tag, message)
             },
         )
@@ -3064,6 +3284,21 @@ class BleManager private constructor() {
                 // 6. 只有 ATT/GATT 操作回调里的授权不足才能恢复 cache/bond；连接断连 status 不走这里。
                 recoverInsufficientAuthorization(gatt, device)
             },
+            securityGateAttempts = securityGateAttempts,
+            securityGateOwner = { gatt -> securityGateOwner(admission, gatt) },
+            onSecurityGateFailure = { gatt, device, causeDomain, causeCode ->
+                handleSecurityGateFailure(admission, gatt, device, causeDomain, causeCode)
+            },
+            onSecurityGatePassed = { uuid ->
+                if (currentAdmissionFor(admission) != null) {
+                    autoReconnectSupervisor.resetSecurityRecovery(uuid)
+                }
+            },
+            onSecurityGateUnavailable = { gatt, device ->
+                // 旧 G2 固件没有可写 5403 时，只有当前 admission 可以在服务发现后
+                // 主动 Bond；callback 返回前必须决定是否暂停普通 Notify。
+                startLegacyBondAfterMissingSecurityGate(admission, gatt, device)
+            },
             consumeDisconnectingState = { uuid ->
                 // 7. 主动断连/超时断连已带有明确状态，消费后不再上报系统断连。
                 if (consumeOtaRebootDisconnectSuppression(uuid)) {
@@ -3131,6 +3366,8 @@ class BleManager private constructor() {
         sessionGeneration: Long = 0L,
     ): BleConnectionAdmission {
         val key = reconnectKey(endpointId)
+        // 新 attempt 创建前清掉旧 Gate owner；旧 GATT 对象随后即使回调也无法消费新 registry。
+        securityGateAttempts.cancelEndpoint(endpointId)
         // 新 session 一旦注册，旧业务 GATT metadata 立即失效；旧 callback 必须同时
         // 匹配 GATT 对象和 admission sessionId，不能误杀新 attempt。
         businessConnectedGattSessions.remove(key)
@@ -3316,7 +3553,7 @@ class BleManager private constructor() {
     /**
      * 在 Gate 内选择主动配对、等待系统配对或直接服务发现。
      *
-     * 1、false-config 与已配对设备不改变既有服务发现路径。
+     * 1、false-config 与已配对设备直接发现服务；Android G2/R1 未配对时先主动 Bond。
      * 2、等待/发起配对时先上报 START_BINDING，并持续占有 Gate 与连接 timeout。
      * 3、只有权威成功广播或 createBond 后 framework 已同步进入 BONDED 才恢复服务发现。
      */
@@ -3361,11 +3598,76 @@ class BleManager private constructor() {
         }
     }
 
+    /**
+     * Android G2 防御性兼容：首次服务发现已证明 5403 缺失或不支持 Write Request 后，
+     * 若历史 false-config 或 Bond 状态竞态仍呈现未配对，才在同一 exact admission/GATT 上补 Bond。
+     *
+     * 返回 true 表示 callback 必须暂停普通 Notify；Bond 成功后会重新发现服务，第二次
+     * 回调因系统已 BONDED 而直接进入 legacy readiness。已 Bond 的设备无需重复动作。
+     */
+    @Synchronized
+    private fun startLegacyBondAfterMissingSecurityGate(
+        expectedAdmission: BleConnectionAdmission,
+        gatt: BluetoothGatt,
+        device: BleDevice,
+    ): Boolean {
+        val current = currentAdmissionFor(expectedAdmission) ?: return true
+        val session = admittedGattSessions[current.sessionId] ?: return true
+        if (session.gatt !== gatt || session.device !== device || device.myGatt !== gatt ||
+            !connectionAdmissionGate.isActive(current)
+        ) {
+            sendLog(
+                BleLoggerTag.d,
+                "Security gate fallback: endpoint=${expectedAdmission.endpointId}, ignored stale owner",
+            )
+            return true
+        }
+
+        val bondState = systemBondStateOf(gatt.device.bondState)
+        val action = decideMissingSecurityGateBondAction(bondState)
+        sendLog(
+            BleLoggerTag.d,
+            "Security gate fallback: endpoint=${current.endpointId}, source=${current.source.flutterValue}, " +
+                "generation=${current.generation}, sessionId=${current.sessionId}, " +
+                "bondState=$bondState, action=$action",
+        )
+        return when (action) {
+            GateGrantedBondAction.DISCOVER_SERVICES -> {
+                // 已有系统 Bond 时不需要重新 discover；当前 callback 可直接初始化 Notify。
+                autoReconnectSupervisor.resetSecurityRecovery(device.uuid)
+                false
+            }
+            GateGrantedBondAction.WAIT_FOR_BOND -> {
+                synchronized(device) {
+                    session.legacySecurityGateFallbackBinding = true
+                    handleConnectState(
+                        device.uuid,
+                        device.name,
+                        BleConnectState.START_BINDING,
+                        source = current.source,
+                        generation = current.sessionGeneration,
+                        attemptGeneration = current.generation,
+                    )
+                }
+                true
+            }
+            GateGrantedBondAction.START_BOND -> {
+                startGrantedSystemBond(
+                    current,
+                    session,
+                    rediscoverAfterBond = true,
+                )
+                true
+            }
+        }
+    }
+
     /** 主动配对前先发布 START_BINDING，并复查 framework 状态消除 createBond(false) 竞态。 */
     @Synchronized
     private fun startGrantedSystemBond(
         admission: BleConnectionAdmission,
         session: GrantedGattSession,
+        rediscoverAfterBond: Boolean = false,
     ) {
         var resumeServiceDiscovery = false
         var failBinding = false
@@ -3387,6 +3689,7 @@ class BleManager private constructor() {
             }
 
             // 2、状态必须先进入 START_BINDING；快速广播随后才能被 exact guard 接受。
+            session.legacySecurityGateFallbackBinding = rediscoverAfterBond
             handleConnectState(
                 session.device.uuid,
                 session.device.name,
@@ -3416,17 +3719,71 @@ class BleManager private constructor() {
 
         // 3、同步成功复用同一服务发现入口；明确拒绝必须 exact teardown 并释放下一 owner。
         when {
-            resumeServiceDiscovery -> startGrantedServiceDiscovery(
-                admission,
-                reason = "createBond observed bonded",
-            )
-            failBinding -> terminateConnectionAdmission(
-                expectedAdmission = admission,
-                gatt = session.gatt,
-                fallbackName = session.device.name,
-                state = BleConnectState.BOUND_FAIL,
-            )
+            resumeServiceDiscovery -> if (rediscoverAfterBond) {
+                restartGrantedServiceDiscoveryAfterLegacyBond(
+                    admission,
+                    reason = "legacy security gate createBond observed bonded",
+                )
+            } else {
+                startGrantedServiceDiscovery(
+                    admission,
+                    reason = "createBond observed bonded",
+                )
+            }
+            failBinding -> {
+                val recoveryAction = handleSecurityGateFailure(
+                    admission,
+                    session.gatt,
+                    session.device,
+                    "AndroidBond",
+                    BluetoothDevice.BOND_NONE,
+                )
+                if (recoveryAction != BleAndroidSecurityRecoveryAction.DUPLICATE_IGNORED) {
+                    terminateConnectionAdmission(
+                        expectedAdmission = admission,
+                        gatt = session.gatt,
+                        fallbackName = session.device.name,
+                        state = recoveryAction.toConnectState(),
+                    )
+                }
+            }
         }
+    }
+
+    /**
+     * 旧 G2 固件 fallback Bond 成功后重新发现服务。
+     *
+     * 首次 discovery 已经消费 `serviceDiscoveryStarted`，因此只允许持有 fallback 标志的
+     * exact session 重置该位。同步 createBond 结果与成功广播无论谁先到都只能重启一次。
+     */
+    @Synchronized
+    private fun restartGrantedServiceDiscoveryAfterLegacyBond(
+        expectedAdmission: BleConnectionAdmission,
+        reason: String,
+    ) {
+        val current = currentAdmissionFor(expectedAdmission) ?: return
+        val session = admittedGattSessions[current.sessionId] ?: return
+        if (!connectionAdmissionGate.isActive(current) || session.device.myGatt !== session.gatt) {
+            return
+        }
+        val shouldRestart = synchronized(session) {
+            if (!session.legacySecurityGateFallbackBinding) {
+                false
+            } else {
+                session.legacySecurityGateFallbackBinding = false
+                session.serviceDiscoveryStarted = false
+                true
+            }
+        }
+        if (!shouldRestart) {
+            sendLog(
+                BleLoggerTag.d,
+                "Security gate fallback: endpoint=${current.endpointId}, duplicate bond success ignored",
+            )
+            return
+        }
+        autoReconnectSupervisor.resetSecurityRecovery(current.endpointId)
+        startGrantedServiceDiscovery(current, reason)
     }
 
     /** exact Gate owner 在同一 GATT 上只允许提交一次 service discovery。 */
@@ -3511,6 +3868,9 @@ class BleManager private constructor() {
         invalidateEndpoint: Boolean,
     ): BleConnectionAdmission? {
         val current = currentAdmissionFor(admission) ?: return null
+        admittedGattSessions[current.sessionId]?.let { session ->
+            securityGateAttempts.cancel(securityGateOwner(current, session.gatt))
+        }
         currentAdmissions.remove(reconnectKey(current.endpointId))
         admittedGattSessions.remove(current.sessionId)
         businessConnectionLeases.remove(reconnectKey(current.endpointId))
@@ -3680,6 +4040,8 @@ class BleManager private constructor() {
         }
         val key = reconnectKey(uuid)
         currentAdmissions.remove(key)?.let { admittedGattSessions.remove(it.sessionId) }
+        securityGateAttempts.cancelEndpoint(uuid)
+        pendingSecurityRetryVisibility.remove(key)
         // Business prepare is scoped to the exact admission; cancelling Gate
         // invalidates the auth grace without touching persisted reconnect owner.
         businessConnectionLeases.remove(key)
@@ -3977,6 +4339,7 @@ class BleManager private constructor() {
         BleConnectState.TIMEOUT -> "timeout"
         BleConnectState.BLE_ERROR -> "bleError"
         BleConnectState.SYSTEM_ERROR -> "systemError"
+        BleConnectState.SECURITY_RECOVERY_EXHAUSTED -> "securityRecoveryExhausted"
         BleConnectState.CONNECTED -> "connected"
         BleConnectState.UPGRADE -> "upgrade"
         BleConnectState.NONE -> "none"
@@ -4058,6 +4421,12 @@ class BleManager private constructor() {
         if (state == BleConnectState.DISCONNECT_BY_USER) {
             autoReconnectSupervisor.cancel(uuid, reason = "disconnectByUser state")
         }
+        if (state == BleConnectState.SECURITY_RECOVERY_EXHAUSTED) {
+            // 第五次只撤销命中的 endpoint native owner；不删除 App 绑定或系统 Bond。
+            businessConnectedGattSessions.remove(key)
+            autoReconnectSupervisor.cancel(uuid, reason = "securityRecoveryExhausted")
+            reconnectStore.removeTarget(weakContext?.get(), uuid)
+        }
         // 3、flow connecting 只清理断连列表，不结束业务超时会话。
         //  注意：CONNECT_FINISH 只表示 BLE 服务/特征流程完成，真正的业务 connected
         //  仍由上层鉴权后调用 deviceConnected 触发，所以这里不取消超时定时器。
@@ -4101,8 +4470,92 @@ class BleManager private constructor() {
             effectiveAttemptGeneration,
         )
         if (scheduleAutoReconnect && (state.isDisconnected || state.isError)) {
-            autoReconnectSupervisor.schedule(uuid, state)
+            val securityTargetVisible = pendingSecurityRetryVisibility.remove(key)
+            if (securityTargetVisible != null) {
+                autoReconnectSupervisor.schedule(
+                    uuid,
+                    state,
+                    retryDelayOverrideMs = if (securityTargetVisible) {
+                        BlePassiveReconnectDelayPolicy.VISIBLE_WAKE_DEBOUNCE_MS
+                    } else {
+                        null
+                    },
+                    reason = "securityGateFailure",
+                    forceVisibleDirectConnect = securityTargetVisible,
+                )
+            } else {
+                autoReconnectSupervisor.schedule(uuid, state)
+            }
         }
+    }
+
+    /** 由 admission 与真实 GATT 对象构造 exact 5403 Gate owner。 */
+    private fun securityGateOwner(
+        admission: BleConnectionAdmission,
+        gatt: BluetoothGatt,
+    ): BleAndroidSecurityGateOwner = BleAndroidSecurityGateOwner(
+        endpointId = admission.endpointId,
+        sessionGeneration = admission.sessionGeneration,
+        attemptGeneration = admission.generation,
+        sessionId = admission.sessionId,
+        gattIdentity = gatt,
+    )
+
+    /**
+     * 所有 Android 安全证据的唯一计数出口。
+     *
+     * 先复验 admission/GATT，再刷新本地 GATT cache 并保留系统 Bond；Supervisor 负责同
+     * attempt 去重与每 endpoint 五次预算。
+     */
+    private fun handleSecurityGateFailure(
+        admission: BleConnectionAdmission,
+        gatt: BluetoothGatt,
+        device: BleDevice,
+        causeDomain: String,
+        causeCode: Int,
+    ): BleAndroidSecurityRecoveryAction {
+        val current = currentAdmissionFor(admission)
+        val session = current?.let { admittedGattSessions[it.sessionId] }
+        if (current == null || session?.gatt !== gatt || device.myGatt !== gatt) {
+            sendLog(
+                BleLoggerTag.d,
+                "Security recovery: ${admission.endpointId} ignored stale evidence " +
+                    "domain=$causeDomain code=$causeCode",
+            )
+            return BleAndroidSecurityRecoveryAction.DUPLICATE_IGNORED
+        }
+        refreshDeviceCache(gatt)
+        device.needsScanBeforeConnect = true
+        val action = autoReconnectSupervisor.recordSecurityFailure(
+            uuid = current.endpointId,
+            source = current.source,
+            attemptGeneration = current.generation,
+        )
+        if (action == BleAndroidSecurityRecoveryAction.RETRY) {
+            pendingSecurityRetryVisibility[reconnectKey(current.endpointId)] =
+                isTargetVisibleInScan(current.endpointId, device.name, device.sn)
+        } else {
+            pendingSecurityRetryVisibility.remove(reconnectKey(current.endpointId))
+        }
+        if (action == BleAndroidSecurityRecoveryAction.MANUAL_FAILURE) {
+            // 手动 attempt 首次安全失败后停止 native owner，让 boundFail/777 成为唯一后续入口。
+            autoReconnectSupervisor.cancel(current.endpointId, reason = "manual security failure")
+            reconnectStore.removeTarget(weakContext?.get(), current.endpointId)
+        }
+        sendLog(
+            if (action == BleAndroidSecurityRecoveryAction.EXHAUSTED) BleLoggerTag.e else BleLoggerTag.d,
+            "Security recovery: ${current.endpointId}, domain=$causeDomain, code=$causeCode, " +
+                "bond=${gatt.device.bondState.toBondStateName()}, keepBond=true, action=$action",
+        )
+        return action
+    }
+
+    /** 安全恢复动作到连接终态的集中映射。 */
+    private fun BleAndroidSecurityRecoveryAction.toConnectState(): BleConnectState = when (this) {
+        BleAndroidSecurityRecoveryAction.RETRY -> BleConnectState.DISCONNECT_FROM_SYS
+        BleAndroidSecurityRecoveryAction.EXHAUSTED -> BleConnectState.SECURITY_RECOVERY_EXHAUSTED
+        BleAndroidSecurityRecoveryAction.MANUAL_FAILURE -> BleConnectState.BOUND_FAIL
+        BleAndroidSecurityRecoveryAction.DUPLICATE_IGNORED -> BleConnectState.NONE
     }
 
     /**

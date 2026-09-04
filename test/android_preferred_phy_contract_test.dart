@@ -20,6 +20,12 @@ void main() {
     expect(helper, contains('readPhy()'));
     expect(callback, contains('reason = "connectFinish"'));
     expect(callback, contains('override fun onPhyUpdate'));
+    expect(
+      RegExp(r'override fun onPhyUpdate\(').allMatches(callback),
+      hasLength(1),
+      reason: 'CoreBluetooth PHY diagnostics must share one JVM callback',
+    );
+    expect(callback, contains('[ezw_ble][phy] update endpoint='));
     expect(callback, contains('override fun onPhyRead'));
     expect(helper, contains('isLe2MPhySupported'));
     expect(manager, contains('reason = "enterUpgradeState"'));

@@ -582,19 +582,6 @@ internal class BleGattSessionCallback(
     }
 
     /**
-     * `setPreferredPhy` 的异步结果。失败或仍停在 1M 只记日志，不能回退 connectFinish。
-     */
-    override fun onPhyUpdate(gatt: BluetoothGatt?, txPhy: Int, rxPhy: Int, status: Int) {
-        super.onPhyUpdate(gatt, txPhy, rxPhy, status)
-        val address = gatt?.device?.address ?: return
-        sendLog(
-            BleLoggerTag.d,
-            "[ezw_ble][phy] update endpoint=$address tx=${BleAndroidPreferredPhy.describe(txPhy)} " +
-                "rx=${BleAndroidPreferredPhy.describe(rxPhy)} status=$status",
-        )
-    }
-
-    /**
      * 串行写入下一个 CCCD。
      *
      * Android descriptor 写入是异步操作，不能在循环里一次性写完；否则后写入会覆盖前写入。
@@ -678,6 +665,14 @@ internal class BleGattSessionCallback(
     /** 记录 controller 最终采用的 PHY；setPreferredPhy 只是偏好，真实结果以该回调为准。 */
     override fun onPhyUpdate(gatt: BluetoothGatt, txPhy: Int, rxPhy: Int, status: Int) {
         super.onPhyUpdate(gatt, txPhy, rxPhy, status)
+        // OTA 的 2M 请求与高可靠模式共用同一个 framework 回调；先记录 controller
+        // 的真实选择，再让 exact GATT owner 决定是否更新连接质量状态。
+        sendLog(
+            BleLoggerTag.d,
+            "[ezw_ble][phy] update endpoint=${gatt.device.address} " +
+                "tx=${BleAndroidPreferredPhy.describe(txPhy)} " +
+                "rx=${BleAndroidPreferredPhy.describe(rxPhy)} status=$status",
+        )
         val device = currentExpectedDeviceForGatt(gatt, "PHY update") ?: return
         if (!device.belongConfig.androidHighReliabilityMode) {
             return
