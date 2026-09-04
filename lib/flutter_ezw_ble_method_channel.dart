@@ -5,6 +5,7 @@ import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
 import 'package:flutter_ezw_ble/core/models/ble_device.dart';
 import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_business_connection_attempt.dart';
+import 'package:flutter_ezw_ble/core/models/ble_scan_start_result.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble.dart';
 
 import 'flutter_ezw_ble_platform_interface.dart';
@@ -30,8 +31,15 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       );
 
   @override
-  Future<void> startScan({bool turnOnPureModel = false}) async => methodChannel
-      .invokeMethod("startScan", {"turnOnPureModel": turnOnPureModel});
+  Future<BleScanStartResult> startScan({
+    bool turnOnPureModel = false,
+  }) async {
+    final result = await methodChannel.invokeMethod<Object?>(
+      "startScan",
+      {"turnOnPureModel": turnOnPureModel},
+    );
+    return BleScanStartResult.fromNative(result);
+  }
 
   @override
   Future<void> stopScan() async => methodChannel.invokeMethod("stopScan");

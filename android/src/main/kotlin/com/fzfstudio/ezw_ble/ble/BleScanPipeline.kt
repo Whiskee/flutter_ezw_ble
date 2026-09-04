@@ -30,6 +30,8 @@ internal class BleScanPipeline(
     private val tryConnectFromPendingScan: (BleDevice) -> Unit,
     /** 将已经按 SN 聚合好的设备列表发送给 Flutter。 */
     private val emitMatchDevices: (String, List<BleDevice>) -> Unit,
+    /** 将系统异步扫描失败交还 manager 按 exact generation 收口。 */
+    private val onScanFailed: (Int) -> Unit,
     /** 统一日志出口。 */
     private val sendLog: (BleLoggerTag, String) -> Unit,
 ) : ScanCallback() {
@@ -109,7 +111,8 @@ internal class BleScanPipeline(
      * 失败码保留原始整数，方便结合 Android 官方错误码或厂商日志排查。
      */
     override fun onScanFailed(errorCode: Int) {
-        // 1. 扫描失败不在 pipeline 内重试，重试策略由 manager/业务层决定。
+        // 1. 扫描失败不在 pipeline 内重试，先让 manager 清理状态并通知 Dart。
+        onScanFailed(errorCode)
         sendLog(BleLoggerTag.e, "Start scan: error = $errorCode")
     }
 

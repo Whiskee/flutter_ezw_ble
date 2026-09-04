@@ -4,6 +4,7 @@ import 'package:flutter_ezw_ble/core/models/ble_cmd.dart';
 import 'package:flutter_ezw_ble/core/models/ble_connect_model.dart';
 import 'package:flutter_ezw_ble/core/models/ble_match_device.dart';
 import 'package:flutter_ezw_ble/core/models/ble_status.dart';
+import 'package:flutter_ezw_ble/core/models/ble_scan_start_result.dart';
 import 'package:flutter_ezw_utils/extension/string_ext.dart';
 
 const String ezwBleTag = "flutter_ezw_ble";
@@ -27,6 +28,10 @@ class EzwBle {
     final jsonMap = (data as String? ?? "").toMap();
     return BleMatchDevice.fromJson(jsonMap);
   });
+  //  - 原生扫描运行态；Android 的异步 onScanFailed 会携带 exact generation。
+  Stream<BleScanStartResult> scanStateEC = BleEventChannel.scanState.ec.map(
+    BleScanStartResult.fromNative,
+  );
   //  - 开启连接后的流程
   Stream<BleConnectModel> connectStatusEC =
       BleEventChannel.connectStatus.ec.map((data) {

@@ -6,6 +6,7 @@ import 'package:flutter_ezw_utils/flutter_ezw_index.dart';
 enum BleEventChannel {
   bleState,
   scanResult,
+  scanState,
   connectStatus,
   receiveData,
   logger,

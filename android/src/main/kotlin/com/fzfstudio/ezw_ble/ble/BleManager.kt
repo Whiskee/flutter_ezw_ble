@@ -386,6 +386,10 @@ class BleManager private constructor() {
     private var scanPureMode: Boolean = false
     //  - 蓝牙搜索回调
     private var scanCallback: ScanCallback? = null
+    /** 每次系统确认启动扫描后递增，用于拒绝上一轮迟到的 onScanFailed。 */
+    private var scanGenerationSeed = 0L
+    /** 当前确实运行中的扫描 generation；0 表示没有有效扫描窗口。 */
+    private var activeScanGeneration = 0L
     //  - 当前蓝牙状态,默认无状态
     private var bleState: Int = 0
     //  - 当前蓝牙权限,默认无权限
@@ -413,7 +417,7 @@ class BleManager private constructor() {
         ) {
             weakContext = WeakReference(context.applicationContext)
             restorePersistedConfigsIfNeeded()
-            checkBluetoothPermission()
+            runCatching { refreshBleState("init.reuse") }
             return
         }
         mainScope = MainScope()
@@ -425,49 +429,69 @@ class BleManager private constructor() {
             context.getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
         }
         //  主动查询蓝牙工具状态
-        bleState = if (bluetoothAdapter.isEnabled) 5 else 4
+        bleState = if (isBluetoothEnabled()) 5 else 4
         //  注册监听：蓝牙状态
         bleStateListener = BleStateListener(context).also {
             it.register(createBleStateListener())
         }
         restorePersistedConfigsIfNeeded()
-        checkBluetoothPermission()
+        runCatching { refreshBleState("init") }
         sendLog(BleLoggerTag.d, "Init: success")
     }
 
     /**
-     * 检查是否有蓝牙权限
+     * 在每个外部操作边界重新读取系统权限和蓝牙开关。
+     *
+     * 权限可能在 Activity 不重建的情况下被系统弹窗或设置页改变，不能把初始化时的值
+     * 当成长期事实。事件只在有效状态变化时发布，避免 resumed/startScan 连续刷新制造重复通知。
      */
-    fun checkBluetoothPermission() {
-        weakContext?.get()?.let {
-            // 1、蓝牙权限
-            // Android 12 (API 31) 及以上使用 BLUETOOTH_SCAN 和 BLUETOOTH_CONNECT 权限
-            blePermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                it.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED &&
-                        it.checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
-            }
-            // 在 Android 12 之前使用 BLUETOOTH_ADMIN 权限
-            else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                it.checkSelfPermission(Manifest.permission.BLUETOOTH_ADMIN) == PackageManager.PERMISSION_GRANTED
-            }
-            // 在较旧版本中，不检查权限，因为 BLUETOOTH_ADMIN 是从 API 23 开始引入的
-            else {
-                true
-            }
-            sendLog(BleLoggerTag.d, "Ble status listener: permission = $blePermission")
-            //  2、位置信息权限
-            bleLocation = if (Build.VERSION.SDK_INT in Build.VERSION_CODES.M..Build.VERSION_CODES.R) {
-                it.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED &&
-                        it.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
-            }
-            // Android 12+ 使用 BLUETOOTH_SCAN/CONNECT；如果 manifest 声明 neverForLocation，
-            // 插件不能再强制要求位置权限，否则合法的现代 BLE 配置会被误判为 noLocation。
-            else {
-                true
-            }
-            BleEC.BLE_STATE.event?.success(currentBleState)
-            sendLog(BleLoggerTag.d, "Ble status listener: location = $bleLocation, status = $currentBleState")
+    fun refreshBleState(reason: String): Int = refreshBleState(reason, eventBaseline = null)
+
+    @Synchronized
+    private fun refreshBleState(reason: String, eventBaseline: Int?): Int {
+        val context = weakContext?.get()
+            ?: throw IllegalStateException("BleManager context is unavailable")
+        val previousState = eventBaseline ?: currentBleState
+
+        // Android 12+ 的 isEnabled 本身需要 CONNECT 权限，所以先刷新权限，再读 adapter。
+        blePermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            context.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED &&
+                    context.checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            context.checkSelfPermission(Manifest.permission.BLUETOOTH_ADMIN) == PackageManager.PERMISSION_GRANTED
+        } else {
+            true
         }
+        bleLocation = if (Build.VERSION.SDK_INT in Build.VERSION_CODES.M..Build.VERSION_CODES.R) {
+            context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED &&
+                    context.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        } else {
+            // Android 12+ 使用 SCAN/CONNECT；neverForLocation 配置不得被位置权限误判拦截。
+            true
+        }
+        try {
+            if (blePermission) {
+                bleState = if (bluetoothAdapter.isEnabled) 5 else 4
+            }
+        } catch (error: Exception) {
+            sendLog(
+                BleLoggerTag.e,
+                "Ble state refresh: reason=$reason failed, error=${error.javaClass.simpleName}, " +
+                        "lastStatus=$currentBleState",
+            )
+            throw error
+        }
+
+        val refreshedState = currentBleState
+        if (refreshedState != previousState) {
+            BleEC.BLE_STATE.event?.success(refreshedState)
+        }
+        sendLog(
+            BleLoggerTag.d,
+            "Ble state refresh: reason=$reason, permission=$blePermission, " +
+                    "location=$bleLocation, status=$refreshedState, changed=${refreshedState != previousState}",
+        )
+        return refreshedState
     }
 
     /// 查找已连接的设备
@@ -775,42 +799,125 @@ class BleManager private constructor() {
     /**
      *  开启扫描
      */
-    fun startScan(pureModel: Boolean = false) {
-        if (!checkIsFunctionCanBeCalled() || isScanning) {
+    fun startScan(pureModel: Boolean = false): Map<String, Any> {
+        val state = try {
+            refreshBleState("startScan")
+        } catch (error: Exception) {
+            if (isScanning) stopScan() else clearLocalScanState()
+            sendLog(BleLoggerTag.e, "Start scan: state refresh failed, error=${error.javaClass.simpleName}")
+            return scanStartResult(started = false, reason = "stateRefreshFailed")
+        }
+        if (state != 5) {
+            return scanStartResult(started = false, reason = "bleUnavailable")
+        }
+        if (!checkBleConfigIsConfigured()) {
+            return scanStartResult(started = false, reason = "notConfigured")
+        }
+        if (isScanning) {
+            return scanStartResult(
+                started = true,
+                generation = activeScanGeneration,
+                reason = "alreadyRunning",
+            )
+        }
+        val scanner = try {
+            bluetoothAdapter.bluetoothLeScanner
+        } catch (error: Exception) {
+            clearLocalScanState()
+            runCatching { refreshBleState("startScan.scannerFailure") }
+            sendLog(BleLoggerTag.e, "Start scan: scanner query failed, error=${error.javaClass.simpleName}")
+            return scanStartResult(started = false, reason = "scannerQueryFailed")
+        }
+        if (scanner == null) {
+            clearLocalScanState()
+            runCatching { refreshBleState("startScan.scannerNull") }
+            sendLog(BleLoggerTag.e, "Start scan: scanner is null, status=$currentBleState")
+            return scanStartResult(started = false, reason = "scannerUnavailable")
+        }
+
+        val generation = ++scanGenerationSeed
+        val callback = createScanCallBack(generation)
+        try {
+            scanner.startScan(null, scanSettings, callback)
+            // 只有系统调用成功后才发布本地 scanning；失败路径不能留下伪扫描窗口。
+            scanCallback = callback
+            scanPureMode = pureModel
+            isScanning = true
+            activeScanGeneration = generation
+            scanResultTemp.clear()
+            sendLog(BleLoggerTag.d, "Start scan: success, generation=$generation")
+            return scanStartResult(
+                started = true,
+                generation = generation,
+                reason = "started",
+            )
+        } catch (error: Exception) {
+            clearLocalScanState()
+            runCatching { refreshBleState("startScan.systemFailure") }
+            sendLog(BleLoggerTag.e, "Start scan: system call failed, error=${error.javaClass.simpleName}, status=$currentBleState")
+            return scanStartResult(started = false, reason = "systemCallFailed")
+        }
+    }
+
+    /** 生成跨平台统一的扫描启动结果，失败不得携带伪造的正 generation。 */
+    private fun scanStartResult(
+        started: Boolean,
+        generation: Long = 0L,
+        reason: String,
+        errorCode: Int? = null,
+    ): Map<String, Any> = buildMap {
+        put("started", started)
+        put("generation", if (started) generation else 0L)
+        put("reason", reason)
+        errorCode?.let { put("errorCode", it) }
+    }
+
+    /** Android 可能在 startScan 返回后才异步失败，只允许当前 generation 清理运行态。 */
+    private fun handleScanFailed(generation: Long, errorCode: Int) {
+        if (!isScanning || activeScanGeneration != generation) {
+            sendLog(
+                BleLoggerTag.d,
+                "Start scan: ignore stale failure, generation=$generation, active=$activeScanGeneration, error=$errorCode",
+            )
             return
         }
-        //  1、是否开启纯净搜索模式
-        scanPureMode = pureModel
-        //  2、执行搜索先优先执行停止搜索
-        stopScan()
-        //  3、执行搜索
-        isScanning = true
-        //  4、移除历史记录
-        scanResultTemp.clear()
-        //  5、创建搜索回调
-        scanCallback = createScanCallBack()
-        //  6、开始搜索
-        bluetoothAdapter.bluetoothLeScanner?.startScan(null, scanSettings, scanCallback)
-        sendLog(BleLoggerTag.d, "Start scan: success")
+        clearLocalScanState()
+        BleEC.SCAN_STATE.event?.success(
+            mapOf(
+                "started" to false,
+                "generation" to generation,
+                "reason" to "asyncFailure",
+                "errorCode" to errorCode,
+            ),
+        )
     }
 
     /**
      *  停止扫描
      */
     fun stopScan(isStartScan: Boolean = false) {
-        if (!checkIsFunctionCanBeCalled()) {
-            return
+        val callback = scanCallback
+        try {
+            if (callback == null) {
+                sendLog(BleLoggerTag.d, "Stop scan: scan call back is null")
+                return
+            }
+            bluetoothAdapter.bluetoothLeScanner?.stopScan(callback)
+            sendLog(BleLoggerTag.d, if (isStartScan) "Stop scan: checking if scan is already running, stopping it first if necessary" else "Stop scan: success")
+        } catch (error: Exception) {
+            sendLog(BleLoggerTag.e, "Stop scan: system call failed, error=${error.javaClass.simpleName}")
+        } finally {
+            // 撤权后 stopScan 可能抛 SecurityException；本地 owner 仍必须无条件释放。
+            clearLocalScanState()
         }
-        if (scanCallback == null) {
-            sendLog(BleLoggerTag.d, "Stop scan: scan call back is null")
-            return
-        }
-        //  停止时关闭纯净模式
+    }
+
+    /** 只清理本地扫描投影，不触碰扫描 owner、连接恢复或 FlowPolicy。 */
+    private fun clearLocalScanState() {
+        scanCallback = null
         scanPureMode = false
         isScanning = false
-        bluetoothAdapter.bluetoothLeScanner?.stopScan(scanCallback)
-        scanCallback = null
-        sendLog(BleLoggerTag.d, if (isStartScan) "Stop scan: checking if scan is already running, stopping it first if necessary" else "Stop scan: success")
+        activeScanGeneration = 0L
     }
 
     /**
@@ -2488,6 +2595,7 @@ class BleManager private constructor() {
      */
     @Synchronized
     private fun handleBluetoothStateChanged(state: Int) {
+        val previousState = currentBleState
         // 1、将稳定 OFF/ON 映射为插件状态；过渡态不推进 teardown/resume。
         bleState = when (state) {
             BluetoothAdapter.STATE_OFF -> 4
@@ -2555,7 +2663,7 @@ class BleManager private constructor() {
             autoReconnectSupervisor.resumeAfterBluetoothOn()
         }
         sendLog(BleLoggerTag.d, "Ble statue listener: Original state = $state, to even state = $bleState")
-        checkBluetoothPermission()
+        runCatching { refreshBleState("bluetoothStateChanged", previousState) }
     }
 
     /**
@@ -2886,7 +2994,7 @@ class BleManager private constructor() {
      * 扫描解析、SN 规则、scan response 补 SN、matchCount 聚合和 scan-then-connect 命中都由
      * `BleScanPipeline` 负责；manager 只注入当前缓存和状态机回调。
      */
-    private fun createScanCallBack(): ScanCallback =
+    private fun createScanCallBack(generation: Long): ScanCallback =
         BleScanPipeline(
             bleConfigs = {
                 // 1. 扫描管线始终读取 manager 当前配置，支持 initConfigs 后立即生效。
@@ -2909,8 +3017,12 @@ class BleManager private constructor() {
                 // 5. EventChannel 输出保持在 manager，避免 pipeline 关心 Flutter JSON 结构。
                 sendMatchDevices(sn, devices)
             },
+            onScanFailed = { errorCode ->
+                // 6. Android 异步失败按创建 callback 时冻结的 generation 精确收口。
+                handleScanFailed(generation, errorCode)
+            },
             sendLog = { tag, message ->
-                // 6. 所有扫描日志仍使用 BleManager 统一前缀。
+                // 7. 所有扫描日志仍使用 BleManager 统一前缀。
                 sendLog(tag, message)
             },
         )

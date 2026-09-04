@@ -7,6 +7,7 @@ import 'package:flutter_ezw_ble/core/models/ble_business_connection_attempt.dart
 import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
 import 'package:flutter_ezw_ble/core/models/ble_device.dart';
 import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
+import 'package:flutter_ezw_ble/core/models/ble_scan_start_result.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_method_channel.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_platform_interface.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -31,7 +32,7 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
-  Future<void> startScan({bool turnOnPureModel = false}) {
+  Future<BleScanStartResult> startScan({bool turnOnPureModel = false}) {
     throw UnimplementedError();
   }
 

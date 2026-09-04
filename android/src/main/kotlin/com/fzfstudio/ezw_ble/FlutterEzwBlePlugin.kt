@@ -75,14 +75,18 @@ class FlutterEzwBlePlugin : FlutterPlugin, MethodCallHandler {
       /** Activity 创建时无需处理 BLE 状态。 */
       override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
 
-      /** Activity 可见时刷新蓝牙权限缓存。 */
-      override fun onActivityStarted(activity: Activity) = BleManager.instance.checkBluetoothPermission()
+      /** Activity 可见时刷新实时蓝牙权限与开关状态。 */
+      override fun onActivityStarted(activity: Activity) {
+        runCatching { BleManager.instance.refreshBleState("activityStarted") }
+      }
 
       /** Activity 停止时不主动断开 BLE，避免后台连接被生命周期误杀。 */
       override fun onActivityStopped(activity: Activity) {}
 
-      /** Activity resumed 时不重复刷新，权限刷新集中在 started 阶段。 */
-      override fun onActivityResumed(activity: Activity) {}
+      /** 权限弹窗返回通常只触发 resumed，必须在此处立即刷新，不能等待下一次 started。 */
+      override fun onActivityResumed(activity: Activity) {
+        runCatching { BleManager.instance.refreshBleState("activityResumed") }
+      }
 
       /** Activity paused 时不主动断开 BLE，后台业务由连接状态机处理。 */
       override fun onActivityPaused(activity: Activity) {}
