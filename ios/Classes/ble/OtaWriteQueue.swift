@@ -110,6 +110,12 @@ private struct OtaWriteItem {
     let batch: OtaWriteBatch?
 }
 
+/// 单次背压等待的阶段。4 秒基础窗口后只进入一次 grace，总预算仍为 5 秒。
+private enum OtaBackpressureStage: String {
+    case base
+    case grace
+}
+
 /// 使用无应答批量写队列的通道标识。
 ///
 /// 只用于日志前缀和 typed error code；OTA 与文件各自持有独立队列实例，pending 从不共享，
@@ -152,6 +158,10 @@ final class OtaWriteQueue {
     private var sinceLastDrainSync: Int = 0
     //  - 进入 canSend=false / 软节流等待的时间
     private var backpressureStartedAt: Date?
+    //  - 每次等待使用独立 episode，取消或恢复后的旧 timer 不能驱动新 pending。
+    private var backpressureEpisode = 0
+    private var activeBackpressureEpisode: Int?
+    private var backpressureStage = OtaBackpressureStage.base
     //  - 兜底重查任务; 只允许一个 pending work item
     private var backpressureRetryWorkItem: OtaWriteCancellable?
     //  - 时钟/调度器注入只服务于真实 XCTest 行为覆盖, 生产路径仍使用系统实现。
@@ -243,7 +253,11 @@ extension OtaWriteQueue {
         // ready 在部分 iPhone 上几乎逐包触发；只累计到 batch summary，避免每次都跨
         // EventChannel 唤醒 Dart 日志链路。单包控制写不需要性能计数。
         pending.first?.batch?.readyCount += 1
-        clearBackpressureWait()
+        // 虚假 ready 不能重置 5 秒总预算；只有系统真的恢复可写才结束当前 episode。
+        if peripheral?.canSendWriteWithoutResponse == true {
+            logBackpressureResumedIfNeeded(source: "callback")
+            clearBackpressureWait()
+        }
         pump()
     }
 
@@ -256,7 +270,8 @@ extension OtaWriteQueue {
         guard !pending.isEmpty else {
             return
         }
-        logger?("[ezw_ble][\(channel)] cancelled endpoint=\(peripheral?.otaEndpointId ?? "released") reason=\(reason) pending=\(pending.count)")
+        let episode = activeBackpressureEpisode ?? backpressureEpisode
+        logger?("[ezw_ble][\(channel)] cancelled endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(episode) stage=\(backpressureStage.rawValue) reason=\(reason) pending=\(pending.count)")
         let snapshot = pending
         pending.removeAll()
         sinceLastDrainSync = 0
@@ -329,6 +344,9 @@ extension OtaWriteQueue {
                 scheduleBackpressureRetry(after: Self.backpressureRetryInterval)
                 return
             }
+            // watchdog 重查恢复与 callback 恢复共享同一 episode 结算；仅 grace 状态
+            // 输出一次诊断，普通可写循环不会产生日志。
+            logBackpressureResumedIfNeeded(source: "poll")
             clearBackpressureWait()
             //  - 2.2、出队并写入
             let head = pending.removeFirst()
@@ -434,23 +452,38 @@ private extension OtaWriteQueue {
 
     func markBackpressureWaitStarted() {
         if backpressureStartedAt == nil {
+            backpressureEpisode += 1
+            activeBackpressureEpisode = backpressureEpisode
+            backpressureStage = .base
             backpressureStartedAt = clock.now
         }
     }
 
     func clearBackpressureWait() {
+        if activeBackpressureEpisode != nil {
+            // 先推进代次再取消 work item；即使测试或系统仍执行旧 block，也会被拒绝。
+            backpressureEpisode += 1
+        }
         backpressureStartedAt = nil
+        activeBackpressureEpisode = nil
+        backpressureStage = .base
         backpressureRetryWorkItem?.cancel()
         backpressureRetryWorkItem = nil
     }
 
     func scheduleBackpressureRetry(after interval: TimeInterval) {
         markBackpressureWaitStarted()
+        guard let episode = activeBackpressureEpisode else {
+            return
+        }
         guard backpressureRetryWorkItem == nil else {
             return
         }
         backpressureRetryWorkItem = scheduler.schedule(after: interval) { [weak self] in
             guard let self = self else {
+                return
+            }
+            guard self.activeBackpressureEpisode == episode else {
                 return
             }
             self.backpressureRetryWorkItem = nil
@@ -463,14 +496,21 @@ private extension OtaWriteQueue {
 
     func shouldCancelStalledBackpressure(reason: String) -> Bool {
         markBackpressureWaitStarted()
-        guard let startedAt = backpressureStartedAt else {
+        guard let startedAt = backpressureStartedAt,
+              let episode = activeBackpressureEpisode else {
             return false
         }
         let waitSeconds = clock.now.timeIntervalSince(startedAt)
-        guard waitSeconds >= Self.backpressureStallTimeout else {
+        if backpressureStage == .base && waitSeconds >= Self.backpressureStallTimeout {
+            backpressureStage = .grace
+            logger?("[ezw_ble][\(channel)] backpressure endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(episode) stage=grace reason=\(reason) wait=\(String(format: "%.1f", waitSeconds))s pending=\(pending.count)")
             return false
         }
-        logger?("[ezw_ble][\(channel)] stalled endpoint=\(peripheral?.otaEndpointId ?? "released") reason=\(reason) wait=\(String(format: "%.1f", waitSeconds))s pending=\(pending.count)")
+        guard backpressureStage == .grace,
+              waitSeconds >= Self.backpressureStallTimeout + 1.0 else {
+            return false
+        }
+        logger?("[ezw_ble][\(channel)] stalled endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(episode) stage=terminal reason=\(reason) wait=\(String(format: "%.1f", waitSeconds))s pending=\(pending.count)")
         let snapshot = pending
         pending.removeAll()
         sinceLastDrainSync = 0
@@ -486,6 +526,17 @@ private extension OtaWriteQueue {
             )
         )
         return true
+    }
+
+    /// grace 恢复是每 episode 最多一次的诊断事件，不属于逐包 ready 热路径。
+    func logBackpressureResumedIfNeeded(source: String) {
+        guard backpressureStage == .grace,
+              let startedAt = backpressureStartedAt,
+              let episode = activeBackpressureEpisode else {
+            return
+        }
+        let waitSeconds = max(0, clock.now.timeIntervalSince(startedAt))
+        logger?("[ezw_ble][\(channel)] resumed endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(episode) stage=grace source=\(source) wait=\(String(format: "%.3f", waitSeconds))s pending=\(pending.count)")
     }
 }
 

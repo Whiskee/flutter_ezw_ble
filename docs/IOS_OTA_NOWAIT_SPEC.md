@@ -196,10 +196,13 @@ no-wait 路径保持原行为。
 ### 4.5 日志
 
 OTA batch 成功路径只输出一次聚合日志，避免逐包 `ready` / `canSend=false` 经
-EventChannel 唤醒 Dart 并参与传输热路径；停滞、取消和不支持仍即时输出：
+EventChannel 唤醒 Dart 并参与传输热路径；每个背压 episode 最多一次的 grace/resumed
+状态变化，以及停滞、取消和不支持仍即时输出：
 
 ```
 [ezw_ble][ota] batch completed endpoint=<uuid> packets=<n> bytes=<n> elapsed=<ms> ready=<n> backpressure=<n> softThrottle=<n> pending=<n>
+[ezw_ble][ota] backpressure endpoint=<uuid> episode=<n> stage=grace reason=<reason> wait=<duration> pending=<n>
+[ezw_ble][ota] resumed endpoint=<uuid> episode=<n> stage=grace source=<callback|poll> wait=<duration> pending=<n>
 [ezw_ble][ota] stalled endpoint=<uuid> episode=<n> stage=terminal reason=<reason> wait=<duration> pending=<n>
 [ezw_ble][ota] cancelled endpoint=<uuid> episode=<n> stage=<base|grace> reason=<reason> pending=<n>
 ```
