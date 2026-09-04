@@ -43,6 +43,7 @@
 - `receiveData` 的二进制 payload 跨 Method/EventChannel 时保持 Base64 约定。
 - Android `onConnectionStateChange` 的 status 使用 HCI/controller 断连语义；characteristic/descriptor 回调才使用 ATT/GATT 操作语义。数值 `8` 在前者是连接超时，严禁触发授权恢复/cache refresh/`needsScanBeforeConnect`；在后者是授权不足，必须走授权恢复后再按回调阶段终止。
 - iOS OTA 中 `psType == 1` 的 `sendCmdNoWait` 必须与 `OtaWriteQueue`、`canSendWriteWithoutResponse` 和 `docs/IOS_OTA_NOWAIT_SPEC.md` 对齐。
+- iOS OTA RAW batch 的 `ready`、`canSend=false` 和 soft-throttle 属于高频热路径，只能在 batch 内累计并于完成时输出一条汇总；terminal stall、取消和能力错误仍即时记录。禁止恢复逐包 EventChannel 日志，否则会让诊断出口参与传输调度。
 - `sendOtaPacketBatch` 只接受 already-framed OTA 小包；Future 等最后一包提交成功，Android 禁止并发 GATT write，失败必须丢掉剩余包。
 - `sendFilePacketBatch`（`psType=3`）与 OTA 批次共用队列实现但**实例必须独立**：`quiteUpgradeState` 只能取消 OTA attempt，共用 pending 会打断进行中的文件传输；升级态仍 fail closed 拒绝文件批次。Android 三条发送路径（普通队列 / OTA 批次 / 文件批次）共用 GATT 单槽位，回调归属只能由 `BleGattWriteCallbackOwnerPolicy` 判定，普通队列在任一批次占槽时不得写出；物理 session 失效与整机 teardown 必须同时释放两条批次通道的 Dart await。typed error code 按通道前缀区分（`ota_write_*` / `file_write_*`），不得混用。
 - Android GATT ready 与进入 OTA 后必须请求 LE 2M PHY（`setPreferredPhy`）；`connectGatt` 的 `PHY_LE_2M` hint 不能当成已切到 2M。PHY 失败不得阻断连接或传输。iOS 无公开 PHY API，只记日志。

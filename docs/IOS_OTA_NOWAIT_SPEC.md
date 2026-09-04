@@ -195,19 +195,17 @@ no-wait 路径保持原行为。
 
 ### 4.5 日志
 
-每次 OTA noResponse 写入、可写恢复、停滞和取消打确定性日志:
+OTA batch 成功路径只输出一次聚合日志，避免逐包 `ready` / `canSend=false` 经
+EventChannel 唤醒 Dart 并参与传输热路径；停滞、取消和不支持仍即时输出：
 
 ```
-[ezw_ble][ota] enqueued endpoint=<uuid> bytes=<len> pending=<n>
-[ezw_ble][ota] submitted endpoint=<uuid> char=<charUuid> bytes=<len> pending=<n>
-[ezw_ble][ota] backpressure endpoint=<uuid> episode=<n> stage=<base|grace> reason=<reason> wait=<duration> pending=<n>
-[ezw_ble][ota] ready endpoint=<uuid> episode=<n> pending=<n>
-[ezw_ble][ota] resumed endpoint=<uuid> episode=<n> stage=<base|grace> reason=<reason> source=<callback|poll> wait=<duration> pending=<n>
+[ezw_ble][ota] batch completed endpoint=<uuid> packets=<n> bytes=<n> elapsed=<ms> ready=<n> backpressure=<n> softThrottle=<n> pending=<n>
 [ezw_ble][ota] stalled endpoint=<uuid> episode=<n> stage=terminal reason=<reason> wait=<duration> pending=<n>
 [ezw_ble][ota] cancelled endpoint=<uuid> episode=<n> stage=<base|grace> reason=<reason> pending=<n>
 ```
 
-日志经现有 `logger` EventChannel 上报到 Dart 端 `blePrintEC`(参考 §6 命名约定)。
+聚合与异常日志经现有 `logger` EventChannel 上报到 Dart 端 `blePrintEC`（参考 §6
+命名约定）。单包控制写保留原有提交日志；RAW batch 不再逐包打点。
 
 ---
 

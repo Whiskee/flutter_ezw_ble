@@ -1379,6 +1379,42 @@ class RunnerTests: XCTestCase {
     XCTAssertNil(results.first!)
   }
 
+  func testOtaWriteQueueBatchAggregatesHotPathLogs() {
+    let peripheral = FakeOtaPeripheral(endpointId: "g2-left", canSend: false)
+    let clock = FakeOtaClock()
+    var results: [Any?] = []
+    var logs: [String] = []
+    let queue = OtaWriteQueue(
+      peripheral: peripheral,
+      logger: { logs.append($0) },
+      clock: clock,
+      scheduler: FakeOtaScheduler()
+    )
+
+    queue.enqueueBatch(
+      packets: [Data([0x01]), Data([0x02, 0x03])],
+      target: makeFakeOtaTarget { _ in true }
+    ) { value in
+      results.append(value)
+    }
+
+    peripheral.canSendWriteWithoutResponse = true
+    queue.onPeripheralReadyToSendWriteWithoutResponse()
+
+    XCTAssertEqual(results.count, 1)
+    XCTAssertNil(results.first!)
+    XCTAssertEqual(logs.filter { $0.contains("batch completed") }.count, 1)
+    XCTAssertFalse(logs.contains { $0.contains(" ready endpoint=") })
+    XCTAssertFalse(logs.contains { $0.contains("reason=canSend=false") })
+    XCTAssertTrue(logs.contains {
+      $0.contains("packets=2") &&
+        $0.contains("bytes=3") &&
+        $0.contains("ready=1") &&
+        $0.contains("backpressure=1") &&
+        $0.contains("softThrottle=0")
+    })
+  }
+
   func testOtaWriteQueueBatchFailureDropsRemainingPackets() {
     let peripheral = FakeOtaPeripheral(endpointId: "g2-left")
     var results: [Any?] = []

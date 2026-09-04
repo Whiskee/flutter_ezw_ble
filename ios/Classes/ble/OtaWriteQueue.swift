@@ -76,12 +76,21 @@ struct MainQueueOtaWriteScheduler: OtaWriteScheduler {
 /// 一批 framed OTA 小包共享一个 Dart Future；成功只在最后一包被 CoreBluetooth 接受后结算。
 private final class OtaWriteBatch {
     let result: FlutterResult
+    let packetCount: Int
+    let byteCount: Int
+    let enqueuedAt: Date
     var remaining: Int
+    var readyCount = 0
+    var backpressureCount = 0
+    var softThrottleCount = 0
     var settled = false
 
-    init(result: @escaping FlutterResult, remaining: Int) {
+    init(result: @escaping FlutterResult, packetCount: Int, byteCount: Int, enqueuedAt: Date) {
         self.result = result
-        self.remaining = remaining
+        self.packetCount = packetCount
+        self.byteCount = byteCount
+        self.enqueuedAt = enqueuedAt
+        self.remaining = packetCount
     }
 
     func settle(_ value: Any?) {
@@ -209,7 +218,12 @@ extension OtaWriteQueue {
             ))
             return
         }
-        let batch = OtaWriteBatch(result: result, remaining: packets.count)
+        let batch = OtaWriteBatch(
+            result: result,
+            packetCount: packets.count,
+            byteCount: packets.reduce(0) { $0 + $1.count },
+            enqueuedAt: clock.now
+        )
         packets.forEach { packet in
             pending.append(OtaWriteItem(
                 data: packet,
@@ -218,10 +232,6 @@ extension OtaWriteQueue {
                 batch: batch
             ))
         }
-        logger?(
-            "[ezw_ble][\(channel)] batch enqueued endpoint=\(peripheral?.otaEndpointId ?? "released") " +
-            "packets=\(packets.count) bytes=\(packets.reduce(0) { $0 + $1.count }) pending=\(pending.count)"
-        )
         pump()
     }
 
@@ -230,7 +240,9 @@ extension OtaWriteQueue {
      *  - OS 通知背压解除, 立即继续抽干队列.
      */
     func onPeripheralReadyToSendWriteWithoutResponse() {
-        logger?("[ezw_ble][\(channel)] ready endpoint=\(peripheral?.otaEndpointId ?? "released") pending=\(pending.count)")
+        // ready 在部分 iPhone 上几乎逐包触发；只累计到 batch summary，避免每次都跨
+        // EventChannel 唤醒 Dart 日志链路。单包控制写不需要性能计数。
+        pending.first?.batch?.readyCount += 1
         clearBackpressureWait()
         pump()
     }
@@ -312,7 +324,8 @@ extension OtaWriteQueue {
                 if shouldCancelStalledBackpressure(reason: "canSend=false") {
                     return
                 }
-                logger?("[ezw_ble][\(channel)] stalled endpoint=\(peripheral.otaEndpointId) reason=canSend=false wait=pending pending=\(pending.count)")
+                // 高频背压只计数；真正达到 stall 阈值时仍立即输出 terminal 日志。
+                pending.first?.batch?.backpressureCount += 1
                 scheduleBackpressureRetry(after: Self.backpressureRetryInterval)
                 return
             }
@@ -332,6 +345,10 @@ extension OtaWriteQueue {
                 continue
             }
             sinceLastDrainSync += 1
+            let shouldSoftThrottle = sinceLastDrainSync >= Self.softDrainEvery
+            if shouldSoftThrottle {
+                head.batch?.softThrottleCount += 1
+            }
             if head.batch == nil {
                 logger?("[ezw_ble][\(channel)] submitted endpoint=\(peripheral.otaEndpointId) char=\(head.target.characteristicUUID) bytes=\(head.data.count) pending=\(pending.count)")
             }
@@ -341,8 +358,7 @@ extension OtaWriteQueue {
             //  - 2.4、软节流: 每 N 包主动让出
             //  -- canSendWriteWithoutResponse 在 iPhone 6s/SE 一代等老机型上"报喜不报忧",
             //  -- 突发塞包会触发底层丢包, 这里强制等下一次 peripheralIsReady 回调
-            if sinceLastDrainSync >= Self.softDrainEvery {
-                logger?("[ezw_ble][\(channel)] stalled endpoint=\(peripheral.otaEndpointId) reason=softThrottle wait=ready pending=\(pending.count)")
+            if shouldSoftThrottle {
                 sinceLastDrainSync = 0
                 markBackpressureWaitStarted()
                 scheduleBackpressureRetry(after: Self.softThrottleRetryInterval)
@@ -388,7 +404,13 @@ private extension OtaWriteQueue {
         }
         batch.remaining -= 1
         if batch.remaining <= 0 {
-            logger?("[ezw_ble][\(channel)] batch completed endpoint=\(peripheral?.otaEndpointId ?? "released") pending=\(pending.count)")
+            let elapsedMs = max(0, Int(clock.now.timeIntervalSince(batch.enqueuedAt) * 1_000))
+            logger?(
+                "[ezw_ble][\(channel)] batch completed endpoint=\(peripheral?.otaEndpointId ?? "released") " +
+                "packets=\(batch.packetCount) bytes=\(batch.byteCount) elapsed=\(elapsedMs)ms " +
+                "ready=\(batch.readyCount) backpressure=\(batch.backpressureCount) " +
+                "softThrottle=\(batch.softThrottleCount) pending=\(pending.count)"
+            )
             batch.settle(nil)
         }
     }
