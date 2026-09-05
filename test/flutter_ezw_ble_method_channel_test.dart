@@ -33,10 +33,20 @@ void main() {
       'left-uuid',
       Uint8List.fromList(<int>[0xAA]),
       allowDuringUpgrade: true,
+      expectedSessionGeneration: 37,
+      expectedAttemptGeneration: 9,
     );
 
     expect(capturedCall?.method, 'sendCmd');
     expect(capturedCall?.arguments, containsPair('allowDuringUpgrade', true));
+    expect(
+      capturedCall?.arguments,
+      containsPair('expectedSessionGeneration', 37),
+    );
+    expect(
+      capturedCall?.arguments,
+      containsPair('expectedAttemptGeneration', 9),
+    );
   });
 
   test('sendCmdNoWait always forwards to the native no-wait method', () async {
@@ -56,31 +66,122 @@ void main() {
     expect(capturedCall?.method, 'sendCmdNoWait');
     expect(capturedCall?.arguments, containsPair('uuid', 'left-uuid'));
     expect(capturedCall?.arguments, containsPair('psType', 1));
+    expect(
+      capturedCall?.arguments,
+      containsPair('expectedSessionGeneration', 0),
+    );
+    expect(
+      capturedCall?.arguments,
+      containsPair('expectedAttemptGeneration', 0),
+    );
   });
 
-  test('prepareBusinessConnection forwards exact attempt and decodes status',
-      () async {
+  test('sendCmdNoWait forwards exact OTA session identity', () async {
     MethodCall? capturedCall;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (methodCall) async {
       capturedCall = methodCall;
-      return 'accepted';
+      return null;
     });
 
-    final status = await MethodChannelEzwBle().prepareBusinessConnection(
-      const BleBusinessConnectionAttempt(
-        uuid: 'left-uuid',
-        sessionGeneration: 37,
-        attemptGeneration: 9,
-      ),
+    await MethodChannelEzwBle().sendCmdNoWait(
+      'left-uuid',
+      Uint8List.fromList(<int>[0xBB]),
+      psType: 1,
+      expectedSessionGeneration: 37,
+      expectedAttemptGeneration: 9,
     );
 
-    expect(capturedCall?.method, 'prepareBusinessConnection');
-    expect(capturedCall?.arguments, containsPair('uuid', 'left-uuid'));
-    expect(capturedCall?.arguments, containsPair('sessionGeneration', 37));
-    expect(capturedCall?.arguments, containsPair('attemptGeneration', 9));
-    expect(status, BleBusinessConnectionStatus.accepted);
+    expect(capturedCall?.method, 'sendCmdNoWait');
+    expect(
+      capturedCall?.arguments,
+      containsPair('expectedSessionGeneration', 37),
+    );
+    expect(
+      capturedCall?.arguments,
+      containsPair('expectedAttemptGeneration', 9),
+    );
   });
+
+  test('quiteUpgradeState forwards exact OTA session identity', () async {
+    MethodCall? capturedCall;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (methodCall) async {
+      capturedCall = methodCall;
+      return null;
+    });
+
+    await MethodChannelEzwBle().quiteUpgradeState(
+      'left-uuid',
+      expectedSessionGeneration: 37,
+      expectedAttemptGeneration: 9,
+    );
+
+    expect(capturedCall?.method, 'quiteUpgradeState');
+    expect(capturedCall?.arguments, containsPair('uuid', 'left-uuid'));
+    expect(
+      capturedCall?.arguments,
+      containsPair('expectedSessionGeneration', 37),
+    );
+    expect(
+      capturedCall?.arguments,
+      containsPair('expectedAttemptGeneration', 9),
+    );
+  });
+
+  test('disconnectForOtaReboot forwards exact OTA session identity', () async {
+    MethodCall? capturedCall;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (methodCall) async {
+      capturedCall = methodCall;
+      return null;
+    });
+
+    await MethodChannelEzwBle().disconnectForOtaReboot(
+      'left-uuid',
+      'Even G2 L',
+      expectedSessionGeneration: 37,
+      expectedAttemptGeneration: 9,
+    );
+
+    expect(capturedCall?.method, 'disconnectForOtaReboot');
+    expect(capturedCall?.arguments, containsPair('uuid', 'left-uuid'));
+    expect(capturedCall?.arguments, containsPair('name', 'Even G2 L'));
+    expect(
+      capturedCall?.arguments,
+      containsPair('expectedSessionGeneration', 37),
+    );
+    expect(
+      capturedCall?.arguments,
+      containsPair('expectedAttemptGeneration', 9),
+    );
+  });
+
+  test(
+    'prepareBusinessConnection forwards exact attempt and decodes status',
+    () async {
+      MethodCall? capturedCall;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (methodCall) async {
+        capturedCall = methodCall;
+        return 'accepted';
+      });
+
+      final status = await MethodChannelEzwBle().prepareBusinessConnection(
+        const BleBusinessConnectionAttempt(
+          uuid: 'left-uuid',
+          sessionGeneration: 37,
+          attemptGeneration: 9,
+        ),
+      );
+
+      expect(capturedCall?.method, 'prepareBusinessConnection');
+      expect(capturedCall?.arguments, containsPair('uuid', 'left-uuid'));
+      expect(capturedCall?.arguments, containsPair('sessionGeneration', 37));
+      expect(capturedCall?.arguments, containsPair('attemptGeneration', 9));
+      expect(status, BleBusinessConnectionStatus.accepted);
+    },
+  );
 
   test('commitBusinessConnection decodes attempt mismatch', () async {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger

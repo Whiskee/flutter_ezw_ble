@@ -17,6 +17,10 @@ data class BleCmd(
     val data: ByteArray?,
     /** 原生写入或读取是否成功。 */
     val isSuccess: Boolean,
+    /** Dart OTA recovery batch 的业务 session，0 表示旧事件或非 OTA。 */
+    val sessionGeneration: Long = 0L,
+    /** Native 物理连接 attempt，0 表示旧事件或非 OTA。 */
+    val attemptGeneration: Long = 0L,
 ) {
 
     companion object {
@@ -40,6 +44,9 @@ data class BleCmd(
         // 2. MethodChannel/EventChannel 不直接暴露 ByteArray 语义，统一使用 Base64 字符串。
         "data" to data?.let { Base64.encodeToString(it, Base64.NO_WRAP) },
         "isSuccess" to isSuccess,
+        // 3. OTA notify/response 需要和 START/INFORMATION/RAW 的 exact pair 绑定。
+        "sessionGeneration" to sessionGeneration,
+        "attemptGeneration" to attemptGeneration,
     )
 
     /**
@@ -58,6 +65,8 @@ data class BleCmd(
         // 3. 标量字段先比较，失败时快速返回。
         if (uuid != other.uuid) return false
         if (psType != other.psType) return false
+        if (sessionGeneration != other.sessionGeneration) return false
+        if (attemptGeneration != other.attemptGeneration) return false
 
         // 4. ByteArray 要按内容比较，避免相同 payload 因引用不同被误判。
         if (data != null) {
@@ -80,6 +89,8 @@ data class BleCmd(
         result = 31 * result + psType
         result = 31 * result + (data?.contentHashCode() ?: 0)
         result = 31 * result + isSuccess.hashCode()
+        result = 31 * result + sessionGeneration.hashCode()
+        result = 31 * result + attemptGeneration.hashCode()
         return result
     }
 

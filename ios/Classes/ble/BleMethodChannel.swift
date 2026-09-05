@@ -241,7 +241,14 @@ enum BleMC: String {
             let jsonData = arguments as? [String: Any] ?? [:]
             let uuid: String = jsonData["uuid"] as? String ?? ""
             let name: String = jsonData["name"] as? String ?? ""
-            BleManager.shared.disconnectForOtaReboot(uuid: uuid, name: name)
+            let expectedSessionGeneration = (jsonData["expectedSessionGeneration"] as? NSNumber)?.int64Value ?? 0
+            let expectedAttemptGeneration = (jsonData["expectedAttemptGeneration"] as? NSNumber)?.int64Value ?? 0
+            BleManager.shared.disconnectForOtaReboot(
+                uuid: uuid,
+                name: name,
+                expectedSessionGeneration: expectedSessionGeneration,
+                expectedAttemptGeneration: expectedAttemptGeneration
+            )
             break
         case .sendCmd:
             let jsonData: [String: Any] = arguments as? [String: Any] ?? [:]
@@ -249,12 +256,16 @@ enum BleMC: String {
             let psType: Int = jsonData["psType"] as? Int ?? 0
             // 默认 false；只有上层协议白名单可以显式放行 OTA 恢复控制指令。
             let allowDuringUpgrade: Bool = jsonData["allowDuringUpgrade"] as? Bool ?? false
+            let expectedSessionGeneration = (jsonData["expectedSessionGeneration"] as? NSNumber)?.int64Value ?? 0
+            let expectedAttemptGeneration = (jsonData["expectedAttemptGeneration"] as? NSNumber)?.int64Value ?? 0
             if let data = jsonData["data"] as? FlutterStandardTypedData {
                 BleManager.shared.sendCmd(
                     uuid: uuid,
                     data: data.data,
                     psType: psType,
-                    allowDuringUpgrade: allowDuringUpgrade
+                    allowDuringUpgrade: allowDuringUpgrade,
+                    expectedSessionGeneration: expectedSessionGeneration,
+                    expectedAttemptGeneration: expectedAttemptGeneration
                 )
             }
             // CoreBluetooth does not expose a reliable per-packet success callback here;
@@ -265,19 +276,35 @@ enum BleMC: String {
             let jsonData: [String: Any] = arguments as? [String: Any] ?? [:]
             let uuid: String = jsonData["uuid"] as? String ?? ""
             let psType: Int = jsonData["psType"] as? Int ?? 0
+            let expectedSessionGeneration = (jsonData["expectedSessionGeneration"] as? NSNumber)?.int64Value ?? 0
+            let expectedAttemptGeneration = (jsonData["expectedAttemptGeneration"] as? NSNumber)?.int64Value ?? 0
             guard let data = jsonData["data"] as? FlutterStandardTypedData else {
                 result(nil)
                 return
             }
-            BleManager.shared.sendCmdNoWait(uuid: uuid, data: data.data, psType: psType, result: result)
+            BleManager.shared.sendCmdNoWait(
+                uuid: uuid,
+                data: data.data,
+                psType: psType,
+                expectedSessionGeneration: expectedSessionGeneration,
+                expectedAttemptGeneration: expectedAttemptGeneration,
+                result: result
+            )
             return
         case .enterUpgradeState:
             let uuid = arguments as? String ?? ""
             BleManager.shared.enterUpgradeState(uuid: uuid)
             break
         case .quiteUpgradeState:
-            let uuid = arguments as? String ?? ""
-            BleManager.shared.quiteUpgradeState(uuid: uuid)
+            let jsonData: [String: Any] = arguments as? [String: Any] ?? [:]
+            let uuid = jsonData["uuid"] as? String ?? arguments as? String ?? ""
+            let expectedSessionGeneration = (jsonData["expectedSessionGeneration"] as? NSNumber)?.int64Value ?? 0
+            let expectedAttemptGeneration = (jsonData["expectedAttemptGeneration"] as? NSNumber)?.int64Value ?? 0
+            BleManager.shared.quiteUpgradeState(
+                uuid: uuid,
+                expectedSessionGeneration: expectedSessionGeneration,
+                expectedAttemptGeneration: expectedAttemptGeneration
+            )
             break
         case .setConnectionTraceEnabled:
             BleManager.shared.setConnectionTraceEnabled(arguments as? Bool == true)

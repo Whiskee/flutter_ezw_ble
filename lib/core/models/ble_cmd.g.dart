@@ -12,6 +12,8 @@ BleCmd _$BleCmdFromJson(Map<String, dynamic> json) => BleCmd(
       data: _$JsonConverterFromJson<String, Uint8List>(
           json['data'], const Uint8ListConverter().fromJson),
       isSuccess: json['isSuccess'] as bool? ?? false,
+      sessionGeneration: (json['sessionGeneration'] as num?)?.toInt() ?? 0,
+      attemptGeneration: (json['attemptGeneration'] as num?)?.toInt() ?? 0,
     );
 
 Map<String, dynamic> _$BleCmdToJson(BleCmd instance) => <String, dynamic>{
@@ -20,6 +22,8 @@ Map<String, dynamic> _$BleCmdToJson(BleCmd instance) => <String, dynamic>{
       'data': _$JsonConverterToJson<String, Uint8List>(
           instance.data, const Uint8ListConverter().toJson),
       'isSuccess': instance.isSuccess,
+      'sessionGeneration': instance.sessionGeneration,
+      'attemptGeneration': instance.attemptGeneration,
     };
 
 Value? _$JsonConverterFromJson<Json, Value>(

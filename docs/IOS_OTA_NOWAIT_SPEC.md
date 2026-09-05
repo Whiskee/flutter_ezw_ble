@@ -179,7 +179,23 @@ result(FlutterError(
 
 - BLE manager 当前不可用、蓝牙/配置不可调用: `ota_write_unavailable`;
 - device 或 OTA write characteristic 缺失: `ota_write_unavailable`;
+- 调用方传入正 `expectedSessionGeneration/expectedAttemptGeneration` 但当前业务 owner
+  或 upgrade marker 无法匹配同一物理 attempt: `ota_write_unavailable`;
 - CoreBluetooth 提交前外设已释放: `ota_write_unavailable`.
+
+OTA response 经 `receiveData` 回传时会附带 `sessionGeneration/attemptGeneration`。
+iOS 没有 Android `BluetoothGatt` 同级别的 handle identity；因此 native 只在当前
+`CBPeripheral` 仍 connected，且能从 current admission 或 reconnect owner 解析出正
+attempt 时 stamp。升级态 OTA response 解析不到正 pair 会被丢弃，避免旧响应被新
+attempt 消费。这个 stamp 不是每条 CoreBluetooth notification 自带的 enqueue-time
+物理 token；iOS 无法在迟到 notification 上恢复已经被系统隐藏的旧连接句柄，只能在当前
+owner/CBPeripheral 仍一致时给出正 pair。
+
+`disconnectForOtaReboot` 使用同一 expected pair。调用方传正数时，native 在执行 firmware
+reboot teardown 前必须匹配当前 owner；不匹配直接拒绝，不 detach 旧物理链路、不发布
+`.disconnectFromSys`、不注册 suppression。teardown 后的迟到断连 suppression 也绑定同一
+pair：Android 绑定 admission + GATT callback pair，iOS 绑定 `CBPeripheral` 对象 +
+owner pair；旧 teardown 不能被新 attempt 消费。0/0 只用于旧调用兼容。
 
 Android `sendCmdNoWait(psType == 1)` 同样必须保留 `BluetoothGatt.writeCharacteristic`
 同步状态。`ERROR_GATT_WRITE_REQUEST_BUSY` 是单槽位背压，不是包错误：原包进入 per-endpoint
@@ -190,8 +206,9 @@ no-wait 路径保持原行为。
 
 ### 4.4 与 `enterUpgradeState` / `quiteUpgradeState` 的关系
 
-`enterUpgradeState` / `quiteUpgradeState` 不必改动。它们继续控制 connection
-参数、断连超时延长等;OTA write type 切换是独立的 per-write 决策。
+`enterUpgradeState` 继续控制 connection state marker。`quiteUpgradeState` 可携带
+`expectedSessionGeneration/expectedAttemptGeneration`，用于避免旧 attempt 的迟到清理
+误消费新 attempt；OTA write type 切换仍是独立的 per-write 决策。
 
 ### 4.5 日志
 
@@ -223,19 +240,23 @@ Future<void> sendCmdNoWait(
   String uuid,
   Uint8List data, {
   int psType = 0,
+  int expectedSessionGeneration = 0,
+  int expectedAttemptGeneration = 0,
 }) async =>
     methodChannel.invokeMethod<void>("sendCmdNoWait", {
       "uuid": uuid,
       "data": data,
       "psType": psType,
+      "expectedSessionGeneration": expectedSessionGeneration,
+      "expectedAttemptGeneration": expectedAttemptGeneration,
     });
 ```
 
 原生 iOS 侧的 `sendCmdNoWait` 方法实现按 §4.1 / §4.2 决定 write type。
 
-> **保留兼容性**: `sendCmd` Dart API 不动,iOS 原生侧的 `sendCmd` 处理也不动。
-> 行为变更仅影响 `sendCmdNoWait` + `psType==1` 的组合 — 这正是 `even_connect`
-> 的 `sendOTABytesData` 在 Android 已经用的形态。
+> **保留兼容性**: `sendCmd` / `sendCmdNoWait` / `quiteUpgradeState` 的
+> `expectedSessionGeneration/expectedAttemptGeneration` 默认均为 `0/0`，旧调用语义不变。
+> 上层 OTA 恢复传正 pair 后，native 才启用 exact attempt guard。
 >
 > **成功语义**: `sendCmdNoWait(psType==1)` 的 Future 成功只表示 native 已经调用
 > `peripheral.writeValue(..., type: .withoutResponse)`,即提交到 CoreBluetooth transmit

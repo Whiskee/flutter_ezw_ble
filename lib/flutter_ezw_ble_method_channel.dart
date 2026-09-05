@@ -114,10 +114,17 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
   }
 
   @override
-  Future<void> disconnectForOtaReboot(String uuid, String name) async =>
+  Future<void> disconnectForOtaReboot(
+    String uuid,
+    String name, {
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+  }) async =>
       methodChannel.invokeMethod("disconnectForOtaReboot", {
         "uuid": uuid,
         "name": name,
+        "expectedSessionGeneration": expectedSessionGeneration,
+        "expectedAttemptGeneration": expectedAttemptGeneration,
       });
 
   @override
@@ -201,12 +208,18 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
     Uint8List data, {
     int psType = 0,
     bool allowDuringUpgrade = false,
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
   }) async =>
       methodChannel.invokeMethod<void>("sendCmd", {
         "uuid": uuid,
         "data": data,
         "psType": psType,
         "allowDuringUpgrade": allowDuringUpgrade,
+        // OTA START/INFORMATION/RESULT 等控制包若走 sendCmd 队列，也必须绑定本轮
+        // 物理 attempt；0/0 保持旧控制包调用兼容。
+        "expectedSessionGeneration": expectedSessionGeneration,
+        "expectedAttemptGeneration": expectedAttemptGeneration,
       });
 
   /// 发送数据 - 原始数据 - 不等待响应
@@ -219,11 +232,17 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
     String uuid,
     Uint8List data, {
     int psType = 0,
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
   }) async =>
       methodChannel.invokeMethod<void>("sendCmdNoWait", {
         "uuid": uuid,
         "data": data,
         "psType": psType,
+        // OTA 断连恢复会冻结本轮业务 session/物理 attempt。native 只在两者为正
+        // 且 psType==1 时启用 strict guard；旧调用保留 0 以维持兼容。
+        "expectedSessionGeneration": expectedSessionGeneration,
+        "expectedAttemptGeneration": expectedAttemptGeneration,
       });
 
   @override
@@ -231,8 +250,17 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       methodChannel.invokeMethod("enterUpgradeState", uuid);
 
   @override
-  Future<void> quiteUpgradeState(String uuid) =>
-      methodChannel.invokeMethod("quiteUpgradeState", uuid);
+  Future<void> quiteUpgradeState(
+    String uuid, {
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+  }) =>
+      methodChannel.invokeMethod("quiteUpgradeState", {
+        "uuid": uuid,
+        // OTA 迟到清理只能消费自己冻结的物理 attempt；0/0 保持旧调用兼容。
+        "expectedSessionGeneration": expectedSessionGeneration,
+        "expectedAttemptGeneration": expectedAttemptGeneration,
+      });
 
   @override
   Future<void> setConnectionTraceEnabled(bool enabled) =>

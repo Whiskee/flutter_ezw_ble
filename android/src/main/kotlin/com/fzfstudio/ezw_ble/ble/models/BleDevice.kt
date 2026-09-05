@@ -124,7 +124,12 @@ class BleDevice(
      *
      */
     @OptIn(ExperimentalStdlibApi::class)
-    fun writeCharacteristic(data: ByteArray?, psType: Int): Boolean {
+    fun writeCharacteristic(
+        data: ByteArray?,
+        psType: Int,
+        expectedSessionGeneration: Long = 0L,
+        expectedAttemptGeneration: Long = 0L,
+    ): Boolean {
         // 1. 空 payload 不能写入，直接返回失败并保留日志。
         if (data == null) {
             Log.i(tag, "Send cmd: $uuid, PS type=$psType, data is null")
@@ -137,7 +142,12 @@ class BleDevice(
 
         // 3. GATT 或 write characteristic 缺失说明 readiness 尚未完成，必须回传失败事件。
         if (gatt == null || writeChars == null) {
-            BleEC.RECEIVE_DATA.event?.success(BleCmd.fail(uuid, psType).toFlutterMap())
+            BleEC.RECEIVE_DATA.event?.success(
+                BleCmd.fail(uuid, psType).copy(
+                    sessionGeneration = expectedSessionGeneration,
+                    attemptGeneration = expectedAttemptGeneration,
+                ).toFlutterMap(),
+            )
             Log.i(tag, "Send cmd: $uuid, PS type=$psType, $data, no write chars found")
             return false
         }
@@ -153,7 +163,12 @@ class BleDevice(
 
         // 5. 原生写入失败时立即回传失败事件，避免 Dart 命令等待超时后才感知。
         if (!isSuccess) {
-            BleEC.RECEIVE_DATA.event?.success(BleCmd.fail(uuid, psType).toFlutterMap())
+            BleEC.RECEIVE_DATA.event?.success(
+                BleCmd.fail(uuid, psType).copy(
+                    sessionGeneration = expectedSessionGeneration,
+                    attemptGeneration = expectedAttemptGeneration,
+                ).toFlutterMap(),
+            )
         }
 
         // 6. 发送日志只记录长度，不展开 payload，避免大量二进制数据污染 logcat。

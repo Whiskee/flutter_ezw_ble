@@ -29,6 +29,10 @@ import java.util.TimerTask
 internal class BleGattSessionCallback(
     /** 本次 GATT session 期望归属的设备 UUID/address；用于过滤 Android autoConnect 串来的非目标回调。 */
     private val expectedUuid: String?,
+    /** 创建 callback 时冻结的业务 session，用于给 OTA response 提供 exact 归属。 */
+    private val sessionGeneration: Long,
+    /** 创建 callback 时冻结的物理 attempt，用于给 OTA response 提供 exact 归属。 */
+    private val attemptGeneration: Long,
     /** 根据回调中的 GATT 句柄解析当前 session 对应的设备，并过滤 stale GATT。 */
     private val currentDeviceForGatt: (BluetoothGatt, String) -> BleDevice?,
     /** 将连接阶段推进给 manager，由 manager 统一更新状态和 EventChannel。 */
@@ -451,7 +455,14 @@ internal class BleGattSessionCallback(
         }
 
         // 4. 数据回传仍走 Base64 Map，由 BleCmd 统一编码。
-        val bleCmdMap = BleCmd(gatt.device.address, privateService.type, characteristic.value, true).toFlutterMap()
+        val bleCmdMap = BleCmd(
+            gatt.device.address,
+            privateService.type,
+            characteristic.value,
+            true,
+            sessionGeneration = sessionGeneration,
+            attemptGeneration = attemptGeneration,
+        ).toFlutterMap()
         emitReceiveData(bleCmdMap)
         sendLog(
             BleLoggerTag.d,

@@ -86,6 +86,28 @@ class BleAndroidOtaWriteQueueTest {
     }
 
     @Test
+    fun `submit receives the frozen ota identity for dispatch validation`() {
+        val seenIdentities = mutableListOf<Pair<Long, Long>>()
+        val queue = BleAndroidOtaWriteQueue(
+            endpoint = "g2-left",
+            submit = { _, sessionGeneration, attemptGeneration ->
+                seenIdentities.add(sessionGeneration to attemptGeneration)
+                BleOtaWriteSubmission.accepted()
+            },
+            scheduler = FakeScheduler(),
+            nowMillis = { 0L },
+        )
+
+        queue.enqueue(
+            byteArrayOf(0x01),
+            sessionGeneration = 37L,
+            attemptGeneration = 9L,
+        ) {}
+
+        assertEquals(listOf(37L to 9L), seenIdentities)
+    }
+
+    @Test
     fun `busy write fails closed after the bounded stall window`() {
         var nowMillis = 0L
         val scheduler = FakeScheduler()
@@ -220,7 +242,7 @@ class BleAndroidOtaWriteQueueTest {
         nowMillis: () -> Long = { 0L },
     ): BleAndroidOtaWriteQueue = BleAndroidOtaWriteQueue(
         endpoint = "g2-left",
-        submit = submit,
+        submit = { data, _, _ -> submit(data) },
         scheduler = scheduler,
         nowMillis = nowMillis,
     )

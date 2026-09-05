@@ -16,8 +16,14 @@ void main() {
 
     expect(platform, contains('disconnectForOtaReboot'));
     expect(method, contains('"disconnectForOtaReboot"'));
+    expect(method, contains('"expectedSessionGeneration"'));
+    expect(method, contains('"expectedAttemptGeneration"'));
     expect(android, contains('DISCONNECT_FOR_OTA_REBOOT'));
+    expect(android, contains('expectedSessionGeneration'));
+    expect(android, contains('expectedAttemptGeneration'));
     expect(ios, contains('case disconnectForOtaReboot'));
+    expect(ios, contains('expectedSessionGeneration'));
+    expect(ios, contains('expectedAttemptGeneration'));
   });
 
   test('OTA reboot does not reuse the user-cancel path or schedule immediately',
@@ -40,7 +46,9 @@ void main() {
     expect(androidMethod, contains('lastEpochAcceptedAdmissions[key]'));
     expect(androidMethod, contains('cancelConnectionAdmission'));
     expect(androidMethod, contains('synthesizeOtaRebootTerminalAdmission'));
+    expect(androidMethod, contains('OTA reboot disconnect rejected'));
     expect(android, contains('BleConnectSource.AUTO_RECONNECT'));
+    expect(android, contains('MutableMap<String, Pair<Long, Long>>'));
     expect(androidMethod, isNot(contains('missing epoch-accepted admission')));
     expect(androidMethod, isNot(contains('autoReconnectSupervisor.cancel')));
     expect(androidMethod, isNot(contains('removePersistedReconnectTarget')));
@@ -49,10 +57,20 @@ void main() {
     final iosEnd = ios.indexOf('\n    /// 标记/消费 OTA', iosStart);
     final iosMethod = ios.substring(iosStart, iosEnd);
     expect(iosMethod, contains('state: .disconnectFromSys'));
+    expect(iosMethod, contains('source: metadata?.source'));
+    expect(iosMethod, contains('generation: metadata?.sessionGeneration'));
+    expect(
+        iosMethod, contains('attemptGeneration: metadata?.attemptGeneration'));
     expect(iosMethod, contains('suppressReconnectSchedule: true'));
+    expect(iosMethod, contains('ota reboot disconnect rejected'));
     expect(iosMethod, isNot(contains('cancelReconnectTask')));
     expect(iosMethod, isNot(contains('removePersistedReconnectTarget')));
     expect(ios, contains('consumeOtaRebootDisconnectSuppression'));
+    expect(ios, contains('peripheralObjectId'));
+    expect(
+        ios,
+        contains(
+            'currentConnectionAdmission(uuid: peripheral.identifier.uuidString)'));
     expect(ios, contains('native reconnect schedule suppressed, tag='));
     expect(android, contains('consumeOtaRebootDisconnectSuppression'));
     expect(iosStore, contains('lastConnectedGeneration'));

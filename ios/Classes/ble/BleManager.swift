@@ -77,7 +77,12 @@ class BleManager: NSObject {
     var peripheralCancellationWatchdogs: [String: (token: Int64, workItem: DispatchWorkItem)] = [:]
     // OTA reboot 主动断开已先发出同代终态；随后 CoreBluetooth 的确认回调不能再次
     // schedule reconnect，否则会和 App 的 afterUpgrade activation 竞争。
-    private var otaRebootDisconnectSuppressions: Set<String> = []
+    private struct OtaRebootDisconnectSuppression {
+        let peripheralObjectId: ObjectIdentifier
+        let sessionGeneration: Int64
+        let attemptGeneration: Int64
+    }
+    private var otaRebootDisconnectSuppressions: [String: OtaRebootDisconnectSuppression] = [:]
     private var otaRebootDisconnectWatchdogs: [String: DispatchWorkItem] = [:]
     //  - central.connect 到 didConnect 之间没有 GATT timeout；exact generation/session
     //    watchdog 对自动回连只做观测，普通前台 attempt 才允许有界回收。
@@ -815,7 +820,12 @@ extension BleManager {
      * 本方法带当前业务 session 的 source/generation 发出 .disconnectFromSys，使 Dart
      * 清理已失效的连接态；原生不在固件 reboot 期间抢跑建链，回连由 afterUpgrade 激活。
      */
-    func disconnectForOtaReboot(uuid: String, name: String) {
+    func disconnectForOtaReboot(
+        uuid: String,
+        name: String,
+        expectedSessionGeneration: Int64 = 0,
+        expectedAttemptGeneration: Int64 = 0
+    ) {
         let effectiveUuid = reconnectIdentityAliases.resolvedCanonical(uuid: uuid) ?? uuid
         guard let device = connectedDevices.first(where: { device in
             isSameConnectTarget(
@@ -830,11 +840,39 @@ extension BleManager {
         }
         let physicalUuid = device.peripheral.identifier.uuidString
         let physicalName = device.peripheral.name ?? name
-        markOtaRebootDisconnectSuppression(uuid: physicalUuid)
+        let metadata = BleExplicitCancellationMetadataPolicy.resolve(
+            currentAdmission: currentConnectionAdmission(uuid: physicalUuid),
+            reconnectTask: reconnectTasks.values.first(where: { task in
+                isSameConnectTarget(
+                    storedUuid: task.uuid,
+                    storedName: task.name,
+                    uuid: physicalUuid,
+                    name: physicalName
+                )
+            })
+        )
+        if expectedSessionGeneration > 0 || expectedAttemptGeneration > 0 {
+            guard let metadata = metadata,
+                  expectedSessionGeneration > 0,
+                  expectedAttemptGeneration > 0,
+                  metadata.sessionGeneration == expectedSessionGeneration,
+                  metadata.attemptGeneration == expectedAttemptGeneration else {
+                loggerE(msg: "ota reboot disconnect rejected: \(physicalUuid)-\(physicalName), expected session=\(expectedSessionGeneration) attempt=\(expectedAttemptGeneration), current session=\(metadata?.sessionGeneration ?? 0) attempt=\(metadata?.attemptGeneration ?? 0)")
+                return
+            }
+        }
+        markOtaRebootDisconnectSuppression(
+            peripheral: device.peripheral,
+            sessionGeneration: metadata?.sessionGeneration ?? 0,
+            attemptGeneration: metadata?.attemptGeneration ?? 0
+        )
         handleConnectState(
             uuid: physicalUuid,
             name: physicalName,
             state: .disconnectFromSys,
+            source: metadata?.source,
+            generation: metadata?.sessionGeneration,
+            attemptGeneration: metadata?.attemptGeneration,
             suppressReconnectSchedule: true,
             tag: "OTA reboot teardown"
         )
@@ -842,12 +880,20 @@ extension BleManager {
     }
 
     /// 标记/消费 OTA 主动 cancel 的唯一 CoreBluetooth 确认回调，禁止跨越到新会话。
-    private func markOtaRebootDisconnectSuppression(uuid: String) {
-        let key = reconnectKey(uuid: uuid)
+    private func markOtaRebootDisconnectSuppression(
+        peripheral: CBPeripheral,
+        sessionGeneration: Int64,
+        attemptGeneration: Int64
+    ) {
+        let key = reconnectKey(uuid: peripheral.identifier.uuidString)
         otaRebootDisconnectWatchdogs[key]?.cancel()
-        otaRebootDisconnectSuppressions.insert(key)
+        otaRebootDisconnectSuppressions[key] = OtaRebootDisconnectSuppression(
+            peripheralObjectId: ObjectIdentifier(peripheral),
+            sessionGeneration: sessionGeneration,
+            attemptGeneration: attemptGeneration
+        )
         let watchdog = DispatchWorkItem { [weak self] in
-            self?.otaRebootDisconnectSuppressions.remove(key)
+            self?.otaRebootDisconnectSuppressions.removeValue(forKey: key)
             self?.otaRebootDisconnectWatchdogs.removeValue(forKey: key)
         }
         otaRebootDisconnectWatchdogs[key] = watchdog
@@ -856,11 +902,18 @@ extension BleManager {
 
     private func consumeOtaRebootDisconnectSuppression(peripheral: CBPeripheral) -> Bool {
         let key = reconnectKey(uuid: peripheral.identifier.uuidString)
-        guard otaRebootDisconnectSuppressions.remove(key) != nil else {
+        guard let suppression = otaRebootDisconnectSuppressions[key],
+              suppression.peripheralObjectId == ObjectIdentifier(peripheral) else {
             return false
         }
+        if let currentAdmission = currentConnectionAdmission(uuid: peripheral.identifier.uuidString),
+           (currentAdmission.sessionGeneration != suppression.sessionGeneration ||
+            currentAdmission.generation != suppression.attemptGeneration) {
+            return false
+        }
+        otaRebootDisconnectSuppressions.removeValue(forKey: key)
         otaRebootDisconnectWatchdogs.removeValue(forKey: key)?.cancel()
-        loggerD(msg: "ota reboot disconnect: consume CoreBluetooth terminal \(peripheral.identifier.uuidString)")
+        loggerD(msg: "ota reboot disconnect: consume CoreBluetooth terminal \(peripheral.identifier.uuidString), session=\(suppression.sessionGeneration), attempt=\(suppression.attemptGeneration)")
         return true
     }
     
@@ -875,7 +928,9 @@ extension BleManager {
         uuid: String,
         data: Data,
         psType: Int = 0,
-        allowDuringUpgrade: Bool = false
+        allowDuringUpgrade: Bool = false,
+        expectedSessionGeneration: Int64 = 0,
+        expectedAttemptGeneration: Int64 = 0
     ) {
         guard checkIsFunctionCanBeCalled() else {
             return
@@ -903,6 +958,16 @@ extension BleManager {
                 return
             }
         }
+        if psType == 1,
+           let identityError = validateOtaWriteIdentity(
+               uuid: uuid,
+               device: device,
+               expectedSessionGeneration: expectedSessionGeneration,
+               expectedAttemptGeneration: expectedAttemptGeneration
+           ) {
+            loggerE(msg: "sendCmd: \(uuid), type=\(psType), \(identityError.message ?? "attempt identity mismatch")")
+            return
+        }
         guard let writeChars = device.writeCharsDic[psType] else {
             loggerE(msg: "sendCmd: \(uuid), type=\(psType), write characteristic missing")
             return
@@ -921,7 +986,14 @@ extension BleManager {
      *  - 其它 psType: 退化到现有 WriteWithoutResponse 立即返回路径(行为不变);
      *  - 设计与验收: 见 docs/IOS_OTA_NOWAIT_SPEC.md.
      */
-    func sendCmdNoWait(uuid: String, data: Data, psType: Int, result: @escaping FlutterResult) {
+    func sendCmdNoWait(
+        uuid: String,
+        data: Data,
+        psType: Int,
+        expectedSessionGeneration: Int64 = 0,
+        expectedAttemptGeneration: Int64 = 0,
+        result: @escaping FlutterResult
+    ) {
         let isOtaChannel = (psType == 1)
         //  1、基础校验失败时，OTA 必须显式失败，避免上层把未提交的数据包当已发送。
         //  -- 非 OTA no-wait 保持历史 nil 返回，避免扩大 MethodChannel 行为面。
@@ -967,6 +1039,16 @@ extension BleManager {
             }
             return
         }
+        if isOtaChannel,
+           let identityError = validateOtaWriteIdentity(
+               uuid: uuid,
+               device: device,
+               expectedSessionGeneration: expectedSessionGeneration,
+               expectedAttemptGeneration: expectedAttemptGeneration
+           ) {
+            result(identityError)
+            return
+        }
         //  4、分发: OTA 走背压队列, 其它走立即返回的 WriteWithoutResponse
         let supportsNoResponse = writeChars.properties.contains(.writeWithoutResponse)
         if isOtaChannel && supportsNoResponse {
@@ -982,7 +1064,17 @@ extension BleManager {
             //  -- 这里构造提交目标而不让队列直接依赖 CBCharacteristic，便于 XCTest 覆盖背压时序。
             let target = OtaWriteTarget(
                 characteristicUUID: writeChars.uuid.uuidString,
-                submit: { peripheral, value in
+                submit: { [weak self, device] peripheral, value in
+                    guard let self = self,
+                          self.validateOtaWriteIdentity(
+                              uuid: uuid,
+                              device: device,
+                              expectedSessionGeneration: expectedSessionGeneration,
+                              expectedAttemptGeneration: expectedAttemptGeneration
+                          ) == nil else {
+                        self?.loggerE(msg: "[ezw_ble][ota] submit rejected uuid=\(uuid) reason=attempt identity mismatch")
+                        return false
+                    }
                     guard let cbPeripheral = peripheral as? CBPeripheral else {
                         return false
                     }
@@ -1012,6 +1104,47 @@ extension BleManager {
     /// OTA 错误 details 需要带上当前 native pending 深度，帮助区分“尚未提交”和“已提交后设备无 ack”。
     private func queueDepthForOta(uuid: String) -> Int {
         return otaWriteQueues[uuid]?.queueDepth ?? 0
+    }
+
+    /// OTA 恢复重传可携带业务层冻结的 exact session/attempt。未传 expected pair 时保持旧
+    /// API 兼容；传入正数后必须和当前 Gate 或业务 connected owner 的同一对 token 匹配。
+    private func validateOtaWriteIdentity(
+        uuid: String,
+        device: BleConnectedDevice,
+        expectedSessionGeneration: Int64,
+        expectedAttemptGeneration: Int64
+    ) -> FlutterError? {
+        if expectedSessionGeneration <= 0, expectedAttemptGeneration <= 0 {
+            return nil
+        }
+        let reconnectTask = reconnectTasks.values.first { task in
+            isSameConnectTarget(
+                storedUuid: task.uuid,
+                storedName: task.name,
+                uuid: uuid,
+                name: device.peripheral.name ?? ""
+            )
+        }
+        let metadata = BleExplicitCancellationMetadataPolicy.resolve(
+            currentAdmission: currentConnectionAdmission(uuid: uuid),
+            reconnectTask: reconnectTask
+        )
+        let matchesExpected =
+            expectedSessionGeneration > 0 &&
+                expectedAttemptGeneration > 0 &&
+                metadata?.sessionGeneration == expectedSessionGeneration &&
+                metadata?.attemptGeneration == expectedAttemptGeneration &&
+                device.peripheral.state == .connected &&
+                (device.isConnected || upgradeStateRegistry.contains(uuid))
+        if matchesExpected {
+            return nil
+        }
+        loggerE(msg: "[ezw_ble][ota] identity mismatch uuid=\(uuid) expectedSessionGeneration=\(expectedSessionGeneration) expectedAttemptGeneration=\(expectedAttemptGeneration) actualSessionGeneration=\(metadata?.sessionGeneration ?? 0) actualAttemptGeneration=\(metadata?.attemptGeneration ?? 0) state=\(device.peripheral.state.rawValue) businessConnected=\(device.isConnected) upgrading=\(upgradeStateRegistry.contains(uuid))")
+        return OtaWriteQueue.unavailableError(
+            endpoint: uuid,
+            reason: "attempt identity mismatch",
+            pending: queueDepthForOta(uuid: uuid)
+        )
     }
 
     /**
@@ -1057,12 +1190,30 @@ extension BleManager {
     /**
      *  退出升级模式
      */
-    func quiteUpgradeState(uuid: String) {
+    func quiteUpgradeState(
+        uuid: String,
+        expectedSessionGeneration: Int64 = 0,
+        expectedAttemptGeneration: Int64 = 0
+    ) {
+        let connectedDevice = connectedDevices.first(where: { $0.peripheral.identifier.uuidString == uuid })
+        if let connectedDevice {
+            if let identityError = validateOtaWriteIdentity(
+                uuid: uuid,
+                device: connectedDevice,
+                expectedSessionGeneration: expectedSessionGeneration,
+                expectedAttemptGeneration: expectedAttemptGeneration
+            ) {
+                loggerE(msg: "quiteUpgradeState rejected: \(uuid), \(identityError.message ?? "attempt identity mismatch")")
+                return
+            }
+        } else if expectedSessionGeneration > 0 || expectedAttemptGeneration > 0 {
+            loggerE(msg: "quiteUpgradeState rejected: \(uuid), missing device cache for exact identity")
+            return
+        }
         // 先消费 marker；后续校验失败时保留真实断连态，不能再次被旧 OTA 回调复活。
         guard upgradeStateRegistry.consume(uuid) else {
             return
         }
-        let connectedDevice = connectedDevices.first(where: { $0.peripheral.identifier.uuidString == uuid })
         let reconnectTask = reconnectTasks.values.first(where: { task in
             isSameConnectTarget(
                 storedUuid: task.uuid,
@@ -3184,10 +3335,57 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             loggerE(msg: "cmd response: \(peripheral.identifier.uuidString), can not find chars")
             return
         }
-        //  4、发送指令到flutter
-        let bleCmdMap = BleCmd(uuid: peripheral.identifier.uuidString, psType: privateService.type, data: data, isSuccess: error == nil).toMap()
+        let responseIdentity = otaResponseIdentity(
+            uuid: peripheral.identifier.uuidString,
+            device: device,
+            psType: privateService.type
+        )
+        if privateService.type == 1, responseIdentity == nil {
+            loggerE(msg: "cmd response(char): \(peripheral.identifier.uuidString), drop OTA response without exact identity")
+            return
+        }
+        //  4、发送指令到flutter。OTA response 必须带 exact pair，供 Dart 绑定当前恢复轮次。
+        let bleCmdMap = BleCmd(
+            uuid: peripheral.identifier.uuidString,
+            psType: privateService.type,
+            data: data,
+            isSuccess: error == nil,
+            sessionGeneration: responseIdentity?.sessionGeneration ?? 0,
+            attemptGeneration: responseIdentity?.attemptGeneration ?? 0
+        ).toMap()
         BleEC.receiveData.emit(bleCmdMap)
         loggerD(msg: "cmd response(char): \(peripheral.identifier.uuidString), chars = \(characteristic.uuid.uuidString), data length = \(data.count)")
+    }
+
+    private func otaResponseIdentity(
+        uuid: String,
+        device: BleConnectedDevice,
+        psType: Int
+    ) -> BleExplicitCancellationMetadata? {
+        guard psType == 1 else {
+            return nil
+        }
+        guard device.peripheral.state == .connected,
+              device.isConnected || upgradeStateRegistry.contains(uuid) else {
+            return nil
+        }
+        let reconnectTask = reconnectTasks.values.first { task in
+            isSameConnectTarget(
+                storedUuid: task.uuid,
+                storedName: task.name,
+                uuid: uuid,
+                name: device.peripheral.name ?? ""
+            )
+        }
+        guard let metadata = BleExplicitCancellationMetadataPolicy.resolve(
+            currentAdmission: currentConnectionAdmission(uuid: uuid),
+            reconnectTask: reconnectTask
+        ),
+              metadata.sessionGeneration > 0,
+              metadata.attemptGeneration > 0 else {
+            return nil
+        }
+        return metadata
     }
     
 }
