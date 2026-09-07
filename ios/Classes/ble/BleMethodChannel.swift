@@ -33,6 +33,8 @@ enum BleMC: String {
     case reconcileBusinessConnections
     /// OTA reboot teardown: disconnect physical transport without revoking reconnect intent.
     case disconnectForOtaReboot
+    /// OTA write-stall recovery teardown: exact physical disconnect, owner preserved.
+    case disconnectForOtaRecovery
     /// Mark business-layer auth as about to complete.
     case devicePreConnected
     /// Mark business-layer auth as complete and arm auto reconnect.
@@ -250,6 +252,17 @@ enum BleMC: String {
                 expectedAttemptGeneration: expectedAttemptGeneration
             )
             break
+        case .disconnectForOtaRecovery:
+            let jsonData = arguments as? [String: Any] ?? [:]
+            let uuid: String = jsonData["uuid"] as? String ?? ""
+            let expectedSessionGeneration = (jsonData["expectedSessionGeneration"] as? NSNumber)?.int64Value ?? 0
+            let expectedAttemptGeneration = (jsonData["expectedAttemptGeneration"] as? NSNumber)?.int64Value ?? 0
+            result(BleManager.shared.disconnectForOtaRecovery(
+                uuid: uuid,
+                expectedSessionGeneration: expectedSessionGeneration,
+                expectedAttemptGeneration: expectedAttemptGeneration
+            ))
+            return
         case .sendCmd:
             let jsonData: [String: Any] = arguments as? [String: Any] ?? [:]
             let uuid: String = jsonData["uuid"] as? String ?? ""

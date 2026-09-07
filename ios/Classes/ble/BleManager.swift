@@ -879,6 +879,78 @@ extension BleManager {
         loggerD(msg: "ota reboot disconnect: \(physicalUuid)-\(physicalName), owner preserved")
     }
 
+    /**
+     * OTA 写阻塞恢复专用断开。
+     *
+     * 与 reboot teardown 不同，本方法不伪造连接状态、不注册 suppression；它只在
+     * exact session/attempt 仍持有当前 CBPeripheral 时，先废止旧写队列和升级 marker，
+     * 再发起真实 CoreBluetooth disconnect，让 didDisconnect 驱动 even_connect 的恢复链。
+     */
+    func disconnectForOtaRecovery(
+        uuid: String,
+        expectedSessionGeneration: Int64 = 0,
+        expectedAttemptGeneration: Int64 = 0
+    ) -> String {
+        guard expectedSessionGeneration > 0, expectedAttemptGeneration > 0 else {
+            loggerE(msg: "ota recovery disconnect rejected: \(uuid), missing exact identity")
+            return "unavailable"
+        }
+        let effectiveUuid = reconnectIdentityAliases.resolvedCanonical(uuid: uuid) ?? uuid
+        // 先按 endpoint owner 证明 exact pair，再观察当前物理链路；否则 connectedDevices
+        // miss 时会把旧 session/attempt 误判为可恢复的 alreadyDisconnected。
+        let reconnectTask = reconnectTasks.values.first { task in
+            isSameConnectTarget(
+                storedUuid: task.uuid,
+                storedName: task.name,
+                uuid: effectiveUuid,
+                name: ""
+            )
+        }
+        let metadata = BleExplicitCancellationMetadataPolicy.resolve(
+            currentAdmission: currentConnectionAdmission(uuid: effectiveUuid)
+                ?? reconnectTask.flatMap { currentConnectionAdmission(uuid: $0.uuid) },
+            reconnectTask: reconnectTask
+        )
+        guard let metadata = metadata else {
+            loggerE(msg: "ota recovery disconnect unavailable: \(uuid), no exact owner")
+            return "unavailable"
+        }
+        guard metadata.sessionGeneration == expectedSessionGeneration,
+              metadata.attemptGeneration == expectedAttemptGeneration else {
+            loggerE(msg: "ota recovery disconnect stale: \(effectiveUuid), expected session=\(expectedSessionGeneration) attempt=\(expectedAttemptGeneration), current session=\(metadata.sessionGeneration) attempt=\(metadata.attemptGeneration)")
+            return "staleIdentity"
+        }
+        guard let device = connectedDevices.first(where: { device in
+            isSameConnectTarget(
+                storedUuid: device.peripheral.identifier.uuidString,
+                storedName: device.peripheral.name ?? "",
+                uuid: effectiveUuid,
+                name: ""
+            )
+        }) else {
+            otaWriteQueues.removeValue(forKey: effectiveUuid)?.cancelAll(reason: "ota recovery already disconnected")
+            if let ownerUuid = reconnectTask?.uuid, ownerUuid != effectiveUuid {
+                otaWriteQueues.removeValue(forKey: ownerUuid)?.cancelAll(reason: "ota recovery already disconnected")
+                upgradeStateRegistry.consume(ownerUuid)
+            }
+            upgradeStateRegistry.consume(effectiveUuid)
+            loggerD(msg: "ota recovery disconnect: \(effectiveUuid), already disconnected after exact identity match")
+            return "alreadyDisconnected"
+        }
+        let physicalUuid = device.peripheral.identifier.uuidString
+        guard device.peripheral.state != .disconnected else {
+            otaWriteQueues.removeValue(forKey: physicalUuid)?.cancelAll(reason: "ota recovery already disconnected")
+            upgradeStateRegistry.consume(physicalUuid)
+            loggerD(msg: "ota recovery disconnect: \(physicalUuid), already disconnected after identity match")
+            return "alreadyDisconnected"
+        }
+        otaWriteQueues.removeValue(forKey: physicalUuid)?.cancelAll(reason: "ota recovery")
+        upgradeStateRegistry.consume(physicalUuid)
+        centralManager.cancelPeripheralConnection(device.peripheral)
+        loggerD(msg: "ota recovery disconnect accepted: \(physicalUuid), session=\(expectedSessionGeneration), attempt=\(expectedAttemptGeneration)")
+        return "accepted"
+    }
+
     /// 标记/消费 OTA 主动 cancel 的唯一 CoreBluetooth 确认回调，禁止跨越到新会话。
     private func markOtaRebootDisconnectSuppression(
         peripheral: CBPeripheral,
@@ -1083,7 +1155,13 @@ extension BleManager {
                 }
             )
             loggerD(msg: "[ezw_ble][ota] enqueued uuid=\(uuid) bytes=\(data.count) canSend=\(device.peripheral.canSendWriteWithoutResponse) queueDepth=\(queue.queueDepth)")
-            queue.enqueue(data: data, target: target, result: result)
+            queue.enqueue(
+                data: data,
+                target: target,
+                expectedSessionGeneration: expectedSessionGeneration,
+                expectedAttemptGeneration: expectedAttemptGeneration,
+                result: result
+            )
         } else if isOtaChannel {
             //  - 4.3、OTA 不支持 WriteWithoutResponse 时 fail closed，不能回退成
             //  -- 看似成功的旧路径，否则 Dart 继续推进会制造 OTA 死锁/错判。

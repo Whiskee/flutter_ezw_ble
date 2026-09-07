@@ -6,6 +6,7 @@ import 'package:flutter_ezw_ble/core/models/ble_cmd.dart';
 import 'package:flutter_ezw_ble/core/models/ble_business_connection_attempt.dart';
 import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
 import 'package:flutter_ezw_ble/core/models/ble_device.dart';
+import 'package:flutter_ezw_ble/core/models/ble_ota_recovery_disconnect_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_scan_start_result.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_method_channel.dart';
@@ -89,6 +90,15 @@ class MockFlutterEzwBlePlatform
   Future<void> disconnectForOtaReboot(
     String uuid,
     String name, {
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<BleOtaRecoveryDisconnectResult> disconnectForOtaRecovery(
+    String uuid, {
     int expectedSessionGeneration = 0,
     int expectedAttemptGeneration = 0,
   }) {
