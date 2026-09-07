@@ -309,3 +309,9 @@ iOS R1 的 CoreBluetooth Code 14 新鲜广播恢复属于同一个长期 reconne
 不变量：finalize 仍必须为未认领 escrow 建 barrier 并取消物理连接；只是 barrier 的生命周期不得依赖外部是否还持有对象。
 
 同一日志里的另一现象：切换到 B 时左腿的 5403 保护写耗时 1.9 秒（其余各腿各次均在 50～250 ms），这是该腿尚未与手机 Bond、iOS 弹出系统配对框并由用户确认所致，属于安全门禁的预期行为，与右腿超时无关；确认后再次连接 63 ms 完成。
+
+## iOS 只交还部分腿时的 headless 补查（2026-09-07 真机修正）
+
+真机现象：连接眼镜 B 双腿（均带 `CBConnectPeripheralOptionEnableAutoReconnect`）后关机重启。iOS 只随 `willRestoreState` 交还右腿（以及另一台眼镜的一条陈旧腿），右腿经 escrow claim 在 25 秒内业务 connected；左腿既无 escrow、也未系统连接、进程内没有对象，`shouldDeferReconnectForAppInactivity` 直接把它延后到前台（`appLifecycle: reconnect deferred … context=beginReconnectAttempt`）。headless 期间整整 10 分钟没有为左腿建立任何 pending connect，眼镜一直单腿，直到用户打开 App、`didBecomeActive` 补偿 retrieve 后 2 秒内连上。iOS 为何遗漏一条腿从 App 日志无法判定（两腿的连接选项、注册与时序一致），必须由 App 侧兜底。
+
+规则：同步 retrieve 的禁令针对退出宽限期，SR 后台拉起既不是退出也没有前台窗口。因此在满足「本进程由 `bluetoothCentrals` 拉起、未收到 `willTerminate`、`applicationState == .background`、central `poweredOn`」时，允许对当前目标中 iOS 未交还的 UUID owner 执行**每进程每 endpoint 一次** `retrievePeripherals(withIdentifiers:)`（`retrievePeripheralForStateRestorationLaunch`），命中后与其它腿同样注册 admission 并建立系统 pending connect；`shouldDeferReconnectForAppInactivity` 在该补查仍可用时不得延后。未命中或已用过则维持原 inactive 延后语义，`didBecomeActive` 补偿不变；`retrieveConnectedPeripherals` 与 name-only owner 的限制不变；事件 `ios_sr_launch_retrieve`。

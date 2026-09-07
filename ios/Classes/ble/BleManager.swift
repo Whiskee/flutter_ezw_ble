@@ -99,6 +99,12 @@ class BleManager: NSObject {
     //  - CBCentralManager 使用主队列；同步 retrieve 只允许在 App active 窗口执行，
     //    避免退出宽限期主线程卡在 CoreBluetooth XPC 同步查询并触发 0x8BADF00D。
     var allowsSynchronousCoreBluetoothLookup = false
+    //  - willTerminate 后的退出宽限期是同步 retrieve 唯一真正危险的窗口；SR 后台拉起
+    //    本身不是退出，这里单独记录以便区分。
+    var hasReceivedWillTerminate = false
+    //  - SR 后台拉起窗口内，每个 endpoint 只允许一次 identifier 补查（每进程一次），
+    //    用于补建 iOS 未随 willRestoreState 交还的当前目标腿的 pending connect。
+    var stateRestorationLaunchRetrieveAttempts: Set<String> = []
     /// Code 14 新鲜广播窗口按 exact session 持有扫描 lease；只有本任务启动的扫描
     /// 才能由它停止，旧窗口回调也不得移除新 owner 的 timer。
     var pairingRecoveryScanTimers: [String: (timer: Timer, ownsScan: Bool, sessionGeneration: Int64)] = [:]
@@ -1403,6 +1409,47 @@ extension BleManager {
             return []
         }
         return centralManager.retrievePeripherals(withIdentifiers: identifiers)
+    }
+
+    /**
+     * SR 后台拉起窗口内，对当前目标中 iOS 未交还的 endpoint 是否还允许一次 identifier 补查。
+     *
+     * 同步 retrieve 的禁令针对退出宽限期（0x8BADF00D）；由 `bluetoothCentrals` 拉起的
+     * 后台进程既非退出也无前台窗口，若 iOS 只交还了一条腿（2026-09-07 真机：重启后只
+     * 交还右腿），另一条腿没有进程内对象就永远建不起 pending connect，headless 期间整机
+     * 无法恢复。这里只放行一次、只在 background + poweredOn + 未收到 willTerminate 时。
+     */
+    func canAttemptStateRestorationLaunchRetrieve(endpointId: String) -> Bool {
+        guard !allowsSynchronousCoreBluetoothLookup,
+              FlutterEzwBlePlugin.wasLaunchedForBluetoothStateRestoration(),
+              !hasReceivedWillTerminate,
+              UIApplication.shared.applicationState == .background,
+              centralManager.state == .poweredOn,
+              UUID(uuidString: endpointId) != nil else {
+            return false
+        }
+        return !stateRestorationLaunchRetrieveAttempts.contains(reconnectKey(uuid: endpointId))
+    }
+
+    /// 消费一次 SR 拉起窗口的 identifier 补查；返回 nil 表示不满足放行条件。
+    func retrievePeripheralForStateRestorationLaunch(
+        endpointId: String,
+        context: String
+    ) -> CBPeripheral? {
+        guard canAttemptStateRestorationLaunchRetrieve(endpointId: endpointId),
+              let identifier = UUID(uuidString: endpointId) else {
+            return nil
+        }
+        stateRestorationLaunchRetrieveAttempts.insert(reconnectKey(uuid: endpointId))
+        let retrieved = centralManager.retrievePeripherals(withIdentifiers: [identifier]).first
+        recordAutoReconnectEvent(
+            type: "ios_sr_launch_retrieve",
+            uuid: endpointId,
+            name: retrieved?.name ?? "",
+            detail: "found=\(retrieved != nil), state=\(retrieved?.state.rawValue ?? -1), context=\(context)"
+        )
+        loggerD(msg: "appLifecycle: state restoration launch retrieve uuid=\(endpointId), found=\(retrieved != nil), state=\(retrieved?.state.rawValue ?? -1), context=\(context)")
+        return retrieved
     }
     
     

@@ -1384,7 +1384,12 @@ extension BleManager {
     /// inactive/background/terminating 只在没有内存 peripheral 时 defer。
     /// 这不是失败 attempt，不递增 retry，不发布 noDeviceFound，也不删除长期 owner。
     private func shouldDeferReconnectForAppInactivity(_ task: BleReconnectTask) -> Bool {
-        !allowsSynchronousCoreBluetoothLookup && inMemoryReconnectPeripheral(task) == nil
+        guard !allowsSynchronousCoreBluetoothLookup,
+              inMemoryReconnectPeripheral(task) == nil else {
+            return false
+        }
+        // SR 后台拉起窗口内仍可用一次 identifier 补查建立 pending connect，不算无对象可用。
+        return !canAttemptStateRestorationLaunchRetrieve(endpointId: task.uuid)
     }
 
     /// 把 exact reconnect task 标记为等待前台；旧 generation 或已取消 owner 无法写回。
@@ -1514,6 +1519,7 @@ extension BleManager {
     /// 进程退出宽限期绝不允许同步 retrieve 阻塞主线程。
     @objc func handleAppWillTerminate() {
         allowsSynchronousCoreBluetoothLookup = false
+        hasReceivedWillTerminate = true
         pausePeerPairingRecoveryForAppInactivity(reason: "willTerminate")
         loggerD(msg: "appLifecycle: synchronous CoreBluetooth lookup disabled reason=willTerminate")
     }
@@ -1738,6 +1744,15 @@ extension BleManager {
                let held = inMemoryReconnectPeripheral(task) {
                 loggerD(msg: "appLifecycle: reuse in-memory peripheral while inactive uuid=\(held.identifier.uuidString), owner=\(task.uuid)")
                 return held
+            }
+            // iOS 未随 willRestoreState 交还的当前目标腿：SR 后台拉起窗口内允许一次
+            // identifier 补查，随后与其它腿同样注册 admission 并建立系统 pending connect。
+            if !allowsSynchronousCoreBluetoothLookup,
+               let restored = retrievePeripheralForStateRestorationLaunch(
+                   endpointId: task.uuid,
+                   context: "auto reconnect by UUID during SR launch"
+               ) {
+                return restored
             }
             // App 重装会让服务端/业务缓存中的 CoreBluetooth UUID 失效。若目标已被
             // iOS/ANCS 持有连接，它可能停止广播，必须在旧 UUID retrieve 和扫描缓存前
