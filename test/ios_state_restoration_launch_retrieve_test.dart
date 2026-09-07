@@ -23,7 +23,10 @@ void main() {
       manager.indexOf('func retrievePeripheralForStateRestorationLaunch('),
     );
     expect(gate, contains('guard !allowsSynchronousCoreBluetoothLookup,'));
-    expect(gate, contains('FlutterEzwBlePlugin.wasLaunchedForBluetoothStateRestoration(),'));
+    // UIScene 下 launchOptions 恒为 nil，必须同时认 willRestoreState 的进程级事实。
+    expect(gate, contains('FlutterEzwBlePlugin.wasLaunchedForBluetoothStateRestoration()'));
+    expect(gate, contains('|| BleManager.didExperienceStateRestorationThisProcess'));
+    expect(gate, contains('launchedForRestoration,'));
     expect(gate, contains('!hasReceivedWillTerminate,'));
     expect(gate, contains('UIApplication.shared.applicationState == .background,'));
     expect(gate, contains('centralManager.state == .poweredOn,'));

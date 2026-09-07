@@ -1420,8 +1420,13 @@ extension BleManager {
      * 无法恢复。这里只放行一次、只在 background + poweredOn + 未收到 willTerminate 时。
      */
     func canAttemptStateRestorationLaunchRetrieve(endpointId: String) -> Bool {
+        // UIScene 生命周期下 didFinishLaunching 的 launchOptions 恒为 nil，插件的
+        // bluetoothCentrals 标记不可靠（2026-09-07 20:26 真机：SR 拉起但标记为 false，
+        // 补查从未放行，左腿仍被延后到前台）。本进程发生过 willRestoreState 即是 SR 证据。
+        let launchedForRestoration = FlutterEzwBlePlugin.wasLaunchedForBluetoothStateRestoration()
+            || BleManager.didExperienceStateRestorationThisProcess
         guard !allowsSynchronousCoreBluetoothLookup,
-              FlutterEzwBlePlugin.wasLaunchedForBluetoothStateRestoration(),
+              launchedForRestoration,
               !hasReceivedWillTerminate,
               UIApplication.shared.applicationState == .background,
               centralManager.state == .poweredOn,
