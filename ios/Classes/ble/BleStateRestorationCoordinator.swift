@@ -141,6 +141,13 @@ final class BleStateRestorationCoordinator {
         )
     }
 
+    /// 该 identifier 是否已在 escrow 中（connection event 只对已托管或当前目标对象有意义）。
+    func contains(uuid: String) -> Bool {
+        pendingPeripherals.contains {
+            $0.identifier.uuidString.caseInsensitiveCompare(uuid) == .orderedSame
+        }
+    }
+
     /// activation 开始时把当前已知 escrow 全部纳入认领窗口；重复调用只会扩大窗口。
     func markClaimWindowSnapshot() {
         claimWindowSequence = max(claimWindowSequence ?? 0, escrowSequence)

@@ -315,3 +315,16 @@ iOS R1 的 CoreBluetooth Code 14 新鲜广播恢复属于同一个长期 reconne
 真机现象：连接眼镜 B 双腿（均带 `CBConnectPeripheralOptionEnableAutoReconnect`）后关机重启。iOS 只随 `willRestoreState` 交还右腿（以及另一台眼镜的一条陈旧腿），右腿经 escrow claim 在 25 秒内业务 connected；左腿既无 escrow、也未系统连接、进程内没有对象，`shouldDeferReconnectForAppInactivity` 直接把它延后到前台（`appLifecycle: reconnect deferred … context=beginReconnectAttempt`）。headless 期间整整 10 分钟没有为左腿建立任何 pending connect，眼镜一直单腿，直到用户打开 App、`didBecomeActive` 补偿 retrieve 后 2 秒内连上。iOS 为何遗漏一条腿从 App 日志无法判定（两腿的连接选项、注册与时序一致），必须由 App 侧兜底。
 
 规则：同步 retrieve 的禁令针对退出宽限期，SR 后台拉起既不是退出也没有前台窗口。因此在满足「本进程由 `bluetoothCentrals` 拉起、未收到 `willTerminate`、`applicationState == .background`、central `poweredOn`」时，允许对当前目标中 iOS 未交还的 UUID owner 执行**每进程每 endpoint 一次** `retrievePeripherals(withIdentifiers:)`（`retrievePeripheralForStateRestorationLaunch`），命中后与其它腿同样注册 admission 并建立系统 pending connect；`shouldDeferReconnectForAppInactivity` 在该补查仍可用时不得延后。未命中或已用过则维持原 inactive 延后语义，`didBecomeActive` 补偿不变；`retrieveConnectedPeripherals` 与 name-only owner 的限制不变；事件 `ios_sr_launch_retrieve`。
+
+## 旧眼镜的 ANCS 右腿不得被 escrow 重新抱住（2026-09-07 真机修正）
+
+真机现象：账号下有眼镜 A、B，反复从搜索页切换。每次切换后旧眼镜的左腿在 0.3 秒内收到 `peerDisconnected` 并开始广播，右腿却始终没有 `peerDisconnected`，切回时右腿立即 `contactDevice`，只有关开蓝牙才断；蓝牙重开后系统自己把旧眼镜右腿连了回来，本 central 按私有服务注册的 connection event 把它交给 escrow，`stage(.disconnected)` 返回 `rearm`，插件为它发了 `connect(EnableAutoReconnect)`。于是旧眼镜的右腿跟着每次重启一起被 `willRestoreState` 交还（14:37:36 交还 B 右腿、14:46:42 交还 A 右腿），每次都要 finalize cancel，并触发了僵尸 barrier 问题。原因：iOS 上通知转发由眼镜直连 ANCS（见主仓 `docs/notifications/notification_architecture.md`），右腿是 ANCS 客户端，App `cancelPeripheralConnection` 只撤销本 central 的连接意图，系统持有的 ANCS 链路不受 App 控制。
+
+规则：
+
+1. restoration 的合法目标只有当前账号的持久化 reconnect target（`reconnectStore.target(uuid:name:)`，UUID 或完整名）与进程内 reconnect owner（`isStateRestorationTarget`）。
+2. `connectionEventDidOccur` 交来的对象若不是目标且不在 escrow 中，直接忽略（`ios_connection_event_ignored reason=notRestorationTarget`）：不托管、不设 delegate、不 rearm。
+3. `rearmStateRestorationEscrow` 只为目标发 `connect`；非目标（含 `willRestoreState` 交还的 `.disconnected` 旧设备）记 `ios_restore_escrow_rearm_skipped` 并留在 escrow，由 finalize 按 `.disconnected` 直接丢弃、不 cancel。
+4. 已 `.connected` 交还的非目标仍由 finalize 建 barrier 并 cancel（见前一节）。
+
+SR 本身没有「最多两个外设」的限制：`willRestoreState` 交还的是系统记住的全部相关对象，connection event 按服务 UUID 匹配任意 G2；数量取决于系统状态，不是配额。

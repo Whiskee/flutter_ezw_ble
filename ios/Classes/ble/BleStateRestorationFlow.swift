@@ -16,8 +16,37 @@ import Foundation
  *  通过 activation 精确认领后，才由自动回连协调器进入 GATT pipeline。
  */
 extension BleManager {
+    /// 当前账号持久化 reconnect target 或进程内 reconnect owner 才是 restoration 的合法目标。
+    /// iOS 通知转发走 ANCS：旧眼镜的右腿在切换设备后仍由系统持有链路并会被系统自动重连，
+    /// 本 central 按私有服务注册的 connection event 会把它再次交来；非目标对象只能忽略，
+    /// 绝不能为它补 pending connect，否则旧眼镜永远跟着 SR 一起回来（2026-09-07 真机）。
+    func isStateRestorationTarget(_ peripheral: CBPeripheral) -> Bool {
+        let uuid = peripheral.identifier.uuidString
+        let name = peripheral.name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if reconnectStore.target(uuid: uuid, name: name) != nil {
+            return true
+        }
+        return reconnectTasks.values.contains { task in
+            isSameConnectTarget(storedUuid: task.uuid, storedName: task.name, uuid: uuid, name: name)
+        }
+    }
+
     /// `willRestoreState` 的唯一入口：只建立物理 escrow，不提前创建业务 admission。
     func escrowStateRestorationPeripheral(_ peripheral: CBPeripheral, source: String) {
+        if source == "connectionEvent",
+           !isStateRestorationTarget(peripheral),
+           !restorationCoordinator.contains(uuid: peripheral.identifier.uuidString) {
+            // 系统为非当前目标（如旧眼镜的 ANCS 右腿、办公室里其它 G2）建立的链路
+            // 不是本进程的 restoration 输入：不托管、不设 delegate、不 rearm。
+            recordAutoReconnectEvent(
+                type: "ios_connection_event_ignored",
+                uuid: peripheral.identifier.uuidString,
+                name: peripheral.name ?? "",
+                detail: "reason=notRestorationTarget, state=\(peripheral.state.rawValue)"
+            )
+            loggerD(msg: "stateRestoration: ignore connection event for non-target uuid=\(peripheral.identifier.uuidString), name=\(peripheral.name ?? ""), state=\(peripheral.state.rawValue)")
+            return
+        }
         peripheral.delegate = self
         let action = restorationCoordinator.enqueue(peripheral)
         recordAutoReconnectEvent(
@@ -73,6 +102,19 @@ extension BleManager {
 
     /// escrow 只调用 CoreBluetooth connect；正式 admission 必须等 Dart target claim。
     private func rearmStateRestorationEscrow(_ peripheral: CBPeripheral, reason: String) {
+        // 只为当前账号的目标补 pending connect。willRestoreState 也可能交还旧眼镜的
+        // ANCS 右腿（已 .disconnected）：为它 connect 只会让本 central 再次抱住旧设备，
+        // 随后每次 finalize 都要 cancel、下次重启又被交还。非目标留在 escrow 等 finalize 丢弃。
+        guard isStateRestorationTarget(peripheral) else {
+            recordAutoReconnectEvent(
+                type: "ios_restore_escrow_rearm_skipped",
+                uuid: peripheral.identifier.uuidString,
+                name: peripheral.name ?? "",
+                detail: "reason=notRestorationTarget, source=\(reason)"
+            )
+            loggerD(msg: "stateRestoration: skip rearm for non-target uuid=\(peripheral.identifier.uuidString), name=\(peripheral.name ?? ""), reason=\(reason)")
+            return
+        }
         // willRestoreState 早于 centralManagerDidUpdateState(poweredOn) 是常态；
         // 未 poweredOn 时提交 connect 依赖未承诺的系统行为，挂起等 poweredOn 补偿。
         guard centralManager.state == .poweredOn else {
