@@ -148,7 +148,12 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// 这不是用户取消：必须保留 native autoReconnect owner 和持久化目标，同时用当前
   /// source/generation 上报系统断连，让 Dart 先清除已经失效的业务连接态。实际回连
   /// 由上层在固件 reboot 窗口结束后以 afterUpgrade 流程重新激活，不能在此处抢跑。
-  Future<void> disconnectForOtaReboot(String uuid, String name) {
+  Future<void> disconnectForOtaReboot(
+    String uuid,
+    String name, {
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+  }) {
     throw UnimplementedError(
       'disconnectForOtaReboot(uuid: $uuid, name: $name) has not been implemented.',
     );
@@ -252,12 +257,16 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// - param data 指令数据
   /// - param psType 指令类型
   /// - param allowDuringUpgrade 业务协议已确认该控制指令可在升级态发送
+  /// - param expectedSessionGeneration OTA 调用方冻结的业务 session；0 表示兼容旧调用
+  /// - param expectedAttemptGeneration OTA 调用方冻结的物理 attempt；0 表示兼容旧调用
   ///
   Future<void> sendCmd(
     String uuid,
     Uint8List data, {
     int psType = 0,
     bool allowDuringUpgrade = false,
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
   }) {
     throw UnimplementedError('sendCmd() has not been implemented.');
   }
@@ -267,8 +276,16 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// - param uuid 设备唯一标识
   /// - param data 指令数据
   /// - param psType 指令类型
+  /// - param expectedSessionGeneration OTA 调用方冻结的业务 session；0 表示兼容旧调用
+  /// - param expectedAttemptGeneration OTA 调用方冻结的物理 attempt；0 表示兼容旧调用
   ///
-  Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0}) {
+  Future<void> sendCmdNoWait(
+    String uuid,
+    Uint8List data, {
+    int psType = 0,
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+  }) {
     throw UnimplementedError('sendCmdNoWait() has not been implemented.');
   }
 
@@ -277,10 +294,13 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// [uuid] 是 endpoint / 设备标识，不是 characteristic UUID；写特征仍由 [psType]
   /// 解析。Future 必须等本批最后一包被原生队列真正提交成功后才完成，不能在入队时
   /// 返回，否则上层 5s 固件 ACK 计时会提前启动。
+  /// 正 expected pair 冻结整批物理 owner，原生每包提交前复验；默认 0/0 保留旧调用兼容。
   Future<void> sendOtaPacketBatch(
     String uuid,
     List<Uint8List> framedPackets, {
     int psType = 1,
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
   }) {
     throw UnimplementedError('sendOtaPacketBatch() has not been implemented.');
   }
@@ -309,8 +329,14 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// 退出升级模式
   ///
   /// - param uuid 设备唯一标识
+  /// - param expectedSessionGeneration OTA 调用方冻结的业务 session；0 表示兼容旧调用
+  /// - param expectedAttemptGeneration OTA 调用方冻结的物理 attempt；0 表示兼容旧调用
   ///
-  Future<void> quiteUpgradeState(String uuid) {
+  Future<void> quiteUpgradeState(
+    String uuid, {
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+  }) {
     throw UnimplementedError('quiteUpgradeState() has not been implemented.');
   }
 

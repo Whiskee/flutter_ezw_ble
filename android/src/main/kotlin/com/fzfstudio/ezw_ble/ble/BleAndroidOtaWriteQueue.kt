@@ -47,7 +47,7 @@ internal fun interface BleOtaWriteScheduler {
  */
 internal class BleAndroidOtaWriteQueue(
     private val endpoint: String,
-    private val submit: (ByteArray) -> BleOtaWriteSubmission,
+    private val submit: (ByteArray, Long, Long) -> BleOtaWriteSubmission,
     private val scheduler: BleOtaWriteScheduler,
     private val nowMillis: () -> Long,
     private val logger: (String) -> Unit = {},
@@ -70,6 +70,8 @@ internal class BleAndroidOtaWriteQueue(
 
     private data class Item(
         val data: ByteArray,
+        val sessionGeneration: Long,
+        val attemptGeneration: Long,
         val completion: (BleOtaWriteError?) -> Unit,
         val batch: OtaWriteBatch? = null,
     )
@@ -93,8 +95,13 @@ internal class BleAndroidOtaWriteQueue(
 
     /** 入队后立即尝试提交；成功回调只会在本包自己的 characteristic callback 后触发。 */
     @Synchronized
-    fun enqueue(data: ByteArray, completion: (BleOtaWriteError?) -> Unit) {
-        pending.addLast(Item(data.copyOf(), completion))
+    fun enqueue(
+        data: ByteArray,
+        sessionGeneration: Long = 0L,
+        attemptGeneration: Long = 0L,
+        completion: (BleOtaWriteError?) -> Unit,
+    ) {
+        pending.addLast(Item(data.copyOf(), sessionGeneration, attemptGeneration, completion))
         logger("[ezw_ble][$channel][android] enqueued endpoint=$endpoint bytes=${data.size} pending=$queueDepth")
         pump()
     }
@@ -106,14 +113,19 @@ internal class BleAndroidOtaWriteQueue(
      * 当成整批已写入，否则 even_connect 的 5s ACK 计时会提前启动。
      */
     @Synchronized
-    fun enqueueBatch(packets: List<ByteArray>, completion: (BleOtaWriteError?) -> Unit) {
+    fun enqueueBatch(
+        packets: List<ByteArray>,
+        sessionGeneration: Long = 0L,
+        attemptGeneration: Long = 0L,
+        completion: (BleOtaWriteError?) -> Unit,
+    ) {
         if (packets.isEmpty()) {
             completion(BleOtaWriteError.unavailable(endpoint, "empty batch", channel = channel))
             return
         }
         val batch = OtaWriteBatch(completion, remaining = packets.size)
         packets.forEach { packet ->
-            pending.addLast(Item(packet.copyOf(), completion = {}, batch = batch))
+            pending.addLast(Item(packet.copyOf(), sessionGeneration, attemptGeneration, completion = {}, batch = batch))
         }
         logger(
             "[ezw_ble][$channel][android] batch enqueued endpoint=$endpoint " +
@@ -265,7 +277,7 @@ internal class BleAndroidOtaWriteQueue(
 
         while (pending.isNotEmpty()) {
             val head = pending.first()
-            val submission = submit(head.data)
+            val submission = submit(head.data, head.sessionGeneration, head.attemptGeneration)
             when (submission.disposition) {
                 BleOtaWriteSubmission.Disposition.ACCEPTED -> {
                     pending.removeFirst()

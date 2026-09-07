@@ -13,8 +13,17 @@ class BleCmd {
   @Uint8ListConverter()
   final Uint8List? data;
   final bool isSuccess;
+  final int sessionGeneration;
+  final int attemptGeneration;
 
-  BleCmd(this.uuid, this.psType, {this.data, this.isSuccess = false});
+  BleCmd(
+    this.uuid,
+    this.psType, {
+    this.data,
+    this.isSuccess = false,
+    this.sessionGeneration = 0,
+    this.attemptGeneration = 0,
+  });
 
   factory BleCmd.fromJson(Map<String, dynamic> json) => _$BleCmdFromJson(json);
 
@@ -39,11 +48,17 @@ class BleCmd {
     final psType = data["psType"] ?? data["b"] ?? data["f"];
     final isSuccess = data["isSuccess"] ?? data["d"] ?? data["h"];
     final uuid = data["uuid"] ?? data["a"] ?? data["e"];
+    final sessionGeneration = data["sessionGeneration"];
+    final attemptGeneration = data["attemptGeneration"];
     return BleCmd(
       uuid is String ? uuid : uuid?.toString() ?? "",
       psType is num ? psType.toInt() : 0,
       data: bytes,
       isSuccess: isSuccess is bool ? isSuccess : false,
+      sessionGeneration:
+          sessionGeneration is num ? sessionGeneration.toInt() : 0,
+      attemptGeneration:
+          attemptGeneration is num ? attemptGeneration.toInt() : 0,
     );
   }
 }

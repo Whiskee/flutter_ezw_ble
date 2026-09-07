@@ -86,6 +86,28 @@ class BleAndroidOtaWriteQueueTest {
     }
 
     @Test
+    fun `submit receives the frozen ota identity for dispatch validation`() {
+        val seenIdentities = mutableListOf<Pair<Long, Long>>()
+        val queue = BleAndroidOtaWriteQueue(
+            endpoint = "g2-left",
+            submit = { _, sessionGeneration, attemptGeneration ->
+                seenIdentities.add(sessionGeneration to attemptGeneration)
+                BleOtaWriteSubmission.accepted()
+            },
+            scheduler = FakeScheduler(),
+            nowMillis = { 0L },
+        )
+
+        queue.enqueue(
+            byteArrayOf(0x01),
+            sessionGeneration = 37L,
+            attemptGeneration = 9L,
+        ) {}
+
+        assertEquals(listOf(37L to 9L), seenIdentities)
+    }
+
+    @Test
     fun `busy write fails closed after the bounded stall window`() {
         var nowMillis = 0L
         val scheduler = FakeScheduler()
@@ -308,6 +330,34 @@ class BleAndroidOtaWriteQueueTest {
         assertEquals(0, fileQueue.queueDepth)
     }
 
+    @Test
+    fun `batch preserves exact owner and drops remaining packets after owner changes`() {
+        // 首包 callback 前发生换代，第二包必须仍携带旧 pair 并被拒绝，不能借新 owner 续写。
+        var currentAttempt = 9L
+        val seen = mutableListOf<Pair<Long, Long>>()
+        val completed = mutableListOf<BleOtaWriteError?>()
+        val queue = BleAndroidOtaWriteQueue(
+            endpoint = "g2-left",
+            submit = { _, session, attempt ->
+                seen.add(session to attempt)
+                if (attempt == currentAttempt) BleOtaWriteSubmission.accepted()
+                else BleOtaWriteSubmission.rejected(null, "attempt identity mismatch")
+            },
+            scheduler = FakeScheduler(),
+            nowMillis = { 0L },
+        )
+        queue.enqueueBatch(
+            listOf(byteArrayOf(1), byteArrayOf(2), byteArrayOf(3)),
+            sessionGeneration = 37L,
+            attemptGeneration = 9L,
+        ) { completed.add(it) }
+        currentAttempt = 10L
+        queue.onCharacteristicWriteComplete(true, true, 0, "GATT_SUCCESS")
+        assertEquals(listOf(37L to 9L, 37L to 9L), seen)
+        assertEquals("ota_write_unavailable", completed.single()?.code)
+        assertEquals(0, queue.queueDepth)
+    }
+
     private fun queue(
         submit: (ByteArray) -> BleOtaWriteSubmission,
         scheduler: BleOtaWriteScheduler = FakeScheduler(),
@@ -315,7 +365,7 @@ class BleAndroidOtaWriteQueueTest {
         channel: String = BleWriteChannel.OTA,
     ): BleAndroidOtaWriteQueue = BleAndroidOtaWriteQueue(
         endpoint = "g2-left",
-        submit = submit,
+        submit = { data, _, _ -> submit(data) },
         scheduler = scheduler,
         nowMillis = nowMillis,
         channel = channel,

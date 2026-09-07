@@ -86,7 +86,12 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
-  Future<void> disconnectForOtaReboot(String uuid, String name) {
+  Future<void> disconnectForOtaReboot(
+    String uuid,
+    String name, {
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+  }) {
     throw UnimplementedError();
   }
 
@@ -147,12 +152,20 @@ class MockFlutterEzwBlePlatform
     Uint8List data, {
     int psType = 0,
     bool allowDuringUpgrade = false,
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
   }) {
     throw UnimplementedError();
   }
 
   @override
-  Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0}) {
+  Future<void> sendCmdNoWait(
+    String uuid,
+    Uint8List data, {
+    int psType = 0,
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+  }) {
     throw UnimplementedError();
   }
 
@@ -161,6 +174,8 @@ class MockFlutterEzwBlePlatform
     String uuid,
     List<Uint8List> framedPackets, {
     int psType = 1,
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
   }) {
     throw UnimplementedError();
   }
@@ -190,7 +205,11 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
-  Future<void> quiteUpgradeState(String uuid) {
+  Future<void> quiteUpgradeState(
+    String uuid, {
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+  }) {
     throw UnimplementedError();
   }
 
@@ -228,12 +247,16 @@ void main() {
       'psType': 2,
       'data': 'AQID',
       'isSuccess': true,
+      'sessionGeneration': 37,
+      'attemptGeneration': 9,
     });
 
     expect(cmd.uuid, 'device-1');
     expect(cmd.psType, 2);
     expect(cmd.data, [1, 2, 3]);
     expect(cmd.isSuccess, isTrue);
+    expect(cmd.sessionGeneration, 37);
+    expect(cmd.attemptGeneration, 9);
   });
 
   test('BleCmd.receiveMap preserves the complete tagged audio frame', () {
@@ -268,6 +291,8 @@ void main() {
       expect(cmd.psType, 0);
       expect(cmd.data, isNull);
       expect(cmd.isSuccess, isFalse);
+      expect(cmd.sessionGeneration, 0);
+      expect(cmd.attemptGeneration, 0);
     },
   );
 

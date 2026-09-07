@@ -114,8 +114,8 @@ class BleManager private constructor() {
         Collections.synchronizedMap(mutableMapOf())
     // OTA reboot 主动 close 后仍会收到一条旧 GATT 的 STATE_DISCONNECTED。它已经由
     // disconnectForOtaReboot 上报过同代终态，必须只消费一次，不能再 schedule retry。
-    private val otaRebootDisconnectSuppressions: MutableSet<String> =
-        Collections.synchronizedSet(mutableSetOf())
+    private val otaRebootDisconnectSuppressions: MutableMap<String, Pair<Long, Long>> =
+        Collections.synchronizedMap(mutableMapOf())
     // 同一 endpoint/session 的存活纠偏只允许上报一次，避免 write failure 与 resumed
     // 同时到达时重复发送 disconnectFromSys。
     private val reconciledBusinessSessions: MutableSet<String> =
@@ -547,7 +547,31 @@ class BleManager private constructor() {
                 return
             }
             val device = findConnectedDevice(cmd.uuid)
-            val started = device?.writeCharacteristic(cmd.data, cmd.psType) == true
+            if (device != null && cmd.psType == 1) {
+                val identityError = validateOtaWriteIdentity(
+                    uuid = cmd.uuid,
+                    device = device,
+                    expectedSessionGeneration = cmd.sessionGeneration,
+                    expectedAttemptGeneration = cmd.attemptGeneration,
+                )
+                if (identityError != null) {
+                    queue.poll()
+                    BleEC.RECEIVE_DATA.event?.success(
+                        BleCmd.fail(cmd.uuid, cmd.psType).copy(
+                            sessionGeneration = cmd.sessionGeneration,
+                            attemptGeneration = cmd.attemptGeneration,
+                        ).toFlutterMap(),
+                    )
+                    sendLog(BleLoggerTag.e, "Send cmd: ${cmd.uuid}, OTA identity mismatch, drop queued command: ${identityError.reason}")
+                    continue
+                }
+            }
+            val started = device?.writeCharacteristic(
+                cmd.data,
+                cmd.psType,
+                expectedSessionGeneration = cmd.sessionGeneration,
+                expectedAttemptGeneration = cmd.attemptGeneration,
+            ) == true
             if (started) {
                 return
             }
@@ -601,12 +625,29 @@ class BleManager private constructor() {
         return queues.getOrPut(key) {
             BleAndroidOtaWriteQueue(
                 endpoint = uuid,
-                submit = { data ->
-                    findConnectedDevice(uuid)?.submitOtaCharacteristic(data, psType = psType)
-                        ?: BleOtaWriteSubmission.rejected(
+                submit = { data, expectedSessionGeneration, expectedAttemptGeneration ->
+                    val device = findConnectedDevice(uuid)
+                    if (device == null) {
+                        BleOtaWriteSubmission.rejected(
                             status = null,
                             reason = "device or characteristic missing",
                         )
+                    } else {
+                        val identityError = validateOtaWriteIdentity(
+                            uuid = uuid,
+                            device = device,
+                            expectedSessionGeneration = expectedSessionGeneration,
+                            expectedAttemptGeneration = expectedAttemptGeneration,
+                        )
+                        if (identityError != null) {
+                            BleOtaWriteSubmission.rejected(
+                                status = null,
+                                reason = identityError.reason,
+                            )
+                        } else {
+                            device.submitOtaCharacteristic(data, psType = psType)
+                        }
+                    }
                 },
                 scheduler = BleOtaWriteScheduler { delayMillis, block ->
                     val job = mainScope.launch {
@@ -1868,7 +1909,12 @@ class BleManager private constructor() {
      * 在设备尚未 reboot 完成时竞争 GATT。
      */
     @Synchronized
-    fun disconnectForOtaReboot(uuid: String, name: String = "") {
+    fun disconnectForOtaReboot(
+        uuid: String,
+        name: String = "",
+        expectedSessionGeneration: Long = 0L,
+        expectedAttemptGeneration: Long = 0L,
+    ) {
         // 1、定位业务已连接设备，并解析可被 Dart 接受的 source/generation 元数据。
         val device = connectedDevices.firstOrNull { candidate ->
             candidate.uuid.equals(uuid, ignoreCase = true) ||
@@ -1879,15 +1925,40 @@ class BleManager private constructor() {
             return
         }
         val key = reconnectKey(device.uuid)
-        val acceptedAdmission = BleBluetoothOffTerminalMetadataPolicy.resolve(
+        val resolvedAdmission = BleBluetoothOffTerminalMetadataPolicy.resolve(
             currentAdmission = currentAdmissions[key],
             businessConnectedAdmission = businessConnectedGattSessions[key]?.admission,
             lastBusinessConnectedAdmission = lastEpochAcceptedAdmissions[key],
-        ) ?: synthesizeOtaRebootTerminalAdmission(device.uuid, key)
+        )
+        val acceptedAdmission = if (expectedSessionGeneration > 0L || expectedAttemptGeneration > 0L) {
+            if (
+                resolvedAdmission == null ||
+                expectedSessionGeneration <= 0L ||
+                expectedAttemptGeneration <= 0L ||
+                resolvedAdmission.sessionGeneration != expectedSessionGeneration ||
+                resolvedAdmission.generation != expectedAttemptGeneration
+            ) {
+                sendLog(
+                    BleLoggerTag.e,
+                    "OTA reboot disconnect rejected: ${device.uuid}, expected " +
+                        "session=$expectedSessionGeneration attempt=$expectedAttemptGeneration, " +
+                        "current session=${resolvedAdmission?.sessionGeneration ?: 0L} " +
+                        "attempt=${resolvedAdmission?.generation ?: 0L}",
+                )
+                return
+            }
+            resolvedAdmission
+        } else {
+            resolvedAdmission ?: synthesizeOtaRebootTerminalAdmission(device.uuid, key)
+        }
         // 2、OTA 只保留逻辑 reconnect owner；旧物理 GATT 必须先从 supervisor 脱钩，
         // 否则 afterUpgrade/manual activation 会永远复用已经被 releaseAndClear 的句柄。
         autoReconnectSupervisor.detachPhysicalGattForOtaReboot(device.uuid)
-        markOtaRebootDisconnectSuppression(device.uuid)
+        markOtaRebootDisconnectSuppression(
+            device.uuid,
+            acceptedAdmission.sessionGeneration,
+            acceptedAdmission.generation,
+        )
         preConnectedDevices.remove(device.uuid)
         businessConnectedGattSessions.remove(key)
         cancelConnectionAdmission(device.uuid, reason = "OTA reboot disconnect")
@@ -1937,17 +2008,35 @@ class BleManager private constructor() {
     }
 
     /** 只屏蔽本次主动 close 的迟到 callback；10 秒内没有回调则自动失效，不能污染新会话。 */
-    private fun markOtaRebootDisconnectSuppression(uuid: String) {
+    private fun markOtaRebootDisconnectSuppression(
+        uuid: String,
+        sessionGeneration: Long,
+        attemptGeneration: Long,
+    ) {
         val key = reconnectKey(uuid)
-        otaRebootDisconnectSuppressions.add(key)
+        otaRebootDisconnectSuppressions[key] = Pair(sessionGeneration, attemptGeneration)
         mainScope.launch {
             delay(10_000)
-            otaRebootDisconnectSuppressions.remove(key)
+            val stored = otaRebootDisconnectSuppressions[key]
+            if (stored?.first == sessionGeneration && stored.second == attemptGeneration) {
+                otaRebootDisconnectSuppressions.remove(key)
+            }
         }
     }
 
-    private fun consumeOtaRebootDisconnectSuppression(uuid: String): Boolean =
-        otaRebootDisconnectSuppressions.remove(reconnectKey(uuid))
+    private fun consumeOtaRebootDisconnectSuppression(
+        uuid: String,
+        sessionGeneration: Long,
+        attemptGeneration: Long,
+    ): Boolean {
+        val key = reconnectKey(uuid)
+        val stored = otaRebootDisconnectSuppressions[key] ?: return false
+        if (stored.first != sessionGeneration || stored.second != attemptGeneration) {
+            return false
+        }
+        otaRebootDisconnectSuppressions.remove(key)
+        return true
+    }
 
     /**
      * 中性释放单个 endpoint 的 native runtime，不删除 persisted reconnect owner/config。
@@ -2076,6 +2165,8 @@ class BleManager private constructor() {
         data: ByteArray,
         psType: Int = 0,
         allowDuringUpgrade: Boolean = false,
+        expectedSessionGeneration: Long = 0L,
+        expectedAttemptGeneration: Long = 0L,
     ) {
         if (!checkIsFunctionCanBeCalled() || uuid.isEmpty()) {
             return
@@ -2094,7 +2185,16 @@ class BleManager private constructor() {
         val key = reconnectKey(uuid)
         val queue = sendCmdQueues.getOrPut(key) { ConcurrentLinkedQueue() }
         val shouldStart = queue.isEmpty()
-        queue.add(BleCmd(uuid, psType, data, false))
+        queue.add(
+            BleCmd(
+                uuid,
+                psType,
+                data,
+                false,
+                sessionGeneration = expectedSessionGeneration,
+                attemptGeneration = expectedAttemptGeneration,
+            ),
+        )
         if (shouldStart) {
             writeNextCommand(uuid)
         }
@@ -2210,6 +2310,8 @@ class BleManager private constructor() {
         uuid: String,
         data: ByteArray,
         psType: Int = 0,
+        expectedSessionGeneration: Long = 0L,
+        expectedAttemptGeneration: Long = 0L,
         completion: (BleOtaWriteError?) -> Unit,
     ) {
         val isOtaChannel = psType == 1
@@ -2247,13 +2349,29 @@ class BleManager private constructor() {
             })
             return
         }
+        if (isOtaChannel) {
+            validateOtaWriteIdentity(
+                uuid = uuid,
+                device = device,
+                expectedSessionGeneration = expectedSessionGeneration,
+                expectedAttemptGeneration = expectedAttemptGeneration,
+            )?.let { error ->
+                completion(error)
+                return
+            }
+        }
         if (isOtaChannel && !device.supportsWriteWithoutResponse(psType)) {
             completion(BleOtaWriteError.unsupported(uuid, "missing writeWithoutResponse"))
             return
         }
 
         if (isOtaChannel) {
-            otaWriteQueueFor(uuid).enqueue(data, completion)
+            otaWriteQueueFor(uuid).enqueue(
+                data,
+                sessionGeneration = expectedSessionGeneration,
+                attemptGeneration = expectedAttemptGeneration,
+                completion = completion,
+            )
             return
         }
 
@@ -2272,6 +2390,8 @@ class BleManager private constructor() {
         uuid: String,
         packets: List<ByteArray>,
         psType: Int = BlePsType.OTA,
+        expectedSessionGeneration: Long = 0L,
+        expectedAttemptGeneration: Long = 0L,
         completion: (BleOtaWriteError?) -> Unit,
     ) {
         if (psType != BlePsType.OTA) {
@@ -2284,7 +2404,59 @@ class BleManager private constructor() {
             psType = psType,
             channel = BleWriteChannel.OTA,
             queue = { fallbackUuid -> otaWriteQueueFor(fallbackUuid) },
+            expectedSessionGeneration = expectedSessionGeneration,
+            expectedAttemptGeneration = expectedAttemptGeneration,
             completion = completion,
+        )
+    }
+
+    /**
+     * OTA 恢复重传必须绑定业务层冻结的 exact session/attempt。未传 expected pair 的旧调用
+     * 保持兼容；一旦传入正数，就同时校验当前 native owner、业务 GATT handle 和物理连接。
+     */
+    @Synchronized
+    private fun validateOtaWriteIdentity(
+        uuid: String,
+        device: BleDevice,
+        expectedSessionGeneration: Long,
+        expectedAttemptGeneration: Long,
+    ): BleOtaWriteError? {
+        if (expectedSessionGeneration <= 0L && expectedAttemptGeneration <= 0L) {
+            return null
+        }
+        val key = reconnectKey(uuid)
+        val acceptedAdmission = BleBluetoothOffTerminalMetadataPolicy.resolve(
+            currentAdmission = currentAdmissions[key],
+            businessConnectedAdmission = businessConnectedGattSessions[key]?.admission,
+            lastBusinessConnectedAdmission = lastEpochAcceptedAdmissions[key],
+        )
+        val exactBusinessSession = businessConnectedGattSessions[key]
+        val hasExactBusinessGatt =
+            device.myGatt != null &&
+                exactBusinessSession?.gatt === device.myGatt
+        val matchesExpected =
+            expectedSessionGeneration > 0L &&
+                expectedAttemptGeneration > 0L &&
+                acceptedAdmission?.sessionGeneration == expectedSessionGeneration &&
+                acceptedAdmission.generation == expectedAttemptGeneration &&
+                (device.connectState.isConnected || device.connectState.isUpgrade) &&
+                hasExactBusinessGatt
+        if (matchesExpected) {
+            return null
+        }
+        sendLog(
+            BleLoggerTag.e,
+            "OTA write identity mismatch: endpoint=$uuid, " +
+                "expectedSessionGeneration=$expectedSessionGeneration, " +
+                "expectedAttemptGeneration=$expectedAttemptGeneration, " +
+                "actualSessionGeneration=${acceptedAdmission?.sessionGeneration ?: 0L}, " +
+                "actualAttemptGeneration=${acceptedAdmission?.generation ?: 0L}, " +
+                "hasExactBusinessGatt=$hasExactBusinessGatt, state=${device.connectState}",
+        )
+        return BleOtaWriteError.unavailable(
+            endpoint = uuid,
+            reason = "attempt identity mismatch",
+            pending = otaWriteQueues[key]?.queueDepth ?: 0,
         )
     }
 
@@ -2328,6 +2500,8 @@ class BleManager private constructor() {
         psType: Int,
         channel: String,
         queue: (String) -> BleAndroidOtaWriteQueue,
+        expectedSessionGeneration: Long = 0L,
+        expectedAttemptGeneration: Long = 0L,
         completion: (BleOtaWriteError?) -> Unit,
     ) {
         if (packets.isEmpty()) {
@@ -2373,7 +2547,13 @@ class BleManager private constructor() {
             )
             return
         }
-        queue(uuid).enqueueBatch(packets, completion)
+        // 每包保留冻结的 pair，后续 callback / BUSY 重试不得把剩余 RAW 写到新 owner。
+        queue(uuid).enqueueBatch(
+            packets,
+            sessionGeneration = expectedSessionGeneration,
+            attemptGeneration = expectedAttemptGeneration,
+            completion = completion,
+        )
     }
 
     /**
@@ -2432,14 +2612,32 @@ class BleManager private constructor() {
      *  退出升级模式
      */
     @Synchronized
-    fun quiteUpgradeState(uuid: String) {
+    fun quiteUpgradeState(
+        uuid: String,
+        expectedSessionGeneration: Long = 0L,
+        expectedAttemptGeneration: Long = 0L,
+    ) {
+        val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
+        if (connectedDevice != null) {
+            validateOtaWriteIdentity(
+                uuid = uuid,
+                device = connectedDevice,
+                expectedSessionGeneration = expectedSessionGeneration,
+                expectedAttemptGeneration = expectedAttemptGeneration,
+            )?.let { error ->
+                sendLog(BleLoggerTag.e, "QuiteUpgradeState rejected: $uuid, ${error.reason}")
+                return
+            }
+        } else if (expectedSessionGeneration > 0L || expectedAttemptGeneration > 0L) {
+            sendLog(BleLoggerTag.e, "QuiteUpgradeState rejected: $uuid, missing device cache for exact identity")
+            return
+        }
         if (!upgradeDevices.remove(uuid)) {
             return
         }
         // 页面/transport 结束升级即撤销本 endpoint 所有 pending 写；当前 GATT 不会被关闭，
         // 所以旧 callback 必须先 drain，下一轮 START/INFO/RAW 才能继续使用物理写槽。
         cancelOtaWriteAttempt(uuid, reason = "quiteUpgradeState")
-        val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
         if (connectedDevice == null) {
             sendLog(BleLoggerTag.e, "QuiteUpgradeState rejected: $uuid, missing device cache")
             return
@@ -3217,6 +3415,8 @@ class BleManager private constructor() {
         val admission = registerConnectionAttempt(expectedUuid, source, sessionGeneration)
         return BleGattSessionCallback(
             expectedUuid = expectedUuid,
+            sessionGeneration = admission.sessionGeneration,
+            attemptGeneration = admission.generation,
             currentDeviceForGatt = { gatt, stage ->
                 // 1. callback 需要按 GATT 句柄校验当前 session，避免 stale callback 改写状态。
                 if (stage in connectionPipelineStages && currentAdmissionFor(admission) == null) {
@@ -3301,7 +3501,13 @@ class BleManager private constructor() {
             },
             consumeDisconnectingState = { uuid ->
                 // 7. 主动断连/超时断连已带有明确状态，消费后不再上报系统断连。
-                if (consumeOtaRebootDisconnectSuppression(uuid)) {
+                if (
+                    consumeOtaRebootDisconnectSuppression(
+                        uuid,
+                        admission.sessionGeneration,
+                        admission.generation,
+                    )
+                ) {
                     BleConnectState.DISCONNECT_FROM_SYS
                 } else {
                     consumeDisconnectingState(uuid)

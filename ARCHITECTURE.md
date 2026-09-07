@@ -182,12 +182,13 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `prepareBusinessConnection` | `Future<BleBusinessConnectionStatus> prepareBusinessConnection(BleBusinessConnectionAttempt attempt)` | G2 exact-attempt 预连接入口。`attempt` 必须来自同一次 `connectFinish` 的 `uuid/sessionGeneration/attemptGeneration`；同 token 幂等刷新有界鉴权宽限，不同 token 替换旧 lease。拒绝只返回状态，不取消长期 autoReconnect owner。 |
 | `commitBusinessConnection` | `Future<BleBusinessConnectionStatus> commitBusinessConnection(BleBusinessConnectionAttempt attempt)` | G2 exact-attempt 真连接入口。原生同时校验 prepare lease、当前 admission、物理连接、当前 GATT/CBPeripheral 身份，以及 write/read/notify readiness；只有成功发布 `connected` 后返回 `accepted`。 |
 | `abortBusinessConnection` | `Future<bool> abortBusinessConnection(BleBusinessConnectionAttempt attempt)` | 只撤销完全匹配的 prepare lease；旧 token abort 不能删除新 lease，也不能断开 GATT、移除 autoReconnect owner 或伪造用户断连。 |
-| `sendCmd` | `Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0, bool allowDuringUpgrade = false})` | 写特征值，等待原生层 write 完成。`psType` 是"私有服务类型"，对应 `BlePrivateService.type`（0=基础，1=OTA，2+=自定义）。升级态默认阻断非 OTA 写入；只有上层协议白名单确认的 AUTH、时间同步等恢复控制指令可显式传 `allowDuringUpgrade=true`。 |
-| `sendCmdNoWait` | `Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0})` | OTA 单包连发入口。Android：`psType == 1` 走 per-endpoint `WRITE_TYPE_NO_RESPONSE` 队列；同步 BUSY 保留原包，Future 等本包 `onCharacteristicWrite` 成功后返回，4s 停滞/teardown typed fail，避免固定延时撞 GATT 单槽位。iOS：`psType == 1` 走 `WriteWithoutResponse` + `canSendWriteWithoutResponse` 背压队列（见 `ios/Classes/ble/OtaWriteQueue.swift` 与 `docs/IOS_OTA_NOWAIT_SPEC.md`）。其它 `psType` 保持历史 no-wait 语义。 |
+| `sendCmd` | `Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0, bool allowDuringUpgrade = false, int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0})` | 写特征值，等待原生层 write 完成。`psType` 是"私有服务类型"，对应 `BlePrivateService.type`（0=基础，1=OTA，2+=自定义）。升级态默认阻断非 OTA 写入；只有上层协议白名单确认的 AUTH、时间同步等恢复控制指令可显式传 `allowDuringUpgrade=true`。OTA 控制包携带正 `expectedSessionGeneration/expectedAttemptGeneration` 时，native 必须在实际 dispatch 前按当前物理 owner 校验，避免旧 START/INFORMATION/RESULT 写入新 GATT。 |
+| `sendCmdNoWait` | `Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0, int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0})` | OTA 连发入口。Android：`psType == 1` 走 per-endpoint `WRITE_TYPE_NO_RESPONSE` 队列；同步 BUSY 保留原包，Future 等本包 `onCharacteristicWrite` 成功后返回，4s 停滞/teardown typed fail，避免固定延时撞 GATT 单槽位。iOS：`psType == 1` 走 `WriteWithoutResponse` + `canSendWriteWithoutResponse` 背压队列（见 `ios/Classes/ble/OtaWriteQueue.swift` 与 `docs/IOS_OTA_NOWAIT_SPEC.md`）。OTA RAW 携带正 expected pair 时，native 在入队/提交前按当前物理 owner 校验；其它 `psType` 保持历史 no-wait 语义。 |
 | `sendOtaPacketBatch` | `Future<void> sendOtaPacketBatch(String uuid, List<Uint8List> framedPackets, {int psType = 1})` | OTA 批次入口。入参是 even_connect 已组好的协议小包，插件不拆 4KB、不改字节。Android 仍保持每 endpoint 一个 GATT write in-flight，由 callback 推进；iOS 一次入队后由 `OtaWriteQueue` 泵送。Future 必须等最后一包真正提交成功才完成。第 N 包失败立即丢掉剩余包并返回 typed error。 |
 | `sendFilePacketBatch` | `Future<void> sendFilePacketBatch(String uuid, List<Uint8List> framedPackets, {int psType = 3})` | 文件批次入口，语义与 OTA 批次相同但**队列实例独立**：`quiteUpgradeState` 只取消 OTA attempt，两者共用 pending 会打断进行中的文件传输；升级态仍 fail closed 拒绝文件写入。文件控制包与 big-package start 继续走 `sendCmd`，只有 RAW 4KB 窗口整批提交。typed error 用 `file_write_*` 前缀。 |
 | `enterUpgradeState` | `Future<void> enterUpgradeState(String uuid)` | 仅允许仍处于真实业务 `connected`、物理链路有效且持有已接受 epoch 的 uuid 进入 OTA；拒绝用缓存制造 `upgrade`。原生侧据此切到 OTA 私有服务、延长断连超时（与 `BleConfig.upgradeSwapTime` 配合）。 |
-| `quiteUpgradeState` | `Future<void> quiteUpgradeState(String uuid)` | 退出 OTA 状态；只有链路仍有效时才恢复 `connected`，断连后到达的旧 OTA 回调只消费 marker，不能复活连接态。 |
+| `quiteUpgradeState` | `Future<void> quiteUpgradeState(String uuid, {int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0})` | 退出 OTA 状态；携带正 expected pair 时，只有当前物理 owner 匹配才消费 OTA marker 和 pending 写，避免旧 attempt 清掉新 attempt。链路仍有效时才恢复 `connected`，断连后到达的旧 OTA 回调不能复活连接态。 |
+| `disconnectForOtaReboot` | `Future<void> disconnectForOtaReboot(String uuid, String name, {int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0})` | OTA 安装成功后的固件 reboot teardown。携带正 expected pair 时，native 必须精确匹配当前 owner 后才 detach 旧物理 GATT/CBPeripheral、发 `disconnectFromSys` 并标记一次性 suppression；旧 pair 不能关闭或屏蔽新 attempt。0/0 仅保留旧调用兼容。 |
 | `setConnectionTraceEnabled` | `Future<void> setConnectionTraceEnabled(bool enabled)` | 打开/关闭原生连接 Trace。默认关闭；关闭只清进程内 Trace/RSSI 诊断缓存，不断开设备、不取消 autoReconnect、不补造当前链路。开启后仅从下一次真实物理 attempt 开始记录。 |
 | `openBleSettings` | `Future<void> openBleSettings()` | 跳系统蓝牙开关页。 |
 | `openAppSettings` | `Future<void> openAppSettings()` | 跳本 App 权限设置页。 |
@@ -221,7 +222,7 @@ enum BleEventChannel {
 | `bleState` | `int`（iOS CoreBluetooth state 值，扩展 `6 = noLocation` 给 Android） | `BleState` | 蓝牙开关、定位权限变化。Android 主动查询、Activity start/resume 与扫描入口都会重新读取实时权限和开关，仅在状态变化时 push。 |
 | `scanResult` | JSON 字符串 | `BleMatchDevice.fromJson` | 一次扫描命中（按 `BleScan.matchCount` 已聚合好的"组合设备"）。 |
 | `connectStatus` | JSON 字符串 | `BleConnectModel.fromJson` | 连接流程的每一步推进（见 §8）；携带 `source`、兼容键 `generation`、`sessionGeneration` 与 `attemptGeneration`。`generation` 始终序列化为 Dart session generation；旧 payload 分别回退为 `unknown` / `0`。 |
-| `receiveData` | Map：`{uuid, psType, data:Base64, isSuccess}` | `BleCmd.receiveMap` | 来自原生的特征值数据。**注意 `data` 字段是 Base64**，业务侧拿到的 `BleCmd.data` 已经是 `Uint8List`，背后由 `flutter_ezw_utils.encodeBase64()` 解码。 |
+| `receiveData` | Map：`{uuid, psType, data:Base64, isSuccess, sessionGeneration, attemptGeneration}` | `BleCmd.receiveMap` | 来自原生的特征值数据。**注意 `data` 字段是 Base64**，业务侧拿到的 `BleCmd.data` 已经是 `Uint8List`，背后由 `flutter_ezw_utils.encodeBase64()` 解码。`sessionGeneration/attemptGeneration` 仅对 native 能确认物理 owner 的 OTA response 为正，旧事件和非 OTA 默认为 0。 |
 | `logger` | String，含 `[d]-` / `[e]-` 前缀 | `String` | 仅 iOS 主动 push；业务侧自行根据前缀分级。 |
 
 iOS 的非 `poweredOn` 状态继续沿用既有连接 teardown；但只有公开状态
@@ -912,6 +913,11 @@ iOS 端 OTA 通道走单独的 per-peripheral 写队列 `OtaWriteQueue`，目标
 - **Android 对齐**：Android `sendCmdNoWait(psType == 1)` 必须保留同步提交状态；`ERROR_GATT_WRITE_REQUEST_BUSY`（旧 API 的 `false` 无法精确分类时也按瞬时背压处理）不得丢包或立即终止，而要保留原包等待当前写回调/watchdog 重试。本包 Future 只在对应 `onCharacteristicWrite` 成功后完成；4s 仍未释放则 `ota_write_stalled`，断连/退出升级/重置则 `ota_write_cancelled`。退出升级但复用同一 GATT session 时，已提交写的旧 callback 必须先经过 drain barrier，期间新的普通命令和 OTA RAW 都不能提交；旧 callback 只释放物理槽，不能完成新 attempt。只有物理 session 已 teardown 且 exact GATT identity 失效后才能丢弃该屏障。非 OTA no-wait 保持历史立即成功语义。
 - **挂起 await 兜底**：断连/蓝牙 OFF/`reset()`/配置撤销/外设释放时 `OtaWriteQueue.cancelAll()` 会对所有 pending 写入回调 `ota_write_cancelled`；蓝牙 OFF 已使全部物理 GATT session 失效，必须在清 upgrade marker 前取消并移除所有 OTA 队列。背压超过 stall 窗口回调 `ota_write_stalled`，details 带 `endpoint/reason/wait/pending`。改这条兜底必须保证**任何路径都不会让 Dart `await` 永远挂着**。
 - **范围外**：iOS connection interval 协商、`psType == 0`（common）write type 切换均**不在本期范围**，改动前先评估对协议层应答匹配的影响。
+
+`sendOtaPacketBatch` 同样接受默认 `0/0` 的 `expectedSessionGeneration/expectedAttemptGeneration`。
+调用方传正 pair 时，Android 每个队列 Item 保存同一冻结值，由每次 submit 复验；iOS 整批
+共用捕获该 pair 与 device 的 `OtaWriteTarget`，每包 `writeValue` 前复验。背压后 owner
+换代必须 typed fail 并丢掉剩余 RAW，不能因批次优化绕开单包入口的安全边界。
 
 ### 12.7 文件通道批量写（`sendFilePacketBatch` + `psType == 3`）
 
