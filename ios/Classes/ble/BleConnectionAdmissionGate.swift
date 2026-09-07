@@ -37,6 +37,9 @@ struct BlePeripheralConnectionSession {
     /// didConnect/contactDevice 后，即使业务 GATT 流程仍在进行，也绝不能由手动点击替换。
     let pendingConnectStartedAt: Date
     var hasObservedPhysicalContact: Bool = false
+    /// 物理接触之后、业务 readiness 之前收到过系统 `peerDisconnected`：链路已经掉过一次，
+    /// 已发出的 service discovery 随旧链路作废，随后的 `didConnect` 不是重复回调而是重连。
+    var linkDroppedSinceContact: Bool = false
 }
 
 /// 非 CoreBluetooth 终态先记录 teardown 债务；只有 didFail/didDisconnect 或 watchdog
@@ -458,6 +461,13 @@ final class BleConnectionAdmissionGate {
         }
         active = admission
         return .granted
+    }
+
+    /// 该 exact session 当前是否持有 Gate（已 granted、尚未 complete/cancel）。
+    func isActiveOwner(_ admission: BleConnectionAdmission) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return active?.sameSession(as: admission) == true
     }
 
     /// 仅 exact active session 可以完成；返回随后获得准入的节点。

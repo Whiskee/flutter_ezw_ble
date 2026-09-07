@@ -328,3 +328,9 @@ iOS R1 的 CoreBluetooth Code 14 新鲜广播恢复属于同一个长期 reconne
 4. 已 `.connected` 交还的非目标仍由 finalize 建 barrier 并 cancel（见前一节）。
 
 SR 本身没有「最多两个外设」的限制：`willRestoreState` 交还的是系统记住的全部相关对象，connection event 按服务 UUID 匹配任意 G2；数量取决于系统状态，不是配额。
+
+## claim 后链路立即抖动：didConnect 不是重复回调（2026-09-07 真机修正）
+
+真机现象：第二次重启后 `willRestoreState` 交还双腿均 `.connected`。左腿 claim 即 granted 并 `discoverServices`；250 ms 后系统 `peerDisconnected`，再 200 ms `peerConnected` + `didConnect`。CoreBluetooth 没有回 `didDisconnect`，已发出的 discovery 随旧链路作废，`onPhysicalConnected` 对同 session 返回 `.duplicate`，插件记「duplicate physical callback ignored」后无人重启 pipeline；左腿 20 秒 `timeout`，右腿从 claim 起一直 `queued` 拿不到 Gate。前一次重启（18:19:35）链路未抖动，双腿 3 秒内 connected。
+
+规则：系统 `peerDisconnected` 落在 exact session 物理接触之后、业务 connected 之前时，标记 `linkDroppedSinceContact`；随后的 `didConnect` 若来自当前 Gate active owner 且带该标记，必须清标记并重新执行 `startGrantedGattPipeline`（重装 delegate、重发 discovery，连接超时沿用原计时），事件 `ios_gate_pipeline_restarted`。没有掉链证据、或该 session 只是排队而非 active owner 时，仍按重复回调忽略；业务已 connected 后的链路终止仍只由 `didDisconnectPeripheral` 收口。

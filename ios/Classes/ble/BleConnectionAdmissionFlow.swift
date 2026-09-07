@@ -675,11 +675,51 @@ extension BleManager {
             )
             loggerD(msg: "admission gate: \(admission.endpointId), queued generation=\(admission.generation)")
         case .duplicate:
+            // SR 交还的 .connected 对象可能在 claim 后立即掉链再重连（2026-09-07 真机：
+            // claim 250 ms 后 peerDisconnected，200 ms 后 peerConnected + didConnect）。
+            // 已发出的 discoverServices 随旧链路作废、CoreBluetooth 不回 didDisconnect，
+            // 若把这次 didConnect 当重复回调忽略，pipeline 永远等不到回调直到 20 秒超时，
+            // 另一条腿也被排在 Gate 后面。exact active owner 收到重连必须重启 pipeline。
+            if let latest = peripheralConnectionSessions[admission.sessionId],
+               latest.linkDroppedSinceContact,
+               connectionAdmissionGate.isActiveOwner(admission) {
+                var restarted = latest
+                restarted.linkDroppedSinceContact = false
+                peripheralConnectionSessions[admission.sessionId] = restarted
+                recordAutoReconnectEvent(
+                    type: "ios_gate_pipeline_restarted",
+                    uuid: admission.endpointId,
+                    name: session.deviceName,
+                    detail: "reason=linkReestablishedBeforeReadiness, generation=\(admission.generation)"
+                )
+                loggerD(msg: "admission gate: \(admission.endpointId), link re-established before readiness; restart GATT pipeline generation=\(admission.generation)")
+                startGrantedGattPipeline(admission)
+                return
+            }
             loggerD(msg: "admission gate: \(admission.endpointId), duplicate physical callback ignored")
         default:
             peripheralConnectionSessions.removeValue(forKey: admission.sessionId)
             centralManager.cancelPeripheralConnection(peripheral)
         }
+    }
+
+    /// 系统 `peerDisconnected` 落在物理接触之后、业务 readiness 之前：记下链路掉过一次，
+    /// 让随后的 `didConnect` 走 pipeline 重启而不是被当作重复回调。业务已 connected 的
+    /// 链路不记（真实断连仍只由 didDisconnectPeripheral 收口）。
+    func markLinkDroppedBeforeReadiness(_ peripheral: CBPeripheral) {
+        guard let admission = currentConnectionAdmission(uuid: peripheral.identifier.uuidString),
+              var session = peripheralConnectionSessions[admission.sessionId],
+              session.peripheral === peripheral,
+              session.hasObservedPhysicalContact else {
+            return
+        }
+        let businessConnected = connectedDevices.first { device in
+            device.peripheral.identifier == peripheral.identifier
+        }?.isConnected == true
+        guard !businessConnected else { return }
+        session.linkDroppedSinceContact = true
+        peripheralConnectionSessions[admission.sessionId] = session
+        loggerD(msg: "admission gate: \(admission.endpointId), link dropped before readiness generation=\(admission.generation)")
     }
 
     /// Gate owner 唯一允许启动 service discovery，此刻才开始连接超时。

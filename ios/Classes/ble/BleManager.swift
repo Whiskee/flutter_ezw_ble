@@ -3089,6 +3089,7 @@ extension BleManager: CBCentralManagerDelegate {
             // 业务断连终态仍只由 didDisconnectPeripheral 收口，避免双重 teardown。
             // escrow 中尚未认领对象的 peerConnected 证据随链路终止一起作废。
             restorationCoordinator.clearPeerConnectedObservation(uuid: uuid)
+            markLinkDroppedBeforeReadiness(peripheral)
             loggerD(msg: "connectionEvent peer disconnected: uuid=\(uuid), name=\(name)")
         @unknown default:
             loggerE(msg: "connectionEventDidOccur: unknown event=\(event.rawValue), uuid=\(uuid)")
