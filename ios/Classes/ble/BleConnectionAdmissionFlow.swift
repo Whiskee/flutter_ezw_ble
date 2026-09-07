@@ -269,8 +269,15 @@ extension BleManager {
             loggerD(msg: "admission gate: \(peripheral.identifier.uuidString), reuse cancellation barrier=\(barrier.token)")
             return
         }
-        let workItem = DispatchWorkItem { [weak self, weak peripheral] in
-            guard let self = self, let peripheral = peripheral else { return }
+        // 必须强持有 peripheral：finalize 取消未认领 escrow 等路径在 cancel 后不再有任何
+        // 强引用，CBPeripheral 随即释放，CoreBluetooth 不会再为它回调 didDisconnect。
+        // 若 watchdog 也只弱持有，它会在 nil 上直接 return，barrier token 永远留在
+        // activeTokens；用户之后切换到同一台设备时，新 attempt 的 connect 被
+        // 「defer connect behind cancellation barrier」无限挂起，直到蓝牙开关重置
+        // （2026-09-07 真机：重启后首次从搜索页切换眼镜，右腿 60 秒超时）。
+        // work item 最长只活 2 秒，且不构成 self 强环。
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
             self.expirePeripheralCancellationBarrier(
                 peripheral,
                 token: barrier.token
@@ -458,16 +465,22 @@ extension BleManager {
 
     /// barrier 释放后启动最新 deferred generation；旧 generation 已由 exact admission guard 排除。
     private func startDeferredPeripheralConnection(_ peripheral: CBPeripheral) {
+        // barrier 由旧对象的终态或 watchdog 释放，而等待中的新 attempt 可能持有
+        // retrieve 返回的另一实例（同 UUID）。deferred connect 必须驱动当前 exact
+        // session 自己的对象，不能要求与释放 barrier 的旧对象同一实例，否则新代
+        // 会静默停在 deferred registry 里直到下一次替换。
         guard let admission = currentConnectionAdmission(uuid: peripheral.identifier.uuidString),
               let session = peripheralConnectionSessions[admission.sessionId],
-              session.peripheral === peripheral,
               let autoReconnect = deferredPeripheralReconnectRegistry.take(
                 endpointId: peripheral.identifier.uuidString
               ) else {
             return
         }
+        if session.peripheral !== peripheral {
+            loggerD(msg: "admission gate: \(admission.endpointId), deferred connect drives current session object after barrier released by stale instance")
+        }
         drivePeripheralConnection(
-            peripheral,
+            session.peripheral,
             expectedAdmission: admission,
             autoReconnect: autoReconnect,
             remainingStateChecks: 10,

@@ -196,7 +196,7 @@ service/char/timeout 等非 CoreBluetooth 终态要先调用 cancel，并保持 
 - 目标配置被删除或 `autoReconnect=false`；
 - 插件释放。
 
-hard cancel、登出、移除设备、配置删除或 `autoReconnect=false` 必须同步移除匹配 escrow，并在取消物理连接前建立 cancellation barrier。冷启动为了加载当前账号而执行的 `resetBle(preserveStateRestoration: true)` 只清 runtime session，必须保留 escrow；普通 `resetBle` 仍是 hard reset。当前目标批次完成后，未认领 escrow 由 finalize fail-closed 清理。
+hard cancel、登出、移除设备、配置删除或 `autoReconnect=false` 必须同步移除匹配 escrow，并在取消物理连接前建立 cancellation barrier。barrier 的 2 秒 watchdog 必须强持有该 `CBPeripheral`：finalize 取消未认领 escrow 后对象再无强引用，CoreBluetooth 不会为已释放对象回调 `didDisconnect`，弱持有的 watchdog 会在 nil 上直接返回，token 永远阻塞同一 endpoint 的下一次 connect（见 §「finalize 取消后的僵尸 barrier」）。冷启动为了加载当前账号而执行的 `resetBle(preserveStateRestoration: true)` 只清 runtime session，必须保留 escrow；普通 `resetBle` 仍是 hard reset。当前目标批次完成后，未认领 escrow 由 finalize fail-closed 清理。
 
 以下事件不能取消长期回连意图：
 
@@ -296,3 +296,16 @@ iOS R1 的 CoreBluetooth Code 14 新鲜广播恢复属于同一个长期 reconne
 2. **前台系统连接对账**：`beginDirectReconnectAttempt` 的 exact-session 对账在 `retrieveConnectedPeripherals` 命中（`systemConnectedTakeover`）且 pending 对象非 `.connected` 时，不再静默返回，而是按同一 `.systemConnectedReconcile` trigger（active 3 秒门槛）替换失效 pending，再注册新一代 connect；同一 endpoint 的这类替换最小间隔 15 秒（`systemConnectedStalledReplacementMinInterval`），App 重试或 didBecomeActive 对账的高频调用不得把它变成 cancel/connect 风暴。`.connected` 分支（同对象进 Gate / 新实例替换）保持不变。
 
 不变量：所有替换仍经 cancellation barrier 与 exact admission 释放；不得把系统 already-connected 直接投影成业务 connected；不得为此增加 Dart 侧重试或改变 5 次 Bond 恢复预算。
+
+## finalize 取消后的僵尸 barrier（2026-09-07 真机修正）
+
+真机现象：账号下有两台眼镜 A、B。重启前 B 的右腿仍有系统链路，重启后 `willRestoreState` 把它以 `.disconnected` 交还并随即收到 `peerConnected`/`didConnect`（escrow `connected`）；当前目标是 A，`finalizeStateRestorationClaims` 按规则取消这条未认领 escrow：`beginPeripheralCancellationBarrier` + `cancelPeripheralConnection`。此后 escrow 已 drain、无 session、无缓存，`CBPeripheral` 立即释放；CoreBluetooth 不再为它回调 `didDisconnect`，watchdog 的 `[weak peripheral]` 在 nil 上直接返回，barrier token 永远留在 `activeTokens`。80 秒后用户从搜索页切换到 B：左腿正常 connect、5403、connected；右腿 `retrieveConnectedPeripherals` 命中后注册新 admission，`connectPeripheralAfterCancellationBarrier` 却被「defer connect behind cancellation barrier」挂起，后续每次 activation 的 stale replacement 也被 `hasPeripheralCancellationBarrier` 拒绝，60 秒展示超时。直到用户关开蓝牙、`suspendConnectionAdmissionGateForBluetoothOff` 重置 Gate 才恢复。
+
+修复：
+
+1. barrier watchdog 的 work item 强持有 peripheral（最长 2 秒、无 self 强环），保证 watchdog 一定能 `timeout` 该 token 并记 `cancellation barrier=N watchdog elapsed`；同时对象在这 2 秒内仍可接收迟到的 `didDisconnect`。
+2. `startDeferredPeripheralConnection` 改为驱动当前 exact session 自己的对象：barrier 可能由旧实例的终态或 watchdog 释放，而等待中的新 attempt 持有 retrieve 返回的另一实例，原先的 `===` 判等会让新代静默停在 deferred registry 里。
+
+不变量：finalize 仍必须为未认领 escrow 建 barrier 并取消物理连接；只是 barrier 的生命周期不得依赖外部是否还持有对象。
+
+同一日志里的另一现象：切换到 B 时左腿的 5403 保护写耗时 1.9 秒（其余各腿各次均在 50～250 ms），这是该腿尚未与手机 Bond、iOS 弹出系统配对框并由用户确认所致，属于安全门禁的预期行为，与右腿超时无关；确认后再次连接 63 ms 完成。
