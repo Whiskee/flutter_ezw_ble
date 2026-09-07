@@ -1441,6 +1441,9 @@ extension BleManager {
             return nil
         }
         stateRestorationLaunchRetrieveAttempts.insert(reconnectKey(uuid: endpointId))
+        // 同步 XPC 是后台唯一可能阻塞主线程的调用：进入前先落一条日志，若进程随后
+        // 静默，沙盒日志的最后一行就能指认它（2026-09-07 18:22 进程静默原因待证）。
+        loggerD(msg: "appLifecycle: state restoration launch retrieve begin uuid=\(endpointId), context=\(context)")
         let retrieved = centralManager.retrievePeripherals(withIdentifiers: [identifier]).first
         recordAutoReconnectEvent(
             type: "ios_sr_launch_retrieve",
