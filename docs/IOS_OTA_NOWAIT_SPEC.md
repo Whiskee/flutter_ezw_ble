@@ -154,10 +154,11 @@ final class OtaWriteQueue {
 `CBPeripheralDelegate.peripheralIsReady(toSendWriteWithoutResponse:)` 必须接入到
 `OtaWriteQueue.onPeripheralReadyToSendWriteWithoutResponse()`。
 
-生产实现还必须保留有界 watchdog：`canSendWriteWithoutResponse == false` 持续 4 秒时只把
-当前等待标记为一次性 `grace`，继续保留原 pending、ready 回调和 100ms 重查；再等待最多
-1 秒仍不可写，才以 `ota_write_stalled` 结束（总窗口 5 秒）。grace 内一旦 callback 或重查
-确认 `canSend == true`，只提交原 pending 一次并取消 watchdog。每次等待/清理必须推进内部
+生产实现还必须保留有界 watchdog：队首请求首次因
+`canSendWriteWithoutResponse == false` 无法提交时开始计时，继续保留原 pending、ready
+回调和 100ms 重查；连续 15 秒仍不可写，才以 `ota_write_stalled` 结束该 exact 队首请求，
+并等待 Dart 侧触发 exact OTA recovery disconnect。15 秒内 callback 或重查确认
+`canSend == true` 时，只提交原 pending 一次并取消 watchdog。每次等待/清理必须推进内部
 episode，使旧 timer 在取消、reset 或新 attempt 建立后不能驱动新 pending。ready 回调不能在
 `canSend` 仍为 false 时重置起始时间，否则虚假/过早 callback 会让 fail-closed 窗口无限延长。
 
@@ -191,7 +192,15 @@ attempt 消费。这个 stamp 不是每条 CoreBluetooth notification 自带的 
 物理 token；iOS 无法在迟到 notification 上恢复已经被系统隐藏的旧连接句柄，只能在当前
 owner/CBPeripheral 仍一致时给出正 pair。
 
-`disconnectForOtaReboot` 使用同一 expected pair。调用方传正数时，native 在执行 firmware
+`disconnectForOtaRecovery` 使用同一 expected pair 专门处理 15 秒 hard stall。调用方必须
+传正 `endpoint + expectedSessionGeneration + expectedAttemptGeneration`；native 只有在
+当前 owner 完全匹配时才取消该 endpoint 的旧 OTA 写队列、清理该 attempt 的 upgrade marker，
+并发起真实 `cancelPeripheralConnection`。该 API 不伪造断连事件、不清 normal
+autoReconnect owner，返回值为 `accepted`、`alreadyDisconnected`、`staleIdentity` 或
+`unavailable`。断开后的业务回连、AUTH、重新进入 upgrade state、START/INFORMATION/RAW
+由上层 OTA 恢复链负责。
+
+`disconnectForOtaReboot` 继续用于 firmware reboot teardown。调用方传正数时，native 在执行
 reboot teardown 前必须匹配当前 owner；不匹配直接拒绝，不 detach 旧物理链路、不发布
 `.disconnectFromSys`、不注册 suppression。teardown 后的迟到断连 suppression 也绑定同一
 pair：Android 绑定 admission + GATT callback pair，iOS 绑定 `CBPeripheral` 对象 +
@@ -200,9 +209,8 @@ owner pair；旧 teardown 不能被新 attempt 消费。0/0 只用于旧调用�
 Android `sendCmdNoWait(psType == 1)` 同样必须保留 `BluetoothGatt.writeCharacteristic`
 同步状态。`ERROR_GATT_WRITE_REQUEST_BUSY` 是单槽位背压，不是包错误：原包进入 per-endpoint
 队列，等待当前 `onCharacteristicWrite` 释放槽位后重试；提交成功后本包 Future 仍等自己的
-`onCharacteristicWrite` 成功才返回。4 秒仍未释放返回 `ota_write_stalled`，断连/退出升级/
-reset 返回 `ota_write_cancelled`。其它明确拒绝才返回 `ota_write_unavailable`；非 OTA
-no-wait 路径保持原行为。
+`onCharacteristicWrite` 成功才返回。iOS 本轮 hard-stall recovery 不改变 Android 既有
+等待/取消策略；非 OTA no-wait 路径保持原行为。
 
 ### 4.4 与 `enterUpgradeState` / `quiteUpgradeState` 的关系
 
@@ -217,11 +225,11 @@ no-wait 路径保持原行为。
 ```
 [ezw_ble][ota] enqueued endpoint=<uuid> bytes=<len> pending=<n>
 [ezw_ble][ota] submitted endpoint=<uuid> char=<charUuid> bytes=<len> pending=<n>
-[ezw_ble][ota] backpressure endpoint=<uuid> episode=<n> stage=<base|grace> reason=<reason> wait=<duration> pending=<n>
+[ezw_ble][ota] backpressure endpoint=<uuid> episode=<n> reason=<reason> wait=<duration> pending=<n>
 [ezw_ble][ota] ready endpoint=<uuid> episode=<n> pending=<n>
-[ezw_ble][ota] resumed endpoint=<uuid> episode=<n> stage=<base|grace> reason=<reason> source=<callback|poll> wait=<duration> pending=<n>
-[ezw_ble][ota] stalled endpoint=<uuid> episode=<n> stage=terminal reason=<reason> wait=<duration> pending=<n>
-[ezw_ble][ota] cancelled endpoint=<uuid> episode=<n> stage=<base|grace> reason=<reason> pending=<n>
+[ezw_ble][ota] resumed endpoint=<uuid> episode=<n> reason=<reason> source=<callback|poll> wait=<duration> pending=<n>
+[ezw_ble][ota] stalled endpoint=<uuid> episode=<n> reason=<reason> wait=<duration> pending=<n> session=<n> attempt=<n>
+[ezw_ble][ota] cancelled endpoint=<uuid> episode=<n> reason=<reason> pending=<n>
 ```
 
 日志经现有 `logger` EventChannel 上报到 Dart 端 `blePrintEC`(参考 §6 命名约定)。
@@ -290,8 +298,11 @@ live peripheral 与 accepted epoch。这样 Bluetooth OFF 或迟到 OTA exit 都
 - BLE 信号弱场景(走廊外)下 OTA 仍能完成,失败时通过应用层 CRC 检验触发 retry;
 - 升级途中主动断连 → 设备状态机正确回到 `disconnectFromSys`,挂起的 noResponse 写以
   `ota_write_cancelled` 结束,不留 Dart await;
-- 背压到 4 秒阈值后进入一次性 1 秒 grace；总窗口仍未恢复 → 挂起 noResponse 写以 `ota_write_stalled` 结束,details
-  带 `endpoint/reason/wait/pending`;
+- 队首写入连续 14.9 秒不可提交 → 原 pending 仍等待；随后 ready 只提交原请求一次，不重连；
+- 队首写入连续 15 秒不可提交 → 仅该 exact noResponse head 以 `ota_write_stalled`
+  结束，迟到 ready/timer/callback 不得发送旧包，details 带
+  `endpoint/reason/wait/pending/session/attempt`；
+- exact recovery cancel/replacement 清理后，新 episode 可正常发送；
 - App 退后台 / 锁屏期间不掉包(iOS 后台 BLE 允许 OTA 类长时操作)。
 
 ---

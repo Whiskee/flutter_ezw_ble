@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:flutter_ezw_ble/core/models/ble_config.dart';
 import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
 import 'package:flutter_ezw_ble/core/models/ble_device.dart';
+import 'package:flutter_ezw_ble/core/models/ble_ota_recovery_disconnect_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_business_connection_attempt.dart';
 import 'package:flutter_ezw_ble/core/models/ble_scan_start_result.dart';
@@ -156,6 +157,22 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   }) {
     throw UnimplementedError(
       'disconnectForOtaReboot(uuid: $uuid, name: $name) has not been implemented.',
+    );
+  }
+
+  /// OTA 写阻塞恢复专用物理断开。
+  ///
+  /// 返回值只描述 native 是否接受 exact teardown：
+  /// `accepted` 会触发真实 CoreBluetooth/GATT 断连并保留 autoReconnect owner；
+  /// `alreadyDisconnected` 表示本 attempt 已无活跃物理链路；`staleIdentity`
+  /// 与 `unavailable` 均由上层直接终止，不强行重试。
+  Future<BleOtaRecoveryDisconnectResult> disconnectForOtaRecovery(
+    String uuid, {
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+  }) {
+    throw UnimplementedError(
+      'disconnectForOtaRecovery(uuid: $uuid) has not been implemented.',
     );
   }
 

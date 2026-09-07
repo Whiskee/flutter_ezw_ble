@@ -1,5 +1,6 @@
 import 'package:flutter/services.dart';
 import 'package:flutter_ezw_ble/core/models/ble_business_connection_attempt.dart';
+import 'package:flutter_ezw_ble/core/models/ble_ota_recovery_disconnect_result.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_method_channel.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -156,6 +157,36 @@ void main() {
       containsPair('expectedAttemptGeneration', 9),
     );
   });
+
+  test(
+    'disconnectForOtaRecovery returns native exact teardown status',
+    () async {
+      MethodCall? capturedCall;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (methodCall) async {
+        capturedCall = methodCall;
+        return 'accepted';
+      });
+
+      final status = await MethodChannelEzwBle().disconnectForOtaRecovery(
+        'left-uuid',
+        expectedSessionGeneration: 37,
+        expectedAttemptGeneration: 9,
+      );
+
+      expect(status, BleOtaRecoveryDisconnectResult.accepted);
+      expect(capturedCall?.method, 'disconnectForOtaRecovery');
+      expect(capturedCall?.arguments, containsPair('uuid', 'left-uuid'));
+      expect(
+        capturedCall?.arguments,
+        containsPair('expectedSessionGeneration', 37),
+      );
+      expect(
+        capturedCall?.arguments,
+        containsPair('expectedAttemptGeneration', 9),
+      );
+    },
+  );
 
   test(
     'prepareBusinessConnection forwards exact attempt and decodes status',

@@ -56,6 +56,8 @@ enum class BleMC {
     RECONCILE_BUSINESS_CONNECTIONS,
     /** OTA reboot 收尾断开：保留长期回连 owner，禁止立即 schedule。 */
     DISCONNECT_FOR_OTA_REBOOT,
+    /** iOS OTA 写阻塞恢复接口；Android 传输路径不消费，固定返回 unavailable。 */
+    DISCONNECT_FOR_OTA_RECOVERY,
     /** 中性释放 endpoint runtime，保留持久自动回连 owner。 */
     RELEASE_DEVICE,
     /** 发送普通 GATT 指令。 */
@@ -260,6 +262,11 @@ enum class BleMC {
                     expectedSessionGeneration,
                     expectedAttemptGeneration,
                 )
+            }
+            DISCONNECT_FOR_OTA_RECOVERY -> {
+                // Android 没有 iOS canSendWriteWithoutResponse stall，保留同名 API 让
+                // Dart/even_connect 做跨平台分发；不能在这里改变 Android OTA 恢复路径。
+                return result.success("unavailable")
             }
             RELEASE_DEVICE -> {
                 // dispose/reset 只释放 runtime；禁止复用 disconnect 的持久 owner 删除语义。

@@ -1137,7 +1137,7 @@ class RunnerTests: XCTestCase {
     XCTAssertNil(results.first!)
   }
 
-  func testOtaWriteQueueKeepsPendingWhenBaseBackpressureThresholdExpires() {
+  func testOtaWriteQueueKeepsPendingBeforeFifteenSecondStallDeadline() {
     let peripheral = FakeOtaPeripheral(endpointId: "g2-left", canSend: false)
     let clock = FakeOtaClock()
     let scheduler = FakeOtaScheduler()
@@ -1156,15 +1156,16 @@ class RunnerTests: XCTestCase {
     }) { value in
       results.append(value)
     }
-    clock.advance(by: 4.1)
+    clock.advance(by: 14.9)
     scheduler.runNext()
 
     XCTAssertTrue(results.isEmpty)
     XCTAssertTrue(queue.hasPending)
-    XCTAssertTrue(logs.contains { $0.contains("stage=grace") })
+    XCTAssertFalse(logs.contains { $0.contains("stage=grace") })
+    XCTAssertFalse(logs.contains { $0.contains("stalled") })
   }
 
-  func testOtaWriteQueueSubmitsOnceWhenReadyArrivesDuringGrace() {
+  func testOtaWriteQueueSubmitsOnceWhenReadyArrivesBeforeFifteenSecondDeadline() {
     let peripheral = FakeOtaPeripheral(endpointId: "g2-left", canSend: false)
     let clock = FakeOtaClock()
     let scheduler = FakeOtaScheduler()
@@ -1184,12 +1185,11 @@ class RunnerTests: XCTestCase {
     }) { value in
       results.append(value)
     }
-    clock.advance(by: 4.1)
+    clock.advance(by: 14.9)
     scheduler.runNext()
-    clock.advance(by: 0.234)
     peripheral.canSendWriteWithoutResponse = true
     queue.onPeripheralReadyToSendWriteWithoutResponse()
-    // 被 ready 取消的 grace watchdog 即使仍留在 fake scheduler，也不能二次结算。
+    // 被 ready 取消的 watchdog 即使仍留在 fake scheduler，也不能二次结算。
     scheduler.runNext()
 
     XCTAssertEqual(submitCount, 1)
@@ -1198,16 +1198,17 @@ class RunnerTests: XCTestCase {
     XCTAssertFalse(queue.hasPending)
     XCTAssertTrue(logs.contains {
       $0.contains("resumed") &&
-        $0.contains("stage=grace") &&
+        $0.contains("wait=14.900s") &&
         $0.contains("source=callback")
     })
   }
 
-  func testOtaWriteQueueCompletesStalledBackpressureAfterGraceWithTypedFlutterError() {
+  func testOtaWriteQueueCompletesExactHeadAfterFifteenSecondStallWithIdentity() {
     let peripheral = FakeOtaPeripheral(endpointId: "g2-left", canSend: false)
     let clock = FakeOtaClock()
     let scheduler = FakeOtaScheduler()
     var results: [Any?] = []
+    var secondResults: [Any?] = []
     var logs: [String] = []
     let queue = OtaWriteQueue(
       peripheral: peripheral,
@@ -1216,15 +1217,29 @@ class RunnerTests: XCTestCase {
       scheduler: scheduler
     )
 
-    queue.enqueue(data: Data([0x04]), target: makeFakeOtaTarget { _ in
-      XCTFail("stalled write must not be submitted")
-      return true
-    }) { value in
+    queue.enqueue(
+      data: Data([0x04]),
+      target: makeFakeOtaTarget { _ in
+        XCTFail("stalled write must not be submitted")
+        return true
+      },
+      expectedSessionGeneration: 1001,
+      expectedAttemptGeneration: 2002
+    ) { value in
       results.append(value)
     }
-    clock.advance(by: 4.1)
-    scheduler.runNext()
-    clock.advance(by: 1.0)
+    queue.enqueue(
+      data: Data([0x05]),
+      target: makeFakeOtaTarget { _ in
+        XCTFail("tail write must wait for exact OTA recovery cleanup")
+        return true
+      },
+      expectedSessionGeneration: 1001,
+      expectedAttemptGeneration: 2003
+    ) { value in
+      secondResults.append(value)
+    }
+    clock.advance(by: 15.0)
     scheduler.runNext()
 
     let error = results.first as? FlutterError
@@ -1232,18 +1247,21 @@ class RunnerTests: XCTestCase {
     let details = error?.details as? [String: Any]
     XCTAssertEqual(details?["endpoint"] as? String, "g2-left")
     XCTAssertEqual(details?["reason"] as? String, "canSend=false")
-    XCTAssertEqual(details?["pending"] as? Int, 1)
-    XCTAssertGreaterThanOrEqual(details?["wait"] as? TimeInterval ?? 0, 5.0)
-    XCTAssertTrue(logs.contains {
-      $0.contains("stage=terminal") && $0.contains("episode=")
-    })
+    XCTAssertEqual(details?["session"] as? Int64, 1001)
+    XCTAssertEqual(details?["attempt"] as? Int64, 2002)
+    XCTAssertEqual(details?["pending"] as? Int, 2)
+    XCTAssertGreaterThanOrEqual(details?["wait"] as? TimeInterval ?? 0, 15.0)
+    XCTAssertTrue(secondResults.isEmpty)
+    XCTAssertTrue(queue.hasPending)
+    XCTAssertTrue(logs.contains { $0.contains("stalled") && $0.contains("episode=") })
   }
 
-  func testOtaWriteQueueCancellationDuringGraceRejectsLateReady() {
+  func testOtaWriteQueueStallRejectsLateReadyUntilExactRecoveryCleanup() {
     let peripheral = FakeOtaPeripheral(endpointId: "g2-left", canSend: false)
     let clock = FakeOtaClock()
     let scheduler = FakeOtaScheduler()
     var results: [Any?] = []
+    var secondResults: [Any?] = []
     var submitCount = 0
     let queue = OtaWriteQueue(
       peripheral: peripheral,
@@ -1257,16 +1275,63 @@ class RunnerTests: XCTestCase {
     }) { value in
       results.append(value)
     }
-    clock.advance(by: 4.1)
+    queue.enqueue(data: Data([0x06]), target: makeFakeOtaTarget { _ in
+      submitCount += 1
+      return true
+    }) { value in
+      secondResults.append(value)
+    }
+    clock.advance(by: 15.0)
     scheduler.runNext()
-    queue.cancelAll(reason: "reset")
+
     peripheral.canSendWriteWithoutResponse = true
     queue.onPeripheralReadyToSendWriteWithoutResponse()
     scheduler.runNext()
 
     XCTAssertEqual(submitCount, 0)
     XCTAssertEqual(results.count, 1)
-    XCTAssertEqual((results.first as? FlutterError)?.code, "ota_write_cancelled")
+    XCTAssertEqual((results.first as? FlutterError)?.code, "ota_write_stalled")
+    XCTAssertTrue(secondResults.isEmpty)
+    XCTAssertTrue(queue.hasPending)
+  }
+
+  func testOtaWriteQueueRecoveryCleanupStartsFreshEpisodeThatCanSend() {
+    let peripheral = FakeOtaPeripheral(endpointId: "g2-left", canSend: false)
+    let clock = FakeOtaClock()
+    let scheduler = FakeOtaScheduler()
+    var stalledResults: [Any?] = []
+    var recoveredResults: [Any?] = []
+    var recoveredSubmitCount = 0
+    let queue = OtaWriteQueue(
+      peripheral: peripheral,
+      clock: clock,
+      scheduler: scheduler
+    )
+
+    queue.enqueue(data: Data([0x05]), target: makeFakeOtaTarget { _ in
+      XCTFail("stalled write must not be submitted")
+      return true
+    }) { value in
+      stalledResults.append(value)
+    }
+    clock.advance(by: 15.0)
+    scheduler.runNext()
+    queue.cancelAll(reason: "ota recovery")
+
+    peripheral.canSendWriteWithoutResponse = true
+    queue.enqueue(data: Data([0x06]), target: makeFakeOtaTarget { _ in
+      recoveredSubmitCount += 1
+      return true
+    }) { value in
+      recoveredResults.append(value)
+    }
+    scheduler.runNextIgnoringCancellation()
+
+    XCTAssertEqual((stalledResults.first as? FlutterError)?.code, "ota_write_stalled")
+    XCTAssertEqual(recoveredSubmitCount, 1)
+    XCTAssertEqual(recoveredResults.count, 1)
+    XCTAssertNil(recoveredResults.first!)
+    XCTAssertFalse(queue.hasPending)
   }
 
   func testOtaWriteQueueStaleEpisodeTimerCannotDriveNewPendingWrite() {

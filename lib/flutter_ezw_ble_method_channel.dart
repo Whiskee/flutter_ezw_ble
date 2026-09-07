@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_ezw_ble/core/models/ble_config.dart';
 import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
 import 'package:flutter_ezw_ble/core/models/ble_device.dart';
+import 'package:flutter_ezw_ble/core/models/ble_ota_recovery_disconnect_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_business_connection_attempt.dart';
 import 'package:flutter_ezw_ble/core/models/ble_scan_start_result.dart';
@@ -31,13 +32,10 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       );
 
   @override
-  Future<BleScanStartResult> startScan({
-    bool turnOnPureModel = false,
-  }) async {
-    final result = await methodChannel.invokeMethod<Object?>(
-      "startScan",
-      {"turnOnPureModel": turnOnPureModel},
-    );
+  Future<BleScanStartResult> startScan({bool turnOnPureModel = false}) async {
+    final result = await methodChannel.invokeMethod<Object?>("startScan", {
+      "turnOnPureModel": turnOnPureModel,
+    });
     return BleScanStartResult.fromNative(result);
   }
 
@@ -126,6 +124,23 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
         "expectedSessionGeneration": expectedSessionGeneration,
         "expectedAttemptGeneration": expectedAttemptGeneration,
       });
+
+  @override
+  Future<BleOtaRecoveryDisconnectResult> disconnectForOtaRecovery(
+    String uuid, {
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+  }) async {
+    // OTA 写阻塞恢复必须由 native 按 exact owner 接受后才让 Dart 进入恢复链；
+    // 未识别返回值统一 fail-closed 为 unavailable。
+    final raw =
+        await methodChannel.invokeMethod<String>("disconnectForOtaRecovery", {
+      "uuid": uuid,
+      "expectedSessionGeneration": expectedSessionGeneration,
+      "expectedAttemptGeneration": expectedAttemptGeneration,
+    });
+    return bleOtaRecoveryDisconnectResultFromNative(raw);
+  }
 
   @override
   Future<void> devicePreConnected(String uuid) async =>
