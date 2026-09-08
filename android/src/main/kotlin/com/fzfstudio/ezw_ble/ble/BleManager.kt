@@ -3423,6 +3423,19 @@ class BleManager private constructor() {
                     writeLimitBytes = writeLimitBytes,
                 )
             },
+            recordPhysicalTrace = { uuid, event ->
+                if (connectionTraceEnabled) {
+                    nativeConnectionTraces[reconnectKey(uuid)]?.record(
+                        stage = "physical_connection", result = event, physicalConnectionEvent = event,
+                    )
+                }
+            },
+            markTraceRssiRequested = { uuid ->
+                if (connectionTraceEnabled) nativeConnectionTraces[reconnectKey(uuid)]?.markRssiRequested()
+            },
+            markTraceRssiFailed = { uuid ->
+                if (connectionTraceEnabled) nativeConnectionTraces[reconnectKey(uuid)]?.markRssiFailed()
+            },
             updateTraceRssi = { uuid, rssi ->
                 updateNativeTraceRssi(uuid, rssi)
             },
