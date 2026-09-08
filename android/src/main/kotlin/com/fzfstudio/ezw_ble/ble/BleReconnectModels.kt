@@ -279,6 +279,21 @@ internal enum class BleReconnectActivationMode(val flutterValue: String) {
     }
 }
 
+/** Reconcile 的授权/transport 门禁。测试直接覆盖拒绝矩阵，Manager 只负责提供实时事实。 */
+internal object BleReconnectActivationGuardPolicy {
+    fun rejectionReason(
+        mode: BleReconnectActivationMode,
+        hasPersistedAuthorization: Boolean,
+        isUpgradeDevice: Boolean,
+    ): String? = when {
+        mode == BleReconnectActivationMode.UNKNOWN -> "invalidMode"
+        mode == BleReconnectActivationMode.RECONCILE && !hasPersistedAuthorization ->
+            "authorizationRevoked"
+        isUpgradeDevice -> "otaInProgress"
+        else -> null
+    }
+}
+
 /** 单目标 activation 后 native owner 的实时处置结果。 */
 internal enum class BleReconnectOwnerDisposition(val flutterValue: String) {
     CREATED("created"),

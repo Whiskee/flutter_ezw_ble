@@ -832,7 +832,12 @@ class BleManager private constructor() {
                 it.belongConfig == target.belongConfig &&
                     it.uuid.equals(target.uuid, ignoreCase = true)
             }
-            if (mode == BleReconnectActivationMode.RECONCILE && !hasPersistedAuthorization) {
+            val activationRejection = BleReconnectActivationGuardPolicy.rejectionReason(
+                mode = mode,
+                hasPersistedAuthorization = hasPersistedAuthorization,
+                isUpgradeDevice = upgradeDevices.any { it.equals(target.uuid, ignoreCase = true) },
+            )
+            if (activationRejection == "authorizationRevoked") {
                 sendLog(
                     BleLoggerTag.d,
                     "Auto reconnect: ${target.uuid}, reconcile rejected, persisted authorization missing",
@@ -849,7 +854,7 @@ class BleManager private constructor() {
             }
             // OTA 独占 endpoint transport；即使历史 owner 仍持久化，也不能由普通
             // autoReconnect reconcile 在升级窗口内创建或复用 GATT。
-            if (upgradeDevices.any { it.equals(target.uuid, ignoreCase = true) }) {
+            if (activationRejection == "otaInProgress") {
                 sendLog(
                     BleLoggerTag.d,
                     "Auto reconnect: ${target.uuid}, activation rejected, OTA transport active",

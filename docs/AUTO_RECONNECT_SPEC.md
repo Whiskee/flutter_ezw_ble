@@ -409,6 +409,15 @@ the replacement returns `repaired`. Unbound targets, explicit disconnects, OTA
 owners, persisted security exhaustion, disabled configs, Bluetooth-off barriers,
 and stale/lower sessions never resurrect a closed owner.
 
+On iOS the activation ACK is computed from the owner visible when the
+MethodChannel call returns. A reconnect task alone is not a live owner.
+`reused` requires an exact admission/session pair whose `CBPeripheral` is still
+connecting or connected. A missing session, mismatched session generation, or
+disconnected peripheral is repaired only for that endpoint; an in-flight
+CoreBluetooth request first enters the existing cancellation barrier. If no
+peripheral is available in the active lifecycle window, the task remains armed
+and the ACK is `deferred`, never `reused`.
+
 ## iOS Strategy
 
 iOS uses CoreBluetooth pending connects without an internal scan-first phase.

@@ -11,6 +11,112 @@ import XCTest
 
 class RunnerTests: XCTestCase {
 
+  func testReconnectOwnerHealthRequiresExactLiveAdmissionSession() {
+    XCTAssertEqual(
+      BleReconnectPendingOwnerPolicy.evaluate(
+        taskSessionGeneration: 41,
+        admissionSessionGeneration: 41,
+        hasSession: true,
+        sessionMatchesAdmission: true,
+        peripheralIsConnectedOrConnecting: true,
+        pendingTeardown: false
+      ),
+      .healthy
+    )
+
+    XCTAssertEqual(
+      BleReconnectPendingOwnerPolicy.evaluate(
+        taskSessionGeneration: 41,
+        admissionSessionGeneration: 41,
+        hasSession: false,
+        sessionMatchesAdmission: false,
+        peripheralIsConnectedOrConnecting: false,
+        pendingTeardown: false
+      ),
+      .missingSession
+    )
+    XCTAssertEqual(
+      BleReconnectPendingOwnerPolicy.evaluate(
+        taskSessionGeneration: 42,
+        admissionSessionGeneration: 41,
+        hasSession: true,
+        sessionMatchesAdmission: true,
+        peripheralIsConnectedOrConnecting: true,
+        pendingTeardown: false
+      ),
+      .sessionMismatch
+    )
+    XCTAssertEqual(
+      BleReconnectPendingOwnerPolicy.evaluate(
+        taskSessionGeneration: 41,
+        admissionSessionGeneration: 41,
+        hasSession: true,
+        sessionMatchesAdmission: false,
+        peripheralIsConnectedOrConnecting: true,
+        pendingTeardown: false
+      ),
+      .sessionMismatch
+    )
+    XCTAssertEqual(
+      BleReconnectPendingOwnerPolicy.evaluate(
+        taskSessionGeneration: 41,
+        admissionSessionGeneration: 41,
+        hasSession: true,
+        sessionMatchesAdmission: true,
+        peripheralIsConnectedOrConnecting: false,
+        pendingTeardown: false
+      ),
+      .stalePeripheral
+    )
+    XCTAssertEqual(
+      BleReconnectPendingOwnerPolicy.evaluate(
+        taskSessionGeneration: 41,
+        admissionSessionGeneration: 41,
+        hasSession: true,
+        sessionMatchesAdmission: true,
+        peripheralIsConnectedOrConnecting: true,
+        pendingTeardown: true
+      ),
+      .teardownPending
+    )
+  }
+
+  func testReconnectActivationDispositionNeverReusesTaskWithoutLiveOwner() {
+    XCTAssertEqual(
+      BleReconnectActivationDispositionPolicy.resolve(
+        hasLiveOwner: true,
+        hasDeferredWork: false,
+        successDisposition: .reused,
+        successReason: "",
+        deferredReason: "nativeOwnerDeferred"
+      ).disposition,
+      .reused
+    )
+    XCTAssertEqual(
+      BleReconnectActivationDispositionPolicy.resolve(
+        hasLiveOwner: false,
+        hasDeferredWork: true,
+        successDisposition: .reused,
+        successReason: "",
+        deferredReason: "nativeOwnerDeferred"
+      ),
+      BleReconnectOwnerActivationOutcome(
+        disposition: .deferred,
+        reason: "nativeOwnerDeferred"
+      )
+    )
+    XCTAssertEqual(
+      BleReconnectActivationDispositionPolicy.resolve(
+        hasLiveOwner: false,
+        hasDeferredWork: false,
+        successDisposition: .reused,
+        successReason: "",
+        deferredReason: "nativeOwnerDeferred"
+      ).disposition,
+      .rejected
+    )
+  }
+
   func testAutomaticPairingRecoveryUsesTenSecondWindowsAndFiveSecondRetryDelay() {
     XCTAssertEqual(BlePeerPairingRecoveryPolicy.scanWindow(for: .autoReconnect), 10)
     XCTAssertEqual(BlePeerPairingRecoveryPolicy.retryDelay, 5)
