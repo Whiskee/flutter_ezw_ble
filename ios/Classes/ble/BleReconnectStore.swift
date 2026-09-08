@@ -584,12 +584,97 @@ enum BleReconnectActivationState: String {
     case rejected
 }
 
+/// MethodChannel activation 的语义模式；未知值在入口处逐目标 rejected。
+enum BleReconnectActivationMode: String {
+    case initial
+    case reconcile
+    case promotion
+    case unknown
+}
+
+/// Native owner 的实时对账处置，供 Dart 区分历史 ACK 与当前 owner。
+enum BleReconnectOwnerDisposition: String {
+    case created
+    case reused
+    case repaired
+    case deferred
+    case rejected
+}
+
+/// iOS activation 的内部结果必须来自当前 CoreBluetooth owner，而不是历史 task 是否存在。
+/// MethodChannel 只消费 disposition/reason；该值也让测试可以覆盖无 peripheral、orphan
+/// admission 与健康 pending owner，而无需伪造 CoreBluetooth 对象。
+struct BleReconnectOwnerActivationOutcome: Equatable {
+    let disposition: BleReconnectOwnerDisposition
+    let reason: String
+}
+
+enum BleReconnectActivationDispositionPolicy {
+    /// `successDisposition` records whether this activation created or repaired the live owner;
+    /// a historical task without a current owner can only be deferred or rejected.
+    static func resolve(
+        hasLiveOwner: Bool,
+        hasDeferredWork: Bool,
+        successDisposition: BleReconnectOwnerDisposition,
+        successReason: String,
+        deferredReason: String
+    ) -> BleReconnectOwnerActivationOutcome {
+        if hasLiveOwner {
+            return BleReconnectOwnerActivationOutcome(
+                disposition: successDisposition,
+                reason: successReason
+            )
+        }
+        if hasDeferredWork {
+            return BleReconnectOwnerActivationOutcome(
+                disposition: .deferred,
+                reason: deferredReason
+            )
+        }
+        return BleReconnectOwnerActivationOutcome(
+            disposition: .rejected,
+            reason: "nativeOwnerUnavailable"
+        )
+    }
+}
+
+/// admission 与 session 的纯状态判定。真实资源修复仍由 BleManager 执行；把判定拆开后，
+/// 每一种 owner 漂移都可以在 XCTest 中作为可执行行为验证，而不是扫描源码字符串。
+enum BleReconnectPendingOwnerHealth: Equatable {
+    case healthy
+    case teardownPending
+    case missingSession
+    case sessionMismatch
+    case stalePeripheral
+}
+
+enum BleReconnectPendingOwnerPolicy {
+    static func evaluate(
+        taskSessionGeneration: Int64,
+        admissionSessionGeneration: Int64,
+        hasSession: Bool,
+        sessionMatchesAdmission: Bool,
+        peripheralIsConnectedOrConnecting: Bool,
+        pendingTeardown: Bool
+    ) -> BleReconnectPendingOwnerHealth {
+        if pendingTeardown { return .teardownPending }
+        guard hasSession else { return .missingSession }
+        guard sessionMatchesAdmission,
+              taskSessionGeneration == admissionSessionGeneration else {
+            return .sessionMismatch
+        }
+        return peripheralIsConnectedOrConnecting ? .healthy : .stalePeripheral
+    }
+}
+
 /// MethodChannel 对单个目标的同步回执；上层据此区分真 owner 与静默丢弃。
 struct BleReconnectActivationResult {
     let target: BleReconnectTarget
     let state: BleReconnectActivationState
     let reason: String
     let source: BleConnectSource
+    let mode: BleReconnectActivationMode
+    let ownerDisposition: BleReconnectOwnerDisposition
     let sessionGeneration: Int64
     let resolvedUuid: String
     let resolutionSource: String
@@ -599,6 +684,8 @@ struct BleReconnectActivationResult {
         state: BleReconnectActivationState,
         reason: String,
         source: BleConnectSource,
+        mode: BleReconnectActivationMode = .initial,
+        ownerDisposition: BleReconnectOwnerDisposition,
         sessionGeneration: Int64,
         resolvedUuid: String = "",
         resolutionSource: String = ""
@@ -607,6 +694,8 @@ struct BleReconnectActivationResult {
         self.state = state
         self.reason = reason
         self.source = source
+        self.mode = mode
+        self.ownerDisposition = ownerDisposition
         self.sessionGeneration = sessionGeneration
         self.resolvedUuid = resolvedUuid
         self.resolutionSource = resolutionSource
@@ -620,6 +709,8 @@ struct BleReconnectActivationResult {
             "state": state.rawValue,
             "reason": reason,
             "source": source.rawValue,
+            "mode": mode.rawValue,
+            "ownerDisposition": ownerDisposition.rawValue,
             "sessionGeneration": sessionGeneration,
             "resolvedUuid": resolvedUuid,
             "resolutionSource": resolutionSource

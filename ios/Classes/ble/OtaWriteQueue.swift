@@ -77,6 +77,8 @@ struct MainQueueOtaWriteScheduler: OtaWriteScheduler {
 private struct OtaWriteItem {
     let data: Data
     let target: OtaWriteTarget
+    let expectedSessionGeneration: Int64
+    let expectedAttemptGeneration: Int64
     let result: FlutterResult
 }
 
@@ -95,11 +97,9 @@ final class OtaWriteQueue {
     private static let backpressureRetryInterval: TimeInterval = 0.1
     //  - 软节流本身用于防突发丢包, 兜底重查要更保守, 避免绕过节流保护。
     private static let softThrottleRetryInterval: TimeInterval = 0.5
-    //  - 4 秒是异常背压的观测阈值；现场日志证明 CoreBluetooth 可能在阈值后数百毫秒
-    //    才发布 ready，因此只进入一次有界宽限，不能在这里提前清掉仍可恢复的 pending。
-    private static let backpressureStallTimeout: TimeInterval = 4.0
-    //  - 宽限最多 1 秒；总等待 5 秒仍不可写时继续 fail-closed，避免 Dart await 永久挂起。
-    private static let backpressureGraceTimeout: TimeInterval = 1.0
+    //  - 15 秒只度量“队首 RAW 无法提交给 CoreBluetooth”的硬阻塞；协议 ACK 的
+    //    30 秒无推进超时仍由 even_connect 持有，不能在 native 层混成同一个计时器。
+    private static let backpressureStallTimeout: TimeInterval = 15.0
 
     //  =========== Variables
     //  - 关联外设(弱引用避免循环持有)
@@ -108,14 +108,15 @@ final class OtaWriteQueue {
     private var pending: [OtaWriteItem] = []
     //  - 自上一次软节流以来已成功写入的包数
     private var sinceLastDrainSync: Int = 0
-    //  - 进入 canSend=false / 软节流等待的时间
+    //  - 进入 canSend=false 等待的时间；softThrottle 不参与 15 秒硬阻塞计时。
     private var backpressureStartedAt: Date?
-    //  - 同一次背压只允许进入一次 grace，避免 watchdog 每 100ms 重复记录阈值日志。
-    private var backpressureEnteredGrace: Bool = false
     //  - 当前等待原因仅用于结构化诊断，不能参与是否放行写入的判断。
     private var backpressureReason: String?
     //  - 每次建立或清理等待都推进 episode；旧 timer 即使迟到执行也不能驱动新 pending。
     private var backpressureEpisode: UInt64 = 0
+    //  - 硬阻塞后必须等待上层 exact recovery 真实断开并清队列；否则迟到 ready
+    //    可能继续发送旧 attempt 的后续 RAW。
+    private var stalledAwaitingRecovery: Bool = false
     //  - 兜底重查任务; 只允许一个 pending work item
     private var backpressureRetryWorkItem: OtaWriteCancellable?
     //  - 时钟/调度器注入只服务于真实 XCTest 行为覆盖, 生产路径仍使用系统实现。
@@ -156,8 +157,31 @@ extension OtaWriteQueue {
      *  - 调用方持有 Dart 端的 await, 直到本条完成后才会发下一包;
      *  - 即立即触发 pump, 在背压允许的窗口内尽量打满 packets-per-event.
      */
-    func enqueue(data: Data, target: OtaWriteTarget, result: @escaping FlutterResult) {
-        pending.append(OtaWriteItem(data: data, target: target, result: result))
+    func enqueue(
+        data: Data,
+        target: OtaWriteTarget,
+        expectedSessionGeneration: Int64 = 0,
+        expectedAttemptGeneration: Int64 = 0,
+        result: @escaping FlutterResult
+    ) {
+        if stalledAwaitingRecovery {
+            result(Self.stalledError(
+                endpoint: peripheral?.otaEndpointId,
+                reason: "queue stalled awaiting OTA recovery disconnect",
+                waitSeconds: Self.backpressureStallTimeout,
+                pending: pending.count,
+                expectedSessionGeneration: expectedSessionGeneration,
+                expectedAttemptGeneration: expectedAttemptGeneration
+            ))
+            return
+        }
+        pending.append(OtaWriteItem(
+            data: data,
+            target: target,
+            expectedSessionGeneration: expectedSessionGeneration,
+            expectedAttemptGeneration: expectedAttemptGeneration,
+            result: result
+        ))
         logger?("[ezw_ble][ota] enqueued endpoint=\(peripheral?.otaEndpointId ?? "released") bytes=\(data.count) pending=\(pending.count)")
         pump()
     }
@@ -169,7 +193,7 @@ extension OtaWriteQueue {
     func onPeripheralReadyToSendWriteWithoutResponse() {
         logger?("[ezw_ble][ota] ready endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) pending=\(pending.count)")
         // ready 回调本身不重置计时；只有 canSend 已真实恢复时 pump 才结束当前 episode，
-        // 否则一次虚假/过早回调会把 5 秒 fail-closed 窗口无限向后延长。
+        // 否则一次虚假/过早回调会把 15 秒 fail-closed 窗口无限向后延长。
         pump(resumeSource: "callback")
     }
 
@@ -181,16 +205,26 @@ extension OtaWriteQueue {
     func cancelAll(reason: String) {
         guard !pending.isEmpty else {
             sinceLastDrainSync = 0
+            stalledAwaitingRecovery = false
             clearBackpressureWait()
             return
         }
-        logger?("[ezw_ble][ota] cancelled endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) stage=\(backpressureStage) reason=\(reason) pending=\(pending.count)")
+        logger?("[ezw_ble][ota] cancelled endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) reason=\(reason) pending=\(pending.count)")
         let snapshot = pending
         pending.removeAll()
         sinceLastDrainSync = 0
+        stalledAwaitingRecovery = false
         clearBackpressureWait()
         snapshot.forEach { item in
-            item.result(Self.error(code: "ota_write_cancelled", endpoint: peripheral?.otaEndpointId, reason: reason, waitSeconds: nil, pending: snapshot.count))
+            item.result(Self.error(
+                code: "ota_write_cancelled",
+                endpoint: peripheral?.otaEndpointId,
+                reason: reason,
+                waitSeconds: nil,
+                pending: snapshot.count,
+                expectedSessionGeneration: item.expectedSessionGeneration,
+                expectedAttemptGeneration: item.expectedAttemptGeneration
+            ))
         }
     }
 
@@ -202,8 +236,23 @@ extension OtaWriteQueue {
         return error(code: "ota_write_unsupported", endpoint: endpoint, reason: reason, waitSeconds: nil, pending: pending)
     }
 
-    static func stalledError(endpoint: String?, reason: String, waitSeconds: TimeInterval, pending: Int) -> FlutterError {
-        return error(code: "ota_write_stalled", endpoint: endpoint, reason: reason, waitSeconds: waitSeconds, pending: pending)
+    static func stalledError(
+        endpoint: String?,
+        reason: String,
+        waitSeconds: TimeInterval,
+        pending: Int,
+        expectedSessionGeneration: Int64,
+        expectedAttemptGeneration: Int64
+    ) -> FlutterError {
+        return error(
+            code: "ota_write_stalled",
+            endpoint: endpoint,
+            reason: reason,
+            waitSeconds: waitSeconds,
+            pending: pending,
+            expectedSessionGeneration: expectedSessionGeneration,
+            expectedAttemptGeneration: expectedAttemptGeneration
+        )
     }
 }
 
@@ -220,6 +269,9 @@ extension OtaWriteQueue {
         //  1、外设已被释放(异常断连/重置), 清空所有 pending
         guard let peripheral = peripheral else {
             completePendingAsUnavailable(reason: "peripheral released")
+            return
+        }
+        guard !stalledAwaitingRecovery else {
             return
         }
         //  2、抽干队列, 直到背压或软节流命中
@@ -255,7 +307,9 @@ extension OtaWriteQueue {
             //  -- 突发塞包会触发底层丢包, 这里强制等下一次 peripheralIsReady 回调
             if sinceLastDrainSync >= Self.softDrainEvery {
                 sinceLastDrainSync = 0
-                markBackpressureWaitStarted(reason: "softThrottle")
+                // softThrottle 只是主动让出以维持老机型稳定性；它不启动 canSend=false
+                // 硬阻塞计时，下一次 poll 会在 canSend 仍为 false 时重新冻结起点。
+                markSoftThrottleWait()
                 scheduleBackpressureRetry(after: Self.softThrottleRetryInterval)
                 return
             }
@@ -274,6 +328,7 @@ private extension OtaWriteQueue {
         let snapshot = pending
         pending.removeAll()
         sinceLastDrainSync = 0
+        stalledAwaitingRecovery = false
         clearBackpressureWait()
         snapshot.forEach { item in
             item.result(Self.error(
@@ -281,7 +336,9 @@ private extension OtaWriteQueue {
                 endpoint: nil,
                 reason: reason,
                 waitSeconds: nil,
-                pending: snapshot.count
+                pending: snapshot.count,
+                expectedSessionGeneration: item.expectedSessionGeneration,
+                expectedAttemptGeneration: item.expectedAttemptGeneration
             ))
         }
     }
@@ -290,18 +347,19 @@ private extension OtaWriteQueue {
 // MARK: - Backpressure Watchdog
 private extension OtaWriteQueue {
 
-    var backpressureStage: String {
-        return backpressureEnteredGrace ? "grace" : "base"
-    }
-
     func markBackpressureWaitStarted(reason: String) {
-        if backpressureStartedAt == nil {
+        if backpressureStartedAt == nil || backpressureReason != reason {
             backpressureEpisode &+= 1
             backpressureStartedAt = clock.now
-            backpressureEnteredGrace = false
             backpressureReason = reason
-            logger?("[ezw_ble][ota] backpressure endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) stage=base reason=\(reason) wait=0.0s pending=\(pending.count)")
+            logger?("[ezw_ble][ota] backpressure endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) reason=\(reason) wait=0.0s pending=\(pending.count)")
         }
+    }
+
+    func markSoftThrottleWait() {
+        clearBackpressureWait()
+        backpressureEpisode &+= 1
+        logger?("[ezw_ble][ota] throttle endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) pending=\(pending.count)")
     }
 
     func clearBackpressureWait() {
@@ -311,7 +369,6 @@ private extension OtaWriteQueue {
             backpressureEpisode &+= 1
         }
         backpressureStartedAt = nil
-        backpressureEnteredGrace = false
         backpressureReason = nil
         backpressureRetryWorkItem?.cancel()
         backpressureRetryWorkItem = nil
@@ -324,19 +381,19 @@ private extension OtaWriteQueue {
         let episode = backpressureEpisode
         backpressureRetryWorkItem = scheduler.schedule(after: interval) { [weak self] in
             guard let self = self,
-                  self.backpressureEpisode == episode,
-                  self.backpressureStartedAt != nil else {
+                  self.backpressureEpisode == episode else {
                 return
             }
             self.backpressureRetryWorkItem = nil
-            guard !self.pending.isEmpty else {
+            guard !self.pending.isEmpty, !self.stalledAwaitingRecovery else {
                 return
             }
             self.pump(resumeSource: "poll")
         }
     }
 
-    /// 4 秒只进入一次 grace，5 秒仍不可写才终止，兼顾迟到 ready 与有界 await。
+    /// 15 秒仍不可写才终止队首请求。只完成 exact head，剩余 pending 等真实断连
+    /// 或 attempt cleanup 取消，避免一个 stalled write 批量制造多个上层失败。
     func shouldCompleteStalledBackpressure(reason: String) -> Bool {
         guard let startedAt = backpressureStartedAt else {
             return false
@@ -345,27 +402,20 @@ private extension OtaWriteQueue {
         guard waitSeconds >= Self.backpressureStallTimeout else {
             return false
         }
-        let terminalTimeout = Self.backpressureStallTimeout + Self.backpressureGraceTimeout
-        guard waitSeconds >= terminalTimeout else {
-            if !backpressureEnteredGrace {
-                backpressureEnteredGrace = true
-                logger?("[ezw_ble][ota] backpressure endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) stage=grace reason=\(reason) wait=\(String(format: "%.3f", waitSeconds))s pending=\(pending.count)")
-            }
-            return false
-        }
-        logger?("[ezw_ble][ota] stalled endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) stage=terminal reason=\(reason) wait=\(String(format: "%.3f", waitSeconds))s pending=\(pending.count)")
-        let snapshot = pending
-        pending.removeAll()
+        let stalled = pending.removeFirst()
+        let pendingCount = pending.count + 1
+        logger?("[ezw_ble][ota] stalled endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) reason=\(reason) wait=\(String(format: "%.3f", waitSeconds))s pending=\(pendingCount) session=\(stalled.expectedSessionGeneration) attempt=\(stalled.expectedAttemptGeneration)")
         sinceLastDrainSync = 0
+        stalledAwaitingRecovery = true
         clearBackpressureWait()
-        snapshot.forEach { item in
-            item.result(Self.stalledError(
-                endpoint: peripheral?.otaEndpointId,
-                reason: reason,
-                waitSeconds: waitSeconds,
-                pending: snapshot.count
-            ))
-        }
+        stalled.result(Self.stalledError(
+            endpoint: peripheral?.otaEndpointId,
+            reason: reason,
+            waitSeconds: waitSeconds,
+            pending: pendingCount,
+            expectedSessionGeneration: stalled.expectedSessionGeneration,
+            expectedAttemptGeneration: stalled.expectedAttemptGeneration
+        ))
         return true
     }
 
@@ -374,7 +424,7 @@ private extension OtaWriteQueue {
             return
         }
         let waitSeconds = clock.now.timeIntervalSince(startedAt)
-        logger?("[ezw_ble][ota] resumed endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) stage=\(backpressureStage) reason=\(backpressureReason ?? "unknown") source=\(source) wait=\(String(format: "%.3f", waitSeconds))s pending=\(pending.count)")
+        logger?("[ezw_ble][ota] resumed endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) reason=\(backpressureReason ?? "unknown") source=\(source) wait=\(String(format: "%.3f", waitSeconds))s pending=\(pending.count)")
     }
 }
 
@@ -385,7 +435,9 @@ private extension OtaWriteQueue {
         endpoint: String?,
         reason: String,
         waitSeconds: TimeInterval?,
-        pending: Int
+        pending: Int,
+        expectedSessionGeneration: Int64 = 0,
+        expectedAttemptGeneration: Int64 = 0
     ) -> FlutterError {
         var details: [String: Any] = [
             "reason": reason,
@@ -396,6 +448,14 @@ private extension OtaWriteQueue {
         }
         if let waitSeconds = waitSeconds {
             details["wait"] = waitSeconds
+        }
+        if expectedSessionGeneration > 0 {
+            details["session"] = expectedSessionGeneration
+            details["expectedSessionGeneration"] = expectedSessionGeneration
+        }
+        if expectedAttemptGeneration > 0 {
+            details["attempt"] = expectedAttemptGeneration
+            details["expectedAttemptGeneration"] = expectedAttemptGeneration
         }
         return FlutterError(
             code: code,

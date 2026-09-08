@@ -174,11 +174,24 @@ internal class BleAutoReconnectSupervisor(
     fun activate(
         device: BleDevice,
         source: BleConnectSource,
+        mode: BleReconnectActivationMode = BleReconnectActivationMode.INITIAL,
         sessionGeneration: Long = 0L,
-    ): Long {
+    ): BleReconnectActivationOutcome {
+        if (mode == BleReconnectActivationMode.UNKNOWN) {
+            return BleReconnectActivationOutcome(
+                sessionGeneration = 0L,
+                ownerDisposition = BleReconnectOwnerDisposition.REJECTED,
+                reason = "invalidMode",
+            )
+        }
+        val hadTask = reconnectTasks.containsKey(reconnectKey(device.uuid))
         // 1、登记/刷新长期目标；这一步不创建第二条 GATT。
         arm(device, source, sessionGeneration)
-        val task = reconnectTasks[reconnectKey(device.uuid)] ?: return 0L
+        val task = reconnectTasks[reconnectKey(device.uuid)] ?: return BleReconnectActivationOutcome(
+            sessionGeneration = 0L,
+            ownerDisposition = BleReconnectOwnerDisposition.REJECTED,
+            reason = "notArmed",
+        )
         // 用户点击连接开启新的安全恢复 episode；该 attempt 首次安全失败直接交给 boundFail。
         if (source == BleConnectSource.MANUAL_RECONNECT) {
             task.securityFailureCount = 0
@@ -227,7 +240,8 @@ internal class BleAutoReconnectSupervisor(
                     beginInitialAttempt(device.uuid)
                 }
             }
-            val actualSession = reconnectTasks[reconnectKey(device.uuid)]?.sessionGeneration ?: 0L
+            val current = reconnectTasks[reconnectKey(device.uuid)]
+            val actualSession = current?.sessionGeneration ?: 0L
             if (actualSession != sessionGeneration) {
                 sendLog(
                     BleLoggerTag.e,
@@ -235,7 +249,22 @@ internal class BleAutoReconnectSupervisor(
                         "requested=$sessionGeneration actual=$actualSession",
                 )
             }
-            return actualSession
+            val disposition = when {
+                actualSession != sessionGeneration -> BleReconnectOwnerDisposition.REJECTED
+                current?.passiveGatt != null -> BleReconnectOwnerDisposition.REPAIRED
+                current?.pausedByBluetoothOff == true || current?.timer != null ->
+                    BleReconnectOwnerDisposition.DEFERRED
+                else -> BleReconnectOwnerDisposition.REJECTED
+            }
+            return BleReconnectActivationOutcome(
+                sessionGeneration = actualSession,
+                ownerDisposition = disposition,
+                reason = when (disposition) {
+                    BleReconnectOwnerDisposition.REPAIRED -> "sessionRebound"
+                    BleReconnectOwnerDisposition.DEFERRED -> "sessionReboundDeferred"
+                    else -> "sessionNotInstalled"
+                },
+            )
         }
 
         // 3、没有 live GATT 的 task 可以安全安装更高 session；旧/同 session 不倒退。
@@ -246,8 +275,15 @@ internal class BleAutoReconnectSupervisor(
         // 4、手动接管前校验 Supervisor/Manager/Gate 是否仍指向同一个 owner。
         // 4.1、若旧 deadline/Gate 清理只完成了一半，先精确修复 orphan，再创建唯一
         // replacement；不能继续把 `passiveGatt != null` 当作健康 owner。
-        if (source == BleConnectSource.MANUAL_RECONNECT && task.passiveGatt != null) {
-            val exactGatt = task.passiveGatt ?: return task.sessionGeneration
+        if ((source == BleConnectSource.MANUAL_RECONNECT ||
+                mode == BleReconnectActivationMode.RECONCILE) &&
+            task.passiveGatt != null
+        ) {
+            val exactGatt = task.passiveGatt ?: return BleReconnectActivationOutcome(
+                sessionGeneration = task.sessionGeneration,
+                ownerDisposition = BleReconnectOwnerDisposition.DEFERRED,
+                reason = "ownerChanged",
+            )
             if (
                 classifyPendingPassiveGattOwner(device.uuid, exactGatt) ==
                 BlePendingOwnerHealth.STALE
@@ -263,7 +299,26 @@ internal class BleAutoReconnectSupervisor(
                     // Manager 已有另一条健康 owner；只清 Supervisor 旧引用，不得重复建链。
                     clearRecycledPendingOwner(device.uuid, exactGatt)
                 }
-                return reconnectTasks[reconnectKey(device.uuid)]?.sessionGeneration ?: 0L
+                val current = reconnectTasks[reconnectKey(device.uuid)]
+                val actualSession = current?.sessionGeneration ?: 0L
+                val ownerDisposition = when {
+                    disposition == BlePendingOwnerDisposition.STALE_OWNER_DROPPED ->
+                        BleReconnectOwnerDisposition.REUSED
+                    current?.passiveGatt != null -> BleReconnectOwnerDisposition.REPAIRED
+                    current?.pausedByBluetoothOff == true || current?.timer != null ->
+                        BleReconnectOwnerDisposition.DEFERRED
+                    else -> BleReconnectOwnerDisposition.REJECTED
+                }
+                return BleReconnectActivationOutcome(
+                    sessionGeneration = actualSession,
+                    ownerDisposition = ownerDisposition,
+                    reason = when (ownerDisposition) {
+                        BleReconnectOwnerDisposition.REUSED -> "managerOwnerPreserved"
+                        BleReconnectOwnerDisposition.REPAIRED -> "staleOwnerRepaired"
+                        BleReconnectOwnerDisposition.DEFERRED -> "staleOwnerRepairDeferred"
+                        else -> "staleOwnerRepairFailed"
+                    },
+                )
             }
         }
 
@@ -272,13 +327,37 @@ internal class BleAutoReconnectSupervisor(
             if (source == BleConnectSource.MANUAL_RECONNECT) {
                 promotePendingAdmission(device.uuid)
             }
-            return task.sessionGeneration
+            val disposition = if (task.timer != null && task.passiveGatt == null) {
+                BleReconnectOwnerDisposition.DEFERRED
+            } else {
+                BleReconnectOwnerDisposition.REUSED
+            }
+            return BleReconnectActivationOutcome(
+                sessionGeneration = task.sessionGeneration,
+                ownerDisposition = disposition,
+                reason = if (disposition == BleReconnectOwnerDisposition.DEFERRED) "pendingRetryDeferred" else "",
+            )
         }
         // 6、首次 activation 同步执行 connectGatt(true)，确保返回前系统已经持有 pending owner。
         // 首轮不能通过 Timer(0) 异步跳出 MethodChannel：调用返回前必须已经同步执行
         // connectGatt(true)，这样上层随后启动扫描时所有有效目标都已进入系统 pending。
         beginInitialAttempt(device.uuid)
-        return reconnectTasks[reconnectKey(device.uuid)]?.sessionGeneration ?: 0L
+        val current = reconnectTasks[reconnectKey(device.uuid)]
+        val disposition = when {
+            current?.passiveGatt != null -> if (hadTask || mode == BleReconnectActivationMode.RECONCILE) {
+                BleReconnectOwnerDisposition.REPAIRED
+            } else {
+                BleReconnectOwnerDisposition.CREATED
+            }
+            current?.pausedByBluetoothOff == true -> BleReconnectOwnerDisposition.DEFERRED
+            current?.timer != null -> BleReconnectOwnerDisposition.DEFERRED
+            else -> BleReconnectOwnerDisposition.REJECTED
+        }
+        return BleReconnectActivationOutcome(
+            sessionGeneration = current?.sessionGeneration ?: 0L,
+            ownerDisposition = disposition,
+            reason = if (disposition == BleReconnectOwnerDisposition.REJECTED) "ownerNotStarted" else "",
+        )
     }
 
     /**
@@ -645,6 +724,8 @@ internal class BleAutoReconnectSupervisor(
             sn = task.sn,
             source = task.source,
             sessionGeneration = task.sessionGeneration,
+            hasPassiveGatt = task.passiveGatt != null,
+            hasRetryTimer = task.timer != null,
         )
     }
 
@@ -664,12 +745,19 @@ internal class BleAutoReconnectSupervisor(
     ) {
         // 1. 非回连状态直接忽略。
         if (!shouldScheduleReconnect(state)) {
+            sendLog(BleLoggerTag.d, "Auto reconnect: $uuid, schedule ignored, state=$state")
             return
         }
 
         // 2. 只有已经 arm 的设备才允许自动回连。
-        val task = reconnectTasks[reconnectKey(uuid)] ?: return
-        val config = bleConfigs().firstOrNull { it.name == task.belongConfig } ?: return
+        val task = reconnectTasks[reconnectKey(uuid)] ?: run {
+            sendLog(BleLoggerTag.d, "Auto reconnect: $uuid, schedule ignored, owner missing")
+            return
+        }
+        val config = bleConfigs().firstOrNull { it.name == task.belongConfig } ?: run {
+            sendLog(BleLoggerTag.e, "Auto reconnect: $uuid, schedule ignored, config removed=${task.belongConfig}")
+            return
+        }
 
         // 2.1、蓝牙刚恢复时必须等 Dart 用一个最终 session 提交全部端点；旧终态不得
         // 在 EventChannel available 处理前抢跑旧 GATT。
@@ -689,6 +777,10 @@ internal class BleAutoReconnectSupervisor(
 
         // 4. 配置关闭或 OTA 中不调度，避免普通回连干扰升级流程。
         if (!config.autoReconnect || isUpgradeDevice(uuid)) {
+            sendLog(
+                BleLoggerTag.d,
+                "Auto reconnect: $uuid, schedule rejected, autoReconnect=${config.autoReconnect}, upgrading=${isUpgradeDevice(uuid)}",
+            )
             return
         }
 
@@ -737,7 +829,10 @@ internal class BleAutoReconnectSupervisor(
 
     /** activation 首轮同步创建 pending GATT，并保留调用方 source。 */
     private fun beginInitialAttempt(uuid: String) {
-        val task = reconnectTasks[reconnectKey(uuid)] ?: return
+        val task = reconnectTasks[reconnectKey(uuid)] ?: run {
+            sendLog(BleLoggerTag.d, "Auto reconnect: $uuid, attempt skipped, owner missing")
+            return
+        }
         if (!isBluetoothEnabled() || bleState() != BLE_STATE_ON) {
             task.pausedByBluetoothOff = true
             return
@@ -758,10 +853,15 @@ internal class BleAutoReconnectSupervisor(
             expectedScheduleGeneration != null &&
             task.retryScheduleGeneration != expectedScheduleGeneration
         ) {
+            sendLog(BleLoggerTag.d, "Auto reconnect: $uuid, stale scheduled attempt ignored")
             return
         }
-        val config = bleConfigs().firstOrNull { it.name == task.belongConfig } ?: return
+        val config = bleConfigs().firstOrNull { it.name == task.belongConfig } ?: run {
+            sendLog(BleLoggerTag.e, "Auto reconnect: $uuid, attempt skipped, config removed=${task.belongConfig}")
+            return
+        }
         if (!config.autoReconnect) {
+            sendLog(BleLoggerTag.d, "Auto reconnect: $uuid, attempt skipped, config autoReconnect disabled")
             return
         }
 
@@ -791,6 +891,7 @@ internal class BleAutoReconnectSupervisor(
         // 4. 蓝牙关闭期间暂停，不把这次 timer 计为失败。
         if (!isBluetoothEnabled() || bleState() != BLE_STATE_ON) {
             task.pausedByBluetoothOff = true
+            sendLog(BleLoggerTag.d, "Auto reconnect: $uuid, attempt deferred because bluetooth is unavailable")
             return
         }
 

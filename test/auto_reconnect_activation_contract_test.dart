@@ -108,6 +108,7 @@ void main() {
     expect(captured?.method, 'activateAutoReconnectTargets');
     final arguments = captured?.arguments as Map<Object?, Object?>;
     expect(arguments['source'], 'autoReconnect');
+    expect(arguments['mode'], 'initial');
     expect(arguments['devices'], isA<List<Object?>>());
     expect(
       (arguments['devices'] as List<Object?>).single,
@@ -127,11 +128,13 @@ void main() {
     await platform.activateAutoReconnectTargets(
       [BleDevice('ring', '11:22', 'Even R1', 'R1-1', -42)],
       source: BleConnectSource.manualReconnect,
+      mode: BleReconnectActivationMode.promotion,
       sessionGeneration: 37,
     );
 
     final arguments = captured?.arguments as Map<Object?, Object?>;
     expect(arguments['source'], 'manualReconnect');
+    expect(arguments['mode'], 'promotion');
     expect(arguments['sessionGeneration'], 37);
   });
 
@@ -192,6 +195,8 @@ void main() {
           'state': 'userRepairRequired',
           'reason': 'peerPairingInformationRemoved',
           'source': 'manualReconnect',
+          'mode': 'promotion',
+          'ownerDisposition': 'rejected',
           'sessionGeneration': 37,
         },
       ];
@@ -200,6 +205,7 @@ void main() {
     final results = await platform.activateAutoReconnectTargets(
       [BleDevice('ring_bcl_1', 'ring-uuid', 'EVEN R1_2639B0', 'R1', -50)],
       source: BleConnectSource.manualReconnect,
+      mode: BleReconnectActivationMode.promotion,
       sessionGeneration: 37,
     );
 
@@ -300,6 +306,8 @@ void main() {
           'name': 'EVEN R1_2639B0',
           'state': 'identityPending',
           'reason': 'awaitingPeripheralIdentity',
+          'mode': 'initial',
+          'ownerDisposition': 'deferred',
         },
       ];
     });
@@ -322,6 +330,8 @@ void main() {
     expect(target['name'], 'EVEN R1_2639B0');
     expect(target['mac'], 'ED:0E:DC:26:39:B0');
     expect(results.single.state, BleReconnectActivationState.identityPending);
+    expect(results.single.ownerDisposition,
+        BleReconnectOwnerDisposition.deferred);
     expect(results.single.isAccepted, isTrue);
   });
 
@@ -339,6 +349,8 @@ void main() {
           'state': 'resolved',
           'reason': 'systemConnectedPeripheralClaimed',
           'source': 'autoReconnect',
+          'mode': 'initial',
+          'ownerDisposition': 'created',
           'sessionGeneration': 7,
           'resolvedUuid': '5FB51C30-E13C-A3B7-F542-796E2CE78830',
           'resolutionSource': 'systemConnected',
@@ -366,6 +378,7 @@ void main() {
     expect(result.resolutionSource, 'systemConnected');
     expect(result.sessionGeneration, 7);
     expect(result.state, BleReconnectActivationState.resolved);
+    expect(result.ownerDisposition, BleReconnectOwnerDisposition.created);
   });
 
   test('activation ack keeps native rejection observable', () async {
@@ -378,6 +391,8 @@ void main() {
           'name': '',
           'state': 'rejected',
           'reason': 'emptyIdentity',
+          'mode': 'initial',
+          'ownerDisposition': 'rejected',
         },
       ];
     });
@@ -389,6 +404,44 @@ void main() {
     expect(results.single.state, BleReconnectActivationState.rejected);
     expect(results.single.isAccepted, isFalse);
     expect(results.single.reason, 'emptyIdentity');
+  });
+
+  test('activation ack requires realtime owner disposition', () {
+    for (final disposition in <Object?>[null, 'futureDisposition']) {
+      final result = BleReconnectActivationResult.fromNative({
+        'belongConfig': 'g2',
+        'uuid': 'AA:BB',
+        'name': 'Even G2_L',
+        'state': 'resolved',
+        'reason': '',
+        'source': 'autoReconnect',
+        'mode': 'reconcile',
+        'ownerDisposition': disposition,
+        'sessionGeneration': 9,
+      });
+
+      expect(result.mode, BleReconnectActivationMode.reconcile);
+      expect(result.ownerDisposition, BleReconnectOwnerDisposition.rejected);
+      expect(result.isAccepted, isFalse);
+    }
+  });
+
+  test('activation ack rejects future native mode values', () {
+    final result = BleReconnectActivationResult.fromNative({
+      'belongConfig': 'g2',
+      'uuid': 'AA:BB',
+      'name': 'Even G2_L',
+      'state': 'resolved',
+      'reason': '',
+      'source': 'autoReconnect',
+      'mode': 'futureMode',
+      'ownerDisposition': 'reused',
+      'sessionGeneration': 9,
+    });
+
+    expect(result.mode, BleReconnectActivationMode.unknown);
+    expect(result.ownerDisposition, BleReconnectOwnerDisposition.reused);
+    expect(result.isAccepted, isFalse);
   });
 }
 

@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_ezw_ble/core/models/ble_config.dart';
 import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
 import 'package:flutter_ezw_ble/core/models/ble_device.dart';
+import 'package:flutter_ezw_ble/core/models/ble_ota_recovery_disconnect_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_business_connection_attempt.dart';
 import 'package:flutter_ezw_ble/core/models/ble_scan_start_result.dart';
@@ -31,13 +32,10 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       );
 
   @override
-  Future<BleScanStartResult> startScan({
-    bool turnOnPureModel = false,
-  }) async {
-    final result = await methodChannel.invokeMethod<Object?>(
-      "startScan",
-      {"turnOnPureModel": turnOnPureModel},
-    );
+  Future<BleScanStartResult> startScan({bool turnOnPureModel = false}) async {
+    final result = await methodChannel.invokeMethod<Object?>("startScan", {
+      "turnOnPureModel": turnOnPureModel,
+    });
     return BleScanStartResult.fromNative(result);
   }
 
@@ -114,11 +112,35 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
   }
 
   @override
-  Future<void> disconnectForOtaReboot(String uuid, String name) async =>
+  Future<void> disconnectForOtaReboot(
+    String uuid,
+    String name, {
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+  }) async =>
       methodChannel.invokeMethod("disconnectForOtaReboot", {
         "uuid": uuid,
         "name": name,
+        "expectedSessionGeneration": expectedSessionGeneration,
+        "expectedAttemptGeneration": expectedAttemptGeneration,
       });
+
+  @override
+  Future<BleOtaRecoveryDisconnectResult> disconnectForOtaRecovery(
+    String uuid, {
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+  }) async {
+    // OTA 写阻塞恢复必须由 native 按 exact owner 接受后才让 Dart 进入恢复链；
+    // 未识别返回值统一 fail-closed 为 unavailable。
+    final raw =
+        await methodChannel.invokeMethod<String>("disconnectForOtaRecovery", {
+      "uuid": uuid,
+      "expectedSessionGeneration": expectedSessionGeneration,
+      "expectedAttemptGeneration": expectedAttemptGeneration,
+    });
+    return bleOtaRecoveryDisconnectResultFromNative(raw);
+  }
 
   @override
   Future<void> devicePreConnected(String uuid) async =>
@@ -171,12 +193,14 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
   Future<List<BleReconnectActivationResult>> activateAutoReconnectTargets(
     List<BleDevice> devices, {
     BleConnectSource source = BleConnectSource.autoReconnect,
+    BleReconnectActivationMode mode = BleReconnectActivationMode.initial,
     int sessionGeneration = 0,
   }) async {
     final raw = await methodChannel
         .invokeListMethod<Object?>("activateAutoReconnectTargets", {
       "devices": devices.map((device) => device.toJson()).toList(),
       "source": source.name,
+      "mode": mode.name,
       "sessionGeneration": sessionGeneration,
     });
     return (raw ?? const <Object?>[])
@@ -201,12 +225,18 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
     Uint8List data, {
     int psType = 0,
     bool allowDuringUpgrade = false,
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
   }) async =>
       methodChannel.invokeMethod<void>("sendCmd", {
         "uuid": uuid,
         "data": data,
         "psType": psType,
         "allowDuringUpgrade": allowDuringUpgrade,
+        // OTA START/INFORMATION/RESULT 等控制包若走 sendCmd 队列，也必须绑定本轮
+        // 物理 attempt；0/0 保持旧控制包调用兼容。
+        "expectedSessionGeneration": expectedSessionGeneration,
+        "expectedAttemptGeneration": expectedAttemptGeneration,
       });
 
   /// 发送数据 - 原始数据 - 不等待响应
@@ -219,11 +249,17 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
     String uuid,
     Uint8List data, {
     int psType = 0,
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
   }) async =>
       methodChannel.invokeMethod<void>("sendCmdNoWait", {
         "uuid": uuid,
         "data": data,
         "psType": psType,
+        // OTA 断连恢复会冻结本轮业务 session/物理 attempt。native 只在两者为正
+        // 且 psType==1 时启用 strict guard；旧调用保留 0 以维持兼容。
+        "expectedSessionGeneration": expectedSessionGeneration,
+        "expectedAttemptGeneration": expectedAttemptGeneration,
       });
 
   @override
@@ -231,8 +267,17 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       methodChannel.invokeMethod("enterUpgradeState", uuid);
 
   @override
-  Future<void> quiteUpgradeState(String uuid) =>
-      methodChannel.invokeMethod("quiteUpgradeState", uuid);
+  Future<void> quiteUpgradeState(
+    String uuid, {
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+  }) =>
+      methodChannel.invokeMethod("quiteUpgradeState", {
+        "uuid": uuid,
+        // OTA 迟到清理只能消费自己冻结的物理 attempt；0/0 保持旧调用兼容。
+        "expectedSessionGeneration": expectedSessionGeneration,
+        "expectedAttemptGeneration": expectedAttemptGeneration,
+      });
 
   @override
   Future<void> setConnectionTraceEnabled(bool enabled) =>

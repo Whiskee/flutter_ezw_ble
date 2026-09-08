@@ -6,6 +6,7 @@ import 'package:flutter_ezw_ble/core/models/ble_cmd.dart';
 import 'package:flutter_ezw_ble/core/models/ble_business_connection_attempt.dart';
 import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
 import 'package:flutter_ezw_ble/core/models/ble_device.dart';
+import 'package:flutter_ezw_ble/core/models/ble_ota_recovery_disconnect_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_scan_start_result.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_method_channel.dart';
@@ -86,7 +87,21 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
-  Future<void> disconnectForOtaReboot(String uuid, String name) {
+  Future<void> disconnectForOtaReboot(
+    String uuid,
+    String name, {
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<BleOtaRecoveryDisconnectResult> disconnectForOtaRecovery(
+    String uuid, {
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+  }) {
     throw UnimplementedError();
   }
 
@@ -128,6 +143,7 @@ class MockFlutterEzwBlePlatform
   Future<List<BleReconnectActivationResult>> activateAutoReconnectTargets(
     List<BleDevice> devices, {
     BleConnectSource source = BleConnectSource.autoReconnect,
+    BleReconnectActivationMode mode = BleReconnectActivationMode.initial,
     int sessionGeneration = 0,
   }) {
     throw UnimplementedError();
@@ -147,12 +163,20 @@ class MockFlutterEzwBlePlatform
     Uint8List data, {
     int psType = 0,
     bool allowDuringUpgrade = false,
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
   }) {
     throw UnimplementedError();
   }
 
   @override
-  Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0}) {
+  Future<void> sendCmdNoWait(
+    String uuid,
+    Uint8List data, {
+    int psType = 0,
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+  }) {
     throw UnimplementedError();
   }
 
@@ -172,7 +196,11 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
-  Future<void> quiteUpgradeState(String uuid) {
+  Future<void> quiteUpgradeState(
+    String uuid, {
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+  }) {
     throw UnimplementedError();
   }
 
@@ -230,12 +258,16 @@ void main() {
       'psType': 2,
       'data': 'AQID',
       'isSuccess': true,
+      'sessionGeneration': 37,
+      'attemptGeneration': 9,
     });
 
     expect(cmd.uuid, 'device-1');
     expect(cmd.psType, 2);
     expect(cmd.data, [1, 2, 3]);
     expect(cmd.isSuccess, isTrue);
+    expect(cmd.sessionGeneration, 37);
+    expect(cmd.attemptGeneration, 9);
   });
 
   test('BleCmd.receiveMap preserves the complete tagged audio frame', () {
@@ -270,6 +302,8 @@ void main() {
       expect(cmd.psType, 0);
       expect(cmd.data, isNull);
       expect(cmd.isSuccess, isFalse);
+      expect(cmd.sessionGeneration, 0);
+      expect(cmd.attemptGeneration, 0);
     },
   );
 

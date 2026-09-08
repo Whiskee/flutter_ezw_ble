@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:flutter_ezw_ble/core/models/ble_config.dart';
 import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
 import 'package:flutter_ezw_ble/core/models/ble_device.dart';
+import 'package:flutter_ezw_ble/core/models/ble_ota_recovery_disconnect_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_business_connection_attempt.dart';
 import 'package:flutter_ezw_ble/core/models/ble_scan_start_result.dart';
@@ -148,9 +149,30 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// 这不是用户取消：必须保留 native autoReconnect owner 和持久化目标，同时用当前
   /// source/generation 上报系统断连，让 Dart 先清除已经失效的业务连接态。实际回连
   /// 由上层在固件 reboot 窗口结束后以 afterUpgrade 流程重新激活，不能在此处抢跑。
-  Future<void> disconnectForOtaReboot(String uuid, String name) {
+  Future<void> disconnectForOtaReboot(
+    String uuid,
+    String name, {
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+  }) {
     throw UnimplementedError(
       'disconnectForOtaReboot(uuid: $uuid, name: $name) has not been implemented.',
+    );
+  }
+
+  /// OTA 写阻塞恢复专用物理断开。
+  ///
+  /// 返回值只描述 native 是否接受 exact teardown：
+  /// `accepted` 会触发真实 CoreBluetooth/GATT 断连并保留 autoReconnect owner；
+  /// `alreadyDisconnected` 表示本 attempt 已无活跃物理链路；`staleIdentity`
+  /// 与 `unavailable` 均由上层直接终止，不强行重试。
+  Future<BleOtaRecoveryDisconnectResult> disconnectForOtaRecovery(
+    String uuid, {
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+  }) {
+    throw UnimplementedError(
+      'disconnectForOtaRecovery(uuid: $uuid) has not been implemented.',
     );
   }
 
@@ -224,10 +246,11 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   Future<List<BleReconnectActivationResult>> activateAutoReconnectTargets(
     List<BleDevice> devices, {
     BleConnectSource source = BleConnectSource.autoReconnect,
+    BleReconnectActivationMode mode = BleReconnectActivationMode.initial,
     int sessionGeneration = 0,
   }) {
     throw UnimplementedError(
-      'activateAutoReconnectTargets(devices: $devices, source: $source, sessionGeneration: $sessionGeneration) has not been implemented.',
+      'activateAutoReconnectTargets(devices: $devices, source: $source, mode: $mode, sessionGeneration: $sessionGeneration) has not been implemented.',
     );
   }
 
@@ -252,12 +275,16 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// - param data 指令数据
   /// - param psType 指令类型
   /// - param allowDuringUpgrade 业务协议已确认该控制指令可在升级态发送
+  /// - param expectedSessionGeneration OTA 调用方冻结的业务 session；0 表示兼容旧调用
+  /// - param expectedAttemptGeneration OTA 调用方冻结的物理 attempt；0 表示兼容旧调用
   ///
   Future<void> sendCmd(
     String uuid,
     Uint8List data, {
     int psType = 0,
     bool allowDuringUpgrade = false,
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
   }) {
     throw UnimplementedError('sendCmd() has not been implemented.');
   }
@@ -267,8 +294,16 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// - param uuid 设备唯一标识
   /// - param data 指令数据
   /// - param psType 指令类型
+  /// - param expectedSessionGeneration OTA 调用方冻结的业务 session；0 表示兼容旧调用
+  /// - param expectedAttemptGeneration OTA 调用方冻结的物理 attempt；0 表示兼容旧调用
   ///
-  Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0}) {
+  Future<void> sendCmdNoWait(
+    String uuid,
+    Uint8List data, {
+    int psType = 0,
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+  }) {
     throw UnimplementedError('sendCmdNoWait() has not been implemented.');
   }
 
@@ -283,8 +318,14 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// 退出升级模式
   ///
   /// - param uuid 设备唯一标识
+  /// - param expectedSessionGeneration OTA 调用方冻结的业务 session；0 表示兼容旧调用
+  /// - param expectedAttemptGeneration OTA 调用方冻结的物理 attempt；0 表示兼容旧调用
   ///
-  Future<void> quiteUpgradeState(String uuid) {
+  Future<void> quiteUpgradeState(
+    String uuid, {
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+  }) {
     throw UnimplementedError('quiteUpgradeState() has not been implemented.');
   }
 

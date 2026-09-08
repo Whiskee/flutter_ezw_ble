@@ -75,10 +75,20 @@ void main() {
       expect(reconnect, contains('requireUniqueMatch: true'));
       expect(reconnect, contains('restoredPeripheralClaimed'));
       expect(reconnect, contains('resolvedUuid: resolvedUuid'));
-      expect(
-        reconnect,
-        contains('activateArmedReconnectTask(task, source: source)'),
+      // 非 claim 路径的兜底 activation 必须仍在 claim 之后；合入上游 owner 对账
+      // 契约后它携带 mode，并声明此前没有 owner（ownerExistedBeforeActivation=false）。
+      final fallbackStart = reconnect.indexOf(
+        'activateArmedReconnectTask(',
+        reconnect.indexOf('reason: "restoredPeripheralClaimed"'),
       );
+      expect(fallbackStart, greaterThan(claim));
+      final fallbackCall = reconnect.substring(
+        fallbackStart,
+        reconnect.indexOf(')', fallbackStart) + 1,
+      );
+      expect(fallbackCall, contains('source: source'));
+      expect(fallbackCall, contains('ownerExistedBeforeActivation: false'));
+      expect(fallbackCall, contains('mode: mode'));
       expect(
         manager,
         isNot(contains('self?.flushPendingRestoredPeripherals()')),

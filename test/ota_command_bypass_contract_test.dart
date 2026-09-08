@@ -35,9 +35,16 @@ void main() {
 
     expect(queue, contains('ota_write_stalled'));
     expect(queue, contains('ota_write_cancelled'));
+    expect(queue, contains('backpressureStallTimeout: TimeInterval = 15.0'));
+    expect(queue, contains('pending.removeFirst()'));
+    expect(queue, contains('"expectedSessionGeneration"'));
+    expect(queue, contains('"expectedAttemptGeneration"'));
+    expect(queue, isNot(contains('backpressureGraceTimeout')));
+    expect(queue, isNot(contains('backpressureEnteredGrace')));
     expect(queue, contains('head.target.submit(peripheral, head.data)'));
     expect(manager, contains('OtaWriteQueue.unavailableError'));
     expect(manager, contains('OtaWriteQueue.unsupportedError'));
+    expect(manager, contains('disconnectForOtaRecovery'));
     expect(manager, isNot(contains('fallback to existing path uuid')));
     expect(
       manager,
@@ -60,23 +67,80 @@ void main() {
     final device = File(
       'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/models/BleDevice.kt',
     ).readAsStringSync();
+    final callback = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleGattSessionCallback.kt',
+    ).readAsStringSync();
+    final cmd = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/models/BleCmd.kt',
+    ).readAsStringSync();
     final error = File(
       'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleOtaWriteError.kt',
     ).readAsStringSync();
 
-    expect(channel,
-        contains('BleManager.instance.sendCmdNoWait(uuid, data, psType)'));
-    expect(channel,
-        contains('result.error(error.code, error.reason, error.details)'));
+    expect(channel, contains('expectedSessionGeneration'));
+    expect(channel, contains('expectedAttemptGeneration'));
+    expect(channel, contains('BleManager.instance.quiteUpgradeState'));
     expect(
-        manager, contains('otaWriteQueueFor(uuid).enqueue(data, completion)'));
+      channel,
+      contains('result.error(error.code, error.reason, error.details)'),
+    );
+    expect(manager, contains('sessionGeneration = expectedSessionGeneration'));
+    expect(manager, contains('attemptGeneration = expectedAttemptGeneration'));
+    expect(
+      manager,
+      contains(
+        'submit = { data, expectedSessionGeneration, expectedAttemptGeneration ->',
+      ),
+    );
+    expect(manager, contains('validateOtaWriteIdentity'));
+    expect(manager, contains('attempt identity mismatch'));
+    expect(manager, contains('hasExactBusinessGatt'));
+    expect(manager, contains('QuiteUpgradeState rejected'));
+    expect(manager, contains('drop queued command'));
     expect(manager, contains('BleOtaWriteSubmission.rejected'));
     expect(manager, contains('BleOtaWriteError.unavailable'));
     expect(manager, contains('BleOtaWriteError.unsupported'));
     expect(device, contains('supportsWriteWithoutResponse'));
     expect(device, contains('submitOtaCharacteristic'));
     expect(device, contains('ERROR_GATT_WRITE_REQUEST_BUSY'));
+    expect(callback, contains('sessionGeneration = sessionGeneration'));
+    expect(callback, contains('attemptGeneration = attemptGeneration'));
+    expect(cmd, contains('"sessionGeneration" to sessionGeneration'));
+    expect(cmd, contains('"attemptGeneration" to attemptGeneration'));
     expect(error, contains('ota_write_unavailable'));
     expect(error, contains('ota_write_unsupported'));
   });
+
+  test(
+    'iOS OTA no-wait validates optional exact session identity before queueing',
+    () {
+      final channel = File(
+        'ios/Classes/ble/BleMethodChannel.swift',
+      ).readAsStringSync();
+      final manager = File(
+        'ios/Classes/ble/BleManager.swift',
+      ).readAsStringSync();
+
+      expect(channel, contains('expectedSessionGeneration'));
+      expect(channel, contains('expectedAttemptGeneration'));
+      expect(channel, contains('BleManager.shared.quiteUpgradeState'));
+      expect(manager, contains('validateOtaWriteIdentity'));
+      expect(manager, contains('otaResponseIdentity'));
+      expect(
+        manager,
+        contains('submit: { [weak self, device] peripheral, value in'),
+      );
+      expect(
+        manager,
+        contains('BleExplicitCancellationMetadataPolicy.resolve'),
+      );
+      expect(manager, contains('attempt identity mismatch'));
+      expect(manager, contains('quiteUpgradeState rejected'));
+      expect(manager, contains('drop OTA response without exact identity'));
+      expect(manager,
+          contains('expectedSessionGeneration: expectedSessionGeneration'));
+      expect(manager,
+          contains('expectedAttemptGeneration: expectedAttemptGeneration'));
+    },
+  );
 }

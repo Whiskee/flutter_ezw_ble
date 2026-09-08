@@ -44,13 +44,15 @@ internal fun interface BleOtaWriteScheduler {
  */
 internal class BleAndroidOtaWriteQueue(
     private val endpoint: String,
-    private val submit: (ByteArray) -> BleOtaWriteSubmission,
+    private val submit: (ByteArray, Long, Long) -> BleOtaWriteSubmission,
     private val scheduler: BleOtaWriteScheduler,
     private val nowMillis: () -> Long,
     private val logger: (String) -> Unit = {},
 ) {
     private data class Item(
         val data: ByteArray,
+        val sessionGeneration: Long,
+        val attemptGeneration: Long,
         val completion: (BleOtaWriteError?) -> Unit,
     )
 
@@ -73,8 +75,13 @@ internal class BleAndroidOtaWriteQueue(
 
     /** 入队后立即尝试提交；成功回调只会在本包自己的 characteristic callback 后触发。 */
     @Synchronized
-    fun enqueue(data: ByteArray, completion: (BleOtaWriteError?) -> Unit) {
-        pending.addLast(Item(data.copyOf(), completion))
+    fun enqueue(
+        data: ByteArray,
+        sessionGeneration: Long = 0L,
+        attemptGeneration: Long = 0L,
+        completion: (BleOtaWriteError?) -> Unit,
+    ) {
+        pending.addLast(Item(data.copyOf(), sessionGeneration, attemptGeneration, completion))
         logger("[ezw_ble][ota][android] enqueued endpoint=$endpoint bytes=${data.size} pending=$queueDepth")
         pump()
     }
@@ -218,7 +225,7 @@ internal class BleAndroidOtaWriteQueue(
 
         while (pending.isNotEmpty()) {
             val head = pending.first()
-            val submission = submit(head.data)
+            val submission = submit(head.data, head.sessionGeneration, head.attemptGeneration)
             when (submission.disposition) {
                 BleOtaWriteSubmission.Disposition.ACCEPTED -> {
                     pending.removeFirst()

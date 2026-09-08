@@ -56,6 +56,8 @@ enum class BleMC {
     RECONCILE_BUSINESS_CONNECTIONS,
     /** OTA reboot 收尾断开：保留长期回连 owner，禁止立即 schedule。 */
     DISCONNECT_FOR_OTA_REBOOT,
+    /** iOS OTA 写阻塞恢复接口；Android 传输路径不消费，固定返回 unavailable。 */
+    DISCONNECT_FOR_OTA_RECOVERY,
     /** 中性释放 endpoint runtime，保留持久自动回连 owner。 */
     RELEASE_DEVICE,
     /** 发送普通 GATT 指令。 */
@@ -207,9 +209,10 @@ enum class BleMC {
                     ?.mapNotNull { (it as? Map<*, *>)?.toReconnectSeed() }
                     ?: emptyList()
                 val source = BleConnectSource.fromFlutterValue(jsonMap?.get("source") as? String)
+                val mode = BleReconnectActivationMode.fromFlutterValue(jsonMap?.get("mode") as? String)
                 val sessionGeneration = (jsonMap?.get("sessionGeneration") as? Number)?.toLong() ?: 0L
                 return result.success(
-                    BleManager.instance.activateAutoReconnectTargets(targets, source, sessionGeneration)
+                    BleManager.instance.activateAutoReconnectTargets(targets, source, mode, sessionGeneration)
                         .map { it.toFlutterMap() },
                 )
             }
@@ -258,7 +261,21 @@ enum class BleMC {
                 val jsonMap = arguments as Map<*, *>?
                 val uuid = jsonMap?.get("uuid") as? String ?: ""
                 val name = jsonMap?.get("name") as? String ?: ""
-                BleManager.instance.disconnectForOtaReboot(uuid, name)
+                val expectedSessionGeneration =
+                    (jsonMap?.get("expectedSessionGeneration") as? Number)?.toLong() ?: 0L
+                val expectedAttemptGeneration =
+                    (jsonMap?.get("expectedAttemptGeneration") as? Number)?.toLong() ?: 0L
+                BleManager.instance.disconnectForOtaReboot(
+                    uuid,
+                    name,
+                    expectedSessionGeneration,
+                    expectedAttemptGeneration,
+                )
+            }
+            DISCONNECT_FOR_OTA_RECOVERY -> {
+                // Android 没有 iOS canSendWriteWithoutResponse stall，保留同名 API 让
+                // Dart/even_connect 做跨平台分发；不能在这里改变 Android OTA 恢复路径。
+                return result.success("unavailable")
             }
             RELEASE_DEVICE -> {
                 // dispose/reset 只释放 runtime；禁止复用 disconnect 的持久 owner 删除语义。
@@ -276,7 +293,18 @@ enum class BleMC {
                 val psType = jsonMap?.get("psType") as Int? ?: 0
                 val allowDuringUpgrade =
                     jsonMap?.get("allowDuringUpgrade") as? Boolean ?: false
-                BleManager.instance.sendCmd(uuid, data, psType, allowDuringUpgrade)
+                val expectedSessionGeneration =
+                    (jsonMap?.get("expectedSessionGeneration") as? Number)?.toLong() ?: 0L
+                val expectedAttemptGeneration =
+                    (jsonMap?.get("expectedAttemptGeneration") as? Number)?.toLong() ?: 0L
+                BleManager.instance.sendCmd(
+                    uuid,
+                    data,
+                    psType,
+                    allowDuringUpgrade,
+                    expectedSessionGeneration,
+                    expectedAttemptGeneration,
+                )
             }
             SEND_CMD_NO_WAIT -> {
                 // 1. Android OTA 必须等本包 characteristic write callback 后才完成 Future；
@@ -285,7 +313,17 @@ enum class BleMC {
                 val uuid = jsonMap?.get("uuid") as? String ?: ""
                 val data = jsonMap?.get("data") as ByteArray? ?: byteArrayOf()
                 val psType = jsonMap?.get("psType") as Int? ?: 0
-                BleManager.instance.sendCmdNoWait(uuid, data, psType) { error ->
+                val expectedSessionGeneration =
+                    (jsonMap?.get("expectedSessionGeneration") as? Number)?.toLong() ?: 0L
+                val expectedAttemptGeneration =
+                    (jsonMap?.get("expectedAttemptGeneration") as? Number)?.toLong() ?: 0L
+                BleManager.instance.sendCmdNoWait(
+                    uuid,
+                    data,
+                    psType,
+                    expectedSessionGeneration,
+                    expectedAttemptGeneration,
+                ) { error ->
                     if (error == null) {
                         result.success(null)
                     } else {
@@ -301,8 +339,17 @@ enum class BleMC {
             }
             QUITE_UPGRADE_STATE -> {
                 // 1. 退出升级态后，后续普通连接会恢复常规清理流程。
-                val uuid = arguments as? String ?: ""
-                BleManager.instance.quiteUpgradeState(uuid)
+                val jsonMap = arguments as? Map<*, *>
+                val uuid = jsonMap?.get("uuid") as? String ?: arguments as? String ?: ""
+                val expectedSessionGeneration =
+                    (jsonMap?.get("expectedSessionGeneration") as? Number)?.toLong() ?: 0L
+                val expectedAttemptGeneration =
+                    (jsonMap?.get("expectedAttemptGeneration") as? Number)?.toLong() ?: 0L
+                BleManager.instance.quiteUpgradeState(
+                    uuid,
+                    expectedSessionGeneration,
+                    expectedAttemptGeneration,
+                )
             }
             SET_CONNECTION_TRACE_ENABLED -> {
                 // 1. Trace 只控制诊断采集；关闭时 manager 仅清 Trace/RSSI 诊断缓存。

@@ -42,6 +42,7 @@
 - Android `onConnectionStateChange` 的 status 使用 HCI/controller 断连语义；characteristic/descriptor 回调才使用 ATT/GATT 操作语义。数值 `8` 在前者是连接超时，严禁触发授权恢复/cache refresh/`needsScanBeforeConnect`；在后者是授权不足，必须走授权恢复后再按回调阶段终止。
 - 原生连接 Trace 默认关闭，只能由 `setConnectionTraceEnabled(bool)` 显式打开；关闭仅清进程内 Trace/RSSI 诊断缓存，不能断开设备、取消/调度 autoReconnect 或补造当前链路。`nativeTrace.attemptId` 是诊断 UUID，不能替代 `sessionGeneration/attemptGeneration` owner 校验；step 快照最多 32 条，溢出必须用连续 `stepSeq` + `trace/gap.droppedCount` 表达缺口。
 - iOS OTA 中 `psType == 1` 的 `sendCmdNoWait` 必须与 `OtaWriteQueue`、`canSendWriteWithoutResponse` 和 `docs/IOS_OTA_NOWAIT_SPEC.md` 对齐。
+- G2 OTA 的 `sendCmd` / `sendCmdNoWait` / `quiteUpgradeState` / `disconnectForOtaReboot` 支持 `expectedSessionGeneration + expectedAttemptGeneration`；调用方传正数时，native 必须在实际写入、清理或 reboot teardown 前按当前物理 owner fail-closed。`disconnectForOtaReboot` 的迟到断连 suppression 只能被同一 pair 消费，旧 teardown 不得屏蔽新 attempt。`receiveData` 的 OTA response 必须尽量携带同一 pair；Android 以 callback 冻结 admission + GATT handle 过滤为准，iOS 只能基于当前 connected peripheral 与 reconnect owner metadata stamp，CoreBluetooth 不提供每条 notification 的底层连接句柄，因此不能宣称具备 Android 同级 GATT handle identity。
 - 改 auto reconnect 时，同步更新 `docs/AUTO_RECONNECT_SPEC.md`、`ARCHITECTURE.md` 和相关测试/排障记录。
 - BLE 行为变化通常需要同时审视 Dart 和原生两端，不要假设 Android 与 iOS 可以共享实现细节。
 
