@@ -82,9 +82,9 @@ void main() {
     expect(activateSource, isNot(contains('passiveGatt?.close()')));
     expect(activateSource, isNot(contains('passiveGatt?.disconnect()')));
     expect(
-        managerSource,
-        contains(
-            'autoReconnectSupervisor.activate(seedDevice, source, sessionGeneration)'));
+      managerSource,
+      contains(
+          'autoReconnectSupervisor.activate(seedDevice, effectiveSource, mode, sessionGeneration)'));
   });
 
   test('Android plugin unregisters Activity lifecycle callbacks on detach', () {

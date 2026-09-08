@@ -33,17 +33,23 @@ back to scan-first because this flag is false.
 Public methods:
 
 - `armAutoReconnectTargets(devices)` records long-lived owners only.
-- `activateAutoReconnectTargets(devices, source)` immediately opens or reuses a
-  pending direct connection for every target. `source` is `autoReconnect` or
-  `manualReconnect`; manual activation promotes the same pending session rather
-  than opening a duplicate connection. On iOS it first resolves a matching
-  stable UUID or unique exact endpoint name, then either enters the Gate or
-  attaches the current pending admission without issuing a duplicate `connect`.
-  It returns one acknowledgement per target: `resolved` means native owns a stable UUID/address,
-  `identityPending` means iOS owns an exact config/name identity awaiting a
-  CoreBluetooth UUID, and `rejected` means no native reconnect owner exists.
-  Callers must not treat desired targets as active until an acknowledgement is
-  accepted; missing, duplicated, or unknown acknowledgement states fail closed.
+- `activateAutoReconnectTargets(devices, source, mode)` immediately opens,
+  reuses, or reconciles a pending direct connection for every target. `source`
+  is `autoReconnect` or `manualReconnect`; `mode` is `initial`, `reconcile`, or
+  `promotion`. `initial` may create a persisted owner, `reconcile` must compare
+  the requested endpoint/session with the realtime native owner, and
+  `promotion` uses the manual source semantics for an existing pending owner
+  instead of opening a duplicate connection. On iOS activation first resolves a
+  matching stable UUID or unique exact endpoint name, then either enters the
+  Gate or attaches the current pending admission without issuing a duplicate
+  `connect`. It returns one acknowledgement per target: `resolved` means native
+  owns a stable UUID/address, `identityPending` means iOS owns an exact
+  config/name identity awaiting a CoreBluetooth UUID, and `rejected` means no
+  native reconnect owner exists. Every acknowledgement also carries
+  `ownerDisposition`: `created`, `reused`, `repaired`, `deferred`, or
+  `rejected`. Callers must not treat desired targets as active until both the
+  compatibility state and owner disposition are accepted; missing, duplicated,
+  or unknown acknowledgement states/dispositions fail closed.
 - `notifyAutoReconnectTargetVisible(uuid, name)` is a scan hint, not a second
   connection owner. Android returns `true` only when it takes over that exact
   target's pre-physical passive GATT or pending retry and queues one serialized
@@ -395,6 +401,13 @@ the Dart recovery activation carrying the final `sessionGeneration`; ordinary
 `arm` calls cannot consume this barrier. Manual promotion also classifies the
 native owner first. A stale `passiveGatt` is repaired or dropped instead of
 being reported as reusable, while a real Gate/business owner is never closed.
+Repeated `reconcile` activation follows the same exact endpoint/session check:
+healthy task/GATT/Gate owners return `reused`, missing runtime tasks with a
+valid persisted authorization recreate a single pending GATT and return `repaired`, and
+orphan Supervisor/GATT state is first invalidated through Manager/Gate before
+the replacement returns `repaired`. Unbound targets, explicit disconnects, OTA
+owners, persisted security exhaustion, disabled configs, Bluetooth-off barriers,
+and stale/lower sessions never resurrect a closed owner.
 
 ## iOS Strategy
 
@@ -499,8 +512,11 @@ hard cancel reachability without linear memory growth.
 
 1. Enable `autoReconnect` on the desired `BleConfig`.
 2. On cold start, Bluetooth recovery, or reconnect entry, call
-   `activateAutoReconnectTargets` once with all bound endpoints. Use
-   `manualReconnect` only for a user click; otherwise use `autoReconnect`.
+   `activateAutoReconnectTargets` with all bound endpoints. Use `mode=initial`
+   for the first batch, `mode=reconcile` when reusing a recovery batch whose
+   business endpoint is not connected, and `mode=promotion` only for a user
+   click. Use `manualReconnect` only for a user click; otherwise use
+   `autoReconnect`.
    Keep desired, activation-in-flight, and native-accepted targets separate so
    a rejected or lost acknowledgement cannot leave a phantom active batch.
    While Bluetooth is unavailable, system-disconnect callbacks may update

@@ -174,7 +174,7 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `stopScan` | `Future<void> stopScan()` | 显式停止扫描。 |
 | `connectDevice` | `Future<void> connectDevice(String belongConfig, String uuid, String name, {String? sn, bool? afterUpgrade, bool directConnect = false})` | 发起连接。`belongConfig` 必须命中 `initConfigs` 注册过的配置名；`name` 在 iOS 端定位，`sn` 仅 Android 用；`afterUpgrade=true` 时走 OTA 后的特殊重连路径；`directConnect=true` 表示调用方明确接受本地/系统缓存直连，不再要求当前扫描窗口可见；默认 `false` 仍保持 scan-first。 |
 | `armAutoReconnectTargets` | `Future<void> armAutoReconnectTargets(List<BleDevice> devices)` | 只登记长期自动回连 owner，不立即打开 GATT/CoreBluetooth connect。保留给业务成功后的持久化与兼容调用。 |
-| `activateAutoReconnectTargets` | `Future<List<BleReconnectActivationResult>> activateAutoReconnectTargets(List<BleDevice> devices, {BleConnectSource source = BleConnectSource.autoReconnect})` | 对全部目标立即建立/复用原生 pending 直连并逐目标返回接管结果；`resolved` 表示已有稳定身份，`identityPending` 表示 iOS 已按配置与完整名称持有待解析 owner，`rejected` 表示原生没有接管。`manualReconnect` 会提升同一 pending session，不创建重复连接。 |
+| `activateAutoReconnectTargets` | `Future<List<BleReconnectActivationResult>> activateAutoReconnectTargets(List<BleDevice> devices, {BleConnectSource source = BleConnectSource.autoReconnect, BleReconnectActivationMode mode = BleReconnectActivationMode.initial})` | 对全部目标立即建立/复用/对账原生 pending 直连并逐目标返回接管结果；`resolved` 表示已有稳定身份，`identityPending` 表示 iOS 已按配置与完整名称持有待解析 owner，`rejected` 表示原生没有接管。`ownerDisposition` 进一步区分 `created/reused/repaired/deferred/rejected`，上层复用 batch 时必须用 `reconcile` 重新确认实时 owner，不能把历史 ACK 等同于当前 native owner。`promotion` 使用手动提升语义，不创建重复连接。 |
 | `notifyAutoReconnectTargetVisible` | `Future<bool> notifyAutoReconnectTargetVisible({required String uuid, String name = ''})` | 上层并行扫描重新看到目标时提示原生。Android 接管该 UUID 尚未物理连接的 exact passive GATT 或其 pending retry，并在全局单槽位中执行一次 `autoConnect=false` 直连；随后仍保留长期 passive owner。iOS 保持普通 pending connect owner，固定返回 `false`。 |
 | `disconnectDevice` | `Future<void> disconnectDevice(String uuid, String name, {bool removeBond = false})` | 主动断连。`removeBond=true`（仅 Android）会一并移除系统配对。 |
 | `devicePreConnected` | `Future<void> devicePreConnected(String uuid)` | G1/R1 兼容的“预连接”通知；G2 禁止使用该 UUID-only 接口。 |
@@ -485,7 +485,7 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 
 本次回连契约：
 
-1. `armAutoReconnectTargets` 只登记 owner；`activateAutoReconnectTargets` 立即对**全部目标**发起/复用 pending 直连，不等待扫描。Android 常态使用 `connectGatt(autoConnect=true)`；辅助扫描命中未完成 target 时，才接管 exact pre-physical GATT 并在全局单槽位中执行一次 `connectGatt(autoConnect=false)` 直连。iOS 一律把可 retrieve/cache 命中的 `CBPeripheral` 交给带 auto-reconnect option 的 `centralManager.connect`。Android 仅对尚未收到物理 callback 的 exact GATT 使用 `connectTimeout`（至少1秒）deadline 回收 zombie handle；收到 callback 后立即取消，Gate 排队不计入该 deadline。
+1. `armAutoReconnectTargets` 只登记 owner；`activateAutoReconnectTargets` 立即对**全部目标**发起/复用/对账 pending 直连，不等待扫描。Android 常态使用 `connectGatt(autoConnect=true)`；辅助扫描命中未完成 target 时，才接管 exact pre-physical GATT 并在全局单槽位中执行一次 `connectGatt(autoConnect=false)` 直连。上层复用 recovery batch 时使用 `mode=reconcile`，Android 必须按 exact endpoint/session 检查 task、GATT 和 Gate：健康 owner 返回 `reused`，缺失 runtime owner但持久授权仍有效时创建唯一 replacement 并返回 `repaired`，orphan GATT 先精确撤销再返回 `repaired`；解绑、主动断开、OTA、安全恢复耗尽、配置关闭和旧 session 都按 `rejected/deferred` fail closed。iOS 一律把可 retrieve/cache 命中的 `CBPeripheral` 交给带 auto-reconnect option 的 `centralManager.connect`，inactive 时只返回 `deferred` 或 `identityPending`。Android 仅对尚未收到物理 callback 的 exact GATT 使用 `connectTimeout`（至少1秒）deadline 回收 zombie handle；收到 callback 后立即取消，Gate 排队不计入该 deadline。
 2. 物理连接可以并行等待，但真实连接 callback 到达后必须进入一个进程级 Gate。automatic 按 callback FIFO；等待中的 manual 优先于 automatic，但不抢占 active owner。Gate 独占 service discovery、characteristic、CCCD/notify 与业务鉴权，直到 G2 exact `commitBusinessConnection`、G1/R1 `deviceConnected` 或终态 teardown 确认才释放。
 3. 自动回连在物理 callback 前不发送用户可见 `connecting`。第一条回连状态从 `contactDevice` 开始，并携带 `source` 与 `generation`。手动点击若已有 pending session，只把 source/队列优先级提升为 `manualReconnect`。
 4. service/char/timeout 等非系统终态必须先完成 GATT/peripheral teardown，再释放 Gate；普通 CoreBluetooth 终态也必须先移除旧 active request，之后才能调度下一代，避免调度被旧 owner 永久 defer。iOS 使用 exact cancellation token + 2s watchdog；超时债务按 endpoint 用饱和 counter 常数内存保存，迟到 callback 不能误杀新 generation。Android 在业务 connected 后保留 exact `(sessionId, GATT)` metadata，稍后的系统断连仍会清理并重建 passive GATT，旧 GATT 不能命中新 attempt。
@@ -586,7 +586,7 @@ App 启动
 
 已绑定设备冷启动 / 蓝牙恢复 / 手动重连
   │
-  ├─ activateAutoReconnectTargets(allDevices, source: autoReconnect/manualReconnect)
+  ├─ activateAutoReconnectTargets(allDevices, source: autoReconnect/manualReconnect, mode: initial/reconcile/promotion)
   ├─ 原生同时建立/复用全部 pending 直连；上层可并行扫描最多 20s，但不等待扫描
   ├─ 最先收到物理 callback 的 endpoint 获得全局 Gate，其余 callback 排队
   ├─ ◀ contactDevice(source, generation) → service/chars/CCCD → connectFinish

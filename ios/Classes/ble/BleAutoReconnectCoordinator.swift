@@ -420,6 +420,7 @@ extension BleManager {
     func activateAutoReconnectTargets(
         _ targets: [BleReconnectTarget],
         source: BleConnectSource = .autoReconnect,
+        mode: BleReconnectActivationMode = .initial,
         sessionGeneration: Int64 = 0
     ) -> [BleReconnectActivationResult] {
         // 1、逐目标校验配置和身份，保持一次 activation 的目标快照稳定。
@@ -433,11 +434,40 @@ extension BleManager {
                     state: .rejected,
                     reason: "invalidConfig",
                     source: source,
+                    mode: mode,
+                    ownerDisposition: .rejected,
                     sessionGeneration: sessionGeneration
                 )
             }
             let trimmedUuid = target.uuid.trimmingCharacters(in: .whitespacesAndNewlines)
             let trimmedName = target.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if mode == .unknown {
+                loggerE(msg: "autoReconnect activation rejected: config=\(target.belongConfig), reason=invalidMode")
+                return BleReconnectActivationResult(
+                    target: target,
+                    state: .rejected,
+                    reason: "invalidMode",
+                    source: source,
+                    mode: mode,
+                    ownerDisposition: .rejected,
+                    sessionGeneration: sessionGeneration
+                )
+            }
+            // Reconcile 只能修复仍由持久化 owner 授权的端点。主动断开、解绑或安全
+            // 恢复耗尽删除记录后，旧 Dart batch 不得重新 arm CoreBluetooth owner。
+            if mode == .reconcile,
+               reconnectStore.target(uuid: trimmedUuid, name: trimmedName) == nil {
+                loggerD(msg: "autoReconnect reconcile rejected: config=\(target.belongConfig), uuid=\(trimmedUuid), reason=authorizationRevoked")
+                return BleReconnectActivationResult(
+                    target: target,
+                    state: .rejected,
+                    reason: "authorizationRevoked",
+                    source: source,
+                    mode: mode,
+                    ownerDisposition: .rejected,
+                    sessionGeneration: sessionGeneration
+                )
+            }
             // 1.2、一次性自动恢复已经结束后不再后台重建 owner。只有下一次手动
             // 点击可以开始新 attempt；这里返回 rejected 只结束当前 batch，不触发 UI。
             let manualTakesOverStoppedRecovery =
@@ -465,6 +495,8 @@ extension BleManager {
                     state: .rejected,
                     reason: rejectionReason,
                     source: source,
+                    mode: mode,
+                    ownerDisposition: .rejected,
                     sessionGeneration: sessionGeneration
                 )
             }
@@ -504,6 +536,8 @@ extension BleManager {
                         state: .rejected,
                         reason: "nativeArmRejectedAfterSystemConnected",
                         source: source,
+                        mode: mode,
+                        ownerDisposition: .rejected,
                         sessionGeneration: sessionGeneration
                     )
                 }
@@ -539,6 +573,8 @@ extension BleManager {
                     state: .resolved,
                     reason: "systemConnectedPeripheralClaimed",
                     source: source,
+                    mode: mode,
+                    ownerDisposition: mode == .reconcile ? .repaired : .created,
                     sessionGeneration: task.sessionGeneration,
                     resolvedUuid: resolvedUuid,
                     resolutionSource: resolutionSource
@@ -552,6 +588,8 @@ extension BleManager {
                         state: .rejected,
                         reason: "emptyIdentity",
                         source: source,
+                        mode: mode,
+                        ownerDisposition: .rejected,
                         sessionGeneration: sessionGeneration
                     )
                 }
@@ -585,10 +623,14 @@ extension BleManager {
                     state: .identityPending,
                     reason: pendingReason,
                     source: source,
+                    mode: mode,
+                    ownerDisposition: .deferred,
                     sessionGeneration: sessionGeneration
                 )
             }
             // 2、稳定 UUID 目标先 arm 长期 owner，再进入统一 activation。
+            let previousTask = reconnectTasks[reconnectKey(uuid: target.uuid)]
+            let hadTask = previousTask != nil
             guard var task = armReconnectTarget(
                 target,
                 source: source,
@@ -599,6 +641,8 @@ extension BleManager {
                     state: .rejected,
                     reason: "nativeArmRejected",
                     source: source,
+                    mode: mode,
+                    ownerDisposition: .rejected,
                     sessionGeneration: sessionGeneration
                 )
             }
@@ -639,16 +683,30 @@ extension BleManager {
                     state: .resolved,
                     reason: "freshPairingRecoveryStarted",
                     source: source,
+                    mode: mode,
+                    ownerDisposition: .created,
                     sessionGeneration: freshTask.sessionGeneration
                 )
             }
             // 3、复用已有 pending owner，或创建同一 Gate 管理的新 attempt。
             let deferredByAppInactivity = activateArmedReconnectTask(task, source: source)
+            let ownerDisposition: BleReconnectOwnerDisposition
+            if deferredByAppInactivity {
+                ownerDisposition = .deferred
+            } else if !hadTask {
+                ownerDisposition = mode == .reconcile ? .repaired : .created
+            } else if task.sessionGeneration > (previousTask?.sessionGeneration ?? 0) {
+                ownerDisposition = .repaired
+            } else {
+                ownerDisposition = .reused
+            }
             return BleReconnectActivationResult(
                 target: target,
                 state: .resolved,
                 reason: deferredByAppInactivity ? "appInactiveDeferred" : "",
                 source: source,
+                mode: mode,
+                ownerDisposition: ownerDisposition,
                 sessionGeneration: task.sessionGeneration
             )
         }

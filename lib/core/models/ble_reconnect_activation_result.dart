@@ -1,5 +1,43 @@
 import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
 
+/// Native activation 的调用语义。
+///
+/// `initial` 用于冷启动/蓝牙恢复的首次提交，`reconcile` 用于上层复用
+/// recovery batch 时重新确认 native owner，`promotion` 用于手动点击提升
+/// 已存在的 pending owner。未知 native/host 值必须 fail closed。
+enum BleReconnectActivationMode {
+  initial,
+  reconcile,
+  promotion,
+  unknown;
+
+  static BleReconnectActivationMode fromNative(Object? value) {
+    return BleReconnectActivationMode.values.firstWhere(
+      (mode) => mode.name == value,
+      orElse: () => BleReconnectActivationMode.unknown,
+    );
+  }
+}
+
+/// Native owner 对账处置结果。
+///
+/// 上层必须读这个字段确认 native 当前是否真的持有 owner；旧的 `state`
+/// 只保留稳定 UUID / identity pending / rejected 的兼容状态。
+enum BleReconnectOwnerDisposition {
+  created,
+  reused,
+  repaired,
+  deferred,
+  rejected;
+
+  static BleReconnectOwnerDisposition fromNative(Object? value) {
+    return BleReconnectOwnerDisposition.values.firstWhere(
+      (disposition) => disposition.name == value,
+      orElse: () => BleReconnectOwnerDisposition.rejected,
+    );
+  }
+}
+
 /// Native 接受自动回连目标后的 owner 状态。
 ///
 /// `resolved` 表示目标已有稳定平台身份并已交给长期回连；`identityPending`
@@ -28,6 +66,8 @@ class BleReconnectActivationResult {
     required this.state,
     required this.reason,
     this.source = BleConnectSource.unknown,
+    this.mode = BleReconnectActivationMode.initial,
+    this.ownerDisposition = BleReconnectOwnerDisposition.rejected,
     this.sessionGeneration = 0,
     this.resolvedUuid = '',
     this.resolutionSource = '',
@@ -39,6 +79,8 @@ class BleReconnectActivationResult {
   final BleReconnectActivationState state;
   final String reason;
   final BleConnectSource source;
+  final BleReconnectActivationMode mode;
+  final BleReconnectOwnerDisposition ownerDisposition;
 
   /// even_connect recovery batch 的逻辑代次；不得与 native Gate attempt 混用。
   final int sessionGeneration;
@@ -52,8 +94,11 @@ class BleReconnectActivationResult {
   /// 平台身份的解析来源，例如 `systemConnected` 或 `cache`。
   final String resolutionSource;
 
-  /// 除 rejected 外都表示 native 已保留当前连接 owner。
-  bool get isAccepted => state != BleReconnectActivationState.rejected;
+  /// 只有兼容 state 与实时 owner disposition 都接受时才算 native 已持有 owner。
+  bool get isAccepted =>
+      state != BleReconnectActivationState.rejected &&
+      mode != BleReconnectActivationMode.unknown &&
+      ownerDisposition != BleReconnectOwnerDisposition.rejected;
 
   /// 宽松解析 MethodChannel map，同时对缺失/未来状态采取 fail-closed。
   factory BleReconnectActivationResult.fromNative(Object? value) {
@@ -67,6 +112,10 @@ class BleReconnectActivationResult {
       source: BleConnectSource.values.firstWhere(
         (source) => source.name == map['source'],
         orElse: () => BleConnectSource.unknown,
+      ),
+      mode: BleReconnectActivationMode.fromNative(map['mode']),
+      ownerDisposition: BleReconnectOwnerDisposition.fromNative(
+        map['ownerDisposition'],
       ),
       sessionGeneration: switch (map['sessionGeneration']) {
         final int value => value,

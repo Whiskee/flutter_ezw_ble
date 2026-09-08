@@ -584,12 +584,31 @@ enum BleReconnectActivationState: String {
     case rejected
 }
 
+/// MethodChannel activation 的语义模式；未知值在入口处逐目标 rejected。
+enum BleReconnectActivationMode: String {
+    case initial
+    case reconcile
+    case promotion
+    case unknown
+}
+
+/// Native owner 的实时对账处置，供 Dart 区分历史 ACK 与当前 owner。
+enum BleReconnectOwnerDisposition: String {
+    case created
+    case reused
+    case repaired
+    case deferred
+    case rejected
+}
+
 /// MethodChannel 对单个目标的同步回执；上层据此区分真 owner 与静默丢弃。
 struct BleReconnectActivationResult {
     let target: BleReconnectTarget
     let state: BleReconnectActivationState
     let reason: String
     let source: BleConnectSource
+    let mode: BleReconnectActivationMode
+    let ownerDisposition: BleReconnectOwnerDisposition
     let sessionGeneration: Int64
     let resolvedUuid: String
     let resolutionSource: String
@@ -599,6 +618,8 @@ struct BleReconnectActivationResult {
         state: BleReconnectActivationState,
         reason: String,
         source: BleConnectSource,
+        mode: BleReconnectActivationMode = .initial,
+        ownerDisposition: BleReconnectOwnerDisposition,
         sessionGeneration: Int64,
         resolvedUuid: String = "",
         resolutionSource: String = ""
@@ -607,6 +628,8 @@ struct BleReconnectActivationResult {
         self.state = state
         self.reason = reason
         self.source = source
+        self.mode = mode
+        self.ownerDisposition = ownerDisposition
         self.sessionGeneration = sessionGeneration
         self.resolvedUuid = resolvedUuid
         self.resolutionSource = resolutionSource
@@ -620,6 +643,8 @@ struct BleReconnectActivationResult {
             "state": state.rawValue,
             "reason": reason,
             "source": source.rawValue,
+            "mode": mode.rawValue,
+            "ownerDisposition": ownerDisposition.rawValue,
             "sessionGeneration": sessionGeneration,
             "resolvedUuid": resolvedUuid,
             "resolutionSource": resolutionSource

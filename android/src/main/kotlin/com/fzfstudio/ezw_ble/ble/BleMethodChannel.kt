@@ -201,9 +201,10 @@ enum class BleMC {
                     ?.mapNotNull { (it as? Map<*, *>)?.toReconnectSeed() }
                     ?: emptyList()
                 val source = BleConnectSource.fromFlutterValue(jsonMap?.get("source") as? String)
+                val mode = BleReconnectActivationMode.fromFlutterValue(jsonMap?.get("mode") as? String)
                 val sessionGeneration = (jsonMap?.get("sessionGeneration") as? Number)?.toLong() ?: 0L
                 return result.success(
-                    BleManager.instance.activateAutoReconnectTargets(targets, source, sessionGeneration)
+                    BleManager.instance.activateAutoReconnectTargets(targets, source, mode, sessionGeneration)
                         .map { it.toFlutterMap() },
                 )
             }

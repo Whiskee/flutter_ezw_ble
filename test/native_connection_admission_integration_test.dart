@@ -51,7 +51,7 @@ void main() {
     expect(
         androidManager,
         contains(
-            'autoReconnectSupervisor.activate(seedDevice, source, sessionGeneration)'));
+            'autoReconnectSupervisor.activate(seedDevice, effectiveSource, mode, sessionGeneration)'));
     expect(
         androidManager,
         contains(
@@ -96,6 +96,10 @@ void main() {
         'invalidatePassiveGattForSessionRebind(device.uuid, exactGatt)',
       ),
     );
+    expect(androidSupervisor,
+        contains('mode == BleReconnectActivationMode.RECONCILE'));
+    expect(androidSupervisor,
+        contains('BleReconnectOwnerDisposition.REPAIRED'));
     expect(
       androidSupervisor,
       contains(
@@ -106,7 +110,7 @@ void main() {
     expect(androidManager, contains('"sessionNotInstalled"'));
     expect(
       androidManager,
-      contains('sessionGeneration = installedSessionGeneration'),
+      contains('sessionGeneration = activation.sessionGeneration'),
     );
 
     // iOS 同样先登记 cancellation barrier，再让 replacement admission
@@ -125,6 +129,29 @@ void main() {
       iosReconnect,
       contains('beginReconnectAttempt(uuid: task.uuid)'),
     );
+  });
+
+  test('reconcile requires durable authorization and repairs exact orphan GATT',
+      () {
+    final androidManager = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleManager.kt',
+    ).readAsStringSync();
+    final androidModels = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleReconnectModels.kt',
+    ).readAsStringSync();
+    final iosReconnect =
+        File('ios/Classes/ble/BleAutoReconnectCoordinator.swift')
+            .readAsStringSync();
+
+    expect(androidManager, contains('hasPersistedAuthorization'));
+    expect(androidManager, contains('reason = "authorizationRevoked"'));
+    expect(androidManager, contains('reason = "otaInProgress"'));
+    expect(androidManager, contains('repairOrphanManagerGattForReconcile'));
+    expect(androidManager, contains('device.myGatt !== expectedGatt'));
+    expect(androidManager, contains('autoReconnectSupervisor.cancel('));
+    expect(androidModels, contains('val hasPassiveGatt: Boolean'));
+    expect(iosReconnect, contains('mode == .reconcile'));
+    expect(iosReconnect, contains('reason: "authorizationRevoked"'));
   });
 
   test('iOS name-only activation owns identity before normal MAC filtering',

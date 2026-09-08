@@ -786,6 +786,7 @@ class BleManager private constructor() {
     internal fun activateAutoReconnectTargets(
         targets: List<BleReconnectSeed>,
         source: BleConnectSource,
+        mode: BleReconnectActivationMode = BleReconnectActivationMode.INITIAL,
         sessionGeneration: Long = 0L,
     ): List<BleReconnectActivationResult> {
         if (targets.isEmpty()) {
@@ -804,8 +805,88 @@ class BleManager private constructor() {
                     state = BleReconnectActivationState.REJECTED,
                     reason = if (target.uuid.isBlank()) "emptyIdentity" else "invalidConfig",
                     source = source,
+                    mode = mode,
+                    ownerDisposition = BleReconnectOwnerDisposition.REJECTED,
                     sessionGeneration = sessionGeneration,
                 )
+            }
+            if (mode == BleReconnectActivationMode.UNKNOWN) {
+                sendLog(
+                    BleLoggerTag.e,
+                    "Auto reconnect: ${target.uuid}, activation ignored, invalid mode",
+                )
+                return@map BleReconnectActivationResult(
+                    target = target,
+                    state = BleReconnectActivationState.REJECTED,
+                    reason = "invalidMode",
+                    source = source,
+                    mode = mode,
+                    ownerDisposition = BleReconnectOwnerDisposition.REJECTED,
+                    sessionGeneration = sessionGeneration,
+                )
+            }
+            // Reconcile 只能修复仍由持久化 owner 授权的 endpoint。用户主动断开、
+            // 解绑或安全恢复耗尽都会先删除该记录；旧 Dart batch 不得借 reconcile
+            // 把已经撤销的目标重新写回并复活连接。
+            val hasPersistedAuthorization = reconnectStore.targets(weakContext?.get()).any {
+                it.belongConfig == target.belongConfig &&
+                    it.uuid.equals(target.uuid, ignoreCase = true)
+            }
+            if (mode == BleReconnectActivationMode.RECONCILE && !hasPersistedAuthorization) {
+                sendLog(
+                    BleLoggerTag.d,
+                    "Auto reconnect: ${target.uuid}, reconcile rejected, persisted authorization missing",
+                )
+                return@map BleReconnectActivationResult(
+                    target = target,
+                    state = BleReconnectActivationState.REJECTED,
+                    reason = "authorizationRevoked",
+                    source = source,
+                    mode = mode,
+                    ownerDisposition = BleReconnectOwnerDisposition.REJECTED,
+                    sessionGeneration = sessionGeneration,
+                )
+            }
+            // OTA 独占 endpoint transport；即使历史 owner 仍持久化，也不能由普通
+            // autoReconnect reconcile 在升级窗口内创建或复用 GATT。
+            if (upgradeDevices.any { it.equals(target.uuid, ignoreCase = true) }) {
+                sendLog(
+                    BleLoggerTag.d,
+                    "Auto reconnect: ${target.uuid}, activation rejected, OTA transport active",
+                )
+                return@map BleReconnectActivationResult(
+                    target = target,
+                    state = BleReconnectActivationState.REJECTED,
+                    reason = "otaInProgress",
+                    source = source,
+                    mode = mode,
+                    ownerDisposition = BleReconnectOwnerDisposition.REJECTED,
+                    sessionGeneration = sessionGeneration,
+                )
+            }
+            if (mode == BleReconnectActivationMode.RECONCILE) {
+                val owner = autoReconnectSupervisor.ownerSnapshot(target.uuid)
+                val runtimeGatt = findConnectedDevice(target.uuid)?.myGatt
+                if (runtimeGatt != null && owner?.hasPassiveGatt != true) {
+                    // Manager/Gate 仍持有 GATT、Supervisor 却没有同一物理 owner 时，
+                    // 该句柄已经无法被长期 task 正确调度。先精确回收 endpoint runtime，
+                    // 再让 activate() 从持久授权重建唯一 replacement。
+                    if (!repairOrphanManagerGattForReconcile(target.uuid, runtimeGatt)) {
+                        return@map BleReconnectActivationResult(
+                            target = target,
+                            state = BleReconnectActivationState.REJECTED,
+                            reason = "orphanOwnerChanged",
+                            source = source,
+                            mode = mode,
+                            ownerDisposition = BleReconnectOwnerDisposition.REJECTED,
+                            sessionGeneration = sessionGeneration,
+                        )
+                    }
+                    autoReconnectSupervisor.cancel(
+                        target.uuid,
+                        reason = "reconcile orphan manager GATT",
+                    )
+                }
             }
             val seedDevice = BleDevice(
                 belongConfig = config,
@@ -815,22 +896,73 @@ class BleManager private constructor() {
                 rssi = target.rssi,
                 connectState = BleConnectState.NONE,
             )
-            val installedSessionGeneration =
-                autoReconnectSupervisor.activate(seedDevice, source, sessionGeneration)
+            val effectiveSource = if (mode == BleReconnectActivationMode.PROMOTION) {
+                BleConnectSource.MANUAL_RECONNECT
+            } else {
+                source
+            }
+            val activation =
+                autoReconnectSupervisor.activate(seedDevice, effectiveSource, mode, sessionGeneration)
             val requestedSessionInstalled =
-                sessionGeneration <= 0L || installedSessionGeneration == sessionGeneration
+                sessionGeneration <= 0L || activation.sessionGeneration == sessionGeneration
+            val accepted =
+                requestedSessionInstalled &&
+                    activation.ownerDisposition != BleReconnectOwnerDisposition.REJECTED
             BleReconnectActivationResult(
                 target = target,
-                state = if (requestedSessionInstalled) {
+                state = if (accepted) {
                     BleReconnectActivationState.RESOLVED
                 } else {
                     BleReconnectActivationState.REJECTED
                 },
-                reason = if (requestedSessionInstalled) "" else "sessionNotInstalled",
-                source = source,
-                sessionGeneration = installedSessionGeneration,
+                reason = if (requestedSessionInstalled) activation.reason else "sessionNotInstalled",
+                source = effectiveSource,
+                mode = mode,
+                ownerDisposition = if (accepted) {
+                    activation.ownerDisposition
+                } else {
+                    BleReconnectOwnerDisposition.REJECTED
+                },
+                sessionGeneration = activation.sessionGeneration,
             )
         }
+    }
+
+    /**
+     * 精确回收“Manager 有 GATT、Supervisor 无 GATT”的单 endpoint orphan。
+     *
+     * 业务已连接的 exact GATT 不允许被 reconcile 打断；其余 runtime 先推进 Gate
+     * attempt 高水位并关闭 exact handle，迟到 callback 因而不能污染 replacement。
+     */
+    @Synchronized
+    private fun repairOrphanManagerGattForReconcile(
+        uuid: String,
+        expectedGatt: BluetoothGatt,
+    ): Boolean {
+        val key = reconnectKey(uuid)
+        val device = findConnectedDevice(uuid) ?: return false
+        if (device.myGatt !== expectedGatt) {
+            return false
+        }
+        val businessSession = businessConnectedGattSessions[key]
+        if (businessSession?.gatt === expectedGatt && device.connectState.isConnected) {
+            sendLog(
+                BleLoggerTag.d,
+                "Auto reconnect: $uuid, reconcile preserved business-connected GATT",
+            )
+            return false
+        }
+        currentAdmissions.remove(key)?.let { admittedGattSessions.remove(it.sessionId) }
+        val next = invalidateConnectionAttempts(setOf(uuid))
+        businessConnectionLeases.remove(key)
+        sendCmdQueues.remove(key)
+        device.releaseAndClear()
+        next?.let { startGrantedGattPipeline(it) }
+        sendLog(
+            BleLoggerTag.e,
+            "Auto reconnect: $uuid, reconcile repaired orphan manager GATT",
+        )
+        return true
     }
 
     /** 将辅助扫描的目标可见信号交给 exact native autoReconnect owner。 */

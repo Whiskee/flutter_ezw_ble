@@ -143,6 +143,7 @@ class MockFlutterEzwBlePlatform
   Future<List<BleReconnectActivationResult>> activateAutoReconnectTargets(
     List<BleDevice> devices, {
     BleConnectSource source = BleConnectSource.autoReconnect,
+    BleReconnectActivationMode mode = BleReconnectActivationMode.initial,
     int sessionGeneration = 0,
   }) {
     throw UnimplementedError();

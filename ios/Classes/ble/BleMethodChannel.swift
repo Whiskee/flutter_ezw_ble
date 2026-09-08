@@ -196,10 +196,12 @@ enum BleMC: String {
                 )
             }
             let source = BleConnectSource(rawValue: data["source"] as? String ?? "") ?? .unknown
+            let mode = BleReconnectActivationMode(rawValue: data["mode"] as? String ?? "") ?? .unknown
             let sessionGeneration = (data["sessionGeneration"] as? NSNumber)?.int64Value ?? 0
             let acknowledgements = BleManager.shared.activateAutoReconnectTargets(
                 targets,
                 source: source,
+                mode: mode,
                 sessionGeneration: sessionGeneration
             )
             result(acknowledgements.map(\.raw))

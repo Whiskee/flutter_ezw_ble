@@ -193,12 +193,14 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
   Future<List<BleReconnectActivationResult>> activateAutoReconnectTargets(
     List<BleDevice> devices, {
     BleConnectSource source = BleConnectSource.autoReconnect,
+    BleReconnectActivationMode mode = BleReconnectActivationMode.initial,
     int sessionGeneration = 0,
   }) async {
     final raw = await methodChannel
         .invokeListMethod<Object?>("activateAutoReconnectTargets", {
       "devices": devices.map((device) => device.toJson()).toList(),
       "source": source.name,
+      "mode": mode.name,
       "sessionGeneration": sessionGeneration,
     });
     return (raw ?? const <Object?>[])

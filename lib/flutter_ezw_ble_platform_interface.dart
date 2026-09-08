@@ -246,10 +246,11 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   Future<List<BleReconnectActivationResult>> activateAutoReconnectTargets(
     List<BleDevice> devices, {
     BleConnectSource source = BleConnectSource.autoReconnect,
+    BleReconnectActivationMode mode = BleReconnectActivationMode.initial,
     int sessionGeneration = 0,
   }) {
     throw UnimplementedError(
-      'activateAutoReconnectTargets(devices: $devices, source: $source, sessionGeneration: $sessionGeneration) has not been implemented.',
+      'activateAutoReconnectTargets(devices: $devices, source: $source, mode: $mode, sessionGeneration: $sessionGeneration) has not been implemented.',
     );
   }
 
