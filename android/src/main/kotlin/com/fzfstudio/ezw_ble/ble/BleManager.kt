@@ -219,6 +219,19 @@ class BleManager private constructor() {
             )
     }
 
+    /** Freeze a real native transport transition without changing connection state. */
+    @Synchronized
+    private fun recordNativePhysicalTrace(endpointId: String, event: String) {
+        if (!connectionTraceEnabled || endpointId.isBlank()) {
+            return
+        }
+        nativeConnectionTraces[reconnectKey(endpointId)]?.record(
+            stage = "physical_connection",
+            result = event,
+            physicalConnectionEvent = event,
+        )
+    }
+
     private fun updateNativeTraceRssi(endpointId: String, rssi: Int) {
         if (connectionTraceEnabled) {
             nativeConnectionTraces[reconnectKey(endpointId)]?.updateRssi(rssi)
@@ -2845,7 +2858,9 @@ class BleManager private constructor() {
      * 已清掉 admission，只允许从仍存活的 reconnect owner 恢复；完全无 owner 的假连接缓存
      * 会被隔离释放，诊断不变量不能在系统 BroadcastReceiver 中升级成进程崩溃。
      */
-    private fun captureBluetoothOffTerminalSnapshots(): BluetoothOffTerminalCapture {
+    private fun captureBluetoothOffTerminalSnapshots(
+        recordPhysicalDisconnect: Boolean = false,
+    ): BluetoothOffTerminalCapture {
         val snapshots = mutableListOf<BluetoothOffTerminalSnapshot>()
         val quarantinedDevices = mutableListOf<BleDevice>()
         connectedDevices
@@ -2903,6 +2918,13 @@ class BleManager private constructor() {
                     )
                 }
             }
+        if (recordPhysicalDisconnect) {
+            // Keep the physical marker in the same exact-owner capture boundary;
+            // callers cannot clear admissions between identity capture and timing.
+            snapshots.forEach { snapshot ->
+                recordNativePhysicalTrace(snapshot.uuid, "disconnected")
+            }
+        }
         return BluetoothOffTerminalCapture(
             snapshots = snapshots,
             quarantinedDevices = quarantinedDevices,
@@ -2928,7 +2950,12 @@ class BleManager private constructor() {
         }
         if (bleState != 5) {
             // 2、先冻结终态身份，再暂停 supervisor 和关闭所有连接态物理句柄。
-            val transportOffCapture = captureBluetoothOffTerminalSnapshots()
+            // Adapter OFF is the native callback that invalidates every live GATT.
+            // Freeze the physical marker in the same exact-owner capture operation;
+            // later GATT callbacks are intentionally ignored by the existing teardown.
+            val transportOffCapture = captureBluetoothOffTerminalSnapshots(
+                recordPhysicalDisconnect = state == BluetoothAdapter.STATE_OFF,
+            )
             autoReconnectSupervisor.pauseForBluetoothOff()
             val admissionGattHandles = admittedGattSessions.values
                 .map { it.gatt }
@@ -3424,11 +3451,7 @@ class BleManager private constructor() {
                 )
             },
             recordPhysicalTrace = { uuid, event ->
-                if (connectionTraceEnabled) {
-                    nativeConnectionTraces[reconnectKey(uuid)]?.record(
-                        stage = "physical_connection", result = event, physicalConnectionEvent = event,
-                    )
-                }
+                recordNativePhysicalTrace(uuid, event)
             },
             markTraceRssiRequested = { uuid ->
                 if (connectionTraceEnabled) nativeConnectionTraces[reconnectKey(uuid)]?.markRssiRequested()
