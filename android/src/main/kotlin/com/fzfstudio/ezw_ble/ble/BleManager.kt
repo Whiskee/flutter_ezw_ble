@@ -382,8 +382,13 @@ class BleManager private constructor() {
             invalidatePendingPassiveGatt = { uuid, gatt ->
                 invalidatePendingPassiveGatt(uuid, gatt)
             },
-            invalidatePassiveGattForSessionRebind = { uuid, gatt, otaRecoveryContext ->
-                invalidatePassiveGattForSessionRebind(uuid, gatt, otaRecoveryContext)
+            invalidatePassiveGattForSessionRebind = { uuid, gatt, previousSessionGeneration, otaRecoveryContext ->
+                invalidatePassiveGattForSessionRebind(
+                    uuid,
+                    gatt,
+                    previousSessionGeneration,
+                    otaRecoveryContext,
+                )
             },
         )
     }
@@ -4876,15 +4881,30 @@ class BleManager private constructor() {
     private fun invalidatePassiveGattForSessionRebind(
         uuid: String,
         gatt: BluetoothGatt,
+        previousSessionGeneration: Long,
         otaRecoveryContext: BleG2OtaNativeContext?,
     ): Boolean {
         val key = reconnectKey(uuid)
-        val device = findConnectedDevice(uuid) ?: return false
-        if (device.myGatt !== gatt) {
+        val device = findConnectedDevice(uuid)
+        if (device != null && device.myGatt !== null && device.myGatt !== gatt) {
             return false
         }
         val admission = currentAdmissions[key]
         val businessSession = businessConnectedGattSessions[key]
+        if (device == null || device.myGatt !== gatt) {
+            if (
+                retireStaleSupervisorGattForOtaRecovery(
+                    uuid = uuid,
+                    key = key,
+                    gatt = gatt,
+                    previousSessionGeneration = previousSessionGeneration,
+                    otaRecoveryContext = otaRecoveryContext,
+                )
+            ) {
+                return true
+            }
+            return false
+        }
         if (businessSession?.gatt === gatt) {
             // 1、普通 activation 仍不得打断业务 GATT。唯一例外是 native registry 已
             // 接受的 OTA RECOVER，并且 credential 与旧业务 session/attempt 完全一致。
@@ -4965,6 +4985,65 @@ class BleManager private constructor() {
             "Admission gate: $uuid, session rebind invalidated exact owner " +
                 "attemptGeneration=${admission.generation}, " +
                 "sessionGeneration=${admission.sessionGeneration}, sessionId=${admission.sessionId}",
+        )
+        return true
+    }
+
+    /**
+     * OTA RECOVER 乱序兜底：系统断连可能已经让 Manager 清掉 live GATT/cache，但
+     * Supervisor 仍保存旧 session 的 passiveGatt。只有 registry 仍处于 RECOVERING、
+     * frozen physical pair 与 Dart 已接受的 last epoch 完全一致，且 Manager 没有另一条
+     * current/admitted/business owner 时，才允许清理这个 stale supervisor owner。
+     */
+    @Synchronized
+    private fun retireStaleSupervisorGattForOtaRecovery(
+        uuid: String,
+        key: String,
+        gatt: BluetoothGatt,
+        previousSessionGeneration: Long,
+        otaRecoveryContext: BleG2OtaNativeContext?,
+    ): Boolean {
+        val recoveryContext = otaRecoveryContext ?: return false
+        if (currentAdmissions[key] != null || businessConnectedGattSessions[key] != null) {
+            return false
+        }
+        val liveDevice = findConnectedDevice(uuid)
+        if (liveDevice?.myGatt != null) {
+            return false
+        }
+        val lastAccepted = lastEpochAcceptedAdmissions[key] ?: return false
+        if (
+            previousSessionGeneration <= 0L ||
+            previousSessionGeneration != lastAccepted.sessionGeneration
+        ) {
+            return false
+        }
+        if (!autoReconnectSupervisor.ownsPassiveGatt(uuid, gatt, previousSessionGeneration)) {
+            return false
+        }
+        val exactOtaRecoveryOwner = g2OtaTransactions.acceptsRecoveryPhysicalPair(
+            context = recoveryContext,
+            uuid = uuid,
+            sessionGeneration = lastAccepted.sessionGeneration,
+            attemptGeneration = lastAccepted.generation,
+        )
+        if (!exactOtaRecoveryOwner) {
+            return false
+        }
+
+        preConnectedDevices.remove(uuid)
+        businessConnectionLeases.remove(key)
+        sendCmdQueues.remove(key)
+        discardOtaWriteQueueForSession(uuid, reason = "OTA recovery stale supervisor rebind")
+        runCatching { gatt.disconnect() }
+        runCatching { gatt.close() }
+        sendLog(
+            BleLoggerTag.d,
+            "Admission gate: $uuid, OTA recovery retired stale supervisor owner " +
+                "transaction=${recoveryContext.transactionId}, " +
+                "otaGeneration=${recoveryContext.generation}, " +
+                "attemptGeneration=${lastAccepted.generation}, " +
+                "sessionGeneration=${lastAccepted.sessionGeneration}",
         )
         return true
     }
@@ -5104,6 +5183,7 @@ class BleManager private constructor() {
         val connectedDeviceBeforeState = connectedDevices.firstOrNull {
             it.uuid.equals(uuid, ignoreCase = true)
         }
+        val terminalGattBeforeState = connectedDeviceBeforeState?.myGatt
         // 1、业务 connected 后 Gate 已释放。若 Android 的系统断连出口没有显式带回
         // admission，必须从该 GATT 的长期业务 session/最后接受快照恢复身份；否则 Dart
         // epoch guard 会拒绝 unknown/0，首页继续保留旧 connected。
@@ -5216,9 +5296,14 @@ class BleManager private constructor() {
                     },
                     reason = "securityGateFailure",
                     forceVisibleDirectConnect = securityTargetVisible,
+                    terminalGattToDetach = terminalGattBeforeState,
                 )
             } else {
-                autoReconnectSupervisor.schedule(uuid, state)
+                autoReconnectSupervisor.schedule(
+                    uuid,
+                    state,
+                    terminalGattToDetach = terminalGattBeforeState,
+                )
             }
         }
     }

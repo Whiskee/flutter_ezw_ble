@@ -82,6 +82,7 @@ class BleManagerG2OtaTransactionTest {
                 manager,
                 endpoint,
                 oldGatt,
+                previousSessionGeneration = 1L,
                 otaRecoveryContext = null,
             )
             assertFalse(ordinaryRejected)
@@ -90,6 +91,7 @@ class BleManagerG2OtaTransactionTest {
                 manager,
                 endpoint,
                 oldGatt,
+                previousSessionGeneration = 1L,
                 otaRecoveryContext = context.copy(transactionId = "tx-stale"),
             )
             assertFalse(staleRejected)
@@ -108,14 +110,15 @@ class BleManagerG2OtaTransactionTest {
                 manager,
                 endpoint,
                 oldGatt,
+                previousSessionGeneration = 1L,
                 otaRecoveryContext = context,
             )
             assertFalse(inFlightRejected)
             assertSame(oldGatt, device.myGatt)
             currentAdmissions(manager).remove(endpoint.lowercase())
 
-            val retired = invokeSessionRebindInvalidation(manager, endpoint, oldGatt, context)
-            val replayRejected = invokeSessionRebindInvalidation(manager, endpoint, oldGatt, context)
+            val retired = invokeSessionRebindInvalidation(manager, endpoint, oldGatt, 1L, context)
+            val replayRejected = invokeSessionRebindInvalidation(manager, endpoint, oldGatt, 1L, context)
 
             assertEquals("accepted", begin["status"])
             assertEquals("accepted", recover["status"])
@@ -128,6 +131,91 @@ class BleManagerG2OtaTransactionTest {
             Mockito.verify(oldGatt, Mockito.times(1)).close()
             Mockito.verify(peerGatt, Mockito.never()).disconnect()
             Mockito.verify(peerGatt, Mockito.never()).close()
+        }
+    }
+
+    @Test
+    fun `ota recovery activation rebinds stale supervisor owner after manager gatt cache was cleared`() {
+        val manager = BleManager.instance
+        resetManager(manager)
+        val endpoint = "AA:BB:CC:DD:EE:64"
+
+        Mockito.mockStatic(Log::class.java).use {
+            configureBle(manager, g2Config())
+            setBleAvailable(manager)
+            val device = installExactBusinessReadyEndpoint(
+                manager = manager,
+                endpoint = endpoint,
+                name = "Even-Recover-R",
+                sn = "SN-MANAGER",
+                sessionGeneration = 1L,
+                attemptGeneration = 1L,
+            )
+            val oldGatt = device.myGatt!!
+            installSupervisorTask(
+                manager = manager,
+                endpoint = endpoint,
+                name = "Even-Recover-R",
+                sn = "SN-MANAGER",
+                sessionGeneration = 1L,
+                passiveGatt = oldGatt,
+            )
+            val endpoints = listOf(BleG2OtaEndpointIdentity(endpoint, "Even-Recover-R", 1L, 1L))
+            val begin = manager.beginG2OtaTransaction(
+                transactionId = "tx-stale-supervisor-rebind",
+                generation = 17L,
+                config = "g2_glasses",
+                sn = "SN-MANAGER",
+                endpoints = endpoints,
+            )
+            val instanceId = begin["instanceId"] as String
+            val recover = manager.updateG2OtaEndpoint(
+                transactionId = "tx-stale-supervisor-rebind",
+                generation = 17L,
+                instanceId = instanceId,
+                uuid = endpoint,
+                action = BleG2OtaEndpointAction.RECOVER,
+                sessionGeneration = 1L,
+                attemptGeneration = 1L,
+            )
+
+            // Reproduce the field log shape: Android already delivered the business
+            // disconnect and Manager lost the live GATT/business session, but the
+            // native supervisor still has the old session=1 passive owner.
+            device.releaseAndClear()
+            device.connectState = BleConnectState.DISCONNECT_FROM_SYS
+            currentAdmissions(manager).remove(endpoint.lowercase())
+            admittedGattSessions(manager).clear()
+            businessConnectedGattSessions(manager).clear()
+            Mockito.clearInvocations(oldGatt)
+            val wrongPreviousSessionRejected = invokeSessionRebindInvalidation(
+                manager,
+                endpoint,
+                oldGatt,
+                previousSessionGeneration = 2L,
+                otaRecoveryContext = BleG2OtaNativeContext("tx-stale-supervisor-rebind", 17L, instanceId),
+            )
+
+            val activation = manager.activateAutoReconnectTargets(
+                listOf(BleReconnectSeed("g2_glasses", endpoint, "Even-Recover-R", "SN-MANAGER", 0)),
+                BleConnectSource.MANUAL_RECONNECT,
+                sessionGeneration = 3L,
+                otaTransactionId = "tx-stale-supervisor-rebind",
+                otaGeneration = 17L,
+                otaInstanceId = instanceId,
+            ).single()
+            val owner = autoReconnectSupervisor(manager).ownerSnapshot(endpoint)
+
+            assertEquals("accepted", begin["status"])
+            assertEquals("accepted", recover["status"])
+            assertFalse(wrongPreviousSessionRejected)
+            assertEquals(BleReconnectActivationState.RESOLVED, activation.state)
+            assertEquals(BleReconnectOwnerDisposition.DEFERRED, activation.ownerDisposition)
+            assertEquals("sessionReboundDeferred", activation.reason)
+            assertEquals(3L, activation.sessionGeneration)
+            assertEquals(3L, owner?.sessionGeneration)
+            Mockito.verify(oldGatt, Mockito.times(1)).disconnect()
+            Mockito.verify(oldGatt, Mockito.times(1)).close()
         }
     }
 
@@ -493,6 +581,26 @@ class BleManagerG2OtaTransactionTest {
         return field.get(manager) as MutableMap<String, Any>
     }
 
+    @Suppress("UNCHECKED_CAST")
+    private fun lastEpochAcceptedAdmissions(manager: BleManager): MutableMap<String, BleConnectionAdmission> {
+        val field = BleManager::class.java.getDeclaredField("lastEpochAcceptedAdmissions")
+        field.isAccessible = true
+        return field.get(manager) as MutableMap<String, BleConnectionAdmission>
+    }
+
+    private fun autoReconnectSupervisor(manager: BleManager): BleAutoReconnectSupervisor {
+        val method = BleManager::class.java.getDeclaredMethod("access\$getAutoReconnectSupervisor", BleManager::class.java)
+        method.isAccessible = true
+        return method.invoke(null, manager) as BleAutoReconnectSupervisor
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun reconnectTasks(supervisor: BleAutoReconnectSupervisor): MutableMap<String, BleReconnectTask> {
+        val field = BleAutoReconnectSupervisor::class.java.getDeclaredField("reconnectTasks")
+        field.isAccessible = true
+        return field.get(supervisor) as MutableMap<String, BleReconnectTask>
+    }
+
     private fun configureBle(manager: BleManager, config: BleConfig) {
         val field = BleManager::class.java.getDeclaredField("bleConfigs")
         field.isAccessible = true
@@ -503,16 +611,18 @@ class BleManagerG2OtaTransactionTest {
         manager: BleManager,
         endpoint: String,
         gatt: BluetoothGatt,
+        previousSessionGeneration: Long,
         otaRecoveryContext: BleG2OtaNativeContext?,
     ): Boolean {
         val method = BleManager::class.java.getDeclaredMethod(
             "invalidatePassiveGattForSessionRebind",
             String::class.java,
             BluetoothGatt::class.java,
+            java.lang.Long.TYPE,
             BleG2OtaNativeContext::class.java,
         )
         method.isAccessible = true
-        return method.invoke(manager, endpoint, gatt, otaRecoveryContext) as Boolean
+        return method.invoke(manager, endpoint, gatt, previousSessionGeneration, otaRecoveryContext) as Boolean
     }
 
     private fun installExactBusinessReadyEndpoint(
@@ -567,7 +677,27 @@ class BleManagerG2OtaTransactionTest {
         currentAdmissions(manager)[endpoint.lowercase()] = admission
         admittedGattSessions(manager)[admission.sessionId] = granted
         businessConnectedGattSessions(manager)[endpoint.lowercase()] = business
+        lastEpochAcceptedAdmissions(manager)[endpoint.lowercase()] = admission
         return device
+    }
+
+    private fun installSupervisorTask(
+        manager: BleManager,
+        endpoint: String,
+        name: String,
+        sn: String,
+        sessionGeneration: Long,
+        passiveGatt: BluetoothGatt,
+    ) {
+        reconnectTasks(autoReconnectSupervisor(manager))[endpoint.lowercase()] = BleReconnectTask(
+            belongConfig = "g2_glasses",
+            uuid = endpoint,
+            name = name,
+            sn = sn,
+            passiveGatt = passiveGatt,
+            source = BleConnectSource.AUTO_RECONNECT,
+            sessionGeneration = sessionGeneration,
+        )
     }
 
     private fun constructPrivateManagerValue(className: String, vararg args: Any): Any {

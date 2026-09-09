@@ -206,6 +206,37 @@ class BleAutoReconnectSupervisorReconcileTest {
     }
 
     @Test
+    fun `ota gate rejects terminal retry after clearing stale passive owner`() {
+        val fixture = Fixture()
+        fixture.use {
+            fixture.supervisor.activate(
+                fixture.target,
+                BleConnectSource.AUTO_RECONNECT,
+                BleReconnectActivationMode.INITIAL,
+                105L,
+            )
+            val staleGatt = fixture.createdGatts.single()
+            fixture.scheduledAttempts.clear()
+            fixture.scheduledDelays.clear()
+            fixture.upgradeDevice = true
+            fixture.recoveryAccepted = false
+
+            fixture.supervisor.schedule(
+                fixture.target.uuid,
+                BleConnectState.DISCONNECT_FROM_SYS,
+                reason = "ota-terminal-disconnect",
+                terminalGattToDetach = staleGatt,
+            )
+
+            assertTrue(fixture.supervisor.ownerSnapshot(fixture.target.uuid)?.hasPassiveGatt == false)
+            assertEquals(1, fixture.createdGatts.size)
+            assertTrue(fixture.scheduledAttempts.isEmpty())
+            Mockito.verify(staleGatt).disconnect()
+            Mockito.verify(staleGatt).close()
+        }
+    }
+
+    @Test
     fun `ota detach requires exact gatt instead of uuid only ownership`() {
         val fixture = Fixture()
         fixture.use {
@@ -333,7 +364,7 @@ class BleAutoReconnectSupervisorReconcileTest {
                     invalidatedGatts += gatt
                     BlePendingOwnerDisposition.REPAIRED_STALE_OWNER
                 },
-                invalidatePassiveGattForSessionRebind = { _, gatt, context ->
+                invalidatePassiveGattForSessionRebind = { _, gatt, _, context ->
                     sessionReboundGatts += gatt
                     sessionReboundContexts += context
                     true

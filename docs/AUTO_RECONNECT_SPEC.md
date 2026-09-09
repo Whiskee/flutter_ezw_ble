@@ -414,6 +414,12 @@ scheduling a generic disconnect, and the same supervisor activation installs
 the requested higher session before creating one replacement. Missing/stale
 credentials, a mismatched physical pair, and active/parked/retired endpoints
 remain rejected.
+
+If a system terminal callback reaches Manager before the ordinary OTA gate
+check, Android must first exact-match the callback GATT against the supervisor's
+current `passiveGatt` and neutralize only that handle. The subsequent gate may
+still reject ordinary reconnect while OTA is active; rejection must leave no
+stale `passiveGatt` and must not create a generic retry.
 Repeated `reconcile` activation follows the same exact endpoint/session check:
 healthy task/GATT/Gate owners return `reused`, missing runtime tasks with a
 valid persisted authorization recreate a single pending GATT and return `repaired`, and

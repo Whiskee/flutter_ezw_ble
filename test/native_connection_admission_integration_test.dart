@@ -261,7 +261,20 @@ void main() {
         manager, contains('generation = expectedAdmission.sessionGeneration'));
     expect(
         manager, contains('attemptGeneration = expectedAdmission.generation'));
-    expect(manager, contains('autoReconnectSupervisor.schedule(uuid, state)'));
+    expect(
+      manager,
+      contains(
+        'val terminalGattBeforeState = connectedDeviceBeforeState?.myGatt',
+      ),
+    );
+    expect(
+      manager,
+      contains('terminalGattToDetach = terminalGattBeforeState'),
+    );
+    expect(
+      reconnect,
+      contains('task.passiveGatt === terminalGattToDetach'),
+    );
     expect(reconnect, contains('task.passiveGatt = null'));
     expect(
       reconnect,
