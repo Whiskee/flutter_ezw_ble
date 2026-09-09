@@ -28,12 +28,16 @@ void main() {
     expect(gate, contains('|| BleManager.didExperienceStateRestorationThisProcess'));
     expect(gate, contains('launchedForRestoration,'));
     expect(gate, contains('!hasReceivedWillTerminate,'));
-    expect(gate, contains('UIApplication.shared.applicationState == .background,'));
+    // UIScene 冷拉起时 applicationState 可能已从 .background 变成 .inactive（2026-09-09
+    // WK15 两次重启门禁未放行），补查只要求非 active。
+    expect(gate, contains('applicationState != .active,'));
+    expect(gate, isNot(contains('applicationState == .background')));
+    // 拒绝时每进程每 endpoint 记一次条件快照，沙盒日志据此指认具体条件。
+    expect(gate, contains('stateRestorationLaunchRetrieveDenialsLogged.insert(key).inserted'));
+    expect(gate, contains('state restoration launch retrieve denied uuid='));
     expect(gate, contains('centralManager.state == .poweredOn,'));
-    expect(
-      gate,
-      contains('return !stateRestorationLaunchRetrieveAttempts.contains(reconnectKey(uuid: endpointId))'),
-    );
+    expect(gate, contains('let key = reconnectKey(uuid: endpointId)'));
+    expect(gate, contains('return !stateRestorationLaunchRetrieveAttempts.contains(key)'));
     final retrieve = manager.substring(
       manager.indexOf('func retrievePeripheralForStateRestorationLaunch('),
     );

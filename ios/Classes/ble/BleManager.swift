@@ -105,6 +105,8 @@ class BleManager: NSObject {
     //  - SR 后台拉起窗口内，每个 endpoint 只允许一次 identifier 补查（每进程一次），
     //    用于补建 iOS 未随 willRestoreState 交还的当前目标腿的 pending connect。
     var stateRestorationLaunchRetrieveAttempts: Set<String> = []
+    /// 补查门禁拒绝只记一次日志（每进程每 endpoint），沙盒日志据此指认具体条件。
+    var stateRestorationLaunchRetrieveDenialsLogged: Set<String> = []
     /// Code 14 新鲜广播窗口按 exact session 持有扫描 lease；只有本任务启动的扫描
     /// 才能由它停止，旧窗口回调也不得移除新 owner 的 timer。
     var pairingRecoveryScanTimers: [String: (timer: Timer, ownsScan: Bool, sessionGeneration: Int64)] = [:]
@@ -1654,15 +1656,25 @@ extension BleManager {
         // 补查从未放行，左腿仍被延后到前台）。本进程发生过 willRestoreState 即是 SR 证据。
         let launchedForRestoration = FlutterEzwBlePlugin.wasLaunchedForBluetoothStateRestoration()
             || BleManager.didExperienceStateRestorationThisProcess
+        // UIScene 冷拉起：didFinishLaunching 时 applicationState 为 .background，但随后
+        // 系统可能在后台把 Scene 连上，applicationState 变成 .inactive（2026-09-09 10:51 /
+        // 10:54 WK15 两次重启：Dart 冻结时 lifecycle=inactive，门禁因要求 == .background
+        // 未放行，左腿与 R1 再次延后到前台）。补查只需要「不是 active」：active 窗口本就
+        // 允许同步 retrieve，不经此门。
+        let applicationState = UIApplication.shared.applicationState
+        let key = reconnectKey(uuid: endpointId)
         guard !allowsSynchronousCoreBluetoothLookup,
               launchedForRestoration,
               !hasReceivedWillTerminate,
-              UIApplication.shared.applicationState == .background,
+              applicationState != .active,
               centralManager.state == .poweredOn,
               UUID(uuidString: endpointId) != nil else {
+            if stateRestorationLaunchRetrieveDenialsLogged.insert(key).inserted {
+                loggerD(msg: "appLifecycle: state restoration launch retrieve denied uuid=\(endpointId), syncLookup=\(allowsSynchronousCoreBluetoothLookup), launchedForRestoration=\(launchedForRestoration), willTerminate=\(hasReceivedWillTerminate), applicationState=\(applicationState.rawValue), central=\(centralManager.state.rawValue)")
+            }
             return false
         }
-        return !stateRestorationLaunchRetrieveAttempts.contains(reconnectKey(uuid: endpointId))
+        return !stateRestorationLaunchRetrieveAttempts.contains(key)
     }
 
     /// 消费一次 SR 拉起窗口的 identifier 补查；返回 nil 表示不满足放行条件。
