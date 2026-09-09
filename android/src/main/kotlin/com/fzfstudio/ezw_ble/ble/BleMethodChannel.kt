@@ -58,6 +58,14 @@ enum class BleMC {
     DISCONNECT_FOR_OTA_REBOOT,
     /** iOS OTA 写阻塞恢复接口；Android 传输路径不消费，固定返回 unavailable。 */
     DISCONNECT_FOR_OTA_RECOVERY,
+    /** 原生登记 G2 OTA 整组事务并安装升级门禁。 */
+    BEGIN_G2_OTA_TRANSACTION,
+    /** 原生绑定、恢复或 park 一个 G2 OTA endpoint。 */
+    UPDATE_G2_OTA_ENDPOINT,
+    /** 原生原子退役整组 G2 OTA 事务。 */
+    FINISH_G2_OTA_TRANSACTION,
+    /** 查询 G2 OTA 事务账本，不产生断连或回连副作用。 */
+    QUERY_G2_OTA_TRANSACTION,
     /** 中性释放 endpoint runtime，保留持久自动回连 owner。 */
     RELEASE_DEVICE,
     /** 发送普通 GATT 指令。 */
@@ -202,9 +210,18 @@ enum class BleMC {
                     ?: emptyList()
                 val source = BleConnectSource.fromFlutterValue(jsonMap?.get("source") as? String)
                 val mode = BleReconnectActivationMode.fromFlutterValue(jsonMap?.get("mode") as? String)
-                val sessionGeneration = (jsonMap?.get("sessionGeneration") as? Number)?.toLong() ?: 0L
+                val sessionGeneration = jsonMap?.get("sessionGeneration").toStrictLongOrDefault()
+                val otaContext = jsonMap?.get("otaContext") as? Map<*, *>
                 return result.success(
-                    BleManager.instance.activateAutoReconnectTargets(targets, source, mode, sessionGeneration)
+                    BleManager.instance.activateAutoReconnectTargets(
+                        targets,
+                        source,
+                        mode,
+                        sessionGeneration,
+                        otaTransactionId = otaContext?.get("transactionId") as? String ?: "",
+                        otaGeneration = otaContext?.get("generation").toStrictLongOrDefault(),
+                        otaInstanceId = otaContext?.get("instanceId") as? String ?: "",
+                    )
                         .map { it.toFlutterMap() },
                 )
             }
@@ -253,10 +270,8 @@ enum class BleMC {
                 val jsonMap = arguments as Map<*, *>?
                 val uuid = jsonMap?.get("uuid") as? String ?: ""
                 val name = jsonMap?.get("name") as? String ?: ""
-                val expectedSessionGeneration =
-                    (jsonMap?.get("expectedSessionGeneration") as? Number)?.toLong() ?: 0L
-                val expectedAttemptGeneration =
-                    (jsonMap?.get("expectedAttemptGeneration") as? Number)?.toLong() ?: 0L
+                val expectedSessionGeneration = jsonMap?.get("expectedSessionGeneration").toStrictLongOrDefault()
+                val expectedAttemptGeneration = jsonMap?.get("expectedAttemptGeneration").toStrictLongOrDefault()
                 BleManager.instance.disconnectForOtaReboot(
                     uuid,
                     name,
@@ -268,6 +283,56 @@ enum class BleMC {
                 // Android 没有 iOS canSendWriteWithoutResponse stall，保留同名 API 让
                 // Dart/even_connect 做跨平台分发；不能在这里改变 Android OTA 恢复路径。
                 return result.success("unavailable")
+            }
+            BEGIN_G2_OTA_TRANSACTION -> {
+                val jsonMap = arguments as? Map<*, *> ?: emptyMap<Any, Any>()
+                return result.success(
+                    BleManager.instance.beginG2OtaTransaction(
+                        transactionId = jsonMap["transactionId"] as? String ?: "",
+                        generation = jsonMap["generation"].toStrictLongOrDefault(),
+                        config = jsonMap["config"] as? String ?: "",
+                        sn = jsonMap["sn"] as? String ?: "",
+                        endpoints = parseG2OtaEndpoints(jsonMap["endpoints"]),
+                    ),
+                )
+            }
+            UPDATE_G2_OTA_ENDPOINT -> {
+                val jsonMap = arguments as? Map<*, *> ?: emptyMap<Any, Any>()
+                return result.success(
+                    BleManager.instance.updateG2OtaEndpoint(
+                        transactionId = jsonMap["transactionId"] as? String ?: "",
+                        generation = jsonMap["generation"].toStrictLongOrDefault(),
+                        instanceId = jsonMap["instanceId"] as? String ?: "",
+                        uuid = jsonMap["uuid"] as? String ?: "",
+                        action = BleG2OtaEndpointAction.fromFlutterValue(jsonMap["action"] as? String),
+                        sessionGeneration = jsonMap["sessionGeneration"].toStrictLongOrDefault(Long.MIN_VALUE),
+                        attemptGeneration = jsonMap["attemptGeneration"].toStrictLongOrDefault(Long.MIN_VALUE),
+                    ),
+                )
+            }
+            FINISH_G2_OTA_TRANSACTION -> {
+                val jsonMap = arguments as? Map<*, *> ?: emptyMap<Any, Any>()
+                return result.success(
+                    BleManager.instance.finishG2OtaTransaction(
+                        transactionId = jsonMap["transactionId"] as? String ?: "",
+                        generation = jsonMap["generation"].toStrictLongOrDefault(),
+                        instanceId = jsonMap["instanceId"] as? String ?: "",
+                        reason = jsonMap["reason"] as? String ?: "",
+                        config = jsonMap["config"] as? String ?: "",
+                        sn = jsonMap["sn"] as? String ?: "",
+                        endpoints = parseG2OtaEndpoints(jsonMap["endpoints"]),
+                    ),
+                )
+            }
+            QUERY_G2_OTA_TRANSACTION -> {
+                val jsonMap = arguments as? Map<*, *> ?: emptyMap<Any, Any>()
+                return result.success(
+                    BleManager.instance.queryG2OtaTransaction(
+                        transactionId = jsonMap["transactionId"] as? String ?: "",
+                        generation = jsonMap["generation"].toStrictLongOrDefault(),
+                        instanceId = jsonMap["instanceId"] as? String ?: "",
+                    ),
+                )
             }
             RELEASE_DEVICE -> {
                 // dispose/reset 只释放 runtime；禁止复用 disconnect 的持久 owner 删除语义。
@@ -285,10 +350,9 @@ enum class BleMC {
                 val psType = jsonMap?.get("psType") as Int? ?: 0
                 val allowDuringUpgrade =
                     jsonMap?.get("allowDuringUpgrade") as? Boolean ?: false
-                val expectedSessionGeneration =
-                    (jsonMap?.get("expectedSessionGeneration") as? Number)?.toLong() ?: 0L
-                val expectedAttemptGeneration =
-                    (jsonMap?.get("expectedAttemptGeneration") as? Number)?.toLong() ?: 0L
+                val expectedSessionGeneration = jsonMap?.get("expectedSessionGeneration").toStrictLongOrDefault()
+                val expectedAttemptGeneration = jsonMap?.get("expectedAttemptGeneration").toStrictLongOrDefault()
+                val otaContext = jsonMap?.get("otaContext") as? Map<*, *>
                 BleManager.instance.sendCmd(
                     uuid,
                     data,
@@ -296,6 +360,9 @@ enum class BleMC {
                     allowDuringUpgrade,
                     expectedSessionGeneration,
                     expectedAttemptGeneration,
+                    otaTransactionId = otaContext?.get("transactionId") as? String ?: "",
+                    otaGeneration = otaContext?.get("generation").toStrictLongOrDefault(),
+                    otaInstanceId = otaContext?.get("instanceId") as? String ?: "",
                 )
             }
             SEND_CMD_NO_WAIT -> {
@@ -305,16 +372,18 @@ enum class BleMC {
                 val uuid = jsonMap?.get("uuid") as? String ?: ""
                 val data = jsonMap?.get("data") as ByteArray? ?: byteArrayOf()
                 val psType = jsonMap?.get("psType") as Int? ?: 0
-                val expectedSessionGeneration =
-                    (jsonMap?.get("expectedSessionGeneration") as? Number)?.toLong() ?: 0L
-                val expectedAttemptGeneration =
-                    (jsonMap?.get("expectedAttemptGeneration") as? Number)?.toLong() ?: 0L
+                val expectedSessionGeneration = jsonMap?.get("expectedSessionGeneration").toStrictLongOrDefault()
+                val expectedAttemptGeneration = jsonMap?.get("expectedAttemptGeneration").toStrictLongOrDefault()
+                val otaContext = jsonMap?.get("otaContext") as? Map<*, *>
                 BleManager.instance.sendCmdNoWait(
                     uuid,
                     data,
                     psType,
                     expectedSessionGeneration,
                     expectedAttemptGeneration,
+                    otaTransactionId = otaContext?.get("transactionId") as? String ?: "",
+                    otaGeneration = otaContext?.get("generation").toStrictLongOrDefault(),
+                    otaInstanceId = otaContext?.get("instanceId") as? String ?: "",
                 ) { error ->
                     if (error == null) {
                         result.success(null)
@@ -333,10 +402,8 @@ enum class BleMC {
                 // 1. 退出升级态后，后续普通连接会恢复常规清理流程。
                 val jsonMap = arguments as? Map<*, *>
                 val uuid = jsonMap?.get("uuid") as? String ?: arguments as? String ?: ""
-                val expectedSessionGeneration =
-                    (jsonMap?.get("expectedSessionGeneration") as? Number)?.toLong() ?: 0L
-                val expectedAttemptGeneration =
-                    (jsonMap?.get("expectedAttemptGeneration") as? Number)?.toLong() ?: 0L
+                val expectedSessionGeneration = jsonMap?.get("expectedSessionGeneration").toStrictLongOrDefault()
+                val expectedAttemptGeneration = jsonMap?.get("expectedAttemptGeneration").toStrictLongOrDefault()
                 BleManager.instance.quiteUpgradeState(
                     uuid,
                     expectedSessionGeneration,
@@ -385,8 +452,8 @@ enum class BleMC {
 private fun Map<*, *>.toBusinessConnectionAttempt(): BleBusinessConnectionAttempt =
     BleBusinessConnectionAttempt(
         uuid = this["uuid"] as? String ?: "",
-        sessionGeneration = (this["sessionGeneration"] as? Number)?.toLong() ?: 0L,
-        attemptGeneration = (this["attemptGeneration"] as? Number)?.toLong() ?: 0L,
+        sessionGeneration = this["sessionGeneration"].toStrictLongOrDefault(),
+        attemptGeneration = this["attemptGeneration"].toStrictLongOrDefault(),
     )
 
 /**
@@ -507,6 +574,21 @@ private fun Map<*, *>.toBlePrivateService(): BlePrivateService? {
     )
 }
 
+/** Parse the frozen G2 OTA endpoint list from MethodChannel payloads. */
+private fun parseG2OtaEndpoints(value: Any?): List<BleG2OtaEndpointIdentity> {
+    return (value as? List<*>)
+        ?.mapNotNull { item ->
+            val map = item as? Map<*, *> ?: return@mapNotNull null
+            BleG2OtaEndpointIdentity(
+                uuid = map["uuid"] as? String ?: "",
+                name = map["name"] as? String ?: "",
+                sessionGeneration = map["sessionGeneration"].toStrictLongOrDefault(Long.MIN_VALUE),
+                attemptGeneration = map["attemptGeneration"].toStrictLongOrDefault(Long.MIN_VALUE),
+            )
+        }
+        ?: emptyList()
+}
+
 /**
  * 宽松地把 MethodChannel 数值转换成 Int。
  *
@@ -520,6 +602,19 @@ private fun Any?.toIntOrDefault(default: Int): Int {
         is Double -> toInt()
         is Float -> toInt()
         is Number -> toInt()
+        else -> default
+    }
+}
+
+/**
+ * OTA owner/session identity 必须由 StandardMessageCodec 的整数类型承载。
+ * Double/Float 不能截断成可用 generation；非法 physical pair 会以 Long.MIN_VALUE
+ * 进入 native 校验并被 fail-closed 拒绝。
+ */
+private fun Any?.toStrictLongOrDefault(default: Long = 0L): Long {
+    return when (this) {
+        is Int -> this.toLong()
+        is Long -> this
         else -> default
     }
 }

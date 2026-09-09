@@ -21,6 +21,12 @@ data class BleCmd(
     val sessionGeneration: Long = 0L,
     /** Native 物理连接 attempt，0 表示旧事件或非 OTA。 */
     val attemptGeneration: Long = 0L,
+    /** G2 OTA native 事务 ID；非事务包保持空字符串。 */
+    val otaTransactionId: String = "",
+    /** G2 OTA App 事务 generation；非事务包保持 0。 */
+    val otaGeneration: Long = 0L,
+    /** G2 OTA native registry 实例标识；非事务包保持空字符串。 */
+    val otaInstanceId: String = "",
 ) {
 
     companion object {
@@ -47,6 +53,11 @@ data class BleCmd(
         // 3. OTA notify/response 需要和 START/INFORMATION/RAW 的 exact pair 绑定。
         "sessionGeneration" to sessionGeneration,
         "attemptGeneration" to attemptGeneration,
+        // 4. G2 OTA ACK/notify 必须携带 native 事务身份；Dart 会 fail-closed
+        //    拒绝空身份，避免旧 OTA 回包消费新事务。
+        "otaTransactionId" to otaTransactionId,
+        "otaGeneration" to otaGeneration,
+        "otaInstanceId" to otaInstanceId,
     )
 
     /**
@@ -67,6 +78,9 @@ data class BleCmd(
         if (psType != other.psType) return false
         if (sessionGeneration != other.sessionGeneration) return false
         if (attemptGeneration != other.attemptGeneration) return false
+        if (otaTransactionId != other.otaTransactionId) return false
+        if (otaGeneration != other.otaGeneration) return false
+        if (otaInstanceId != other.otaInstanceId) return false
 
         // 4. ByteArray 要按内容比较，避免相同 payload 因引用不同被误判。
         if (data != null) {
@@ -91,6 +105,9 @@ data class BleCmd(
         result = 31 * result + isSuccess.hashCode()
         result = 31 * result + sessionGeneration.hashCode()
         result = 31 * result + attemptGeneration.hashCode()
+        result = 31 * result + otaTransactionId.hashCode()
+        result = 31 * result + otaGeneration.hashCode()
+        result = 31 * result + otaInstanceId.hashCode()
         return result
     }
 

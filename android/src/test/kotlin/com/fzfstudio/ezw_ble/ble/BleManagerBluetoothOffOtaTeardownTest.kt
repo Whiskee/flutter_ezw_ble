@@ -20,7 +20,7 @@ class BleManagerBluetoothOffOtaTeardownTest {
         val completions = mutableListOf<BleOtaWriteError?>()
         val queue = BleAndroidOtaWriteQueue(
             endpoint = endpoint,
-            submit = { _, _, _ -> BleOtaWriteSubmission.accepted() },
+            submit = { _, _, _, _, _, _ -> BleOtaWriteSubmission.accepted() },
             scheduler = BleOtaWriteScheduler { _, _ -> BleOtaWriteCancellable {} },
             nowMillis = { 0L },
         )

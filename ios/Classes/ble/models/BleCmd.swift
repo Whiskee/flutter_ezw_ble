@@ -18,6 +18,10 @@ struct BleCmd: Codable {
     var sessionGeneration: Int64 = 0
     //  Native 物理连接 attempt；0 表示旧事件或非 OTA。
     var attemptGeneration: Int64 = 0
+    //  G2 OTA transaction identity. Empty/0 表示旧事件或非 OTA；Dart 必须 fail closed。
+    var otaTransactionId: String = ""
+    var otaGeneration: Int64 = 0
+    var otaInstanceId: String = ""
     
     func toMap() -> [String:Any] {
         var jsonMap: [String:Any] = [
@@ -25,7 +29,10 @@ struct BleCmd: Codable {
             "psType": psType,
             "isSuccess": isSuccess,
             "sessionGeneration": sessionGeneration,
-            "attemptGeneration": attemptGeneration
+            "attemptGeneration": attemptGeneration,
+            "otaTransactionId": otaTransactionId,
+            "otaGeneration": otaGeneration,
+            "otaInstanceId": otaInstanceId
         ]
         if let data = data {
             jsonMap["data"] = data.base64EncodedString()

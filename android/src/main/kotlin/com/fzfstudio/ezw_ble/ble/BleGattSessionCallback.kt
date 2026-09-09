@@ -75,6 +75,8 @@ internal class BleGattSessionCallback(
     private val consumeDisconnectingState: (String) -> BleConnectState?,
     /** 通知 manager 写入完成，并携带 psType/status 让普通队列与 OTA 背压队列精确认领。 */
     private val onCharacteristicWriteComplete: (String, Int?, Int, String) -> Unit,
+    /** 查询当前 endpoint 的 G2 OTA native 事务身份，用于标记 ACK/notify。 */
+    private val activeG2OtaContextForEndpoint: (String) -> BleG2OtaNativeContext?,
     /** 把 notify 数据回传到 Flutter EventChannel。 */
     private val emitReceiveData: (Map<String, Any?>) -> Unit,
     /** 统一日志出口，保证所有 GATT 日志仍带 BleManager 前缀。 */
@@ -454,7 +456,13 @@ internal class BleGattSessionCallback(
             return
         }
 
-        // 4. 数据回传仍走 Base64 Map，由 BleCmd 统一编码。
+        // 4. 数据回传仍走 Base64 Map；G2 OTA 包额外携带 native 事务身份，
+        //    让 Dart 拒绝旧事务 ACK/notify。
+        val otaContext = if (privateService.type == 1) {
+            activeG2OtaContextForEndpoint(gatt.device.address)
+        } else {
+            null
+        }
         val bleCmdMap = BleCmd(
             gatt.device.address,
             privateService.type,
@@ -462,6 +470,9 @@ internal class BleGattSessionCallback(
             true,
             sessionGeneration = sessionGeneration,
             attemptGeneration = attemptGeneration,
+            otaTransactionId = otaContext?.transactionId ?: "",
+            otaGeneration = otaContext?.generation ?: 0L,
+            otaInstanceId = otaContext?.instanceId ?: "",
         ).toFlutterMap()
         emitReceiveData(bleCmdMap)
         sendLog(

@@ -38,6 +38,8 @@ internal class BleAutoReconnectSupervisor(
     private val isBluetoothEnabled: () -> Boolean,
     /** 判断设备是否处于 OTA，OTA 中不做普通自动回连。 */
     private val isUpgradeDevice: (String) -> Boolean,
+    /** 复验 OTA recovery grant；只有 recovering endpoint 可绕过普通升级门禁。 */
+    private val acceptsOtaRecoveryContext: (BleG2OtaNativeContext, String) -> Boolean = { _, _ -> false },
     /** 创建一条绑定目标 UUID 的 GATT callback。 */
     private val createConnectCallback: (String, BleConnectSource, Long) -> BleGattSessionCallback,
     /** 提升已经进入 Gate waiting queue 的同一 session，不抢占 active。 */
@@ -176,6 +178,7 @@ internal class BleAutoReconnectSupervisor(
         source: BleConnectSource,
         mode: BleReconnectActivationMode = BleReconnectActivationMode.INITIAL,
         sessionGeneration: Long = 0L,
+        otaRecoveryContext: BleG2OtaNativeContext? = null,
     ): BleReconnectActivationOutcome {
         if (mode == BleReconnectActivationMode.UNKNOWN) {
             return BleReconnectActivationOutcome(
@@ -201,6 +204,20 @@ internal class BleAutoReconnectSupervisor(
         // 此时 sessionAction 会在任何新 GATT 创建前完成 session 安装或 exact rebind。
         task.pausedByBluetoothOff = false
         task.awaitingRecoveryActivation = false
+        if (otaRecoveryContext != null) {
+            if (acceptsOtaRecoveryContext(otaRecoveryContext, device.uuid)) {
+                task.otaRecoveryContext = otaRecoveryContext
+            } else {
+                task.otaRecoveryContext = null
+                return BleReconnectActivationOutcome(
+                    sessionGeneration = task.sessionGeneration,
+                    ownerDisposition = BleReconnectOwnerDisposition.REJECTED,
+                    reason = "otaRecoveryGrantRejected",
+                )
+            }
+        } else if (!isUpgradeDevice(device.uuid)) {
+            task.otaRecoveryContext = null
+        }
 
         // 2、session 未变化时复用当前 owner；更高 session 必须重建 callback 归属，
         // 不能只改 task 字段后让旧 GATT 冒充新会话。
@@ -414,9 +431,21 @@ internal class BleAutoReconnectSupervisor(
      * 本方法不关闭仍由 BleDevice 持有的 GATT，避免与 manager 的统一 teardown 重复抢占；
      * 仅当 supervisor 引用已经和 BleDevice 脱钩时，才回收这个孤立句柄。
      */
-    fun detachPhysicalGattForOtaReboot(uuid: String): Boolean {
+    fun detachPhysicalGattForOtaReboot(
+        uuid: String,
+        expectedGatt: BluetoothGatt? = null,
+        otaRecoveryContext: BleG2OtaNativeContext? = null,
+    ): BluetoothGatt? {
         val detachedGatt = synchronized(this) {
-            val task = reconnectTasks[reconnectKey(uuid)] ?: return false
+            val task = reconnectTasks[reconnectKey(uuid)] ?: return null
+            val ownsExpectedGatt = expectedGatt != null && task.passiveGatt === expectedGatt
+            val ownsOtaRecoveryGrant = otaRecoveryContext != null && task.otaRecoveryContext == otaRecoveryContext
+            if (!ownsExpectedGatt && !ownsOtaRecoveryGrant) {
+                // UUID is not sufficient during OTA teardown: a newer task for the same
+                // endpoint may already own passiveGatt. Callers must prove either exact
+                // physical GATT ownership or the same transaction recovery grant.
+                return null
+            }
             invalidateRetrySchedule(task)
             task.pendingPhysicalDeadline?.cancel()
             task.pendingPhysicalDeadline = null
@@ -425,6 +454,7 @@ internal class BleAutoReconnectSupervisor(
             val gatt = task.passiveGatt
             task.passiveGatt = null
             task.passiveStartedAtMs = 0L
+            task.otaRecoveryContext = null
             gatt
         }
 
@@ -440,7 +470,7 @@ internal class BleAutoReconnectSupervisor(
             BleLoggerTag.d,
             "Auto reconnect: $uuid, OTA reboot detached physical GATT, owner preserved, hadGatt=${detachedGatt != null}",
         )
-        return true
+        return detachedGatt
     }
 
     /**
@@ -776,10 +806,11 @@ internal class BleAutoReconnectSupervisor(
         }
 
         // 4. 配置关闭或 OTA 中不调度，避免普通回连干扰升级流程。
-        if (!config.autoReconnect || isUpgradeDevice(uuid)) {
+        val hasOtaRecoveryGrant = task.hasActiveOtaRecoveryGrant()
+        if (!config.autoReconnect || (isUpgradeDevice(uuid) && !hasOtaRecoveryGrant)) {
             sendLog(
                 BleLoggerTag.d,
-                "Auto reconnect: $uuid, schedule rejected, autoReconnect=${config.autoReconnect}, upgrading=${isUpgradeDevice(uuid)}",
+                "Auto reconnect: $uuid, schedule rejected, autoReconnect=${config.autoReconnect}, upgrading=${isUpgradeDevice(uuid)}, otaRecoveryGrant=$hasOtaRecoveryGrant",
             )
             return
         }
@@ -862,6 +893,11 @@ internal class BleAutoReconnectSupervisor(
         }
         if (!config.autoReconnect) {
             sendLog(BleLoggerTag.d, "Auto reconnect: $uuid, attempt skipped, config autoReconnect disabled")
+            return
+        }
+        val hasOtaRecoveryGrant = task.hasActiveOtaRecoveryGrant()
+        if (isUpgradeDevice(uuid) && !hasOtaRecoveryGrant) {
+            sendLog(BleLoggerTag.d, "Auto reconnect: $uuid, attempt skipped by OTA gate")
             return
         }
 
@@ -1122,7 +1158,7 @@ internal class BleAutoReconnectSupervisor(
                 task.pausedByBluetoothOff ||
                 !isBluetoothEnabled() ||
                 bleState() != BLE_STATE_ON ||
-                isUpgradeDevice(uuid)
+                (isUpgradeDevice(uuid) && !task.hasActiveOtaRecoveryGrant())
             ) {
                 return false
             }
@@ -1338,6 +1374,20 @@ internal class BleAutoReconnectSupervisor(
         task.timer = null
         task.pendingPassiveRetry = false
         task.retryScheduleGeneration = nextScheduleGeneration(task.retryScheduleGeneration)
+    }
+
+    /**
+     * OTA recovery grant is not a durable reconnect authorization. It is valid only
+     * while the native transaction registry still says this exact endpoint is in
+     * recovering, so every scheduler/visibility/retry continuation must re-check it.
+     */
+    private fun BleReconnectTask.hasActiveOtaRecoveryGrant(): Boolean {
+        val context = otaRecoveryContext ?: return false
+        val accepted = acceptsOtaRecoveryContext(context, uuid)
+        if (!accepted) {
+            otaRecoveryContext = null
+        }
+        return accepted
     }
 
     private companion object {

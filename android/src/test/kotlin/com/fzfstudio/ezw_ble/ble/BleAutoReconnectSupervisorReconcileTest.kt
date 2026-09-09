@@ -13,7 +13,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertSame
+import kotlin.test.assertTrue
 import org.mockito.Mockito
 
 /**
@@ -110,6 +113,124 @@ class BleAutoReconnectSupervisorReconcileTest {
         }
     }
 
+    @Test
+    fun `ota-owned endpoint requires a recovery grant before supervisor creates an attempt`() {
+        val fixture = Fixture()
+        fixture.use {
+            fixture.upgradeDevice = true
+
+            val rejected = fixture.supervisor.activate(
+                fixture.target,
+                BleConnectSource.AUTO_RECONNECT,
+                BleReconnectActivationMode.INITIAL,
+                101L,
+            )
+
+            assertEquals(BleReconnectOwnerDisposition.REJECTED, rejected.ownerDisposition)
+            assertEquals("ownerNotStarted", rejected.reason)
+            assertTrue(fixture.createdGatts.isEmpty())
+            assertTrue(fixture.scheduledAttempts.isEmpty())
+        }
+    }
+
+    @Test
+    fun `ota recovery grant survives null gatt retry and expires before delayed retry`() {
+        val fixture = Fixture()
+        fixture.use {
+            fixture.upgradeDevice = true
+            fixture.recoveryAccepted = true
+            fixture.returnNullGatt = true
+            val grant = BleG2OtaNativeContext("tx-recovery", 10L, "native-instance")
+
+            val admitted = fixture.supervisor.activate(
+                fixture.target,
+                BleConnectSource.AUTO_RECONNECT,
+                BleReconnectActivationMode.INITIAL,
+                102L,
+                grant,
+            )
+
+            assertEquals(BleReconnectOwnerDisposition.DEFERRED, admitted.ownerDisposition)
+            assertEquals(listOf(1_500L), fixture.scheduledDelays)
+            assertEquals(1, fixture.scheduledAttempts.size)
+
+            fixture.recoveryAccepted = false
+            fixture.scheduledAttempts.single().invoke()
+
+            assertFalse(fixture.createdGatts.isNotEmpty())
+            assertEquals(
+                listOf(1_500L),
+                fixture.scheduledDelays,
+                "invalid recovery grant must not enqueue another retry while OTA gate is active",
+            )
+        }
+    }
+
+    @Test
+    fun `ota detach requires exact gatt instead of uuid only ownership`() {
+        val fixture = Fixture()
+        fixture.use {
+            fixture.supervisor.activate(
+                fixture.target,
+                BleConnectSource.AUTO_RECONNECT,
+                BleReconnectActivationMode.INITIAL,
+                103L,
+            )
+            val exactGatt = fixture.createdGatts.single()
+            val wrongGatt = Mockito.mock(BluetoothGatt::class.java)
+
+            assertNull(fixture.supervisor.detachPhysicalGattForOtaReboot(fixture.target.uuid))
+            assertTrue(fixture.supervisor.ownerSnapshot(fixture.target.uuid)?.hasPassiveGatt == true)
+            assertNull(
+                fixture.supervisor.detachPhysicalGattForOtaReboot(
+                    fixture.target.uuid,
+                    expectedGatt = wrongGatt,
+                ),
+            )
+
+            assertSame(
+                exactGatt,
+                fixture.supervisor.detachPhysicalGattForOtaReboot(
+                    fixture.target.uuid,
+                    expectedGatt = exactGatt,
+                ),
+            )
+            assertTrue(fixture.supervisor.ownerSnapshot(fixture.target.uuid)?.hasPassiveGatt == false)
+        }
+    }
+
+    @Test
+    fun `ota detach can use the same recovery grant without accepting a different transaction`() {
+        val fixture = Fixture()
+        fixture.use {
+            fixture.upgradeDevice = true
+            fixture.recoveryAccepted = true
+            val grant = BleG2OtaNativeContext("tx-recovery", 10L, "native-instance")
+            fixture.supervisor.activate(
+                fixture.target,
+                BleConnectSource.AUTO_RECONNECT,
+                BleReconnectActivationMode.INITIAL,
+                104L,
+                grant,
+            )
+            val exactGatt = fixture.createdGatts.single()
+
+            assertNull(
+                fixture.supervisor.detachPhysicalGattForOtaReboot(
+                    fixture.target.uuid,
+                    otaRecoveryContext = grant.copy(transactionId = "tx-other"),
+                ),
+            )
+            assertSame(
+                exactGatt,
+                fixture.supervisor.detachPhysicalGattForOtaReboot(
+                    fixture.target.uuid,
+                    otaRecoveryContext = grant,
+                ),
+            )
+        }
+    }
+
     private class Fixture : AutoCloseable {
         val config = BleConfig.empty().copy(name = "g2-test", autoReconnect = true)
         val devices = mutableListOf<BleDevice>()
@@ -117,7 +238,12 @@ class BleAutoReconnectSupervisorReconcileTest {
         val createdGatts = mutableListOf<BluetoothGatt>()
         val invalidatedGatts = mutableListOf<BluetoothGatt>()
         val sessionReboundGatts = mutableListOf<BluetoothGatt>()
+        val scheduledDelays = mutableListOf<Long>()
+        val scheduledAttempts = mutableListOf<() -> Unit>()
         var ownerHealth = BlePendingOwnerHealth.PRE_PHYSICAL
+        var upgradeDevice = false
+        var recoveryAccepted = false
+        var returnNullGatt = false
 
         private val adapter = Mockito.mock(BluetoothAdapter::class.java)
         private val remoteDevice = Mockito.mock(BluetoothDevice::class.java)
@@ -133,7 +259,11 @@ class BleAutoReconnectSupervisorReconcileTest {
             elapsedRealtime.`when`<Long> { SystemClock.elapsedRealtime() }.thenReturn(1_000L)
 
             val factory = BlePassiveGattFactory { _, _, _, _ ->
-                Mockito.mock(BluetoothGatt::class.java).also(createdGatts::add)
+                if (returnNullGatt) {
+                    null
+                } else {
+                    Mockito.mock(BluetoothGatt::class.java).also(createdGatts::add)
+                }
             }
             supervisor = BleAutoReconnectSupervisor(
                 connectedDevices = devices,
@@ -143,7 +273,14 @@ class BleAutoReconnectSupervisorReconcileTest {
                 mainScope = { scope },
                 bleState = { 5 },
                 isBluetoothEnabled = { true },
-                isUpgradeDevice = { false },
+                isUpgradeDevice = { upgradeDevice },
+                acceptsOtaRecoveryContext = { context, uuid ->
+                    recoveryAccepted &&
+                        uuid == target.uuid &&
+                        context.transactionId == "tx-recovery" &&
+                        context.generation == 10L &&
+                        context.instanceId == "native-instance"
+                },
                 createConnectCallback = { _, _, _ ->
                     Mockito.mock(BleGattSessionCallback::class.java)
                 },
@@ -162,7 +299,9 @@ class BleAutoReconnectSupervisorReconcileTest {
                 },
                 passiveGattFactory = factory,
                 visibleDirectGattFactory = factory,
-                attemptScheduler = BleReconnectAttemptScheduler { _, _ ->
+                attemptScheduler = BleReconnectAttemptScheduler { delayMs, attempt ->
+                    scheduledDelays += delayMs
+                    scheduledAttempts += attempt
                     BleReconnectScheduleHandle {}
                 },
             )

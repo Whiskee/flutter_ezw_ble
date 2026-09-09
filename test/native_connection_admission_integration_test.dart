@@ -50,8 +50,8 @@ void main() {
 
     expect(
         androidManager,
-        contains(
-            'autoReconnectSupervisor.activate(seedDevice, effectiveSource, mode, sessionGeneration)'));
+        matches(RegExp(
+            r'autoReconnectSupervisor\.activate\(\s*seedDevice,\s*effectiveSource,\s*mode,\s*sessionGeneration,\s*otaRecoveryContext,\s*\)')));
     expect(
         androidManager,
         contains(
@@ -98,8 +98,8 @@ void main() {
     );
     expect(androidSupervisor,
         contains('mode == BleReconnectActivationMode.RECONCILE'));
-    expect(androidSupervisor,
-        contains('BleReconnectOwnerDisposition.REPAIRED'));
+    expect(
+        androidSupervisor, contains('BleReconnectOwnerDisposition.REPAIRED'));
     expect(
       androidSupervisor,
       contains(
