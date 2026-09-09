@@ -71,6 +71,93 @@ class BleG2OtaTransactionRegistryTest {
     }
 
     @Test
+    fun `recovered endpoint can finish with frozen transaction scope after physical rebind`() {
+        val registry = BleG2OtaTransactionRegistry()
+        val begin = registry.begin("tx-rebound-finish", 9, "G2", "SN-REBOUND", endpoints)
+        val endpoint = endpoints.first()
+
+        val recover = registry.updateEndpoint(
+            "tx-rebound-finish",
+            9,
+            begin.instanceId,
+            endpoint.uuid,
+            BleG2OtaEndpointAction.RECOVER,
+            endpoint.sessionGeneration,
+            endpoint.attemptGeneration,
+        )
+        val bind = registry.updateEndpoint(
+            "tx-rebound-finish",
+            9,
+            begin.instanceId,
+            endpoint.uuid,
+            BleG2OtaEndpointAction.BIND,
+            30,
+            31,
+        )
+        val oldPairCannotParkNewOwner = registry.updateEndpoint(
+            "tx-rebound-finish",
+            9,
+            begin.instanceId,
+            endpoint.uuid,
+            BleG2OtaEndpointAction.PARK,
+            endpoint.sessionGeneration,
+            endpoint.attemptGeneration,
+        )
+        val park = registry.updateEndpoint(
+            "tx-rebound-finish",
+            9,
+            begin.instanceId,
+            endpoint.uuid,
+            BleG2OtaEndpointAction.PARK,
+            30,
+            31,
+        )
+        val duplicateBegin = registry.begin("tx-rebound-finish", 9, "G2", "SN-REBOUND", endpoints)
+        val invalidPairFinish = registry.prepareFinish(
+            "tx-rebound-finish",
+            9,
+            begin.instanceId,
+            "success",
+            "G2",
+            "SN-REBOUND",
+            endpoints.mapIndexed { index, identity ->
+                if (index == 0) identity.copy(sessionGeneration = 30, attemptGeneration = 0) else identity
+            },
+        )
+        val conflictingEndpointFinish = registry.prepareFinish(
+            "tx-rebound-finish",
+            9,
+            begin.instanceId,
+            "success",
+            "G2",
+            "SN-REBOUND",
+            endpoints.mapIndexed { index, identity ->
+                if (index == 0) identity.copy(name = "Wrong-L") else identity
+            },
+        )
+        val prepare = registry.prepareFinish(
+            "tx-rebound-finish", 9, begin.instanceId, "success", "G2", "SN-REBOUND", endpoints,
+        )
+        val finish = registry.commitFinish(
+            "tx-rebound-finish", 9, begin.instanceId, "success", "G2", "SN-REBOUND", endpoints,
+        )
+        val replay = registry.commitFinish(
+            "tx-rebound-finish", 9, begin.instanceId, "success", "G2", "SN-REBOUND", endpoints,
+        )
+
+        assertEquals(BleG2OtaTransactionStatus.ACCEPTED, recover.status)
+        assertEquals(BleG2OtaTransactionStatus.ACCEPTED, bind.status)
+        assertEquals(BleG2OtaTransactionStatus.STALE_OWNER, oldPairCannotParkNewOwner.status)
+        assertEquals(BleG2OtaTransactionStatus.ACCEPTED, park.status)
+        assertEquals(BleG2OtaTransactionStatus.ACCEPTED, duplicateBegin.status)
+        assertEquals(BleG2OtaTransactionStatus.STALE_OWNER, invalidPairFinish.status)
+        assertEquals(BleG2OtaTransactionStatus.STALE_OWNER, conflictingEndpointFinish.status)
+        assertEquals(BleG2OtaTransactionStatus.ACCEPTED, prepare.status)
+        assertEquals(BleG2OtaTransactionStatus.COMMITTED, finish.status)
+        assertEquals(BleG2OtaTransactionStatus.ALREADY_COMMITTED, replay.status)
+    }
+
+    @Test
     fun `active transactions reject overlapping endpoint ownership`() {
         val registry = BleG2OtaTransactionRegistry()
 

@@ -99,11 +99,14 @@ internal class BleG2OtaTransactionRegistry {
         val config: String,
         val sn: String,
         val instanceId: String,
+        // The begin request is immutable transaction identity. Runtime endpoint leases
+        // may move to a new physical pair during recovery and must not rewrite it.
+        val beginEndpoints: Map<String, BleG2OtaEndpointIdentity>,
         val endpoints: MutableMap<String, EndpointLease>,
         var terminalStatus: BleG2OtaTransactionStatus? = null,
         var terminalReason: String = "",
     ) {
-        fun sameScope(
+        fun sameBeginScope(
             generation: Long,
             config: String,
             sn: String,
@@ -113,12 +116,37 @@ internal class BleG2OtaTransactionRegistry {
                 return false
             }
             val incoming = endpoints.associateBy { it.key }
-            return incoming.keys == this.endpoints.keys &&
+            return incoming.keys == beginEndpoints.keys &&
                 endpoints.all { endpoint ->
-                    val current = this.endpoints[endpoint.key] ?: return@all false
-                    current.name == endpoint.name &&
-                        current.sessionGeneration == endpoint.sessionGeneration &&
-                        current.attemptGeneration == endpoint.attemptGeneration
+                    val initial = beginEndpoints[endpoint.key] ?: return@all false
+                    initial.name == endpoint.name &&
+                        initial.sessionGeneration == endpoint.sessionGeneration &&
+                        initial.attemptGeneration == endpoint.attemptGeneration
+                }
+        }
+
+        /**
+         * Finish owns the logical transaction, not a caller-supplied physical GATT.
+         *
+         * Keep config/SN and the frozen endpoint set exact, but intentionally ignore
+         * session/attempt values: recovery can legitimately rebind those values and
+         * teardown must use the registry's current EndpointLease instead.
+         */
+        fun sameFinishScope(
+            generation: Long,
+            config: String,
+            sn: String,
+            endpoints: List<BleG2OtaEndpointIdentity>,
+        ): Boolean {
+            if (this.generation != generation || this.config != config || this.sn != sn) {
+                return false
+            }
+            val incoming = endpoints.associateBy { it.key }
+            return incoming.size == endpoints.size &&
+                incoming.keys == beginEndpoints.keys &&
+                endpoints.all { endpoint ->
+                    val initial = beginEndpoints[endpoint.key] ?: return@all false
+                    endpoint.hasValidPhysicalPairShape() && initial.name == endpoint.name
                 }
         }
 
@@ -151,7 +179,7 @@ internal class BleG2OtaTransactionRegistry {
         }
         val existing = transactions[transactionId]
         if (existing != null) {
-            if (!existing.sameScope(generation, config, sn, endpoints)) {
+            if (!existing.sameBeginScope(generation, config, sn, endpoints)) {
                 return existing.result(BleG2OtaTransactionStatus.INVALID_REQUEST, "scopeConflict")
             }
             val terminal = existing.terminalStatus
@@ -193,6 +221,7 @@ internal class BleG2OtaTransactionRegistry {
             config = config,
             sn = sn,
             instanceId = nativeInstanceId,
+            beginEndpoints = endpoints.associateBy { it.key },
             endpoints = leases,
         )
         transactions[transactionId] = transaction
@@ -285,7 +314,7 @@ internal class BleG2OtaTransactionRegistry {
             if (
                 existing.generation != generation ||
                 (instanceId.isNotBlank() && existing.instanceId != instanceId) ||
-                !existing.sameScope(generation, config, sn, endpoints)
+                !existing.sameFinishScope(generation, config, sn, endpoints)
             ) {
                 return existing.result(BleG2OtaTransactionStatus.STALE_OWNER, "ownerMismatch")
             }
@@ -329,7 +358,7 @@ internal class BleG2OtaTransactionRegistry {
             if (
                 existing.generation != generation ||
                 (instanceId.isNotBlank() && existing.instanceId != instanceId) ||
-                !existing.sameScope(generation, config, sn, endpoints)
+                !existing.sameFinishScope(generation, config, sn, endpoints)
             ) {
                 return existing.result(BleG2OtaTransactionStatus.STALE_OWNER, "ownerMismatch")
             }
@@ -555,7 +584,7 @@ internal class BleG2OtaTransactionRegistry {
         sn: String,
         endpoints: List<BleG2OtaEndpointIdentity>,
     ): Boolean {
-        if (this.generation != generation || !sameScope(generation, config, sn, endpoints)) {
+        if (this.generation != generation || !sameFinishScope(generation, config, sn, endpoints)) {
             return false
         }
         return if (instanceId.isNotBlank()) {
@@ -591,6 +620,7 @@ internal class BleG2OtaTransactionRegistry {
                 config = config,
                 sn = sn,
                 instanceId = nativeInstanceId,
+                beginEndpoints = endpoints.associateBy { it.key },
                 endpoints = endpoints.associate { endpoint ->
                     endpoint.key to EndpointLease(
                         uuid = endpoint.uuid,
@@ -635,9 +665,11 @@ internal class BleG2OtaTransactionRegistry {
             sn.isNotBlank() &&
             endpoints.isNotEmpty() &&
             endpoints.all { it.uuid.isNotBlank() } &&
-            endpoints.all {
-                (it.sessionGeneration == 0L && it.attemptGeneration == 0L) ||
-                    (it.sessionGeneration > 0L && it.attemptGeneration > 0L)
-            } &&
+            endpoints.all { it.hasValidPhysicalPairShape() } &&
             endpoints.map { it.key }.toSet().size == endpoints.size
 }
+
+/** Reject partial, negative, or fabricated physical identities at every scope boundary. */
+private fun BleG2OtaEndpointIdentity.hasValidPhysicalPairShape(): Boolean =
+    (sessionGeneration == 0L && attemptGeneration == 0L) ||
+        (sessionGeneration > 0L && attemptGeneration > 0L)
