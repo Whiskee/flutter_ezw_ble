@@ -71,8 +71,11 @@ internal class BleAutoReconnectSupervisor(
      *
      * 与 pre-physical deadline 不同，这里允许撤销已经进入 Gate 的 exact admission；
      * manager 必须先失效旧 attempt、释放 GATT/Gate，再返回允许 supervisor 创建唯一新 owner。
+     * 业务 GATT 默认不可撤销；只有携带当前 G2 OTA recovery context 且 frozen physical
+     * pair 一致时，manager 才能把它作为固件重启后的旧 owner 中性退役。
      */
-    private val invalidatePassiveGattForSessionRebind: (String, BluetoothGatt) -> Boolean,
+    private val invalidatePassiveGattForSessionRebind:
+        (String, BluetoothGatt, BleG2OtaNativeContext?) -> Boolean,
     /** 创建长期 passive GATT 的平台边界；测试可注入 fake 验证 autoConnect pending 次序。 */
     private val passiveGattFactory: BlePassiveGattFactory = AndroidBlePassiveGattFactory,
     /** 扫描确认目标可见后的单次 `autoConnect=false` 直连平台边界。 */
@@ -229,7 +232,14 @@ internal class BleAutoReconnectSupervisor(
         if (sessionAction == BleReconnectSessionUpdateAction.REBUILD_PHYSICAL_OWNER) {
             val exactGatt = task.passiveGatt
             val previousSessionGeneration = task.sessionGeneration
-            if (exactGatt != null && invalidatePassiveGattForSessionRebind(device.uuid, exactGatt)) {
+            if (
+                exactGatt != null &&
+                invalidatePassiveGattForSessionRebind(
+                    device.uuid,
+                    exactGatt,
+                    task.otaRecoveryContext,
+                )
+            ) {
                 val rebound = synchronized(this) {
                     val current = reconnectTasks[reconnectKey(device.uuid)] ?: return@synchronized false
                     if (current.passiveGatt !== exactGatt) {

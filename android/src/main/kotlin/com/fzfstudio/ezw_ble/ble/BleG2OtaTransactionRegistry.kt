@@ -440,6 +440,30 @@ internal class BleG2OtaTransactionRegistry {
             lease.state == EndpointState.RECOVERING
     }
 
+    /**
+     * Authorize teardown of the exact pre-recovery physical owner.
+     *
+     * A recovery credential identifies the logical transaction, while the frozen
+     * session/attempt pair identifies the one old GATT that may be replaced. Both
+     * must still match while the endpoint is RECOVERING; an ACTIVE/PARKED endpoint,
+     * a stale native instance, or a different physical attempt fails closed.
+     */
+    @Synchronized
+    fun acceptsRecoveryPhysicalPair(
+        context: BleG2OtaNativeContext,
+        uuid: String,
+        sessionGeneration: Long,
+        attemptGeneration: Long,
+    ): Boolean {
+        val transaction = transactions[context.transactionId] ?: return false
+        val lease = transaction.endpoints[uuid.lowercase()] ?: return false
+        return transaction.terminalStatus == null &&
+            transaction.generation == context.generation &&
+            transaction.instanceId == context.instanceId &&
+            lease.state == EndpointState.RECOVERING &&
+            lease.samePhysicalPair(sessionGeneration, attemptGeneration)
+    }
+
     @Synchronized
     fun endpointIds(transactionId: String): List<String> =
         transactions[transactionId]?.endpoints?.values?.map { it.uuid }.orEmpty()

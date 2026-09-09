@@ -930,7 +930,7 @@ Endpoint phase 为 `waiting -> active/recovering -> parked -> retired`：
 
 - `waiting`：事务已登记但该 endpoint 尚未绑定 live physical pair；
 - `active`：当前事务已绑定真实 GATT/CBPeripheral，可以执行 OTA 写入；
-- `recovering`：仅允许当前事务、未完成 endpoint 和有断连证据的恢复 activation 进入；
+- `recovering`：仅允许当前事务、未完成 endpoint 和有断连证据的恢复 activation 进入；Android 若此时 supervisor 仍持有旧业务 GATT，只能在 transaction context 与 begin 冻结的正 `sessionGeneration/attemptGeneration` 同时匹配时中性退役该 exact GATT，再安装更高 session 并创建唯一 replacement。普通 activation、旧事务或错 pair 仍不得打断业务 GATT；
 - `parked`：该 endpoint 已完成传输并等待同伴，不能再次进入传输恢复；
 - `retired`：整组 finish 已提交或事务被明确失效/撤销。
 

@@ -110,6 +110,45 @@ class BleAutoReconnectSupervisorReconcileTest {
             assertEquals(92L, rebound.sessionGeneration)
             assertEquals(listOf(oldGatt), fixture.sessionReboundGatts)
             assertEquals(2, fixture.createdGatts.size)
+            assertEquals(
+                listOf<BleG2OtaNativeContext?>(null),
+                fixture.sessionReboundContexts,
+            )
+        }
+    }
+
+    @Test
+    fun `ota recovery credential is forwarded when a higher session replaces the old owner`() {
+        val fixture = Fixture()
+        fixture.use {
+            fixture.upgradeDevice = true
+            fixture.recoveryAccepted = true
+            val grant = BleG2OtaNativeContext("tx-recovery", 10L, "native-instance")
+            fixture.supervisor.activate(
+                fixture.target,
+                BleConnectSource.AUTO_RECONNECT,
+                BleReconnectActivationMode.INITIAL,
+                93L,
+                grant,
+            )
+            val oldGatt = fixture.createdGatts.single()
+
+            val rebound = fixture.supervisor.activate(
+                fixture.target,
+                BleConnectSource.AUTO_RECONNECT,
+                BleReconnectActivationMode.RECONCILE,
+                94L,
+                grant,
+            )
+
+            assertEquals(BleReconnectOwnerDisposition.REPAIRED, rebound.ownerDisposition)
+            assertEquals(94L, rebound.sessionGeneration)
+            assertEquals(listOf(oldGatt), fixture.sessionReboundGatts)
+            assertEquals(
+                listOf<BleG2OtaNativeContext?>(grant),
+                fixture.sessionReboundContexts,
+            )
+            assertEquals(2, fixture.createdGatts.size)
         }
     }
 
@@ -238,6 +277,7 @@ class BleAutoReconnectSupervisorReconcileTest {
         val createdGatts = mutableListOf<BluetoothGatt>()
         val invalidatedGatts = mutableListOf<BluetoothGatt>()
         val sessionReboundGatts = mutableListOf<BluetoothGatt>()
+        val sessionReboundContexts = mutableListOf<BleG2OtaNativeContext?>()
         val scheduledDelays = mutableListOf<Long>()
         val scheduledAttempts = mutableListOf<() -> Unit>()
         var ownerHealth = BlePendingOwnerHealth.PRE_PHYSICAL
@@ -293,8 +333,9 @@ class BleAutoReconnectSupervisorReconcileTest {
                     invalidatedGatts += gatt
                     BlePendingOwnerDisposition.REPAIRED_STALE_OWNER
                 },
-                invalidatePassiveGattForSessionRebind = { _, gatt ->
+                invalidatePassiveGattForSessionRebind = { _, gatt, context ->
                     sessionReboundGatts += gatt
+                    sessionReboundContexts += context
                     true
                 },
                 passiveGattFactory = factory,

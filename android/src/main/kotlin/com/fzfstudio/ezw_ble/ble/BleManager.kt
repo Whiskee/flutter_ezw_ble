@@ -382,8 +382,8 @@ class BleManager private constructor() {
             invalidatePendingPassiveGatt = { uuid, gatt ->
                 invalidatePendingPassiveGatt(uuid, gatt)
             },
-            invalidatePassiveGattForSessionRebind = { uuid, gatt ->
-                invalidatePassiveGattForSessionRebind(uuid, gatt)
+            invalidatePassiveGattForSessionRebind = { uuid, gatt, otaRecoveryContext ->
+                invalidatePassiveGattForSessionRebind(uuid, gatt, otaRecoveryContext)
             },
         )
     }
@@ -4876,6 +4876,7 @@ class BleManager private constructor() {
     private fun invalidatePassiveGattForSessionRebind(
         uuid: String,
         gatt: BluetoothGatt,
+        otaRecoveryContext: BleG2OtaNativeContext?,
     ): Boolean {
         val key = reconnectKey(uuid)
         val device = findConnectedDevice(uuid) ?: return false
@@ -4885,10 +4886,48 @@ class BleManager private constructor() {
         val admission = currentAdmissions[key]
         val businessSession = businessConnectedGattSessions[key]
         if (businessSession?.gatt === gatt) {
-            // 1、业务已连接的长期 GATT 不属于“在途 owner”。Dart 正常不会为已连接
-            // endpoint 提交新 session；若迟到 activation 到达，拒绝重建，避免主动打断
-            // 可用命令通道。
-            return false
+            // 1、普通 activation 仍不得打断业务 GATT。唯一例外是 native registry 已
+            // 接受的 OTA RECOVER，并且 credential 与旧业务 session/attempt 完全一致。
+            // 这覆盖镜腿重启后系统断连已上报、但 supervisor 仍持有旧 GATT 的窗口。
+            val recoveryContext = otaRecoveryContext ?: return false
+            val exactOtaRecoveryOwner = g2OtaTransactions.acceptsRecoveryPhysicalPair(
+                context = recoveryContext,
+                uuid = uuid,
+                sessionGeneration = businessSession.admission.sessionGeneration,
+                attemptGeneration = businessSession.admission.generation,
+            )
+            if (!exactOtaRecoveryOwner) {
+                return false
+            }
+
+            // 1.1、业务 connected 正常已原子释放 Gate。此处若仍有 admission，说明另一条
+            // attempt 已经在途或 runtime 不一致；无论看起来是否同 pair 都 fail closed，留给
+            // exact callback/事务终态收口，不能为了 recovery 误杀新尝试。
+            if (admission != null) {
+                return false
+            }
+
+            // 1.2、先撤销旧 callback/Gate 身份并清空传输，再关闭 exact GATT。这里不发送
+            // 普通断连事件、不调度 generic retry；调用中的 OTA supervisor 会立即安装
+            // incoming session 并创建唯一 replacement。
+            businessConnectedGattSessions.remove(key)
+            businessConnectionLeases.remove(key)
+            preConnectedDevices.remove(uuid)
+            val next = invalidateConnectionAttempts(setOf(uuid))
+            sendCmdQueues.remove(key)
+            discardOtaWriteQueueForSession(uuid, reason = "OTA recovery session rebind")
+            device.releaseAndClear()
+            device.connectState = BleConnectState.NONE
+            next?.let { startGrantedGattPipeline(it) }
+            sendLog(
+                BleLoggerTag.d,
+                "Admission gate: $uuid, OTA recovery retired exact business owner " +
+                    "transaction=${recoveryContext.transactionId}, " +
+                    "otaGeneration=${recoveryContext.generation}, " +
+                    "attemptGeneration=${businessSession.admission.generation}, " +
+                    "sessionGeneration=${businessSession.admission.sessionGeneration}",
+            )
+            return true
         }
         if (admission == null) {
             // 2、STATE_CONNECTED 前还没有 Gate admission，但 passive autoConnect GATT

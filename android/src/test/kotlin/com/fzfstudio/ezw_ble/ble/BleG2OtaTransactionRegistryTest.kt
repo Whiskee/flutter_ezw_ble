@@ -207,6 +207,13 @@ class BleG2OtaTransactionRegistryTest {
             11,
         )
         val activeRecovery = registry.acceptsRecoveryContext("tx-8", 8, begin.instanceId, endpoints.first().uuid)
+        val context = BleG2OtaNativeContext("tx-8", 8, begin.instanceId)
+        val activePhysicalRecovery = registry.acceptsRecoveryPhysicalPair(
+            context,
+            endpoints.first().uuid,
+            sessionGeneration = 10,
+            attemptGeneration = 11,
+        )
         val recover = registry.updateEndpoint(
             "tx-8",
             8,
@@ -217,6 +224,30 @@ class BleG2OtaTransactionRegistryTest {
             11,
         )
         val recoveringRecovery = registry.acceptsRecoveryContext("tx-8", 8, begin.instanceId, endpoints.first().uuid)
+        val exactPhysicalRecovery = registry.acceptsRecoveryPhysicalPair(
+            context,
+            endpoints.first().uuid,
+            sessionGeneration = 10,
+            attemptGeneration = 11,
+        )
+        val stalePhysicalRecovery = registry.acceptsRecoveryPhysicalPair(
+            context,
+            endpoints.first().uuid,
+            sessionGeneration = 10,
+            attemptGeneration = 12,
+        )
+        val zeroPhysicalRecovery = registry.acceptsRecoveryPhysicalPair(
+            context,
+            endpoints.first().uuid,
+            sessionGeneration = 0,
+            attemptGeneration = 0,
+        )
+        val staleInstanceRecovery = registry.acceptsRecoveryPhysicalPair(
+            context.copy(instanceId = "stale-native-instance"),
+            endpoints.first().uuid,
+            sessionGeneration = 10,
+            attemptGeneration = 11,
+        )
         val park = registry.updateEndpoint(
             "tx-8",
             8,
@@ -229,10 +260,16 @@ class BleG2OtaTransactionRegistryTest {
 
         assertEquals(BleG2OtaTransactionStatus.ACCEPTED, bind.status)
         assertFalse(activeRecovery)
+        assertFalse(activePhysicalRecovery)
         assertEquals(BleG2OtaTransactionStatus.ACCEPTED, recover.status)
         assertTrue(recoveringRecovery)
+        assertTrue(exactPhysicalRecovery)
+        assertFalse(stalePhysicalRecovery)
+        assertFalse(zeroPhysicalRecovery)
+        assertFalse(staleInstanceRecovery)
         assertEquals(BleG2OtaTransactionStatus.ACCEPTED, park.status)
         assertFalse(registry.acceptsContext("tx-8", 8, begin.instanceId, endpoints.first().uuid))
         assertFalse(registry.acceptsRecoveryContext("tx-8", 8, begin.instanceId, endpoints.first().uuid))
+        assertFalse(registry.acceptsRecoveryPhysicalPair(context, endpoints.first().uuid, 10, 11))
     }
 }

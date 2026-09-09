@@ -405,7 +405,15 @@ On Bluetooth-on, Android does not replay paused tasks by itself. It waits for
 the Dart recovery activation carrying the final `sessionGeneration`; ordinary
 `arm` calls cannot consume this barrier. Manual promotion also classifies the
 native owner first. A stale `passiveGatt` is repaired or dropped instead of
-being reported as reusable, while a real Gate/business owner is never closed.
+being reported as reusable. A real Gate/business owner is never closed by an
+ordinary activation. The only business-GATT replacement exception is a current
+G2 OTA endpoint already in `RECOVERING`: the native transaction credential and
+the frozen positive `sessionGeneration/attemptGeneration` must both match the
+old business session. Manager then retires that exact GATT without emitting or
+scheduling a generic disconnect, and the same supervisor activation installs
+the requested higher session before creating one replacement. Missing/stale
+credentials, a mismatched physical pair, and active/parked/retired endpoints
+remain rejected.
 Repeated `reconcile` activation follows the same exact endpoint/session check:
 healthy task/GATT/Gate owners return `reused`, missing runtime tasks with a
 valid persisted authorization recreate a single pending GATT and return `repaired`, and

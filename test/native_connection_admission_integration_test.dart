@@ -92,9 +92,13 @@ void main() {
     );
     expect(
       androidSupervisor,
-      contains(
-        'invalidatePassiveGattForSessionRebind(device.uuid, exactGatt)',
-      ),
+      contains('invalidatePassiveGattForSessionRebind('),
+    );
+    expect(androidSupervisor, contains('task.otaRecoveryContext'));
+    expect(androidManager, contains('acceptsRecoveryPhysicalPair'));
+    expect(
+      androidManager,
+      contains('OTA recovery retired exact business owner'),
     );
     expect(androidSupervisor,
         contains('mode == BleReconnectActivationMode.RECONCILE'));

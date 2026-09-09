@@ -13,6 +13,8 @@ import java.lang.ref.WeakReference
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -21,6 +23,113 @@ import org.mockito.Mockito
 
 /** Manager-level regression coverage for Android OTA cleanup after GATT/cache loss. */
 class BleManagerG2OtaTransactionTest {
+
+    @Test
+    fun `ota recovery retires the exact disconnected business gatt before session rebind`() {
+        val manager = BleManager.instance
+        resetManager(manager)
+        val endpoint = "AA:BB:CC:DD:EE:60"
+        val peerEndpoint = "AA:BB:CC:DD:EE:69"
+
+        Mockito.mockStatic(Log::class.java).use {
+            configureBle(manager, g2Config())
+            setBleAvailable(manager)
+            val device = installExactBusinessReadyEndpoint(
+                manager = manager,
+                endpoint = endpoint,
+                name = "Even-R",
+                sn = "SN-MANAGER",
+                sessionGeneration = 1L,
+                attemptGeneration = 1L,
+            )
+            val oldGatt = device.myGatt!!
+            val peer = installExactBusinessReadyEndpoint(
+                manager = manager,
+                endpoint = peerEndpoint,
+                name = "Even-Peer",
+                sn = "SN-PEER",
+                sessionGeneration = 9L,
+                attemptGeneration = 9L,
+            )
+            val peerGatt = peer.myGatt!!
+
+            // Business connected has already released the Gate admission; the exact
+            // long-lived GATT metadata remains until OTA recovery replaces that owner.
+            currentAdmissions(manager).remove(endpoint.lowercase())
+            admittedGattSessions(manager).remove(1L)
+            val endpoints = listOf(BleG2OtaEndpointIdentity(endpoint, "Even-R", 1L, 1L))
+            val begin = manager.beginG2OtaTransaction(
+                transactionId = "tx-session-rebind",
+                generation = 16L,
+                config = "g2_glasses",
+                sn = "SN-MANAGER",
+                endpoints = endpoints,
+            )
+            val instanceId = begin["instanceId"] as String
+            val recover = manager.updateG2OtaEndpoint(
+                transactionId = "tx-session-rebind",
+                generation = 16L,
+                instanceId = instanceId,
+                uuid = endpoint,
+                action = BleG2OtaEndpointAction.RECOVER,
+                sessionGeneration = 1L,
+                attemptGeneration = 1L,
+            )
+            device.connectState = BleConnectState.DISCONNECT_FROM_SYS
+
+            val context = BleG2OtaNativeContext("tx-session-rebind", 16L, instanceId)
+            val ordinaryRejected = invokeSessionRebindInvalidation(
+                manager,
+                endpoint,
+                oldGatt,
+                otaRecoveryContext = null,
+            )
+            assertFalse(ordinaryRejected)
+            assertSame(oldGatt, device.myGatt)
+            val staleRejected = invokeSessionRebindInvalidation(
+                manager,
+                endpoint,
+                oldGatt,
+                otaRecoveryContext = context.copy(transactionId = "tx-stale"),
+            )
+            assertFalse(staleRejected)
+            assertSame(oldGatt, device.myGatt)
+
+            // A concurrently registered attempt is stronger evidence than the stale
+            // business cache, so recovery must not tear either owner down.
+            currentAdmissions(manager)[endpoint.lowercase()] = BleConnectionAdmission(
+                endpointId = endpoint,
+                generation = 2L,
+                sessionId = 200L,
+                source = BleConnectSource.AUTO_RECONNECT,
+                sessionGeneration = 2L,
+            )
+            val inFlightRejected = invokeSessionRebindInvalidation(
+                manager,
+                endpoint,
+                oldGatt,
+                otaRecoveryContext = context,
+            )
+            assertFalse(inFlightRejected)
+            assertSame(oldGatt, device.myGatt)
+            currentAdmissions(manager).remove(endpoint.lowercase())
+
+            val retired = invokeSessionRebindInvalidation(manager, endpoint, oldGatt, context)
+            val replayRejected = invokeSessionRebindInvalidation(manager, endpoint, oldGatt, context)
+
+            assertEquals("accepted", begin["status"])
+            assertEquals("accepted", recover["status"])
+            assertTrue(retired)
+            assertFalse(replayRejected)
+            assertNull(device.myGatt)
+            assertFalse(businessConnectedGattSessions(manager).containsKey(endpoint.lowercase()))
+            assertSame(peerGatt, peer.myGatt)
+            Mockito.verify(oldGatt, Mockito.times(1)).disconnect()
+            Mockito.verify(oldGatt, Mockito.times(1)).close()
+            Mockito.verify(peerGatt, Mockito.never()).disconnect()
+            Mockito.verify(peerGatt, Mockito.never()).close()
+        }
+    }
 
     @Test
     fun `group finish rejects reentrant activation and writes before releasing either endpoint gate`() {
@@ -388,6 +497,22 @@ class BleManagerG2OtaTransactionTest {
         val field = BleManager::class.java.getDeclaredField("bleConfigs")
         field.isAccessible = true
         field.set(manager, listOf(config))
+    }
+
+    private fun invokeSessionRebindInvalidation(
+        manager: BleManager,
+        endpoint: String,
+        gatt: BluetoothGatt,
+        otaRecoveryContext: BleG2OtaNativeContext?,
+    ): Boolean {
+        val method = BleManager::class.java.getDeclaredMethod(
+            "invalidatePassiveGattForSessionRebind",
+            String::class.java,
+            BluetoothGatt::class.java,
+            BleG2OtaNativeContext::class.java,
+        )
+        method.isAccessible = true
+        return method.invoke(manager, endpoint, gatt, otaRecoveryContext) as Boolean
     }
 
     private fun installExactBusinessReadyEndpoint(
