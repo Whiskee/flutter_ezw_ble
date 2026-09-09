@@ -633,6 +633,18 @@ final class BleG2OtaTransactionRegistry {
         return nil
     }
 
+    /// Resolve immutable transaction metadata only for the exact live native
+    /// owner. Endpoint updates intentionally do not repeat config/SN because
+    /// accepting mutable Dart copies would weaken the scope frozen by begin.
+    func activeScope(for context: BleG2OtaContext) -> BleG2OtaTransactionScope? {
+        guard let record = activeRecords[context.transactionId],
+              record.scope.generation == context.generation,
+              record.instanceId == context.instanceId else {
+            return nil
+        }
+        return record.scope
+    }
+
     func scopeEndpointIds(data: [String: Any]) -> [String] {
         BleG2OtaTransactionScope(data: data)?.endpoints.map(\.uuid) ?? []
     }

@@ -457,6 +457,11 @@ extension BleManager {
         let transactionId = context.transactionId
         let generation = context.generation
         let instanceId = context.instanceId
+        guard let scope = g2OtaTransactions.activeScope(for: context) else {
+            // Let the registry return the authoritative missing/stale owner
+            // result instead of inventing a structural validation failure.
+            return nil
+        }
         guard let uuid = (data["uuid"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !uuid.isEmpty,
               let sessionGeneration = BleG2OtaInteger.parseRequired(data["sessionGeneration"]),
@@ -477,16 +482,9 @@ extension BleManager {
         guard let snapshot = snapshots[key] else {
             return nil
         }
-        let config = (data["config"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !config.isEmpty else {
-            return BleG2OtaTransactionResult(
-                status: .invalidRequest,
-                transactionId: transactionId,
-                generation: generation,
-                instanceId: instanceId,
-                reason: "invalidNativeUpdateRequest"
-            )
-        }
+        // The MethodChannel update contract carries only context + endpoint
+        // identity. Config is immutable authority owned by the accepted begin.
+        let config = scope.config
 
         if action == .recover && sessionGeneration == 0 && attemptGeneration == 0 {
             // A never-bound waiting endpoint may enter recovery to let the

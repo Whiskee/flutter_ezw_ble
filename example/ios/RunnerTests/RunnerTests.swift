@@ -1839,6 +1839,38 @@ class RunnerTests: XCTestCase {
     XCTAssertEqual(BleG2OtaNativeBeginPolicy.rejectionReason(scope: scope, states: stalePositivePair), "nativePhysicalOwnerMismatch")
   }
 
+  func testG2OtaNativeUpdateUsesConfigFrozenByBeginWhenWirePayloadOmitsConfig() {
+    let manager = BleManager.shared
+    let uuid = "OTA-BIND-\(UUID().uuidString)"
+    let scope = g2OtaScope(
+      id: "tx-native-bind-\(UUID().uuidString)",
+      generation: 10,
+      endpoints: [uuid: (0, 0)]
+    )
+    let begin = manager.g2OtaTransactions.begin(data: scope)
+    XCTAssertEqual(begin.status, .accepted)
+    defer {
+      _ = manager.g2OtaTransactions.clearActive(reason: .revoked)
+      manager.upgradeStateRegistry.consume(uuid)
+    }
+
+    // This is the production MethodChannel shape: config/SN/endpoints are
+    // frozen by begin and are intentionally not repeated on endpoint updates.
+    let update: [String: Any] = [
+      "transactionId": begin.transactionId,
+      "generation": NSNumber(value: begin.generation),
+      "instanceId": begin.instanceId,
+      "uuid": uuid,
+      "action": "bind",
+      "sessionGeneration": NSNumber(value: 41),
+      "attemptGeneration": NSNumber(value: 42)
+    ]
+
+    let result = manager.updateG2OtaEndpoint(update)
+    XCTAssertEqual(result.status, .staleOwner)
+    XCTAssertEqual(result.reason, "nativePhysicalOwnerMismatch")
+  }
+
   func testG2OtaConfigPolicyRequiresProductionOtaPrivateService() {
     XCTAssertTrue(BleG2OtaConfigPolicy.supportsG2Ota(privateServices: [
       (type: 0, service: "0000180A-0000-1000-8000-00805F9B34FB"),
