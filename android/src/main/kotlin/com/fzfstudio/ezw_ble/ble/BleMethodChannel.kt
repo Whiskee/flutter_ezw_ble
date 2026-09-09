@@ -97,8 +97,16 @@ enum class BleMC {
          *
          * 未知方法会统一落到 `UNKNOWN`，避免平台侧因为新增 Dart 方法而直接抛异常。
          */
-        fun from(method: String): BleMC =
-            runCatching { valueOf(method.toUpperSnakeCase()) }.getOrDefault(UNKNOWN)
+        fun from(method: String): BleMC = when (method) {
+            // The shared converter only splits lower-case to upper-case boundaries, so `G2Ota`
+            // becomes `G2OTA`. Resolve these wire names exactly or OTA ownership silently falls
+            // through to UNKNOWN and Dart receives a null begin result before transfer starts.
+            "beginG2OtaTransaction" -> BEGIN_G2_OTA_TRANSACTION
+            "updateG2OtaEndpoint" -> UPDATE_G2_OTA_ENDPOINT
+            "finishG2OtaTransaction" -> FINISH_G2_OTA_TRANSACTION
+            "queryG2OtaTransaction" -> QUERY_G2_OTA_TRANSACTION
+            else -> runCatching { valueOf(method.toUpperSnakeCase()) }.getOrDefault(UNKNOWN)
+        }
     }
 
     /**
