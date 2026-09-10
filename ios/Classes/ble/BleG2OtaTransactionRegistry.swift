@@ -571,7 +571,12 @@ final class BleG2OtaTransactionRegistry {
 
     func isEndpointOwned(_ uuid: String) -> Bool {
         let key = uuid.lowercased()
-        return activeRecords.values.contains { $0.endpoints[key]?.phase != .retired }
+        // Missing keys must not count as owned: `nil != .retired` is true in Swift
+        // and would let one G2 transaction gate every unrelated UUID, including R1.
+        return activeRecords.values.contains { record in
+            guard let lease = record.endpoints[key] else { return false }
+            return lease.phase != .retired
+        }
     }
 
     func shouldAllowAdmission(
