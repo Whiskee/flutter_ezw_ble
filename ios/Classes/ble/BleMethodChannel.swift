@@ -35,6 +35,14 @@ enum BleMC: String {
     case disconnectForOtaReboot
     /// OTA write-stall recovery teardown: exact physical disconnect, owner preserved.
     case disconnectForOtaRecovery
+    /// Register a native-owned G2 OTA transaction before the first OTA command.
+    case beginG2OtaTransaction
+    /// Bind, recover, or park one endpoint under the native OTA transaction.
+    case updateG2OtaEndpoint
+    /// Atomically retire the full native G2 OTA transaction.
+    case finishG2OtaTransaction
+    /// Query active or terminal state for a native G2 OTA transaction.
+    case queryG2OtaTransaction
     /// Mark business-layer auth as about to complete.
     case devicePreConnected
     /// Mark business-layer auth as complete and arm auto reconnect.
@@ -206,11 +214,13 @@ enum BleMC: String {
             let source = BleConnectSource(rawValue: data["source"] as? String ?? "") ?? .unknown
             let mode = BleReconnectActivationMode(rawValue: data["mode"] as? String ?? "") ?? .unknown
             let sessionGeneration = (data["sessionGeneration"] as? NSNumber)?.int64Value ?? 0
+            let otaContext = BleG2OtaContext(data: data["otaContext"] as? [String: Any])
             let acknowledgements = BleManager.shared.activateAutoReconnectTargets(
                 targets,
                 source: source,
                 mode: mode,
-                sessionGeneration: sessionGeneration
+                sessionGeneration: sessionGeneration,
+                otaContext: otaContext
             )
             result(acknowledgements.map(\.raw))
             return
@@ -267,11 +277,25 @@ enum BleMC: String {
             let uuid: String = jsonData["uuid"] as? String ?? ""
             let expectedSessionGeneration = (jsonData["expectedSessionGeneration"] as? NSNumber)?.int64Value ?? 0
             let expectedAttemptGeneration = (jsonData["expectedAttemptGeneration"] as? NSNumber)?.int64Value ?? 0
+            let otaContext = BleG2OtaContext(data: jsonData["otaContext"] as? [String: Any])
             result(BleManager.shared.disconnectForOtaRecovery(
                 uuid: uuid,
                 expectedSessionGeneration: expectedSessionGeneration,
-                expectedAttemptGeneration: expectedAttemptGeneration
+                expectedAttemptGeneration: expectedAttemptGeneration,
+                otaContext: otaContext
             ))
+            return
+        case .beginG2OtaTransaction:
+            result(BleManager.shared.beginG2OtaTransaction(arguments as? [String: Any] ?? [:]).raw)
+            return
+        case .updateG2OtaEndpoint:
+            result(BleManager.shared.updateG2OtaEndpoint(arguments as? [String: Any] ?? [:]).raw)
+            return
+        case .finishG2OtaTransaction:
+            result(BleManager.shared.finishG2OtaTransaction(arguments as? [String: Any] ?? [:]).raw)
+            return
+        case .queryG2OtaTransaction:
+            result(BleManager.shared.queryG2OtaTransaction(arguments as? [String: Any] ?? [:]).raw)
             return
         case .sendCmd:
             let jsonData: [String: Any] = arguments as? [String: Any] ?? [:]
@@ -281,6 +305,7 @@ enum BleMC: String {
             let allowDuringUpgrade: Bool = jsonData["allowDuringUpgrade"] as? Bool ?? false
             let expectedSessionGeneration = (jsonData["expectedSessionGeneration"] as? NSNumber)?.int64Value ?? 0
             let expectedAttemptGeneration = (jsonData["expectedAttemptGeneration"] as? NSNumber)?.int64Value ?? 0
+            let otaContext = BleG2OtaContext(data: jsonData["otaContext"] as? [String: Any])
             if let data = jsonData["data"] as? FlutterStandardTypedData {
                 BleManager.shared.sendCmd(
                     uuid: uuid,
@@ -288,7 +313,8 @@ enum BleMC: String {
                     psType: psType,
                     allowDuringUpgrade: allowDuringUpgrade,
                     expectedSessionGeneration: expectedSessionGeneration,
-                    expectedAttemptGeneration: expectedAttemptGeneration
+                    expectedAttemptGeneration: expectedAttemptGeneration,
+                    otaContext: otaContext
                 )
             }
             // CoreBluetooth does not expose a reliable per-packet success callback here;
@@ -301,6 +327,7 @@ enum BleMC: String {
             let psType: Int = jsonData["psType"] as? Int ?? 0
             let expectedSessionGeneration = (jsonData["expectedSessionGeneration"] as? NSNumber)?.int64Value ?? 0
             let expectedAttemptGeneration = (jsonData["expectedAttemptGeneration"] as? NSNumber)?.int64Value ?? 0
+            let otaContext = BleG2OtaContext(data: jsonData["otaContext"] as? [String: Any])
             guard let data = jsonData["data"] as? FlutterStandardTypedData else {
                 result(nil)
                 return
@@ -311,6 +338,7 @@ enum BleMC: String {
                 psType: psType,
                 expectedSessionGeneration: expectedSessionGeneration,
                 expectedAttemptGeneration: expectedAttemptGeneration,
+                otaContext: otaContext,
                 result: result
             )
             return

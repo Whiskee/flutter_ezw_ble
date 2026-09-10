@@ -174,7 +174,7 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `stopScan` | `Future<void> stopScan()` | 显式停止扫描。 |
 | `connectDevice` | `Future<void> connectDevice(String belongConfig, String uuid, String name, {String? sn, bool? afterUpgrade, bool directConnect = false})` | 发起连接。`belongConfig` 必须命中 `initConfigs` 注册过的配置名；`name` 在 iOS 端定位，`sn` 仅 Android 用；`afterUpgrade=true` 时走 OTA 后的特殊重连路径；`directConnect=true` 表示调用方明确接受本地/系统缓存直连，不再要求当前扫描窗口可见；默认 `false` 仍保持 scan-first。 |
 | `armAutoReconnectTargets` | `Future<void> armAutoReconnectTargets(List<BleDevice> devices)` | 只登记长期自动回连 owner，不立即打开 GATT/CoreBluetooth connect。保留给业务成功后的持久化与兼容调用。 |
-| `activateAutoReconnectTargets` | `Future<List<BleReconnectActivationResult>> activateAutoReconnectTargets(List<BleDevice> devices, {BleConnectSource source = BleConnectSource.autoReconnect, BleReconnectActivationMode mode = BleReconnectActivationMode.initial})` | 对全部目标立即建立/复用/对账原生 pending 直连并逐目标返回接管结果；`resolved` 表示已有稳定身份，`identityPending` 表示 iOS 已按配置与完整名称持有待解析 owner，`rejected` 表示原生没有接管。`ownerDisposition` 进一步区分 `created/reused/repaired/deferred/rejected`，上层复用 batch 时必须用 `reconcile` 重新确认实时 owner，不能把历史 ACK 等同于当前 native owner。`promotion` 使用手动提升语义，不创建重复连接。 |
+| `activateAutoReconnectTargets` | `Future<List<BleReconnectActivationResult>> activateAutoReconnectTargets(List<BleDevice> devices, {BleConnectSource source = BleConnectSource.autoReconnect, BleReconnectActivationMode mode = BleReconnectActivationMode.initial, int sessionGeneration = 0, BleG2OtaContext? otaContext})` | 对全部目标立即建立/复用/对账原生 pending 直连并逐目标返回接管结果；`resolved` 表示已有稳定身份，`identityPending` 表示 iOS 已按配置与完整名称持有待解析 owner，`rejected` 表示原生没有接管。`ownerDisposition` 进一步区分 `created/reused/repaired/deferred/rejected`，上层复用 batch 时必须用 `reconcile` 重新确认实时 owner，不能把历史 ACK 等同于当前 native owner。`promotion` 使用手动提升语义，不创建重复连接。G2 OTA 专用恢复可携带 `otaContext`，native 仅对当前 transaction 的未完成 endpoint 准入；普通 activation 不得绕过 OTA transaction 门禁。 |
 | `notifyAutoReconnectTargetVisible` | `Future<bool> notifyAutoReconnectTargetVisible({required String uuid, String name = ''})` | 上层并行扫描重新看到目标时提示原生。Android 接管该 UUID 尚未物理连接的 exact passive GATT 或其 pending retry，并在全局单槽位中执行一次 `autoConnect=false` 直连；随后仍保留长期 passive owner。iOS 保持普通 pending connect owner，固定返回 `false`。 |
 | `disconnectDevice` | `Future<void> disconnectDevice(String uuid, String name, {bool removeBond = false})` | 主动断连。`removeBond=true`（仅 Android）会一并移除系统配对。 |
 | `devicePreConnected` | `Future<void> devicePreConnected(String uuid)` | G1/R1 兼容的“预连接”通知；G2 禁止使用该 UUID-only 接口。 |
@@ -182,8 +182,12 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `prepareBusinessConnection` | `Future<BleBusinessConnectionStatus> prepareBusinessConnection(BleBusinessConnectionAttempt attempt)` | G2 exact-attempt 预连接入口。`attempt` 必须来自同一次 `connectFinish` 的 `uuid/sessionGeneration/attemptGeneration`；同 token 幂等刷新有界鉴权宽限，不同 token 替换旧 lease。拒绝只返回状态，不取消长期 autoReconnect owner。 |
 | `commitBusinessConnection` | `Future<BleBusinessConnectionStatus> commitBusinessConnection(BleBusinessConnectionAttempt attempt)` | G2 exact-attempt 真连接入口。原生同时校验 prepare lease、当前 admission、物理连接、当前 GATT/CBPeripheral 身份，以及 write/read/notify readiness；只有成功发布 `connected` 后返回 `accepted`。 |
 | `abortBusinessConnection` | `Future<bool> abortBusinessConnection(BleBusinessConnectionAttempt attempt)` | 只撤销完全匹配的 prepare lease；旧 token abort 不能删除新 lease，也不能断开 GATT、移除 autoReconnect owner 或伪造用户断连。 |
-| `sendCmd` | `Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0, bool allowDuringUpgrade = false, int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0})` | 写特征值，等待原生层 write 完成。`psType` 是"私有服务类型"，对应 `BlePrivateService.type`（0=基础，1=OTA，2+=自定义）。升级态默认阻断非 OTA 写入；只有上层协议白名单确认的 AUTH、时间同步等恢复控制指令可显式传 `allowDuringUpgrade=true`。OTA 控制包携带正 `expectedSessionGeneration/expectedAttemptGeneration` 时，native 必须在实际 dispatch 前按当前物理 owner 校验，避免旧 START/INFORMATION/RESULT 写入新 GATT。 |
-| `sendCmdNoWait` | `Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0, int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0})` | OTA 连发入口。Android：`psType == 1` 走 per-endpoint `WRITE_TYPE_NO_RESPONSE` 队列；同步 BUSY 保留原包，Future 等本包 `onCharacteristicWrite` 成功后返回，4s 停滞/teardown typed fail，避免固定延时撞 GATT 单槽位。iOS：`psType == 1` 走 `WriteWithoutResponse` + `canSendWriteWithoutResponse` 背压队列（见 `ios/Classes/ble/OtaWriteQueue.swift` 与 `docs/IOS_OTA_NOWAIT_SPEC.md`）。OTA RAW 携带正 expected pair 时，native 在入队/提交前按当前物理 owner 校验；其它 `psType` 保持历史 no-wait 语义。 |
+| `sendCmd` | `Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0, bool allowDuringUpgrade = false, int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0, BleG2OtaContext? otaContext})` | 写特征值，等待原生层 write 完成。`psType` 是"私有服务类型"，对应 `BlePrivateService.type`（0=基础，1=OTA，2+=自定义）。升级态默认阻断非 OTA 写入；只有上层协议白名单确认的 AUTH、时间同步等恢复控制指令可显式传 `allowDuringUpgrade=true`。OTA 控制包携带正 `expectedSessionGeneration/expectedAttemptGeneration` 时，native 必须在实际 dispatch 前按当前物理 owner 校验；携带 `otaContext` 时还必须命中当前 G2 OTA transaction，避免旧 START/INFORMATION/RESULT 写入新 GATT 或越权清理。 |
+| `sendCmdNoWait` | `Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0, int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0, BleG2OtaContext? otaContext})` | OTA 连发入口。Android：`psType == 1` 走 per-endpoint `WRITE_TYPE_NO_RESPONSE` 队列；同步 BUSY 保留原包，Future 等本包 `onCharacteristicWrite` 成功后返回，4s 停滞/teardown typed fail，避免固定延时撞 GATT 单槽位。iOS：`psType == 1` 走 `WriteWithoutResponse` + `canSendWriteWithoutResponse` 背压队列（见 `ios/Classes/ble/OtaWriteQueue.swift` 与 `docs/IOS_OTA_NOWAIT_SPEC.md`）。OTA RAW 携带正 expected pair 时，native 在入队/提交前按当前物理 owner 校验；携带 `otaContext` 时还必须命中当前 G2 OTA transaction。其它 `psType` 保持历史 no-wait 语义。 |
+| `beginG2OtaTransaction` | `Future<BleG2OtaTransactionResult> beginG2OtaTransaction({required String transactionId, required int generation, required String config, required String sn, required List<BleG2OtaEndpointIdentity> endpoints})` | 在首条 G2 OTA 指令前原子登记本轮事务、完整 endpoint 集合和初始物理 identity。重复相同 scope 幂等返回同一 native instance；参数冲突、空 identity、非正 generation 或旧 tombstone 必须拒绝。 |
+| `updateG2OtaEndpoint` | `Future<BleG2OtaTransactionResult> updateG2OtaEndpoint({required BleG2OtaContext context, required String uuid, required BleG2OtaEndpointAction action, int sessionGeneration = 0, int attemptGeneration = 0})` | 在同一事务内绑定真实连接、进入 recover，或将完成 endpoint 转为 `parked`。更新请求不重复携带 `config/SN/endpoints`；native 必须按 exact context 读取 begin 已冻结的 scope，不能把缺失的重复字段当成无效请求，也不能信任调用方补传的可变副本。`bind` 需要 live exact pair；`recover` 需要已登记旧 pair 的真实断连，或从未绑定的 waiting endpoint；`park` 使用已登记的正 exact pair，可在 GATT 已释放时隔离旧 transport。 |
+| `finishG2OtaTransaction` | `Future<BleG2OtaTransactionResult> finishG2OtaTransaction({required String transactionId, required int generation, required String reason, required String config, required String sn, required List<BleG2OtaEndpointIdentity> endpoints, String instanceId = ''})` | 整组退役入口。native 校验 begin 冻结的 transaction/config/SN/endpoint 集合，但 session/attempt 属于可变 physical lease，恢复重绑后不得拿调用方的旧 pair 拒绝合法 finish；实际 teardown 始终使用 registry 当前 exact pair。在同一串行域隔离队列、通知、回调和旧 owner，本地退役完成后一次性解除门禁并记录 terminal ledger。只有 `committed` / `alreadyCommitted` 证明退役完成。 |
+| `queryG2OtaTransaction` | `Future<BleG2OtaTransactionResult> queryG2OtaTransaction({required String transactionId, required int generation, String instanceId = ''})` | 只读查询事务状态，用于 ACK 丢失、5 秒等待超时、生命周期恢复和手动连接前的重放判断；不得二次断连或唤醒。 |
 | `enterUpgradeState` | `Future<void> enterUpgradeState(String uuid)` | 仅允许仍处于真实业务 `connected`、物理链路有效且持有已接受 epoch 的 uuid 进入 OTA；拒绝用缓存制造 `upgrade`。原生侧据此切到 OTA 私有服务、延长断连超时（与 `BleConfig.upgradeSwapTime` 配合）。 |
 | `quiteUpgradeState` | `Future<void> quiteUpgradeState(String uuid, {int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0})` | 退出 OTA 状态；携带正 expected pair 时，只有当前物理 owner 匹配才消费 OTA marker 和 pending 写，避免旧 attempt 清掉新 attempt。链路仍有效时才恢复 `connected`，断连后到达的旧 OTA 回调不能复活连接态。 |
 | `disconnectForOtaReboot` | `Future<void> disconnectForOtaReboot(String uuid, String name, {int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0})` | OTA 安装成功后的固件 reboot teardown。携带正 expected pair 时，native 必须精确匹配当前 owner 后才 detach 旧物理 GATT/CBPeripheral、发 `disconnectFromSys` 并标记一次性 suppression；旧 pair 不能关闭或屏蔽新 attempt。0/0 仅保留旧调用兼容。 |
@@ -222,7 +226,7 @@ enum BleEventChannel {
 | `bleState` | `int`（iOS CoreBluetooth state 值，扩展 `6 = noLocation` 给 Android） | `BleState` | 蓝牙开关、定位权限变化。Android 主动查询、Activity start/resume 与扫描入口都会重新读取实时权限和开关，仅在状态变化时 push。 |
 | `scanResult` | JSON 字符串 | `BleMatchDevice.fromJson` | 一次扫描命中（按 `BleScan.matchCount` 已聚合好的"组合设备"）。 |
 | `connectStatus` | JSON 字符串 | `BleConnectModel.fromJson` | 连接流程的每一步推进（见 §8）；携带 `source`、兼容键 `generation`、`sessionGeneration` 与 `attemptGeneration`。`generation` 始终序列化为 Dart session generation；旧 payload 分别回退为 `unknown` / `0`。 |
-| `receiveData` | Map：`{uuid, psType, data:Base64, isSuccess, sessionGeneration, attemptGeneration}` | `BleCmd.receiveMap` | 来自原生的特征值数据。**注意 `data` 字段是 Base64**，业务侧拿到的 `BleCmd.data` 已经是 `Uint8List`，背后由 `flutter_ezw_utils.encodeBase64()` 解码。`sessionGeneration/attemptGeneration` 仅对 native 能确认物理 owner 的 OTA response 为正，旧事件和非 OTA 默认为 0。 |
+| `receiveData` | Map：`{uuid, psType, data:Base64, isSuccess, sessionGeneration, attemptGeneration, otaTransactionId, otaGeneration, otaInstanceId}` | `BleCmd.receiveMap` | 来自原生的特征值数据。**注意 `data` 字段是 Base64**，业务侧拿到的 `BleCmd.data` 已经是 `Uint8List`，背后由 `flutter_ezw_utils.encodeBase64()` 解码。`sessionGeneration/attemptGeneration` 仅对 native 能确认物理 owner 的 OTA response 为正，旧事件和非 OTA 默认为 0。G2 OTA 事务持有期间还会附带 transaction 字段；Dart 必须同时校验 transaction 与 physical pair 后才消费 ACK/Notify。 |
 | `logger` | String，含 `[d]-` / `[e]-` 前缀 | `String` | 仅 iOS 主动 push；业务侧自行根据前缀分级。 |
 
 iOS 的非 `poweredOn` 状态继续沿用既有连接 teardown；但只有公开状态
@@ -487,7 +491,7 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 
 本次回连契约：
 
-1. `armAutoReconnectTargets` 只登记 owner；`activateAutoReconnectTargets` 立即对**全部目标**发起/复用/对账 pending 直连，不等待扫描。Android 常态使用 `connectGatt(autoConnect=true)`；辅助扫描命中未完成 target 时，才接管 exact pre-physical GATT 并在全局单槽位中执行一次 `connectGatt(autoConnect=false)` 直连。上层复用 recovery batch 时使用 `mode=reconcile`，Android 必须按 exact endpoint/session 检查 task、GATT 和 Gate：健康 owner 返回 `reused`，缺失 runtime owner但持久授权仍有效时创建唯一 replacement 并返回 `repaired`，orphan GATT 先精确撤销再返回 `repaired`；解绑、主动断开、OTA、安全恢复耗尽、配置关闭和旧 session 都按 `rejected/deferred` fail closed。iOS 同样以 exact endpoint/session 对账 task、admission、session 与 peripheral 状态：完整且仍处于 connecting/connected 的 owner 才返回 `reused`；缺失或陈旧资源先按 exact admission 释放或进入 cancellation barrier，再注册 replacement 并返回 `repaired/deferred`。可 retrieve/cache 命中的 `CBPeripheral` 交给带 auto-reconnect option 的 `centralManager.connect`，无 peripheral 或 inactive 时只返回 `deferred` 或 `identityPending`。Android 仅对尚未收到物理 callback 的 exact GATT 使用 `connectTimeout`（至少1秒）deadline 回收 zombie handle；收到 callback 后立即取消，Gate 排队不计入该 deadline。
+1. `armAutoReconnectTargets` 只登记 owner；`activateAutoReconnectTargets` 立即对**全部目标**发起/复用/对账 pending 直连，不等待扫描。Android 常态使用 `connectGatt(autoConnect=true)`；辅助扫描命中未完成 target 时，才接管 exact pre-physical GATT 并在全局单槽位中执行一次 `connectGatt(autoConnect=false)` 直连。上层复用 recovery batch 时使用 `mode=reconcile`，Android 必须按 exact endpoint/session 检查 task、GATT 和 Gate：健康 owner 返回 `reused`，缺失 runtime owner但持久授权仍有效时创建唯一 replacement 并返回 `repaired`，orphan GATT 先精确撤销再返回 `repaired`；解绑、主动断开、OTA、安全恢复耗尽、配置关闭和旧 session 都按 `rejected/deferred` fail closed。业务断连终态若能精确命中 supervisor 当前 `passiveGatt`，Android 先中性回收该旧 owner，再执行 OTA gate；升级门禁拒绝时不得创建 generic retry 或保留 zombie GATT。iOS 同样以 exact endpoint/session 对账 task、admission、session 与 peripheral 状态：完整且仍处于 connecting/connected 的 owner 才返回 `reused`；缺失或陈旧资源先按 exact admission 释放或进入 cancellation barrier，再注册 replacement 并返回 `repaired/deferred`。可 retrieve/cache 命中的 `CBPeripheral` 交给带 auto-reconnect option 的 `centralManager.connect`，无 peripheral 或 inactive 时只返回 `deferred` 或 `identityPending`。Android 仅对尚未收到物理 callback 的 exact GATT 使用 `connectTimeout`（至少1秒）deadline 回收 zombie handle；收到 callback 后立即取消，Gate 排队不计入该 deadline。
 2. 物理连接可以并行等待，但真实连接 callback 到达后必须进入一个进程级 Gate。automatic 按 callback FIFO；等待中的 manual 优先于 automatic，但不抢占 active owner。Gate 独占 service discovery、characteristic、CCCD/notify 与业务鉴权，直到 G2 exact `commitBusinessConnection`、G1/R1 `deviceConnected` 或终态 teardown 确认才释放。
 3. 自动回连在物理 callback 前不发送用户可见 `connecting`。第一条回连状态从 `contactDevice` 开始，并携带 `source` 与 `generation`。手动点击若已有 pending session，只把 source/队列优先级提升为 `manualReconnect`。
 4. service/char/timeout 等非系统终态必须先完成 GATT/peripheral teardown，再释放 Gate；普通 CoreBluetooth 终态也必须先移除旧 active request，之后才能调度下一代，避免调度被旧 owner 永久 defer。iOS 使用 exact cancellation token + 2s watchdog；超时债务按 endpoint 用饱和 counter 常数内存保存，迟到 callback 不能误杀新 generation。Android 在业务 connected 后保留 exact `(sessionId, GATT)` metadata，稍后的系统断连仍会清理并重建 passive GATT，旧 GATT 不能命中新 attempt。
@@ -604,21 +608,18 @@ App 启动
   │                                                       其它 psType 即时 WriteWithoutResponse
   └─ ◀ receiveDataEC: BleCmd(data, psType, isSuccess)
 
-OTA 流程
-  ├─ EzwBle.to.bleMC.enterUpgradeState(uuid)
-  │    （仅 live business connected + accepted epoch 可进入）
-  ├─ ◀ connectStatusEC: upgrade
-  ├─ EzwBle.to.bleMC.sendCmdNoWait(..., psType=1)       ▶ 通过 OTA 私有服务连发
-  │                                                       Android: callback 驱动的单槽位背压队列
-  │                                                       iOS:     OtaWriteQueue + canSendWriteWithoutResponse 背压
-  │                                                       (与 Android packets-per-event 行为对齐, 详见 docs/IOS_OTA_NOWAIT_SPEC.md)
-  ├─ （固件烧录、设备重启 → 系统断连）
-  ├─ ◀ connectStatusEC: disconnectFromSys
-  │      （iOS 侧 OtaWriteQueue 自动 cancelAll, 释放挂起的 await）
-  ├─ （等 upgradeSwapTime ms 后重连）
-  ├─ ◀ connectStatusEC: connecting ... connected
-  └─ EzwBle.to.bleMC.quiteUpgradeState(uuid)
-       （链路已断时只消费 upgrade marker，不重新上报 connected）
+G2 OTA 流程（R1 沿用独立 DFU transport）
+  ├─ beginG2OtaTransaction(冻结整组 scope) → accepted + native instance
+  ├─ updateG2OtaEndpoint(bind, live exact pair)
+  ├─ sendCmd / sendCmdNoWait(..., psType=1, otaContext, exact pair)
+  │    （Android 单槽背压；iOS OtaWriteQueue；提交不等于固件 ACK）
+  ├─ 同 attempt 断连 → recover → 专用 activation → AUTH → bind
+  │    └─ START → INFORMATION → 当前组件 offset 0（既有有界预算）
+  ├─ 当前腿最终成功 → park（隔离旧 transport；同伴完成前不回连）
+  ├─ 全部目标完成 → Dart 同步提交版本并启动既有 Reboot 时钟
+  ├─ finishG2OtaTransaction → 全组隔离 → 提交退役 → 原生唤醒授权 owner
+  ├─ ACK 未知 → 既有恢复机会 query/replay（不重置 Reboot 时钟）
+  └─ 已确认退役 + 当前真实业务 connected → Reboot 100%
 
 主动断开
   └─ EzwBle.to.bleMC.disconnectDevice(uuid, name, removeBond: false)
@@ -635,7 +636,7 @@ OTA 流程
 | 连接 | `connectDevice` / `devicePreConnected` / `deviceConnected` | `connectStatusEC` |
 | 断连 | `disconnectDevice` | `connectStatusEC` (`disconnectByUser`) |
 | 发送 | `sendCmd` / `sendCmdNoWait` | `receiveDataEC` |
-| OTA | `enterUpgradeState` / `quiteUpgradeState` | `connectStatusEC` (`upgrade`) |
+| G2 OTA | `beginG2OtaTransaction` / `updateG2OtaEndpoint` / `finishG2OtaTransaction` / `queryG2OtaTransaction` | 带事务与 physical pair 的 `receiveDataEC`；真实业务 `connectStatusEC` |
 | 兜底 | `resetBle` / `cleanConnectCache` / `openBleSettings` / `openAppSettings` | — |
 
 ---
@@ -907,9 +908,50 @@ iOS 端 OTA 通道走单独的 per-peripheral 写队列 `OtaWriteQueue`，目标
 - **Dart 侧同步**：`MethodChannelEzwBle.sendCmdNoWait` 已统一走 `methodChannel.invokeMethod`，**不再 fall back 到 `sendCmd`**。改 Dart 入口前先确认原生 `sendCmdNoWait` handler 仍然处理所有 `psType` 分支（OTA + 兜底）。
 - **fail closed**：OTA 特征不支持 `.writeWithoutResponse`、manager 不可用、device/characteristic 缺失或提交前外设释放时，`sendCmdNoWait(psType == 1)` 返回 typed `FlutterError`（`ota_write_unsupported` / `ota_write_unavailable`），不得回退为看似成功的旧路径。
 - **Android 对齐**：Android `sendCmdNoWait(psType == 1)` 必须保留同步提交状态；`ERROR_GATT_WRITE_REQUEST_BUSY`（旧 API 的 `false` 无法精确分类时也按瞬时背压处理）不得丢包或立即终止，而要保留原包等待当前写回调/watchdog 重试。本包 Future 只在对应 `onCharacteristicWrite` 成功后完成；断连/退出升级/重置则 `ota_write_cancelled`。退出升级但复用同一 GATT session 时，已提交写的旧 callback 必须先经过 drain barrier，期间新的普通命令和 OTA RAW 都不能提交；旧 callback 只释放物理槽，不能完成新 attempt。只有物理 session 已 teardown 且 exact GATT identity 失效后才能丢弃该屏障。非 OTA no-wait 保持历史立即成功语义。
-- **硬阻塞恢复**：`disconnectForOtaRecovery(endpoint, expectedSession, expectedAttempt)` 是写阻塞专用接口；iOS exact identity 匹配时取消该 endpoint 的旧 OTA 写队列、清本 attempt upgrade marker，并发起真实 CoreBluetooth disconnect，不伪造断连事件、不复用 reboot suppression。返回 `accepted`、`alreadyDisconnected`、`staleIdentity` 或 `unavailable`。
+- **硬阻塞恢复**：`disconnectForOtaRecovery(endpoint, expectedSession, expectedAttempt, otaContext)` 是写阻塞专用接口；G2 必须同时匹配当前事务和 exact physical pair，隔离旧写队列并发起真实 CoreBluetooth disconnect，不伪造断连事件、不复用 reboot suppression。整组 transaction gate 仍保留，只有后续受控 `recover` 能取得恢复准入。返回 `accepted`、`alreadyDisconnected`、`staleIdentity` 或 `unavailable`；无事务的 legacy 调用不得清理 transaction-owned endpoint。
 - **挂起 await 兜底**：断连/蓝牙 OFF/`reset()`/配置撤销/外设释放时 `OtaWriteQueue.cancelAll()` 会对所有 pending 写入回调 `ota_write_cancelled`；蓝牙 OFF 已使全部物理 GATT session 失效，必须在清 upgrade marker 前取消并移除所有 OTA 队列。改这条兜底必须保证**任何路径都不会让 Dart `await` 永远挂着**。
 - **范围外**：`psType == 3`（file）通道、iOS connection interval 协商、`psType == 0`（common）write type 切换均**不在本期范围**，改动前先评估对协议层应答匹配的影响。
+
+### 12.7 G2 OTA native transaction registry
+
+G2 OTA transaction 是升级期间的 native 所有权边界，不替代物理连接
+`sessionGeneration/attemptGeneration`。调用方必须先用 `beginG2OtaTransaction`
+登记完整 scope，之后所有 OTA 写入、恢复 activation、park 和 finish 都携带
+`BleG2OtaContext`。旧 UUID-only 接口和只带 physical pair 的 legacy 调用不得清理或唤醒
+transaction-owned endpoint。
+
+Native begin 复验配置具有 G2 OTA 私有服务能力、endpoint 已由原生认识且属于该配置；
+非零 physical pair 必须对应当前真实业务连接。`SN` 连同完整 endpoint 集合冻结用于后续
+精确重放；iOS 当前 connected/reconnect 状态未保存稳定 SN，因此不能声称原生独立验证了
+SN 与 endpoint 的绑定，该归属由 `even_connect` 的已绑定目标提供，不能用 peripheral 名称猜测。
+后续 endpoint update 只携带 exact transaction context、endpoint 和 physical pair；原生必须
+从 begin 记录读取冻结的 config，旧 generation/instance 取不到 scope 时继续 fail-closed，
+不得要求更新请求重复 scope，也不得用调用方补传的 config 覆盖已登记所有权。
+
+Endpoint phase 为 `waiting -> active/recovering -> parked -> retired`：
+
+- `waiting`：事务已登记但该 endpoint 尚未绑定 live physical pair；
+- `active`：当前事务已绑定真实 GATT/CBPeripheral，可以执行 OTA 写入；
+- `recovering`：仅允许当前事务、未完成 endpoint 和有断连证据的恢复 activation 进入；Android 若此时 supervisor 仍持有旧业务 GATT，只能在 transaction context 与 begin 冻结的正 `sessionGeneration/attemptGeneration` 同时匹配时中性退役该 exact GATT，再安装更高 session 并创建唯一 replacement。普通 activation、旧事务或错 pair 仍不得打断业务 GATT；
+- `parked`：该 endpoint 已完成传输并等待同伴，不能再次进入传输恢复；
+- `retired`：整组 finish 已提交或事务被明确失效/撤销。
+
+`finishG2OtaTransaction` 必须在原生串行域内校验完整 scope，隔离本事务的写队列、
+通知、回调和旧 physical owner；即使 Android GATT 或 iOS CBPeripheral 已释放，也要能凭
+登记的 transaction 精确退役旧资源。提交成功后只解除一次整组门禁、只唤醒一次仍被授权的
+autoReconnect owner，并在 terminal ledger 中保留 `committed/alreadyCommitted` 供 ACK 丢失后
+查询或重放。`unknown`、`unavailable`、`staleOwner`、未知 enum、`null` 或空 instanceId 不能
+映射为成功。
+
+`staleOwner` 也不能释放 Dart 的待确认记录。只有精确匹配的退役、失效或撤销回执可以
+结束旧权限；MethodChannel 异常和 5 秒等待超时仅表示结果未知。原生实例重建后，只有查询
+确认旧事务不存在且请求中的旧 instance 与当前 nonce 不同，才以 `nativeInstanceRecreated`
+返回对应旧凭据的 `invalidated`，不得触碰新实例中的其他 owner；同实例未知事务仍保持未知。
+
+iOS notification 仍不具备 Android GATT callback handle 同级的 enqueue-time 身份。iOS 只能在
+当前 CBPeripheral、reconnect owner metadata 和 OTA transaction 同时一致时 stamp
+`otaTransactionId/otaGeneration/otaInstanceId`；Dart 消费前仍需同时校验 transaction 与
+physical pair，迟到或无法归属的通知交给 5s/30s/90s watchdog 收口。
 
 ---
 
@@ -920,3 +962,14 @@ iOS 端 OTA 通道走单独的 per-peripheral 写队列 `OtaWriteQueue`，目标
 - `receiveDataEC` 的 `data` 是 Base64 字符串，跨大数据（OTA）有 ~33% 体积放大，未来可考虑切到 `StandardMethodCodec` 的 `Uint8List` 通路，但会破坏当前 Dart API 的兼容性。
 - `BleDeviceHardware.fromByte` 中 `isMaster = isMaster;` 是**自赋值 bug**（构造形参覆盖了字段），导致 `isMaster` 永远是字段默认值 `false`。改时记得同步更新 §7.8 的字段说明。
 - `BleConnectStateExt.label` 没有覆盖 `disconnectFromSys`、`bleError`、`systemError` 三个分支，反序列化时会回落到 `BleConnectState.none`——若原生侧真的会推这些字符串，需要补全 switch。
+
+
+### Native trace occurrence evidence
+
+`BleNativeConnectionTraceStep.occurredAtMs` is frozen at production using a per-attempt wall/monotonic anchor. `timingStatus` is `valid` or `clock_changed` (wall drift over 1,000 ms); older payloads omit both and consumers must report partial timing. `elapsedMs`, producer `stepSeq` and snapshot `capturedElapsedMs` retain their original meanings. Snapshot/replay never changes a retained step's occurrence time.
+
+A `physical_connection` step carries `physicalConnectionEvent=connected|disconnected` only after the platform callback passes the existing current peripheral/GATT owner check. Android `BluetoothAdapter.STATE_OFF` is also a native transport-invalidating callback: it freezes `disconnected` against each exact live owner before the manager clears GATT maps. This step is context evidence, not a new connection state or success/failure result. Consumers must handle it before normal stage parsing. Logical reset, cancellation and `didFailToConnect` do not set physical timestamps. Platform callbacks filtered after owner teardown remain unknown rather than being attributed to a later owner.
+
+Snapshot `rssiStatus` describes existing sampling evidence: `not_requested` before a read is requested, `not_observable` while no requested read result is available, `read_failed` when a read failed without a valid sample, and `available` when a valid sample is retained (with its original age). Old/unsupported sources are `not_observable` upstream. No new read or timer is introduced. The 32-step buffer retains the start, physical callbacks and earliest failure while evicting intermediate detail with a cumulative gap marker.
+
+Validation: `fvm flutter test`; `swiftc ios/Classes/ble/BleNativeConnectionTrace.swift test/native/connection_trace_test.swift -o /tmp/native-trace-tests` then `/tmp/native-trace-tests` exercises delayed delivery, clock jumps, RSSI evidence and overflow using injected clocks. Real-device lifecycle and radio behavior remain separate acceptance.

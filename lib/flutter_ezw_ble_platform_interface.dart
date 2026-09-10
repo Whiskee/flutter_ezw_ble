@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:flutter_ezw_ble/core/models/ble_config.dart';
 import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
 import 'package:flutter_ezw_ble/core/models/ble_device.dart';
+import 'package:flutter_ezw_ble/core/models/ble_g2_ota_transaction.dart';
 import 'package:flutter_ezw_ble/core/models/ble_ota_recovery_disconnect_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_business_connection_attempt.dart';
@@ -166,13 +167,70 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// `accepted` 会触发真实 CoreBluetooth/GATT 断连并保留 autoReconnect owner；
   /// `alreadyDisconnected` 表示本 attempt 已无活跃物理链路；`staleIdentity`
   /// 与 `unavailable` 均由上层直接终止，不强行重试。
+  /// G2 事务持有期间必须同时携带 otaContext；旧 physical-only 调用不能
+  /// 取消新事务写队列。此入口只产生真实断连，恢复仍沿原有有界 supervisor。
   Future<BleOtaRecoveryDisconnectResult> disconnectForOtaRecovery(
     String uuid, {
     int expectedSessionGeneration = 0,
     int expectedAttemptGeneration = 0,
+    BleG2OtaContext? otaContext,
   }) {
     throw UnimplementedError(
       'disconnectForOtaRecovery(uuid: $uuid) has not been implemented.',
+    );
+  }
+
+  /// Register the full G2 OTA endpoint set in native before the first OTA
+  /// command. Native returns an instance token that must be supplied to all
+  /// following transaction calls.
+  Future<BleG2OtaTransactionResult> beginG2OtaTransaction({
+    required String transactionId,
+    required int generation,
+    required String config,
+    required String sn,
+    required List<BleG2OtaEndpointIdentity> endpoints,
+  }) {
+    throw UnimplementedError(
+      'beginG2OtaTransaction(transactionId: $transactionId) has not been implemented.',
+    );
+  }
+
+  /// Bind, recover, or park one endpoint under the native-owned transaction.
+  Future<BleG2OtaTransactionResult> updateG2OtaEndpoint({
+    required BleG2OtaContext context,
+    required String uuid,
+    required BleG2OtaEndpointAction action,
+    int sessionGeneration = 0,
+    int attemptGeneration = 0,
+  }) {
+    throw UnimplementedError(
+      'updateG2OtaEndpoint(transactionId: ${context.transactionId}, uuid: $uuid) has not been implemented.',
+    );
+  }
+
+  /// Atomically retire the whole native G2 OTA transaction group.
+  Future<BleG2OtaTransactionResult> finishG2OtaTransaction({
+    required String transactionId,
+    required int generation,
+    required String reason,
+    required String config,
+    required String sn,
+    required List<BleG2OtaEndpointIdentity> endpoints,
+    String instanceId = '',
+  }) {
+    throw UnimplementedError(
+      'finishG2OtaTransaction(transactionId: $transactionId) has not been implemented.',
+    );
+  }
+
+  /// Query the native terminal ledger without mutating connection state.
+  Future<BleG2OtaTransactionResult> queryG2OtaTransaction({
+    required String transactionId,
+    required int generation,
+    String instanceId = '',
+  }) {
+    throw UnimplementedError(
+      'queryG2OtaTransaction(transactionId: $transactionId) has not been implemented.',
     );
   }
 
@@ -248,6 +306,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     BleConnectSource source = BleConnectSource.autoReconnect,
     BleReconnectActivationMode mode = BleReconnectActivationMode.initial,
     int sessionGeneration = 0,
+    BleG2OtaContext? otaContext,
   }) {
     throw UnimplementedError(
       'activateAutoReconnectTargets(devices: $devices, source: $source, mode: $mode, sessionGeneration: $sessionGeneration) has not been implemented.',
@@ -277,6 +336,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// - param allowDuringUpgrade 业务协议已确认该控制指令可在升级态发送
   /// - param expectedSessionGeneration OTA 调用方冻结的业务 session；0 表示兼容旧调用
   /// - param expectedAttemptGeneration OTA 调用方冻结的物理 attempt；0 表示兼容旧调用
+  /// - param otaContext G2 OTA 原生事务凭据；非空时 native 必须同时校验事务和物理身份
   ///
   Future<void> sendCmd(
     String uuid,
@@ -285,6 +345,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     bool allowDuringUpgrade = false,
     int expectedSessionGeneration = 0,
     int expectedAttemptGeneration = 0,
+    BleG2OtaContext? otaContext,
   }) {
     throw UnimplementedError('sendCmd() has not been implemented.');
   }
@@ -296,6 +357,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// - param psType 指令类型
   /// - param expectedSessionGeneration OTA 调用方冻结的业务 session；0 表示兼容旧调用
   /// - param expectedAttemptGeneration OTA 调用方冻结的物理 attempt；0 表示兼容旧调用
+  /// - param otaContext G2 OTA 原生事务凭据；非空时 native 必须同时校验事务和物理身份
   ///
   Future<void> sendCmdNoWait(
     String uuid,
@@ -303,6 +365,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     int psType = 0,
     int expectedSessionGeneration = 0,
     int expectedAttemptGeneration = 0,
+    BleG2OtaContext? otaContext,
   }) {
     throw UnimplementedError('sendCmdNoWait() has not been implemented.');
   }

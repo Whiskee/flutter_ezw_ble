@@ -6,7 +6,8 @@ import 'package:json_annotation/json_annotation.dart';
 
 part 'ble_connect_model.g.dart';
 
-@JsonSerializable()
+// Preserve nested trace metadata when callers use toJson without jsonEncode.
+@JsonSerializable(explicitToJson: true)
 class BleConnectModel {
   final String uuid;
   final String name;

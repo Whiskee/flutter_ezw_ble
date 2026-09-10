@@ -6,6 +6,7 @@ import 'package:flutter_ezw_ble/core/models/ble_cmd.dart';
 import 'package:flutter_ezw_ble/core/models/ble_business_connection_attempt.dart';
 import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
 import 'package:flutter_ezw_ble/core/models/ble_device.dart';
+import 'package:flutter_ezw_ble/core/models/ble_g2_ota_transaction.dart';
 import 'package:flutter_ezw_ble/core/models/ble_ota_recovery_disconnect_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_scan_start_result.dart';
@@ -101,6 +102,51 @@ class MockFlutterEzwBlePlatform
     String uuid, {
     int expectedSessionGeneration = 0,
     int expectedAttemptGeneration = 0,
+    BleG2OtaContext? otaContext,
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<BleG2OtaTransactionResult> beginG2OtaTransaction({
+    required String transactionId,
+    required int generation,
+    required String config,
+    required String sn,
+    required List<BleG2OtaEndpointIdentity> endpoints,
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<BleG2OtaTransactionResult> updateG2OtaEndpoint({
+    required BleG2OtaContext context,
+    required String uuid,
+    required BleG2OtaEndpointAction action,
+    int sessionGeneration = 0,
+    int attemptGeneration = 0,
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<BleG2OtaTransactionResult> finishG2OtaTransaction({
+    required String transactionId,
+    required int generation,
+    required String reason,
+    required String config,
+    required String sn,
+    required List<BleG2OtaEndpointIdentity> endpoints,
+    String instanceId = '',
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<BleG2OtaTransactionResult> queryG2OtaTransaction({
+    required String transactionId,
+    required int generation,
+    String instanceId = '',
   }) {
     throw UnimplementedError();
   }
@@ -145,6 +191,7 @@ class MockFlutterEzwBlePlatform
     BleConnectSource source = BleConnectSource.autoReconnect,
     BleReconnectActivationMode mode = BleReconnectActivationMode.initial,
     int sessionGeneration = 0,
+    BleG2OtaContext? otaContext,
   }) {
     throw UnimplementedError();
   }
@@ -165,6 +212,7 @@ class MockFlutterEzwBlePlatform
     bool allowDuringUpgrade = false,
     int expectedSessionGeneration = 0,
     int expectedAttemptGeneration = 0,
+    BleG2OtaContext? otaContext,
   }) {
     throw UnimplementedError();
   }
@@ -176,6 +224,7 @@ class MockFlutterEzwBlePlatform
     int psType = 0,
     int expectedSessionGeneration = 0,
     int expectedAttemptGeneration = 0,
+    BleG2OtaContext? otaContext,
   }) {
     throw UnimplementedError();
   }
@@ -260,6 +309,9 @@ void main() {
       'isSuccess': true,
       'sessionGeneration': 37,
       'attemptGeneration': 9,
+      'otaTransactionId': 'tx-1',
+      'otaGeneration': 37,
+      'otaInstanceId': 'native-1',
     });
 
     expect(cmd.uuid, 'device-1');
@@ -268,6 +320,9 @@ void main() {
     expect(cmd.isSuccess, isTrue);
     expect(cmd.sessionGeneration, 37);
     expect(cmd.attemptGeneration, 9);
+    expect(cmd.otaTransactionId, 'tx-1');
+    expect(cmd.otaGeneration, 37);
+    expect(cmd.otaInstanceId, 'native-1');
   });
 
   test('BleCmd.receiveMap preserves the complete tagged audio frame', () {
@@ -304,6 +359,9 @@ void main() {
       expect(cmd.isSuccess, isFalse);
       expect(cmd.sessionGeneration, 0);
       expect(cmd.attemptGeneration, 0);
+      expect(cmd.otaTransactionId, isEmpty);
+      expect(cmd.otaGeneration, 0);
+      expect(cmd.otaInstanceId, isEmpty);
     },
   );
 
