@@ -1276,7 +1276,8 @@ extension BleManager {
                 hasConnectedCache: true,
                 isPeripheralConnected: device.peripheral.state != .disconnected,
                 sessionGeneration: metadata?.sessionGeneration ?? 0,
-                attemptGeneration: metadata?.attemptGeneration ?? 0
+                attemptGeneration: metadata?.attemptGeneration ?? 0,
+                isUpgrading: upgradeStateRegistry.contains(uuid)
             )
             let decision = BleG2OtaRetirementPolicy.decide(
                 snapshot: snapshots[key],
@@ -1315,7 +1316,8 @@ extension BleManager {
                     hasConnectedCache: false,
                     isPeripheralConnected: false,
                     sessionGeneration: 0,
-                    attemptGeneration: 0
+                    attemptGeneration: 0,
+                    isUpgrading: upgradeStateRegistry.contains(snapshot.uuid)
                 )
             )
             guard decision.shouldClearLocalState else { continue }
