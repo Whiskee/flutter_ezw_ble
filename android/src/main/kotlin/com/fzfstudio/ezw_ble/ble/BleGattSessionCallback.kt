@@ -43,6 +43,11 @@ internal class BleGattSessionCallback(
     private val recordTraceMtu: (String, String, Int, Int) -> Unit,
     /** 写入最新 RSSI 诊断快照，不独立上报。 */
     private val updateTraceRssi: (String, Int) -> Unit,
+    /** Failure evidence from the existing exact GATT sampling path. */
+    private val markTraceRssiRequested: (String) -> Unit,
+    private val markTraceRssiFailed: (String) -> Unit,
+    /** Only genuine accepted GATT callbacks may set physical timestamps. */
+    private val recordPhysicalTrace: (String, String) -> Unit,
     /** 写入 controller 实际 PHY 诊断快照。 */
     private val updateTracePhy: (String, String?) -> Unit,
     /** 写入最近一次 Android requested connection priority。 */
@@ -139,6 +144,7 @@ internal class BleGattSessionCallback(
         //    否则多设备会同时占用 HCI/GATT 初始化通道。
         if (newState == BluetoothProfile.STATE_CONNECTED) {
             val connectedDevice = currentExpectedDeviceForGatt(gatt, "connection connected") ?: return
+            recordPhysicalTrace(address, "connected")
             recordTraceStep(address, "connect", "success", null, "HCI", status)
             startAdaptiveLinkMonitoring(gatt, connectedDevice)
             onPhysicalConnected(gatt, connectedDevice)
@@ -169,6 +175,7 @@ internal class BleGattSessionCallback(
         // 6. 断连会使本 session 的 GATT readiness 失效。
         isPrivateServiceReady = false
         val device = currentExpectedDeviceForGatt(gatt, "connection disconnected") ?: return
+        recordPhysicalTrace(address, "disconnected")
         val connectionStatus = BluetoothGattStatus.getConnectionStatusDescription(status)
 
         // 7. 连接状态回调中的 status 是 HCI/controller 断连原因，不是 ATT/GATT 操作码。
@@ -652,6 +659,7 @@ internal class BleGattSessionCallback(
             return
         }
         if (status != BluetoothGatt.GATT_SUCCESS) {
+            markTraceRssiFailed(device.uuid)
             sendLog(
                 BleLoggerTag.e,
                 "Link quality: ${device.uuid}, RSSI read failed, status=${BluetoothGattStatus.getGattOperationStatusDescription(status)}",
@@ -885,12 +893,14 @@ internal class BleGattSessionCallback(
         if (isRssiReadPending) {
             return
         }
+        markTraceRssiRequested(device.uuid)
         val accepted = runCatching { gatt.readRemoteRssi() }.getOrElse { error ->
             sendLog(BleLoggerTag.e, "Link quality: ${device.uuid}, request RSSI exception=${error.message}")
             false
         }
         isRssiReadPending = accepted
         if (!accepted) {
+            markTraceRssiFailed(device.uuid)
             sendLog(BleLoggerTag.e, "Link quality: ${device.uuid}, request RSSI rejected")
         }
     }

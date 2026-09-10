@@ -20,10 +20,23 @@ void main() {
     expect(model.nativeTrace, isNull);
   });
 
+  test('old trace payload keeps unknown source evidence unknown', () {
+    final trace = BleNativeConnectionTrace.fromJson({
+      'attemptId': 'old',
+      'steps': [
+        {'stepSeq': 1, 'stage': 'attempt', 'result': 'started', 'elapsedMs': 0}
+      ],
+    });
+    expect(trace.rssiStatus, isNull);
+    expect(trace.steps.single.occurredAtMs, isNull);
+    expect(trace.steps.single.physicalConnectionEvent, isNull);
+  });
+
   test('connect model round-trips native trace snapshot', () {
     const trace = BleNativeConnectionTrace(
       attemptId: 'attempt-1',
       capturedElapsedMs: 45,
+      rssiStatus: "available",
       lastRssiDbm: -72,
       rssiAgeMs: 1200,
       phy: '1M',
@@ -40,6 +53,9 @@ void main() {
           stage: 'bond',
           result: 'not_observable',
           elapsedMs: 31,
+          occurredAtMs: 1000031,
+          timingStatus: 'clock_changed',
+          physicalConnectionEvent: 'connected',
           bondState: 'not_observable',
           writeLimitBytes: 244,
           linkTrigger: 'platform_capability',
@@ -62,6 +78,11 @@ void main() {
     expect(decoded.nativeTrace?.attemptId, 'attempt-1');
     expect(decoded.nativeTrace?.capturedElapsedMs, 45);
     expect(decoded.nativeTrace?.lastRssiDbm, -72);
+    expect(decoded.nativeTrace?.rssiStatus, 'available');
+    expect(decoded.nativeTrace?.steps.last.occurredAtMs, 1000031);
+    expect(decoded.nativeTrace?.steps.last.timingStatus, 'clock_changed');
+    expect(
+        decoded.nativeTrace?.steps.last.physicalConnectionEvent, 'connected');
     expect(decoded.nativeTrace?.steps.map((step) => step.stepSeq), [1, 2]);
     expect(decoded.nativeTrace?.steps.last.bondState, 'not_observable');
     expect(decoded.nativeTrace?.steps.last.writeLimitBytes, 244);

@@ -960,3 +960,14 @@ physical pair，迟到或无法归属的通知交给 5s/30s/90s watchdog 收口�
 - `receiveDataEC` 的 `data` 是 Base64 字符串，跨大数据（OTA）有 ~33% 体积放大，未来可考虑切到 `StandardMethodCodec` 的 `Uint8List` 通路，但会破坏当前 Dart API 的兼容性。
 - `BleDeviceHardware.fromByte` 中 `isMaster = isMaster;` 是**自赋值 bug**（构造形参覆盖了字段），导致 `isMaster` 永远是字段默认值 `false`。改时记得同步更新 §7.8 的字段说明。
 - `BleConnectStateExt.label` 没有覆盖 `disconnectFromSys`、`bleError`、`systemError` 三个分支，反序列化时会回落到 `BleConnectState.none`——若原生侧真的会推这些字符串，需要补全 switch。
+
+
+### Native trace occurrence evidence
+
+`BleNativeConnectionTraceStep.occurredAtMs` is frozen at production using a per-attempt wall/monotonic anchor. `timingStatus` is `valid` or `clock_changed` (wall drift over 1,000 ms); older payloads omit both and consumers must report partial timing. `elapsedMs`, producer `stepSeq` and snapshot `capturedElapsedMs` retain their original meanings. Snapshot/replay never changes a retained step's occurrence time.
+
+A `physical_connection` step carries `physicalConnectionEvent=connected|disconnected` only after the platform callback passes the existing current peripheral/GATT owner check. Android `BluetoothAdapter.STATE_OFF` is also a native transport-invalidating callback: it freezes `disconnected` against each exact live owner before the manager clears GATT maps. This step is context evidence, not a new connection state or success/failure result. Consumers must handle it before normal stage parsing. Logical reset, cancellation and `didFailToConnect` do not set physical timestamps. Platform callbacks filtered after owner teardown remain unknown rather than being attributed to a later owner.
+
+Snapshot `rssiStatus` describes existing sampling evidence: `not_requested` before a read is requested, `not_observable` while no requested read result is available, `read_failed` when a read failed without a valid sample, and `available` when a valid sample is retained (with its original age). Old/unsupported sources are `not_observable` upstream. No new read or timer is introduced. The 32-step buffer retains the start, physical callbacks and earliest failure while evicting intermediate detail with a cumulative gap marker.
+
+Validation: `fvm flutter test`; `swiftc ios/Classes/ble/BleNativeConnectionTrace.swift test/native/connection_trace_test.swift -o /tmp/native-trace-tests` then `/tmp/native-trace-tests` exercises delayed delivery, clock jumps, RSSI evidence and overflow using injected clocks. Real-device lifecycle and radio behavior remain separate acceptance.

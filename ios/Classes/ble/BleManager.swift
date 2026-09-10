@@ -2240,6 +2240,21 @@ extension BleManager {
         )
     }
 
+    /// Physical evidence is accepted only for the current peripheral owner. Synthetic
+    /// resets and didFailToConnect never enter this path and cannot forge link time.
+    private func recordPhysicalTrace(_ peripheral: CBPeripheral, event: String) {
+        guard connectionTraceEnabled else { return }
+        let uuid = peripheral.identifier.uuidString
+        if let admission = currentConnectionAdmission(uuid: uuid) {
+            guard peripheralConnectionSessions[admission.sessionId]?.peripheral === peripheral else { return }
+        } else {
+            guard connectedDevices.contains(where: { $0.peripheral === peripheral }) else { return }
+        }
+        nativeConnectionTraces[reconnectKey(uuid: uuid)]?.record(
+            stage: "physical_connection", result: event, physicalConnectionEvent: event
+        )
+    }
+
     func nativeTraceSnapshot(uuid: String) -> BleNativeConnectionTrace? {
         guard connectionTraceEnabled else { return nil }
         return nativeConnectionTraces[reconnectKey(uuid: uuid)]?.snapshot()
@@ -2397,6 +2412,7 @@ extension BleManager {
             return
         }
         nativeTraceRssiInFlightAttemptIds[key] = expectedAttemptId
+        trace.markRssiRequested()
         peripheral.readRSSI()
     }
 
@@ -3553,6 +3569,7 @@ extension BleManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, timestamp: CFAbsoluteTime, isReconnecting: Bool, error: (any Error)?) {
         loggerE(msg: "didDisconnectPeripheral: timestamp = \(timestamp), isReconnecting = \(isReconnecting), error = \(String(describing: error))")
         if consumePeripheralCancellationBarrier(peripheral) { return }
+        recordPhysicalTrace(peripheral, event: "disconnected")
         if isReconnecting {
             // 系统已持有 reconnect 时只结束旧业务 session 并重建 admission；再次 connect/cancel
             // 会破坏 CoreBluetooth 的自动回连 rendezvous。
@@ -3588,6 +3605,7 @@ extension BleManager: CBCentralManagerDelegate {
         }
         //  2、真实 didConnect 只提交 Gate；排队期间不启动 timeout/service discovery。
         loggerD(msg: "didConnect: \(peripheral.identifier.uuidString)-\(peripheral.name ?? ""), requestName=\(connectRequest.name), config=\(bleConfig.name)")
+        recordPhysicalTrace(peripheral, event: "connected")
         enqueuePhysicalConnectionThroughGate(peripheral)
     }
 
@@ -3604,6 +3622,7 @@ extension BleManager: CBCentralManagerDelegate {
      */
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         if consumePeripheralCancellationBarrier(peripheral) { return }
+        recordPhysicalTrace(peripheral, event: "disconnected")
         handleConnectError(peripheral: peripheral, error: error, formMethod: "didDisconnectPeripheral")
     }
     
@@ -3875,6 +3894,7 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
         }
         if let error = error {
             let nsError = error as NSError
+            trace.markRssiFailed()
             loggerE(msg: "connection trace RSSI: \(uuid), read failed domain=\(nsError.domain), code=\(nsError.code)")
             return
         }
