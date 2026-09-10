@@ -1571,6 +1571,25 @@ class RunnerTests: XCTestCase {
     XCTAssertEqual(registry.begin(data: conflictingSameId).status, .invalidRequest)
   }
 
+  func testG2OtaEndpointOwnershipIgnoresUnrelatedRingUuid() {
+    let registry = BleG2OtaTransactionRegistry(nativeInstanceId: "native-A")
+    let glasses = g2OtaScope(id: "tx-owned", generation: 10, endpoints: ["left": (0, 0), "right": (0, 0)])
+    XCTAssertEqual(registry.begin(data: glasses).status, .accepted)
+
+    XCTAssertTrue(registry.isEndpointOwned("left"))
+    XCTAssertTrue(registry.isEndpointOwned("right"))
+    XCTAssertFalse(registry.isEndpointOwned("r1-unrelated"))
+    XCTAssertTrue(registry.shouldAllowLegacyCleanup(endpointId: "r1-unrelated"))
+
+    let ringAdmission = registry.shouldAllowAdmission(
+      endpointId: "r1-unrelated",
+      otaContext: nil,
+      purpose: .activation
+    )
+    XCTAssertTrue(ringAdmission.allowed)
+    XCTAssertEqual(ringAdmission.reason, "")
+  }
+
   func testG2OtaRegistryRejectsBoolFractionalAndNegativeIdentities() {
     let registry = BleG2OtaTransactionRegistry(nativeInstanceId: "native-A")
     var boolGeneration = g2OtaScope(id: "tx-bool", generation: 1, endpoints: ["left": (0, 0)])
