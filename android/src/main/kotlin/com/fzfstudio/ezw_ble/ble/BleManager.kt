@@ -47,6 +47,9 @@ class BleManager private constructor() {
     companion object {
         val instance: BleManager = BleManager()
         private const val logcatTag = "flutter_ezw_ble"
+        private const val g2OtaServiceUuid = "00002760-08c2-11e1-9073-0e8ac72e1001"
+        private const val g2OtaWriteCharUuid = "00002760-08c2-11e1-9073-0e8ac72e0001"
+        private const val g2OtaReadCharUuid = "00002760-08c2-11e1-9073-0e8ac72e0002"
         /** 这些 callback 只属于连接 readiness pipeline，业务 connected 后的迟到回调也必须拒绝。 */
         private val connectionPipelineStages = setOf(
             "connection connected",
@@ -76,6 +79,8 @@ class BleManager private constructor() {
     private val scanResultTemp: MutableList<BleDevice> = Collections.synchronizedList(mutableListOf())
     //  - 是否正在升级中
     private val upgradeDevices: MutableList<String> = Collections.synchronizedList(mutableListOf())
+    //  - G2 OTA 事务登记表。它只持有逻辑所有权；实际写入继续由 exact GATT/session 校验。
+    private val g2OtaTransactions = BleG2OtaTransactionRegistry()
     //  - 指令发送队列。按 uuid 隔离，避免左右腿并发写回调把下一条指令写到错误的 GATT。
     private val sendCmdQueues: MutableMap<String, ConcurrentLinkedQueue<BleCmd>> =
         Collections.synchronizedMap(mutableMapOf())
@@ -361,7 +366,18 @@ class BleManager private constructor() {
             mainScope = { mainScope },
             bleState = { bleState },
             isBluetoothEnabled = { isBluetoothEnabled() },
-            isUpgradeDevice = { uuid -> upgradeDevices.contains(uuid) },
+            isUpgradeDevice = { uuid ->
+                upgradeDevices.any { it.equals(uuid, ignoreCase = true) } ||
+                    g2OtaTransactions.ownsEndpoint(uuid)
+            },
+            acceptsOtaRecoveryContext = { context, uuid ->
+                g2OtaTransactions.acceptsRecoveryContext(
+                    transactionId = context.transactionId,
+                    generation = context.generation,
+                    instanceId = context.instanceId,
+                    uuid = uuid,
+                )
+            },
             createConnectCallback = { expectedUuid, source, sessionGeneration ->
                 createConnectCallBack(
                     expectedUuid,
@@ -379,8 +395,13 @@ class BleManager private constructor() {
             invalidatePendingPassiveGatt = { uuid, gatt ->
                 invalidatePendingPassiveGatt(uuid, gatt)
             },
-            invalidatePassiveGattForSessionRebind = { uuid, gatt ->
-                invalidatePassiveGattForSessionRebind(uuid, gatt)
+            invalidatePassiveGattForSessionRebind = { uuid, gatt, previousSessionGeneration, otaRecoveryContext ->
+                invalidatePassiveGattForSessionRebind(
+                    uuid,
+                    gatt,
+                    previousSessionGeneration,
+                    otaRecoveryContext,
+                )
             },
         )
     }
@@ -545,19 +566,27 @@ class BleManager private constructor() {
             }
             val device = findConnectedDevice(cmd.uuid)
             if (device != null && cmd.psType == 1) {
-                val identityError = validateOtaWriteIdentity(
+                val transactionAccepted = validateG2OtaContextForWrite(
                     uuid = cmd.uuid,
-                    device = device,
-                    expectedSessionGeneration = cmd.sessionGeneration,
-                    expectedAttemptGeneration = cmd.attemptGeneration,
+                    psType = cmd.psType,
+                    transactionId = cmd.otaTransactionId,
+                    generation = cmd.otaGeneration,
+                    instanceId = cmd.otaInstanceId,
                 )
+                val identityError = if (transactionAccepted) {
+                    validateOtaWriteIdentity(
+                        uuid = cmd.uuid,
+                        device = device,
+                        expectedSessionGeneration = cmd.sessionGeneration,
+                        expectedAttemptGeneration = cmd.attemptGeneration,
+                    )
+                } else {
+                    BleOtaWriteError.unavailable(cmd.uuid, "ota transaction mismatch")
+                }
                 if (identityError != null) {
                     queue.poll()
                     BleEC.RECEIVE_DATA.event?.success(
-                        BleCmd.fail(cmd.uuid, cmd.psType).copy(
-                            sessionGeneration = cmd.sessionGeneration,
-                            attemptGeneration = cmd.attemptGeneration,
-                        ).toFlutterMap(),
+                        cmd.copy(data = null, isSuccess = false).toFlutterMap(),
                     )
                     sendLog(BleLoggerTag.e, "Send cmd: ${cmd.uuid}, OTA identity mismatch, drop queued command: ${identityError.reason}")
                     continue
@@ -610,12 +639,31 @@ class BleManager private constructor() {
         return otaWriteQueues.getOrPut(key) {
             BleAndroidOtaWriteQueue(
                 endpoint = uuid,
-                submit = { data, expectedSessionGeneration, expectedAttemptGeneration ->
+                submit = {
+                        data,
+                        expectedSessionGeneration,
+                        expectedAttemptGeneration,
+                        submitTransactionId,
+                        submitOtaGeneration,
+                        submitInstanceId,
+                    ->
                     val device = findConnectedDevice(uuid)
                     if (device == null) {
                         BleOtaWriteSubmission.rejected(
                             status = null,
                             reason = "device or characteristic missing",
+                        )
+                    } else if (!validateG2OtaContextForWrite(
+                            uuid = uuid,
+                            psType = 1,
+                            transactionId = submitTransactionId,
+                            generation = submitOtaGeneration,
+                            instanceId = submitInstanceId,
+                        )
+                    ) {
+                        BleOtaWriteSubmission.rejected(
+                            status = null,
+                            reason = "ota transaction mismatch",
                         )
                     } else {
                         val identityError = validateOtaWriteIdentity(
@@ -701,6 +749,7 @@ class BleManager private constructor() {
             .filter { it.isNotBlank() }
             .toSet()
         val endpointKeys = endpointIds.map(::reconnectKey).toSet()
+        revokeG2OtaTransactionsForEndpoints(endpointIds, reason = "configRevoked")
 
         // 2、先快照并移除被撤销 session；map/Gate 失效后迟到 callback 只能 fail closed。
         val revokedAdmissionSessions = admittedGattSessions.values
@@ -801,6 +850,9 @@ class BleManager private constructor() {
         source: BleConnectSource,
         mode: BleReconnectActivationMode = BleReconnectActivationMode.INITIAL,
         sessionGeneration: Long = 0L,
+        otaTransactionId: String = "",
+        otaGeneration: Long = 0L,
+        otaInstanceId: String = "",
     ): List<BleReconnectActivationResult> {
         if (targets.isEmpty()) {
             return emptyList()
@@ -848,7 +900,7 @@ class BleManager private constructor() {
             val activationRejection = BleReconnectActivationGuardPolicy.rejectionReason(
                 mode = mode,
                 hasPersistedAuthorization = hasPersistedAuthorization,
-                isUpgradeDevice = upgradeDevices.any { it.equals(target.uuid, ignoreCase = true) },
+                isUpgradeDevice = isEndpointInUpgradeGate(target.uuid),
             )
             if (activationRejection == "authorizationRevoked") {
                 sendLog(
@@ -867,20 +919,41 @@ class BleManager private constructor() {
             }
             // OTA 独占 endpoint transport；即使历史 owner 仍持久化，也不能由普通
             // autoReconnect reconcile 在升级窗口内创建或复用 GATT。
+            var otaRecoveryContext: BleG2OtaNativeContext? = null
             if (activationRejection == "otaInProgress") {
-                sendLog(
-                    BleLoggerTag.d,
-                    "Auto reconnect: ${target.uuid}, activation rejected, OTA transport active",
+                val admittedByOtaTransaction = g2OtaTransactions.acceptsRecoveryContext(
+                    transactionId = otaTransactionId,
+                    generation = otaGeneration,
+                    instanceId = otaInstanceId,
+                    uuid = target.uuid,
                 )
-                return@map BleReconnectActivationResult(
-                    target = target,
-                    state = BleReconnectActivationState.REJECTED,
-                    reason = "otaInProgress",
-                    source = source,
-                    mode = mode,
-                    ownerDisposition = BleReconnectOwnerDisposition.REJECTED,
-                    sessionGeneration = sessionGeneration,
-                )
+                if (admittedByOtaTransaction) {
+                    // OTA recovery 使用现有 supervisor，但必须携带 native 事务凭据；
+                    // 普通 activation/reconcile 仍被 otaInProgress 门禁阻断。
+                    otaRecoveryContext = BleG2OtaNativeContext(
+                        transactionId = otaTransactionId,
+                        generation = otaGeneration,
+                        instanceId = otaInstanceId,
+                    )
+                    sendLog(
+                        BleLoggerTag.d,
+                        "Auto reconnect: ${target.uuid}, activation admitted by G2 OTA transaction",
+                    )
+                } else {
+                    sendLog(
+                        BleLoggerTag.d,
+                        "Auto reconnect: ${target.uuid}, activation rejected, OTA transport active",
+                    )
+                    return@map BleReconnectActivationResult(
+                        target = target,
+                        state = BleReconnectActivationState.REJECTED,
+                        reason = "otaInProgress",
+                        source = source,
+                        mode = mode,
+                        ownerDisposition = BleReconnectOwnerDisposition.REJECTED,
+                        sessionGeneration = sessionGeneration,
+                    )
+                }
             }
             if (mode == BleReconnectActivationMode.RECONCILE) {
                 val owner = autoReconnectSupervisor.ownerSnapshot(target.uuid)
@@ -920,7 +993,13 @@ class BleManager private constructor() {
                 source
             }
             val activation =
-                autoReconnectSupervisor.activate(seedDevice, effectiveSource, mode, sessionGeneration)
+                autoReconnectSupervisor.activate(
+                    seedDevice,
+                    effectiveSource,
+                    mode,
+                    sessionGeneration,
+                    otaRecoveryContext,
+                )
             val requestedSessionInstalled =
                 sessionGeneration <= 0L || activation.sessionGeneration == sessionGeneration
             val accepted =
@@ -1334,6 +1413,370 @@ class BleManager private constructor() {
             }
     }
 
+    /** Register a native-owned G2 OTA transaction and install the group gate. */
+    @Synchronized
+    internal fun beginG2OtaTransaction(
+        transactionId: String,
+        generation: Long,
+        config: String,
+        sn: String,
+        endpoints: List<BleG2OtaEndpointIdentity>,
+    ): Map<String, Any> {
+        if (!g2OtaTransactions.hasTransaction(transactionId)) {
+            val validationFailure = validateNativeG2OtaBeginScope(
+                transactionId = transactionId,
+                generation = generation,
+                config = config,
+                sn = sn,
+                endpoints = endpoints,
+            )
+            if (validationFailure != null) {
+                sendLog(
+                    BleLoggerTag.e,
+                    "G2 OTA transaction begin rejected: tx=$transactionId generation=$generation reason=$validationFailure",
+                )
+                return BleG2OtaTransactionResult(
+                    status = BleG2OtaTransactionStatus.INVALID_REQUEST,
+                    transactionId = transactionId,
+                    generation = generation,
+                    reason = validationFailure,
+                ).toFlutterMap()
+            }
+        }
+        val result = g2OtaTransactions.begin(transactionId, generation, config, sn, endpoints)
+        if (result.status == BleG2OtaTransactionStatus.ACCEPTED) {
+            endpoints.forEach { endpoint -> addUpgradeMarker(endpoint.uuid) }
+        }
+        sendLog(
+            BleLoggerTag.d,
+            "G2 OTA transaction begin: tx=$transactionId generation=$generation status=${result.status.flutterValue}",
+        )
+        return result.toFlutterMap()
+    }
+
+    /**
+     * Dart 提供 OTA scope，但 native 必须在登记事务前证明这些 endpoint 属于当前
+     * G2 runtime。0/0 只表达“本轮目标已冻结但尚未绑定物理 pair”；正 pair 必须来自
+     * 已完成业务 connected 的 exact GATT，不能让伪造 payload 安装升级门禁。
+     */
+    private fun validateNativeG2OtaBeginScope(
+        transactionId: String,
+        generation: Long,
+        config: String,
+        sn: String,
+        endpoints: List<BleG2OtaEndpointIdentity>,
+    ): String? {
+        if (transactionId.isBlank() || generation <= 0L || config.isBlank() || endpoints.isEmpty()) {
+            return "invalidScope"
+        }
+        val nativeConfig = bleConfigs.firstOrNull { it.name == config } ?: return "unknownConfig"
+        if (nativeConfig.privateServices.none {
+                it.type == 1 &&
+                    it.service.equals(g2OtaServiceUuid, ignoreCase = true) &&
+                    it.writeChars?.equals(g2OtaWriteCharUuid, ignoreCase = true) == true &&
+                    it.readChars?.equals(g2OtaReadCharUuid, ignoreCase = true) == true
+            }
+        ) {
+            return "missingOtaService"
+        }
+        val duplicate = endpoints
+            .map { reconnectKey(it.uuid) }
+            .firstOrNull { key -> key.isBlank() || endpoints.count { reconnectKey(it.uuid) == key } > 1 }
+        if (duplicate != null) {
+            return "duplicateEndpoint"
+        }
+        endpoints.forEach { endpoint ->
+            val device = connectedDevices.firstOrNull { candidate ->
+                candidate.uuid.equals(endpoint.uuid, ignoreCase = true)
+            } ?: return "unknownEndpoint"
+            if (device.belongConfig.name != config) {
+                return "configMismatch"
+            }
+            if (sn.isNotBlank() && device.sn.isNotBlank() && !device.sn.equals(sn, ignoreCase = true)) {
+                return "snMismatch"
+            }
+            if (endpoint.name.isNotBlank() && device.name.isNotBlank() && endpoint.name != device.name) {
+                return "nameMismatch"
+            }
+            val waitingForFirstBind = endpoint.sessionGeneration == 0L && endpoint.attemptGeneration == 0L
+            if (waitingForFirstBind) {
+                // WAITING endpoint is accepted only because native already knows the frozen
+                // target identity. It does not grant write authority until update(bind).
+                return@forEach
+            }
+            if (endpoint.sessionGeneration <= 0L || endpoint.attemptGeneration <= 0L) {
+                return "missingPhysicalPair"
+            }
+            val key = reconnectKey(endpoint.uuid)
+            val businessSession = businessConnectedGattSessions[key] ?: return "missingBusinessSession"
+            val liveGatt = device.myGatt ?: return "missingLiveGatt"
+            val admission = businessSession.admission
+            val ownsExactReadyGatt =
+                businessSession.gatt === liveGatt &&
+                    admission.sessionGeneration == endpoint.sessionGeneration &&
+                    admission.generation == endpoint.attemptGeneration &&
+                    device.connectState.isConnected &&
+                    device.hasCompleteGattReadiness()
+            if (!ownsExactReadyGatt) {
+                return "physicalPairMismatch"
+            }
+        }
+        return null
+    }
+
+    /** Bind/recover/park one endpoint without allowing legacy teardown to consume ownership. */
+    @Synchronized
+    internal fun updateG2OtaEndpoint(
+        transactionId: String,
+        generation: Long,
+        instanceId: String,
+        uuid: String,
+        action: BleG2OtaEndpointAction?,
+        sessionGeneration: Long,
+        attemptGeneration: Long,
+    ): Map<String, Any> {
+        val result = g2OtaTransactions.updateEndpoint(
+            transactionId = transactionId,
+            generation = generation,
+            instanceId = instanceId,
+            uuid = uuid,
+            action = action,
+            sessionGeneration = sessionGeneration,
+            attemptGeneration = attemptGeneration,
+        )
+        if (result.status == BleG2OtaTransactionStatus.ACCEPTED) {
+            addUpgradeMarker(uuid)
+            if (action == BleG2OtaEndpointAction.PARK) {
+                retireG2OtaEndpointRuntime(
+                    endpoint = BleG2OtaEndpointIdentity(
+                        uuid = uuid,
+                        sessionGeneration = sessionGeneration,
+                        attemptGeneration = attemptGeneration,
+                    ),
+                    reason = "g2OtaPark",
+                    keepUpgradeMarker = true,
+                    transactionContext = BleG2OtaNativeContext(transactionId, generation, instanceId),
+                )
+            }
+        }
+        sendLog(
+            BleLoggerTag.d,
+            "G2 OTA transaction update: tx=$transactionId endpoint=$uuid action=${action?.flutterValue} status=${result.status.flutterValue}",
+        )
+        return result.toFlutterMap()
+    }
+
+    /** Atomically retire the whole native-owned G2 OTA group. */
+    @Synchronized
+    internal fun finishG2OtaTransaction(
+        transactionId: String,
+        generation: Long,
+        instanceId: String,
+        reason: String,
+        config: String,
+        sn: String,
+        endpoints: List<BleG2OtaEndpointIdentity>,
+    ): Map<String, Any> {
+        val prepareResult = g2OtaTransactions.prepareFinish(
+            transactionId = transactionId,
+            generation = generation,
+            instanceId = instanceId,
+            reason = reason,
+            config = config,
+            sn = sn,
+            endpoints = endpoints,
+        )
+        val terminalWithoutRuntime = prepareResult.status == BleG2OtaTransactionStatus.ALREADY_COMMITTED ||
+            prepareResult.status == BleG2OtaTransactionStatus.INVALIDATED ||
+            prepareResult.status == BleG2OtaTransactionStatus.REVOKED
+        val result = if (prepareResult.status == BleG2OtaTransactionStatus.ACCEPTED) {
+            val endpointIds = g2OtaTransactions.endpointIds(transactionId)
+            val frozenEndpoints = g2OtaTransactions.endpointIdentities(transactionId)
+            frozenEndpoints.forEach { endpoint ->
+                retireG2OtaEndpointRuntime(
+                    endpoint = endpoint,
+                    reason = "g2OtaFinish:$reason",
+                    keepUpgradeMarker = false,
+                    transactionContext = if (instanceId.isNotBlank()) {
+                        BleG2OtaNativeContext(transactionId, generation, instanceId)
+                    } else {
+                        null
+                    },
+                )
+            }
+            val commitResult = g2OtaTransactions.commitFinish(
+                transactionId = transactionId,
+                generation = generation,
+                instanceId = instanceId,
+                reason = reason,
+                config = config,
+                sn = sn,
+                endpoints = endpoints,
+            )
+            if (commitResult.status == BleG2OtaTransactionStatus.COMMITTED && reason != "revoked") {
+                endpointIds.forEach { endpointId ->
+                    autoReconnectSupervisor.schedule(
+                        endpointId,
+                        BleConnectState.DISCONNECT_FROM_SYS,
+                        reason = "g2OtaFinish",
+                    )
+                }
+            }
+            commitResult
+        } else {
+            prepareResult
+        }
+        if (terminalWithoutRuntime) {
+            sendLog(
+                BleLoggerTag.d,
+                "G2 OTA transaction finish replay/no-runtime: tx=$transactionId status=${prepareResult.status.flutterValue}",
+            )
+        }
+        sendLog(
+            BleLoggerTag.d,
+            "G2 OTA transaction finish: tx=$transactionId generation=$generation reason=$reason status=${result.status.flutterValue}",
+        )
+        return result.toFlutterMap()
+    }
+
+    /** Query the transaction ledger without disconnecting or waking reconnect. */
+    @Synchronized
+    fun queryG2OtaTransaction(
+        transactionId: String,
+        generation: Long,
+        instanceId: String,
+    ): Map<String, Any> = g2OtaTransactions
+        .query(transactionId, generation, instanceId)
+        .toFlutterMap()
+
+    private fun addUpgradeMarker(uuid: String) {
+        if (uuid.isBlank()) {
+            return
+        }
+        if (upgradeDevices.none { it.equals(uuid, ignoreCase = true) }) {
+            upgradeDevices.add(uuid)
+        }
+    }
+
+    private fun removeUpgradeMarker(uuid: String) {
+        upgradeDevices.removeAll { it.equals(uuid, ignoreCase = true) }
+    }
+
+    /** Ordinary connection/write gates stay closed while either legacy marker or native OTA owner exists. */
+    private fun isEndpointInUpgradeGate(uuid: String): Boolean =
+        upgradeDevices.any { it.equals(uuid, ignoreCase = true) } ||
+            g2OtaTransactions.ownsEndpoint(uuid)
+
+    /**
+     * Retire one registered G2 OTA endpoint by transaction ownership.
+     *
+     * The GATT may already be gone when Android reports upgrade completion, so this path
+     * intentionally avoids validateOtaWriteIdentity and only touches the registered endpoint.
+     */
+    private fun retireG2OtaEndpointRuntime(
+        endpoint: BleG2OtaEndpointIdentity,
+        reason: String,
+        keepUpgradeMarker: Boolean,
+        transactionContext: BleG2OtaNativeContext? = null,
+    ) {
+        val uuid = endpoint.uuid
+        val key = reconnectKey(uuid)
+        val acceptedAdmission = BleBluetoothOffTerminalMetadataPolicy.resolve(
+            currentAdmission = currentAdmissions[key],
+            businessConnectedAdmission = businessConnectedGattSessions[key]?.admission,
+            lastBusinessConnectedAdmission = lastEpochAcceptedAdmissions[key],
+        )
+        otaRebootDisconnectSuppressions.remove(key)
+        preConnectedDevices.remove(uuid)
+        val expectedPairKnown = endpoint.sessionGeneration > 0L && endpoint.attemptGeneration > 0L
+        val businessSession = businessConnectedGattSessions[key]
+        val currentAdmission = currentAdmissions[key]
+        val admittedSession = currentAdmission?.let { admittedGattSessions[it.sessionId] }
+        val businessMatchesFrozenPair = expectedPairKnown &&
+            (
+                businessSession?.admission?.sessionGeneration == endpoint.sessionGeneration &&
+                    businessSession.admission.generation == endpoint.attemptGeneration
+                )
+        val currentMatchesFrozenPair = expectedPairKnown &&
+            (
+                currentAdmission?.sessionGeneration == endpoint.sessionGeneration &&
+                    currentAdmission.generation == endpoint.attemptGeneration
+                )
+        val supervisorExpectedGatt = when {
+            businessMatchesFrozenPair -> businessSession?.gatt
+            currentMatchesFrozenPair -> admittedSession?.gatt
+            else -> null
+        }
+        val mayTouchTransport = expectedPairKnown || transactionContext != null
+        if (mayTouchTransport) {
+            cancelOtaWriteAttempt(uuid, reason = reason)
+            discardOtaWriteQueueForSession(uuid, reason = reason)
+        }
+        val detachedSupervisorGatt = if (supervisorExpectedGatt != null || transactionContext != null) {
+            autoReconnectSupervisor.detachPhysicalGattForOtaReboot(
+                uuid,
+                expectedGatt = supervisorExpectedGatt,
+                otaRecoveryContext = transactionContext,
+            )
+        } else {
+            null
+        }
+        if (businessMatchesFrozenPair) {
+            businessConnectedGattSessions.remove(key)
+        }
+        if (currentMatchesFrozenPair) {
+            currentAdmissions.remove(key)?.let { admission ->
+                admittedGattSessions.remove(admission.sessionId)
+            }
+        }
+        connectedDevices.firstOrNull { it.uuid.equals(uuid, ignoreCase = true) }?.let { device ->
+            val liveGattMatchesFrozenOwner = expectedPairKnown &&
+                (
+                    businessMatchesFrozenPair &&
+                        businessSession?.gatt === device.myGatt
+                    ) ||
+                (
+                    currentMatchesFrozenPair &&
+                        admittedSession?.gatt === device.myGatt
+                    )
+            val liveGattMatchesRecoveryGrant = detachedSupervisorGatt != null && detachedSupervisorGatt === device.myGatt
+            if (liveGattMatchesFrozenOwner || liveGattMatchesRecoveryGrant) {
+                device.releaseAndClear()
+            }
+            if (acceptedAdmission != null && liveGattMatchesFrozenOwner) {
+                handleConnectState(
+                    uuid,
+                    device.name,
+                    BleConnectState.DISCONNECT_FROM_SYS,
+                    source = acceptedAdmission.source,
+                    generation = acceptedAdmission.sessionGeneration,
+                    attemptGeneration = acceptedAdmission.generation,
+                    scheduleAutoReconnect = false,
+                )
+            }
+        }
+        if (!keepUpgradeMarker) {
+            removeUpgradeMarker(uuid)
+        }
+    }
+
+    /** Revoke matching G2 OTA transactions at explicit authorization-removal boundaries. */
+    private fun revokeG2OtaTransactionsForEndpoints(endpointIds: Set<String>, reason: String) {
+        val contexts = endpointIds.associate { endpointId ->
+            reconnectKey(endpointId) to g2OtaTransactions.activeContextForEndpoint(endpointId)
+        }
+        g2OtaTransactions
+            .revokeTransactionsForEndpoints(endpointIds, reason)
+            .forEach { endpoint ->
+                retireG2OtaEndpointRuntime(
+                    endpoint = endpoint,
+                    reason = "g2OtaRevoked:$reason",
+                    keepUpgradeMarker = false,
+                    transactionContext = contexts[endpoint.key],
+                )
+            }
+    }
+
     /** 对账单个 endpoint；所有动作都必须经过纯策略和 session 去重。 */
     private fun reconcileBusinessConnection(
         target: BleReconnectSeed,
@@ -1357,7 +1800,7 @@ class BleManager private constructor() {
         val protectedByLifecycle =
             !isBluetoothEnabled() ||
                 config?.autoReconnect != true ||
-                upgradeDevices.any { it.equals(target.uuid, ignoreCase = true) } ||
+                isEndpointInUpgradeGate(target.uuid) ||
                 identityMismatch
         val nativeBusinessConnected = device?.connectState?.isConnected == true
         val exactBusinessSession = businessConnectedGattSessions[key]
@@ -1939,6 +2382,7 @@ class BleManager private constructor() {
         // 1、撤销持久回连目标和当前 endpoint 的所有 pending/scan 任务。
         sendLog(BleLoggerTag.d, "Star disconnect: $uuid by user")
         val key = reconnectKey(uuid)
+        revokeG2OtaTransactionsForEndpoints(setOf(uuid), reason = "userDisconnect")
         clearLivenessReconcileMarkers(uuid)
         businessConnectedGattSessions.remove(key)
         lastEpochAcceptedAdmissions.remove(key)
@@ -1978,6 +2422,7 @@ class BleManager private constructor() {
         if (endpointIds.isEmpty()) {
             return
         }
+        revokeG2OtaTransactionsForEndpoints(endpointIds, reason = "batchCancel")
 
         // 2、Manager 与 Gate 以同一高水位原子失效一次；返回的 next 先保留到全部
         // 旧 GATT 关闭后再启动。不能在 release runtime 时再次推进 generation。
@@ -2028,6 +2473,10 @@ class BleManager private constructor() {
         expectedSessionGeneration: Long = 0L,
         expectedAttemptGeneration: Long = 0L,
     ) {
+        if (g2OtaTransactions.ownsEndpoint(uuid)) {
+            sendLog(BleLoggerTag.e, "OTA reboot disconnect rejected: $uuid, endpoint owned by G2 OTA transaction")
+            return
+        }
         // 1、定位业务已连接设备，并解析可被 Dart 接受的 source/generation 元数据。
         val device = connectedDevices.firstOrNull { candidate ->
             candidate.uuid.equals(uuid, ignoreCase = true) ||
@@ -2066,7 +2515,22 @@ class BleManager private constructor() {
         }
         // 2、OTA 只保留逻辑 reconnect owner；旧物理 GATT 必须先从 supervisor 脱钩，
         // 否则 afterUpgrade/manual activation 会永远复用已经被 releaseAndClear 的句柄。
-        autoReconnectSupervisor.detachPhysicalGattForOtaReboot(device.uuid)
+        val expectedSupervisorGatt = businessConnectedGattSessions[key]
+            ?.takeIf { session ->
+                session.admission.sessionGeneration == acceptedAdmission.sessionGeneration &&
+                    session.admission.generation == acceptedAdmission.generation
+            }
+            ?.gatt
+            ?: currentAdmissions[key]
+                ?.takeIf { admission ->
+                    admission.sessionGeneration == acceptedAdmission.sessionGeneration &&
+                        admission.generation == acceptedAdmission.generation
+                }
+                ?.let { admission -> admittedGattSessions[admission.sessionId]?.gatt }
+        autoReconnectSupervisor.detachPhysicalGattForOtaReboot(
+            device.uuid,
+            expectedGatt = expectedSupervisorGatt,
+        )
         markOtaRebootDisconnectSuppression(
             device.uuid,
             acceptedAdmission.sessionGeneration,
@@ -2190,6 +2654,7 @@ class BleManager private constructor() {
         if (endpointIds.isEmpty()) {
             return
         }
+        revokeG2OtaTransactionsForEndpoints(endpointIds, reason = "releaseDevice")
         val endpointKeys = endpointIds.map(::reconnectKey).toSet()
         val admissionSessions = admittedGattSessions.values.filter {
             reconnectKey(it.admission.endpointId) in endpointKeys
@@ -2280,6 +2745,9 @@ class BleManager private constructor() {
         allowDuringUpgrade: Boolean = false,
         expectedSessionGeneration: Long = 0L,
         expectedAttemptGeneration: Long = 0L,
+        otaTransactionId: String = "",
+        otaGeneration: Long = 0L,
+        otaInstanceId: String = "",
     ) {
         if (!checkIsFunctionCanBeCalled() || uuid.isEmpty()) {
             return
@@ -2287,12 +2755,15 @@ class BleManager private constructor() {
         // OTA 数据通道天然放行；common 只接受业务协议显式标记的 AUTH/时间同步等
         // 恢复控制指令，其余写入继续阻断，避免升级过程中产生通道竞争。
         if (!BleUpgradeCommandPolicy.canSend(
-                isUpgrading = upgradeDevices.contains(uuid),
+                isUpgrading = isEndpointInUpgradeGate(uuid),
                 psType = psType,
                 allowDuringUpgrade = allowDuringUpgrade,
             )
         ) {
             sendLog(BleLoggerTag.e, "Send cmd: $uuid, Cannot send commands during upgrade")
+            return
+        }
+        if (!validateG2OtaContextForWrite(uuid, psType, otaTransactionId, otaGeneration, otaInstanceId)) {
             return
         }
         val key = reconnectKey(uuid)
@@ -2306,6 +2777,9 @@ class BleManager private constructor() {
                 false,
                 sessionGeneration = expectedSessionGeneration,
                 attemptGeneration = expectedAttemptGeneration,
+                otaTransactionId = otaTransactionId,
+                otaGeneration = otaGeneration,
+                otaInstanceId = otaInstanceId,
             ),
         )
         if (shouldStart) {
@@ -2425,6 +2899,9 @@ class BleManager private constructor() {
         psType: Int = 0,
         expectedSessionGeneration: Long = 0L,
         expectedAttemptGeneration: Long = 0L,
+        otaTransactionId: String = "",
+        otaGeneration: Long = 0L,
+        otaInstanceId: String = "",
         completion: (BleOtaWriteError?) -> Unit,
     ) {
         val isOtaChannel = psType == 1
@@ -2438,7 +2915,7 @@ class BleManager private constructor() {
         }
         // no-wait 只服务 OTA bulk data，不接受业务白名单；升级态下非 OTA 写入必须拒绝。
         if (!BleUpgradeCommandPolicy.canSend(
-                isUpgrading = upgradeDevices.contains(uuid),
+                isUpgrading = isEndpointInUpgradeGate(uuid),
                 psType = psType,
             )
         ) {
@@ -2448,6 +2925,14 @@ class BleManager private constructor() {
             )
             completion(if (isOtaChannel) {
                 BleOtaWriteError.unavailable(uuid, "upgrade gate rejected")
+            } else {
+                null
+            })
+            return
+        }
+        if (!validateG2OtaContextForWrite(uuid, psType, otaTransactionId, otaGeneration, otaInstanceId)) {
+            completion(if (isOtaChannel) {
+                BleOtaWriteError.unavailable(uuid, "ota transaction mismatch")
             } else {
                 null
             })
@@ -2483,6 +2968,9 @@ class BleManager private constructor() {
                 data,
                 sessionGeneration = expectedSessionGeneration,
                 attemptGeneration = expectedAttemptGeneration,
+                otaTransactionId = otaTransactionId,
+                otaGeneration = otaGeneration,
+                otaInstanceId = otaInstanceId,
                 completion = completion,
             )
             return
@@ -2492,6 +2980,47 @@ class BleManager private constructor() {
         sendLog(BleLoggerTag.d, "Send cmd - no wait: $uuid, type=$psType, data length=${data.size}")
         completion(null)
     }
+
+    /** Transaction-owned G2 OTA writes require both logical owner and physical exact pair. */
+    private fun validateG2OtaContextForWrite(
+        uuid: String,
+        psType: Int,
+        transactionId: String,
+        generation: Long,
+        instanceId: String,
+    ): Boolean {
+        if (psType != 1) {
+            return true
+        }
+        val hasSuppliedContext = transactionId.isNotBlank() || generation > 0L || instanceId.isNotBlank()
+        if (!g2OtaTransactions.ownsEndpoint(uuid)) {
+            if (!hasSuppliedContext) {
+                return true
+            }
+            sendLog(
+                BleLoggerTag.e,
+                "G2 OTA write rejected: endpoint=$uuid stale transaction=$transactionId generation=$generation",
+            )
+            return false
+        }
+        val accepted = g2OtaTransactions.acceptsContext(
+            transactionId = transactionId,
+            generation = generation,
+            instanceId = instanceId,
+            uuid = uuid,
+        )
+        if (!accepted) {
+            sendLog(
+                BleLoggerTag.e,
+                "G2 OTA write rejected: endpoint=$uuid transaction=$transactionId generation=$generation",
+            )
+        }
+        return accepted
+    }
+
+    /** 当前 endpoint 的活跃 OTA 事务身份，用于 ACK/notify 反向标记给 Dart。 */
+    private fun activeG2OtaContextForEndpoint(uuid: String): BleG2OtaNativeContext? =
+        g2OtaTransactions.activeContextForEndpoint(uuid)
 
     /**
      * OTA 恢复重传必须绑定业务层冻结的 exact session/attempt。未传 expected pair 的旧调用
@@ -2597,6 +3126,10 @@ class BleManager private constructor() {
         expectedSessionGeneration: Long = 0L,
         expectedAttemptGeneration: Long = 0L,
     ) {
+        if (g2OtaTransactions.ownsEndpoint(uuid)) {
+            sendLog(BleLoggerTag.e, "QuiteUpgradeState rejected: $uuid, endpoint owned by G2 OTA transaction")
+            return
+        }
         val connectedDevice = connectedDevices.firstOrNull { it.uuid == uuid }
         if (connectedDevice != null) {
             validateOtaWriteIdentity(
@@ -2670,6 +3203,7 @@ class BleManager private constructor() {
      * resetBle 与 cleanConnectCache 共用这条链路，避免两种 teardown 在 Gate/GATT 清理上分叉。
      */
     private fun teardownConnectionRuntime(reason: String) {
+        g2OtaTransactions.clearInvalidated(reason)
         // 1. 先快照所有 runtime GATT，再让 manager map 与 Gate 一次性失效。之后任何
         // active/waiting/pre-physical 迟到 callback 都无法通过 current admission 校验。
         val deviceGattHandles = connectedDevices.mapNotNull { it.myGatt }
@@ -2974,6 +3508,7 @@ class BleManager private constructor() {
             cancelAllOtaWriteQueues(reason = "bluetoothOff")
 
             // 3、句柄 teardown 后暂停 Gate，并一次失效全部 attempt/session callback。
+            g2OtaTransactions.clearInvalidated("bluetoothOff")
             connectionAdmissionGate.suspendAndReset()
             securityGateAttempts.clear()
             pendingSecurityRetryVisibility.clear()
@@ -3542,6 +4077,9 @@ class BleManager private constructor() {
                     // 普通 START/INFO 命令。writeNextCommand 会再次核对物理槽归属。
                     writeNextCommand(uuid)
                 }
+            },
+            activeG2OtaContextForEndpoint = { uuid ->
+                activeG2OtaContextForEndpoint(uuid)
             },
             emitReceiveData = { map ->
                 // 9. EventChannel 必须回到 manager 的协程作用域，避免 callback 持有 Flutter 线程细节。
@@ -4379,19 +4917,73 @@ class BleManager private constructor() {
     private fun invalidatePassiveGattForSessionRebind(
         uuid: String,
         gatt: BluetoothGatt,
+        previousSessionGeneration: Long,
+        otaRecoveryContext: BleG2OtaNativeContext?,
     ): Boolean {
         val key = reconnectKey(uuid)
-        val device = findConnectedDevice(uuid) ?: return false
-        if (device.myGatt !== gatt) {
+        val device = findConnectedDevice(uuid)
+        if (device != null && device.myGatt !== null && device.myGatt !== gatt) {
             return false
         }
         val admission = currentAdmissions[key]
         val businessSession = businessConnectedGattSessions[key]
-        if (businessSession?.gatt === gatt) {
-            // 1、业务已连接的长期 GATT 不属于“在途 owner”。Dart 正常不会为已连接
-            // endpoint 提交新 session；若迟到 activation 到达，拒绝重建，避免主动打断
-            // 可用命令通道。
+        if (device == null || device.myGatt !== gatt) {
+            if (
+                retireStaleSupervisorGattForOtaRecovery(
+                    uuid = uuid,
+                    key = key,
+                    gatt = gatt,
+                    previousSessionGeneration = previousSessionGeneration,
+                    otaRecoveryContext = otaRecoveryContext,
+                )
+            ) {
+                return true
+            }
             return false
+        }
+        if (businessSession?.gatt === gatt) {
+            // 1、普通 activation 仍不得打断业务 GATT。唯一例外是 native registry 已
+            // 接受的 OTA RECOVER，并且 credential 与旧业务 session/attempt 完全一致。
+            // 这覆盖镜腿重启后系统断连已上报、但 supervisor 仍持有旧 GATT 的窗口。
+            val recoveryContext = otaRecoveryContext ?: return false
+            val exactOtaRecoveryOwner = g2OtaTransactions.acceptsRecoveryPhysicalPair(
+                context = recoveryContext,
+                uuid = uuid,
+                sessionGeneration = businessSession.admission.sessionGeneration,
+                attemptGeneration = businessSession.admission.generation,
+            )
+            if (!exactOtaRecoveryOwner) {
+                return false
+            }
+
+            // 1.1、业务 connected 正常已原子释放 Gate。此处若仍有 admission，说明另一条
+            // attempt 已经在途或 runtime 不一致；无论看起来是否同 pair 都 fail closed，留给
+            // exact callback/事务终态收口，不能为了 recovery 误杀新尝试。
+            if (admission != null) {
+                return false
+            }
+
+            // 1.2、先撤销旧 callback/Gate 身份并清空传输，再关闭 exact GATT。这里不发送
+            // 普通断连事件、不调度 generic retry；调用中的 OTA supervisor 会立即安装
+            // incoming session 并创建唯一 replacement。
+            businessConnectedGattSessions.remove(key)
+            businessConnectionLeases.remove(key)
+            preConnectedDevices.remove(uuid)
+            val next = invalidateConnectionAttempts(setOf(uuid))
+            sendCmdQueues.remove(key)
+            discardOtaWriteQueueForSession(uuid, reason = "OTA recovery session rebind")
+            device.releaseAndClear()
+            device.connectState = BleConnectState.NONE
+            next?.let { startGrantedGattPipeline(it) }
+            sendLog(
+                BleLoggerTag.d,
+                "Admission gate: $uuid, OTA recovery retired exact business owner " +
+                    "transaction=${recoveryContext.transactionId}, " +
+                    "otaGeneration=${recoveryContext.generation}, " +
+                    "attemptGeneration=${businessSession.admission.generation}, " +
+                    "sessionGeneration=${businessSession.admission.sessionGeneration}",
+            )
+            return true
         }
         if (admission == null) {
             // 2、STATE_CONNECTED 前还没有 Gate admission，但 passive autoConnect GATT
@@ -4429,6 +5021,65 @@ class BleManager private constructor() {
             "Admission gate: $uuid, session rebind invalidated exact owner " +
                 "attemptGeneration=${admission.generation}, " +
                 "sessionGeneration=${admission.sessionGeneration}, sessionId=${admission.sessionId}",
+        )
+        return true
+    }
+
+    /**
+     * OTA RECOVER 乱序兜底：系统断连可能已经让 Manager 清掉 live GATT/cache，但
+     * Supervisor 仍保存旧 session 的 passiveGatt。只有 registry 仍处于 RECOVERING、
+     * frozen physical pair 与 Dart 已接受的 last epoch 完全一致，且 Manager 没有另一条
+     * current/admitted/business owner 时，才允许清理这个 stale supervisor owner。
+     */
+    @Synchronized
+    private fun retireStaleSupervisorGattForOtaRecovery(
+        uuid: String,
+        key: String,
+        gatt: BluetoothGatt,
+        previousSessionGeneration: Long,
+        otaRecoveryContext: BleG2OtaNativeContext?,
+    ): Boolean {
+        val recoveryContext = otaRecoveryContext ?: return false
+        if (currentAdmissions[key] != null || businessConnectedGattSessions[key] != null) {
+            return false
+        }
+        val liveDevice = findConnectedDevice(uuid)
+        if (liveDevice?.myGatt != null) {
+            return false
+        }
+        val lastAccepted = lastEpochAcceptedAdmissions[key] ?: return false
+        if (
+            previousSessionGeneration <= 0L ||
+            previousSessionGeneration != lastAccepted.sessionGeneration
+        ) {
+            return false
+        }
+        if (!autoReconnectSupervisor.ownsPassiveGatt(uuid, gatt, previousSessionGeneration)) {
+            return false
+        }
+        val exactOtaRecoveryOwner = g2OtaTransactions.acceptsRecoveryPhysicalPair(
+            context = recoveryContext,
+            uuid = uuid,
+            sessionGeneration = lastAccepted.sessionGeneration,
+            attemptGeneration = lastAccepted.generation,
+        )
+        if (!exactOtaRecoveryOwner) {
+            return false
+        }
+
+        preConnectedDevices.remove(uuid)
+        businessConnectionLeases.remove(key)
+        sendCmdQueues.remove(key)
+        discardOtaWriteQueueForSession(uuid, reason = "OTA recovery stale supervisor rebind")
+        runCatching { gatt.disconnect() }
+        runCatching { gatt.close() }
+        sendLog(
+            BleLoggerTag.d,
+            "Admission gate: $uuid, OTA recovery retired stale supervisor owner " +
+                "transaction=${recoveryContext.transactionId}, " +
+                "otaGeneration=${recoveryContext.generation}, " +
+                "attemptGeneration=${lastAccepted.generation}, " +
+                "sessionGeneration=${lastAccepted.sessionGeneration}",
         )
         return true
     }
@@ -4568,6 +5219,7 @@ class BleManager private constructor() {
         val connectedDeviceBeforeState = connectedDevices.firstOrNull {
             it.uuid.equals(uuid, ignoreCase = true)
         }
+        val terminalGattBeforeState = connectedDeviceBeforeState?.myGatt
         // 1、业务 connected 后 Gate 已释放。若 Android 的系统断连出口没有显式带回
         // admission，必须从该 GATT 的长期业务 session/最后接受快照恢复身份；否则 Dart
         // epoch guard 会拒绝 unknown/0，首页继续保留旧 connected。
@@ -4680,9 +5332,14 @@ class BleManager private constructor() {
                     },
                     reason = "securityGateFailure",
                     forceVisibleDirectConnect = securityTargetVisible,
+                    terminalGattToDetach = terminalGattBeforeState,
                 )
             } else {
-                autoReconnectSupervisor.schedule(uuid, state)
+                autoReconnectSupervisor.schedule(
+                    uuid,
+                    state,
+                    terminalGattToDetach = terminalGattBeforeState,
+                )
             }
         }
     }

@@ -33,7 +33,7 @@ back to scan-first because this flag is false.
 Public methods:
 
 - `armAutoReconnectTargets(devices)` records long-lived owners only.
-- `activateAutoReconnectTargets(devices, source, mode)` immediately opens,
+- `activateAutoReconnectTargets(devices, source, mode, sessionGeneration, otaContext?)` immediately opens,
   reuses, or reconciles a pending direct connection for every target. `source`
   is `autoReconnect` or `manualReconnect`; `mode` is `initial`, `reconcile`, or
   `promotion`. `initial` may create a persisted owner, `reconcile` must compare
@@ -49,7 +49,12 @@ Public methods:
   `ownerDisposition`: `created`, `reused`, `repaired`, `deferred`, or
   `rejected`. Callers must not treat desired targets as active until both the
   compatibility state and owner disposition are accepted; missing, duplicated,
-  or unknown acknowledgement states/dispositions fail closed.
+  or unknown acknowledgement states/dispositions fail closed. When `otaContext`
+  is present, activation is an internal G2 OTA recovery path: native must verify
+  the transaction is active, the endpoint belongs to the frozen set, the
+  endpoint is not parked/retired, and recovery was authorized by the existing
+  supervisor owner. Ordinary activation without this context remains blocked by
+  active/waiting/parked/retiring OTA ownership.
 - `notifyAutoReconnectTargetVisible(uuid, name)` is a scan hint, not a second
   connection owner. Android returns `true` only when it takes over that exact
   target's pre-physical passive GATT or pending retry and queues one serialized
@@ -400,7 +405,21 @@ On Bluetooth-on, Android does not replay paused tasks by itself. It waits for
 the Dart recovery activation carrying the final `sessionGeneration`; ordinary
 `arm` calls cannot consume this barrier. Manual promotion also classifies the
 native owner first. A stale `passiveGatt` is repaired or dropped instead of
-being reported as reusable, while a real Gate/business owner is never closed.
+being reported as reusable. A real Gate/business owner is never closed by an
+ordinary activation. The only business-GATT replacement exception is a current
+G2 OTA endpoint already in `RECOVERING`: the native transaction credential and
+the frozen positive `sessionGeneration/attemptGeneration` must both match the
+old business session. Manager then retires that exact GATT without emitting or
+scheduling a generic disconnect, and the same supervisor activation installs
+the requested higher session before creating one replacement. Missing/stale
+credentials, a mismatched physical pair, and active/parked/retired endpoints
+remain rejected.
+
+If a system terminal callback reaches Manager before the ordinary OTA gate
+check, Android must first exact-match the callback GATT against the supervisor's
+current `passiveGatt` and neutralize only that handle. The subsequent gate may
+still reject ordinary reconnect while OTA is active; rejection must leave no
+stale `passiveGatt` and must not create a generic retry.
 Repeated `reconcile` activation follows the same exact endpoint/session check:
 healthy task/GATT/Gate owners return `reused`, missing runtime tasks with a
 valid persisted authorization recreate a single pending GATT and return `repaired`, and

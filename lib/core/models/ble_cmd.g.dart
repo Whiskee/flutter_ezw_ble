@@ -14,6 +14,9 @@ BleCmd _$BleCmdFromJson(Map<String, dynamic> json) => BleCmd(
       isSuccess: json['isSuccess'] as bool? ?? false,
       sessionGeneration: (json['sessionGeneration'] as num?)?.toInt() ?? 0,
       attemptGeneration: (json['attemptGeneration'] as num?)?.toInt() ?? 0,
+      otaTransactionId: json['otaTransactionId'] as String? ?? '',
+      otaGeneration: (json['otaGeneration'] as num?)?.toInt() ?? 0,
+      otaInstanceId: json['otaInstanceId'] as String? ?? '',
     );
 
 Map<String, dynamic> _$BleCmdToJson(BleCmd instance) => <String, dynamic>{
@@ -24,6 +27,9 @@ Map<String, dynamic> _$BleCmdToJson(BleCmd instance) => <String, dynamic>{
       'isSuccess': instance.isSuccess,
       'sessionGeneration': instance.sessionGeneration,
       'attemptGeneration': instance.attemptGeneration,
+      'otaTransactionId': instance.otaTransactionId,
+      'otaGeneration': instance.otaGeneration,
+      'otaInstanceId': instance.otaInstanceId,
     };
 
 Value? _$JsonConverterFromJson<Json, Value>(

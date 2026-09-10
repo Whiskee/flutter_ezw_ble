@@ -88,9 +88,9 @@ void main() {
     expect(manager, contains('attemptGeneration = expectedAttemptGeneration'));
     expect(
       manager,
-      contains(
-        'submit = { data, expectedSessionGeneration, expectedAttemptGeneration ->',
-      ),
+      matches(RegExp(
+        r'submit = \{\s*data,\s*expectedSessionGeneration,\s*expectedAttemptGeneration,\s*submitTransactionId,\s*submitOtaGeneration,\s*submitInstanceId,\s*->',
+      )),
     );
     expect(manager, contains('validateOtaWriteIdentity'));
     expect(manager, contains('attempt identity mismatch'));

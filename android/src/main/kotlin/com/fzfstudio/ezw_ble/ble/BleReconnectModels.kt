@@ -64,6 +64,12 @@ internal data class BleReconnectTask(
      * `even_connect` 的新 recovery batch 关闭重建。
      */
     var awaitingRecoveryActivation: Boolean = false,
+    /**
+     * G2 OTA 内部恢复 grant。普通 autoReconnect 仍会被 OTA gate 拒绝；只有
+     * even_connect 已把 endpoint 转入 recovering 且 native registry 仍接受同一
+     * transaction/instance 时，supervisor 的后续 retry/visible wake 才能继续建链。
+     */
+    var otaRecoveryContext: BleG2OtaNativeContext? = null,
     /** 当前 pending session 的来源；手动点击可提升但不会新建重复 GATT。 */
     var source: BleConnectSource = BleConnectSource.AUTO_RECONNECT,
     /** Dart reconnect batch generation forwarded unchanged on status callbacks. */

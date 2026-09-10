@@ -44,6 +44,9 @@ class BleManager: NSObject {
     private lazy var scanConnectTimeoutTimers: [(String, String, Timer)] = []
     //  - Native OTA marker 与写入门禁的唯一状态源；非可选集合保证首次 enter 必定落盘。
     let upgradeStateRegistry = BleUpgradeStateRegistry()
+    //  - G2 OTA 事务所有权。marker 只说明 endpoint 处于升级态；事务 registry 决定
+    //    begin/update/finish/recovery/cleanup 哪个 Dart owner 仍有权限操作这些 marker。
+    let g2OtaTransactions = BleG2OtaTransactionRegistry()
     //  - 预连接设备集合（使用uuid作为key）
     lazy var preConnectedDevices: Set<String> = []
     //  - OTA WriteWithoutResponse 写队列(key: peripheral.identifier.uuidString)
@@ -277,6 +280,12 @@ extension BleManager {
         upgradeStateRegistry.removeAll {
             endpointKeys.contains(reconnectKey(uuid: $0))
         }
+        // Revoking a reconnect config also revokes any native OTA transaction that
+        // owns the same endpoint.  The whole group is retired so late finish/query
+        // calls cannot mutate resources for a removed target.
+        let revokedOtaSnapshots = g2OtaTransactions.endpointSnapshots(endpointIds: Array(endpointIds))
+        let revokedOtaContexts = g2OtaTransactions.endpointContexts(endpointIds: Array(endpointIds))
+        let revokedOtaEndpoints = g2OtaTransactions.revokeEndpoints(endpointIds)
         var shouldStopOwnedPairingRecoveryScan = false
         endpointKeys.forEach { key in
             otaWriteQueues.removeValue(forKey: key)?.cancelAll(reason: "initConfigs revoked")
@@ -295,6 +304,8 @@ extension BleManager {
         deferredPeripheralReconnectRegistry.remove(endpointIds: endpointIds)
         peripheralCancellationBarrierGate.discard(endpointIds: endpointIds)
         securityGateAttempts.cancel(endpointIds: endpointIds)
+        retireG2OtaEndpoints(revokedOtaEndpoints, reason: "initConfigs revoked", snapshots: revokedOtaSnapshots)
+        clearG2OtaRecoveryGrants(contextsByEndpoint: revokedOtaContexts)
 
         // 4. map 全部失效后再触发 CoreBluetooth cancel；后续 callback 只能走 stale 路径。
         var cancelledPeripherals = Set<ObjectIdentifier>()
@@ -314,6 +325,288 @@ extension BleManager {
      */
     func drainAutoReconnectEvents() -> [[String: Any]] {
         reconnectStore.drainEvents()
+    }
+
+    /**
+     * Register the native G2 OTA transaction before Dart sends START/INFO/RAW.
+     *
+     * The marker is installed for the full frozen endpoint set here, not later
+     * at the first write, so a firmware-triggered disconnect between Dart's
+     * begin call and its success ACK is still covered by the OTA gate.
+     */
+    func beginG2OtaTransaction(_ data: [String: Any]) -> BleG2OtaTransactionResult {
+        if !g2OtaTransactions.hasKnownTransaction(data: data),
+           let scope = BleG2OtaTransactionScope(data: data),
+           let rejection = validateG2OtaBeginScope(scope) {
+            loggerE(msg: "g2 ota transaction begin rejected transactionId=\(scope.transactionId), reason=\(rejection)")
+            return BleG2OtaTransactionResult(
+                status: .staleOwner,
+                transactionId: scope.transactionId,
+                generation: scope.generation,
+                instanceId: g2OtaTransactions.nativeInstanceId,
+                reason: rejection
+            )
+        }
+        let result = g2OtaTransactions.begin(data: data)
+        if result.status == .accepted {
+            for endpointId in g2OtaTransactions.scopeEndpointIds(data: data) {
+                upgradeStateRegistry.enter(endpointId)
+            }
+        }
+        loggerD(msg: "g2 ota transaction begin status=\(result.status.rawValue), transactionId=\(result.transactionId), generation=\(result.generation)")
+        return result
+    }
+
+    private func validateG2OtaBeginScope(_ scope: BleG2OtaTransactionScope) -> String? {
+        guard let bleConfig = bleConfigs.first(where: { $0.name == scope.config }) else {
+            return "nativeConfigUnknown"
+        }
+        guard BleG2OtaConfigPolicy.supportsG2Ota(
+            privateServices: bleConfig.privateServices.map { (type: $0.type, service: $0.service) }
+        ) else {
+            return "nativeConfigUnsupported"
+        }
+        let states = Dictionary(uniqueKeysWithValues: scope.endpoints.map { endpoint in
+            (endpoint.key, nativeG2OtaEndpointState(endpoint: endpoint, config: scope.config))
+        })
+        return BleG2OtaNativeBeginPolicy.rejectionReason(scope: scope, states: states)
+    }
+
+    private func nativeG2OtaEndpointState(
+        endpoint: BleG2OtaEndpoint,
+        config: String
+    ) -> BleG2OtaNativeEndpointState {
+        nativeG2OtaEndpointState(uuid: endpoint.uuid, name: endpoint.name, config: config)
+    }
+
+    private func nativeG2OtaEndpointState(
+        uuid endpointUuid: String,
+        name endpointName: String,
+        config: String
+    ) -> BleG2OtaNativeEndpointState {
+        let device = connectedDevices.first { device in
+            device.belongConfig.name == config &&
+                isSameConnectTarget(
+                    storedUuid: device.peripheral.identifier.uuidString,
+                    storedName: device.peripheral.name ?? "",
+                    uuid: endpointUuid,
+                    name: endpointName
+                )
+        }
+        let request = findActiveConnectRequest(uuid: endpointUuid, name: endpointName)
+        let reconnectTask = reconnectTasks.values.first { task in
+            task.belongConfig == config &&
+                isSameConnectTarget(
+                    storedUuid: task.uuid,
+                    storedName: task.name,
+                    uuid: endpointUuid,
+                    name: endpointName
+                )
+        }
+        let physicalUuid = device?.peripheral.identifier.uuidString ?? reconnectTask?.uuid ?? endpointUuid
+        let metadata = BleExplicitCancellationMetadataPolicy.resolve(
+            currentAdmission: currentConnectionAdmission(uuid: physicalUuid),
+            reconnectTask: reconnectTask
+        )
+        return BleG2OtaNativeEndpointState(
+            uuid: endpointUuid,
+            name: endpointName,
+            belongConfig: device?.belongConfig.name ?? reconnectTask?.belongConfig ?? request?.belongConfig ?? "",
+            isNativeKnown: device != nil || reconnectTask != nil || request != nil,
+            isBusinessConnected: device?.isConnected == true,
+            isPeripheralConnected: device?.peripheral.state == .connected,
+            sessionGeneration: metadata?.sessionGeneration ?? 0,
+            attemptGeneration: metadata?.attemptGeneration ?? 0
+        )
+    }
+
+    /**
+     * Update one endpoint inside the current native-owned G2 OTA transaction.
+     *
+     * `park` is the first-leg success path: it isolates the old transport and
+     * suppresses normal reconnect scheduling while the peer leg is still moving.
+     */
+    func updateG2OtaEndpoint(_ data: [String: Any]) -> BleG2OtaTransactionResult {
+        if let rejection = validateG2OtaEndpointUpdateBeforeRegistry(data) {
+            loggerE(msg: "g2 ota transaction update rejected before registry status=\(rejection.status.rawValue), transactionId=\(rejection.transactionId), reason=\(rejection.reason ?? "")")
+            return rejection
+        }
+        let result = g2OtaTransactions.update(data: data)
+        guard result.status == .accepted else {
+            loggerE(msg: "g2 ota transaction update rejected status=\(result.status.rawValue), transactionId=\(result.transactionId), reason=\(result.reason ?? "")")
+            return result
+        }
+        let uuid = data["uuid"] as? String ?? ""
+        let action = data["action"] as? String ?? ""
+        if action == BleG2OtaUpdateAction.bind.rawValue || action == BleG2OtaUpdateAction.recover.rawValue {
+            upgradeStateRegistry.enter(uuid)
+        } else if action == BleG2OtaUpdateAction.park.rawValue {
+            let snapshots = g2OtaTransactions.endpointSnapshots(endpointIds: [uuid])
+            retireG2OtaEndpoints([uuid], reason: "g2 ota transaction park", snapshots: snapshots)
+        }
+        loggerD(msg: "g2 ota transaction update status=\(result.status.rawValue), action=\(action), uuid=\(uuid), transactionId=\(result.transactionId)")
+        return result
+    }
+
+    private func validateG2OtaEndpointUpdateBeforeRegistry(_ data: [String: Any]) -> BleG2OtaTransactionResult? {
+        guard let context = BleG2OtaContext(data: data),
+              let action = BleG2OtaUpdateAction(rawValue: data["action"] as? String ?? ""),
+              action == .bind || action == .recover else {
+            return nil
+        }
+        let transactionId = context.transactionId
+        let generation = context.generation
+        let instanceId = context.instanceId
+        guard let scope = g2OtaTransactions.activeScope(for: context) else {
+            // Let the registry return the authoritative missing/stale owner
+            // result instead of inventing a structural validation failure.
+            return nil
+        }
+        guard let uuid = (data["uuid"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !uuid.isEmpty,
+              let sessionGeneration = BleG2OtaInteger.parseRequired(data["sessionGeneration"]),
+              let attemptGeneration = BleG2OtaInteger.parseRequired(data["attemptGeneration"]),
+              sessionGeneration >= 0,
+              attemptGeneration >= 0,
+              (sessionGeneration == 0) == (attemptGeneration == 0) else {
+            return BleG2OtaTransactionResult(
+                status: .invalidRequest,
+                transactionId: transactionId,
+                generation: generation,
+                instanceId: instanceId,
+                reason: "invalidPhysicalPair"
+            )
+        }
+        let key = reconnectKey(uuid: uuid)
+        let snapshots = g2OtaTransactions.endpointSnapshots(endpointIds: [uuid])
+        guard let snapshot = snapshots[key] else {
+            return nil
+        }
+        // The MethodChannel update contract carries only context + endpoint
+        // identity. Config is immutable authority owned by the accepted begin.
+        let config = scope.config
+
+        if action == .recover && sessionGeneration == 0 && attemptGeneration == 0 {
+            // A never-bound waiting endpoint may enter recovery to let the
+            // supervisor rebuild readiness.  It still cannot write until bind
+            // verifies a positive live physical pair.
+            guard snapshot.phase == .waiting, !snapshot.hasBoundPhysicalPair else {
+                return BleG2OtaTransactionResult(
+                    status: .invalidRequest,
+                    transactionId: transactionId,
+                    generation: generation,
+                    instanceId: instanceId,
+                    reason: "recoverWithoutWaiting"
+                )
+            }
+            return nil
+        }
+
+        guard sessionGeneration > 0, attemptGeneration > 0 else {
+            return BleG2OtaTransactionResult(
+                status: .invalidRequest,
+                transactionId: transactionId,
+                generation: generation,
+                instanceId: instanceId,
+                reason: "invalidPhysicalPair"
+            )
+        }
+
+        let state = nativeG2OtaEndpointState(uuid: snapshot.uuid, name: snapshot.name, config: config)
+        switch action {
+        case .bind:
+            guard state.belongConfig == config,
+                  state.isNativeKnown,
+                  state.isBusinessConnected,
+                  state.isPeripheralConnected,
+                  state.sessionGeneration == sessionGeneration,
+                  state.attemptGeneration == attemptGeneration else {
+                return BleG2OtaTransactionResult(
+                    status: .staleOwner,
+                    transactionId: transactionId,
+                    generation: generation,
+                    instanceId: instanceId,
+                    reason: "nativePhysicalOwnerMismatch"
+                )
+            }
+        case .recover:
+            guard snapshot.hasBoundPhysicalPair,
+                  snapshot.sessionGeneration == sessionGeneration,
+                  snapshot.attemptGeneration == attemptGeneration else {
+                return BleG2OtaTransactionResult(
+                    status: .staleOwner,
+                    transactionId: transactionId,
+                    generation: generation,
+                    instanceId: instanceId,
+                    reason: "recoverPhysicalMismatch"
+                )
+            }
+            guard state.isNativeKnown,
+                  state.sessionGeneration == sessionGeneration,
+                  state.attemptGeneration == attemptGeneration else {
+                return BleG2OtaTransactionResult(
+                    status: .staleOwner,
+                    transactionId: transactionId,
+                    generation: generation,
+                    instanceId: instanceId,
+                    reason: "nativeDisconnectOwnerMismatch"
+                )
+            }
+            guard !(state.isBusinessConnected && state.isPeripheralConnected) else {
+                return BleG2OtaTransactionResult(
+                    status: .staleOwner,
+                    transactionId: transactionId,
+                    generation: generation,
+                    instanceId: instanceId,
+                    reason: "missingDisconnectEvidence"
+                )
+            }
+        case .park:
+            break
+        }
+        return nil
+    }
+
+    /**
+     * Retire the complete native G2 OTA transaction in one local critical section.
+     *
+     * The method does not wait for CoreBluetooth didDisconnect.  It first removes
+     * old queues and markers for every frozen endpoint, then records a terminal
+     * ledger result so lost MethodChannel ACKs can be replayed without a second
+     * detach or reconnect wake.
+     */
+    func finishG2OtaTransaction(_ data: [String: Any]) -> BleG2OtaTransactionResult {
+        var committedEndpointCount = 0
+        let result = BleG2OtaFinishOrchestrator.finish(
+            data: data,
+            registry: g2OtaTransactions,
+            retire: { [weak self] endpointIds, snapshots, contexts, preparedResult in
+                committedEndpointCount = endpointIds.count
+                // Keep the transaction gate held while native resources are detached.
+                // CoreBluetooth callbacks can re-enter scheduling synchronously; releasing
+                // the ledger before teardown would allow generic activation to observe an
+                // open gate while stale queues/callbacks still belong to the old OTA.
+                self?.retireG2OtaEndpoints(
+                    endpointIds,
+                    reason: "g2 ota transaction finish \(preparedResult.reason ?? "")",
+                    snapshots: snapshots
+                )
+                self?.clearG2OtaRecoveryGrants(contextsByEndpoint: contexts)
+            },
+            wake: { [weak self] endpointIds in
+                self?.wakeG2OtaReconnectOwnersOnce(endpointIds: endpointIds, reason: "g2 ota transaction finish")
+            }
+        )
+        if result.status != .committed {
+            loggerD(msg: "g2 ota transaction finish status=\(result.status.rawValue), transactionId=\(result.transactionId), reason=\(result.reason ?? "")")
+        } else {
+            loggerD(msg: "g2 ota transaction finish committed transactionId=\(result.transactionId), generation=\(result.generation), endpoints=\(committedEndpointCount)")
+        }
+        return result
+    }
+
+    func queryG2OtaTransaction(_ data: [String: Any]) -> BleG2OtaTransactionResult {
+        g2OtaTransactions.query(data: data)
     }
     
     /**
@@ -795,6 +1088,9 @@ extension BleManager {
 
         // 3. Remove every stale endpoint from the Gate as one operation and delay the next owner.
         let next = connectionAdmissionGate.cancelEndpoints(endpointIds)
+        let revokedOtaSnapshots = g2OtaTransactions.endpointSnapshots(endpointIds: Array(endpointIds))
+        let revokedOtaContexts = g2OtaTransactions.endpointContexts(endpointIds: Array(endpointIds))
+        let revokedOtaEndpoints = g2OtaTransactions.revokeEndpoints(endpointIds)
 
         // 4. Existing disconnect owns task/store/request/peripheral cleanup and installs a
         // cancellation barrier before CoreBluetooth can deliver a late terminal callback.
@@ -805,12 +1101,143 @@ extension BleManager {
                 cancellationMetadata: metadata
             )
         }
+        retireG2OtaEndpoints(revokedOtaEndpoints, reason: "cancel auto reconnect targets", snapshots: revokedOtaSnapshots)
+        clearG2OtaRecoveryGrants(contextsByEndpoint: revokedOtaContexts)
 
         // 5. Only after all old targets have been revoked may a surviving owner enter GATT.
         if let next {
             startGrantedGattPipeline(next)
         }
         loggerD(msg: "cancel auto reconnect targets: endpoints=\(endpointIds), reason=\(reason)")
+    }
+
+    /**
+     * Group finish removes every frozen endpoint's old upgrade resources before
+     * any ordinary owner can re-enter scheduling. Missing GATT/cache is still a
+     * successful local retirement because authority comes from the transaction.
+     */
+    private func retireG2OtaEndpoints(
+        _ endpointIds: [String],
+        reason: String,
+        snapshots: [String: BleG2OtaEndpointSnapshot] = [:]
+    ) {
+        let endpointKeys = Set(endpointIds.map(reconnectKey))
+        guard !endpointKeys.isEmpty else { return }
+        var locallyClearedKeys = Set<String>()
+        for index in connectedDevices.indices {
+            var device = connectedDevices[index]
+            let uuid = device.peripheral.identifier.uuidString
+            let key = reconnectKey(uuid: uuid)
+            guard endpointKeys.contains(key) else { continue }
+            let reconnectTask = reconnectTasks.values.first { task in
+                endpointKeys.contains(reconnectKey(uuid: task.uuid)) &&
+                    isSameConnectTarget(
+                        storedUuid: task.uuid,
+                        storedName: task.name,
+                        uuid: uuid,
+                        name: device.peripheral.name ?? ""
+                    )
+            }
+            let metadata = BleExplicitCancellationMetadataPolicy.resolve(
+                currentAdmission: currentConnectionAdmission(uuid: uuid),
+                reconnectTask: reconnectTask
+            )
+            let state = BleG2OtaRetirementEndpointState(
+                uuid: uuid,
+                hasConnectedCache: true,
+                isPeripheralConnected: device.peripheral.state != .disconnected,
+                sessionGeneration: metadata?.sessionGeneration ?? 0,
+                attemptGeneration: metadata?.attemptGeneration ?? 0
+            )
+            let decision = BleG2OtaRetirementPolicy.decide(
+                snapshot: snapshots[key],
+                state: state
+            )
+            if decision.shouldClearLocalState {
+                clearG2OtaLocalEndpointState(endpointId: uuid, reason: reason)
+                locallyClearedKeys.insert(key)
+            }
+            if decision.shouldIsolateCache {
+                device.isConnected = false
+                device.isBleFlowCompleted = false
+                device.securityGateWriteChar = nil
+                device.securityGateDiscoveryComplete = false
+                device.readCharsNotify = 0
+                device.notifiedReadCharUUIDs.removeAll()
+                connectedDevices[index] = device
+            }
+            if decision.shouldInstallCancellationBarrier {
+                beginPeripheralCancellationBarrier(device.peripheral)
+            }
+            if decision.shouldCancelPeripheral {
+                centralManager.cancelPeripheralConnection(device.peripheral)
+            }
+        }
+        // If CoreBluetooth already dropped the old GATT/cache, transaction
+        // ownership is still enough to clear only this OTA's queues/markers.
+        // Missing or pair-mismatched snapshots intentionally do nothing so a
+        // stale UUID-only cleanup cannot erase a newer owner.
+        for key in endpointKeys.subtracting(locallyClearedKeys) {
+            guard let snapshot = snapshots[key] else { continue }
+            let decision = BleG2OtaRetirementPolicy.decide(
+                snapshot: snapshot,
+                state: BleG2OtaRetirementEndpointState(
+                    uuid: snapshot.uuid,
+                    hasConnectedCache: false,
+                    isPeripheralConnected: false,
+                    sessionGeneration: 0,
+                    attemptGeneration: 0
+                )
+            )
+            guard decision.shouldClearLocalState else { continue }
+            clearG2OtaLocalEndpointState(endpointId: snapshot.uuid, reason: reason)
+        }
+    }
+
+    private func clearG2OtaLocalEndpointState(endpointId: String, reason: String) {
+        let key = reconnectKey(uuid: endpointId)
+        otaWriteQueues.removeValue(forKey: endpointId)?.cancelAll(reason: reason)
+        if key != endpointId {
+            otaWriteQueues.removeValue(forKey: key)?.cancelAll(reason: reason)
+        }
+        upgradeStateRegistry.consume(endpointId)
+        if key != endpointId {
+            upgradeStateRegistry.consume(key)
+        }
+        otaRebootDisconnectWatchdogs.removeValue(forKey: key)?.cancel()
+        otaRebootDisconnectSuppressions.removeValue(forKey: key)
+    }
+
+    func clearG2OtaRecoveryGrants(contextsByEndpoint: [String: BleG2OtaContext]) {
+        guard !contextsByEndpoint.isEmpty else { return }
+        for (key, task) in reconnectTasks {
+            guard let taskContext = task.g2OtaRecoveryContext else { continue }
+            let frozenEndpointKey = reconnectKey(uuid: task.g2OtaRecoveryEndpointId ?? task.uuid)
+            guard let expectedContext = contextsByEndpoint[frozenEndpointKey],
+                  expectedContext == taskContext else {
+                continue
+            }
+            var updated = task
+            updated.g2OtaRecoveryContext = nil
+            updated.g2OtaRecoveryEndpointId = nil
+            reconnectTasks[key] = updated
+            loggerD(msg: "g2 ota transaction cleared recovery grant endpoint=\(frozenEndpointKey), transactionId=\(taskContext.transactionId), generation=\(taskContext.generation)")
+        }
+    }
+
+    /**
+     * Commit-time reconnect wake is intentionally single-shot and scoped to
+     * existing reconnect owners.  Idempotent finish replay does not call this
+     * helper, so ACK loss cannot create duplicate reconnect attempts.
+     */
+    private func wakeG2OtaReconnectOwnersOnce(endpointIds: [String], reason: String) {
+        guard centralManager.state == .poweredOn else { return }
+        let endpointKeys = Set(endpointIds.map(reconnectKey))
+        for task in reconnectTasks.values where endpointKeys.contains(reconnectKey(uuid: task.uuid)) {
+            guard currentConnectionAdmission(uuid: task.uuid) == nil else { continue }
+            loggerD(msg: "g2 ota transaction wake reconnect owner: \(task.uuid), reason=\(reason)")
+            beginReconnectAttempt(uuid: task.uuid)
+        }
     }
 
     /**
@@ -826,6 +1253,10 @@ extension BleManager {
         expectedSessionGeneration: Int64 = 0,
         expectedAttemptGeneration: Int64 = 0
     ) {
+        guard g2OtaTransactions.shouldAllowLegacyCleanup(endpointId: uuid) else {
+            loggerE(msg: "ota reboot disconnect rejected: \(uuid)-\(name), active transaction requires finishG2OtaTransaction")
+            return
+        }
         let effectiveUuid = reconnectIdentityAliases.resolvedCanonical(uuid: uuid) ?? uuid
         guard let device = connectedDevices.first(where: { device in
             isSameConnectTarget(
@@ -889,8 +1320,23 @@ extension BleManager {
     func disconnectForOtaRecovery(
         uuid: String,
         expectedSessionGeneration: Int64 = 0,
-        expectedAttemptGeneration: Int64 = 0
+        expectedAttemptGeneration: Int64 = 0,
+        otaContext: BleG2OtaContext? = nil
     ) -> String {
+        if let otaContext {
+            let otaGate = g2OtaTransactions.shouldAllowAdmission(
+                endpointId: uuid,
+                otaContext: otaContext,
+                purpose: .activation
+            )
+            guard otaGate.allowed else {
+                loggerE(msg: "ota recovery disconnect rejected: \(uuid), reason=\(otaGate.reason)")
+                return "staleIdentity"
+            }
+        } else if !g2OtaTransactions.shouldAllowLegacyCleanup(endpointId: uuid) {
+            loggerE(msg: "ota recovery disconnect rejected: \(uuid), active transaction requires otaContext")
+            return "staleIdentity"
+        }
         guard expectedSessionGeneration > 0, expectedAttemptGeneration > 0 else {
             loggerE(msg: "ota recovery disconnect rejected: \(uuid), missing exact identity")
             return "unavailable"
@@ -1002,7 +1448,8 @@ extension BleManager {
         psType: Int = 0,
         allowDuringUpgrade: Bool = false,
         expectedSessionGeneration: Int64 = 0,
-        expectedAttemptGeneration: Int64 = 0
+        expectedAttemptGeneration: Int64 = 0,
+        otaContext: BleG2OtaContext? = nil
     ) {
         guard checkIsFunctionCanBeCalled() else {
             return
@@ -1035,7 +1482,8 @@ extension BleManager {
                uuid: uuid,
                device: device,
                expectedSessionGeneration: expectedSessionGeneration,
-               expectedAttemptGeneration: expectedAttemptGeneration
+               expectedAttemptGeneration: expectedAttemptGeneration,
+               otaContext: otaContext
            ) {
             loggerE(msg: "sendCmd: \(uuid), type=\(psType), \(identityError.message ?? "attempt identity mismatch")")
             return
@@ -1064,6 +1512,7 @@ extension BleManager {
         psType: Int,
         expectedSessionGeneration: Int64 = 0,
         expectedAttemptGeneration: Int64 = 0,
+        otaContext: BleG2OtaContext? = nil,
         result: @escaping FlutterResult
     ) {
         let isOtaChannel = (psType == 1)
@@ -1116,7 +1565,8 @@ extension BleManager {
                uuid: uuid,
                device: device,
                expectedSessionGeneration: expectedSessionGeneration,
-               expectedAttemptGeneration: expectedAttemptGeneration
+               expectedAttemptGeneration: expectedAttemptGeneration,
+               otaContext: otaContext
            ) {
             result(identityError)
             return
@@ -1142,7 +1592,8 @@ extension BleManager {
                               uuid: uuid,
                               device: device,
                               expectedSessionGeneration: expectedSessionGeneration,
-                              expectedAttemptGeneration: expectedAttemptGeneration
+                              expectedAttemptGeneration: expectedAttemptGeneration,
+                              otaContext: otaContext
                           ) == nil else {
                         self?.loggerE(msg: "[ezw_ble][ota] submit rejected uuid=\(uuid) reason=attempt identity mismatch")
                         return false
@@ -1190,8 +1641,41 @@ extension BleManager {
         uuid: String,
         device: BleConnectedDevice,
         expectedSessionGeneration: Int64,
-        expectedAttemptGeneration: Int64
+        expectedAttemptGeneration: Int64,
+        otaContext: BleG2OtaContext? = nil
     ) -> FlutterError? {
+        let isTransactionWrite = otaContext != nil || g2OtaTransactions.isEndpointOwned(uuid)
+        if let otaContext {
+            let otaGate = g2OtaTransactions.shouldAllowAdmission(
+                endpointId: uuid,
+                otaContext: otaContext,
+                purpose: .write
+            )
+            guard otaGate.allowed else {
+                loggerE(msg: "[ezw_ble][ota] transaction mismatch uuid=\(uuid) reason=\(otaGate.reason)")
+                return OtaWriteQueue.unavailableError(
+                    endpoint: uuid,
+                    reason: otaGate.reason,
+                    pending: queueDepthForOta(uuid: uuid)
+                )
+            }
+        } else if g2OtaTransactions.isEndpointOwned(uuid) {
+            loggerE(msg: "[ezw_ble][ota] transaction mismatch uuid=\(uuid) reason=missing otaContext")
+            return OtaWriteQueue.unavailableError(
+                endpoint: uuid,
+                reason: "missing otaContext",
+                pending: queueDepthForOta(uuid: uuid)
+            )
+        }
+        if isTransactionWrite,
+           (expectedSessionGeneration <= 0 || expectedAttemptGeneration <= 0) {
+            loggerE(msg: "[ezw_ble][ota] transaction write rejected uuid=\(uuid) reason=missing exact identity")
+            return OtaWriteQueue.unavailableError(
+                endpoint: uuid,
+                reason: "missing exact identity",
+                pending: queueDepthForOta(uuid: uuid)
+            )
+        }
         if expectedSessionGeneration <= 0, expectedAttemptGeneration <= 0 {
             return nil
         }
@@ -1273,6 +1757,10 @@ extension BleManager {
         expectedSessionGeneration: Int64 = 0,
         expectedAttemptGeneration: Int64 = 0
     ) {
+        guard g2OtaTransactions.shouldAllowLegacyCleanup(endpointId: uuid) else {
+            loggerE(msg: "quiteUpgradeState rejected: \(uuid), active transaction requires update/finish")
+            return
+        }
         let connectedDevice = connectedDevices.first(where: { $0.peripheral.identifier.uuidString == uuid })
         if let connectedDevice {
             if let identityError = validateOtaWriteIdentity(
@@ -1353,6 +1841,11 @@ extension BleManager {
         cancelAllConnectionAdmissions(reason: "reset")
         businessConnectionLeases.clear()
         securityGateAttempts.removeAll()
+        let invalidatedOtaSnapshots = g2OtaTransactions.allEndpointSnapshots()
+        let invalidatedOtaContexts = g2OtaTransactions.allEndpointContexts()
+        let invalidatedOtaEndpoints = g2OtaTransactions.clearActive(reason: .revoked)
+        retireG2OtaEndpoints(invalidatedOtaEndpoints, reason: "reset", snapshots: invalidatedOtaSnapshots)
+        clearG2OtaRecoveryGrants(contextsByEndpoint: invalidatedOtaContexts)
         connectedDevices.forEach { device in
             centralManager.cancelPeripheralConnection(device.peripheral)
         }
@@ -3009,6 +3502,11 @@ extension BleManager: CBCentralManagerDelegate {
             let transportOffSnapshots = bluetoothOffConnectionSnapshots()
             pauseReconnectTasksForBluetoothOff()
             suspendConnectionAdmissionGateForBluetoothOff()
+            let invalidatedOtaSnapshots = g2OtaTransactions.allEndpointSnapshots()
+            let invalidatedOtaContexts = g2OtaTransactions.allEndpointContexts()
+            let invalidatedOtaEndpoints = g2OtaTransactions.clearActive(reason: .revoked)
+            retireG2OtaEndpoints(invalidatedOtaEndpoints, reason: "central \(central.state.label)", snapshots: invalidatedOtaSnapshots)
+            clearG2OtaRecoveryGrants(contextsByEndpoint: invalidatedOtaContexts)
             //  - 1.1、移除所有升级设备，避免退出OTA时，重置会连接状态的设备
             upgradeStateRegistry.clear()
             //  - 1.2、系统级蓝牙关闭：把连接中/已连接端点标记为 .disconnectFromSys，
@@ -3442,6 +3940,9 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             loggerE(msg: "cmd response(char): \(peripheral.identifier.uuidString), drop OTA response without exact identity")
             return
         }
+        let otaContext = privateService.type == 1
+            ? g2OtaTransactions.activeContext(for: peripheral.identifier.uuidString)
+            : nil
         //  4、发送指令到flutter。OTA response 必须带 exact pair，供 Dart 绑定当前恢复轮次。
         let bleCmdMap = BleCmd(
             uuid: peripheral.identifier.uuidString,
@@ -3449,7 +3950,10 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             data: data,
             isSuccess: error == nil,
             sessionGeneration: responseIdentity?.sessionGeneration ?? 0,
-            attemptGeneration: responseIdentity?.attemptGeneration ?? 0
+            attemptGeneration: responseIdentity?.attemptGeneration ?? 0,
+            otaTransactionId: otaContext?.transactionId ?? "",
+            otaGeneration: otaContext?.generation ?? 0,
+            otaInstanceId: otaContext?.instanceId ?? ""
         ).toMap()
         BleEC.receiveData.emit(bleCmdMap)
         loggerD(msg: "cmd response(char): \(peripheral.identifier.uuidString), chars = \(characteristic.uuid.uuidString), data length = \(data.count)")

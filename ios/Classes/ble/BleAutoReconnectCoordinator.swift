@@ -166,6 +166,8 @@ extension BleManager {
             task.lastConnectedGeneration = generation
             task.lastConnectedAttemptGeneration = attemptGeneration
             task.sessionGeneration = generation
+            task.g2OtaRecoveryContext = nil
+            task.g2OtaRecoveryEndpointId = nil
         }
         task.attempt = 0
         task.pausedByBluetoothOff = false
@@ -249,7 +251,8 @@ extension BleManager {
     func armReconnectTarget(
         _ target: BleReconnectTarget,
         source: BleConnectSource,
-        sessionGeneration: Int64 = 0
+        sessionGeneration: Int64 = 0,
+        otaContext: BleG2OtaContext? = nil
     ) -> BleReconnectTask? {
         // A cold-start automatic arm must honor the durable fifth-failure latch
         // before it recreates either a reconnect target or a CoreBluetooth owner.
@@ -347,6 +350,16 @@ extension BleManager {
         }
         task.attempt = 0
         task.pausedByBluetoothOff = false
+        if let otaContext {
+            // MethodChannel context only exists at the initial OTA activation.
+            // Store it on the exact native owner so internal retries can keep
+            // passing the transaction gate until park/finish/revoke invalidates it.
+            task.g2OtaRecoveryContext = otaContext
+            task.g2OtaRecoveryEndpointId = effectiveTarget.uuid
+        } else if source == .manualReconnect {
+            task.g2OtaRecoveryContext = nil
+            task.g2OtaRecoveryEndpointId = nil
+        }
         let preservesCurrentRecoveryWait = source != .manualReconnect &&
             task.pairingRecoveryState == .waitingFreshAdvertisementRetry &&
             task.sessionGeneration == previousSessionGeneration
@@ -421,7 +434,8 @@ extension BleManager {
         _ targets: [BleReconnectTarget],
         source: BleConnectSource = .autoReconnect,
         mode: BleReconnectActivationMode = .initial,
-        sessionGeneration: Int64 = 0
+        sessionGeneration: Int64 = 0,
+        otaContext: BleG2OtaContext? = nil
     ) -> [BleReconnectActivationResult] {
         // 1、逐目标校验配置和身份，保持一次 activation 的目标快照稳定。
         return targets.map { target in
@@ -441,6 +455,23 @@ extension BleManager {
             }
             let trimmedUuid = target.uuid.trimmingCharacters(in: .whitespacesAndNewlines)
             let trimmedName = target.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let otaGate = g2OtaTransactions.shouldAllowAdmission(
+                endpointId: reconnectIdentityAliases.resolvedCanonical(uuid: trimmedUuid) ?? trimmedUuid,
+                otaContext: otaContext,
+                purpose: .activation
+            )
+            guard otaGate.allowed else {
+                loggerD(msg: "autoReconnect activation rejected: config=\(target.belongConfig), uuid=\(trimmedUuid), reason=\(otaGate.reason)")
+                return BleReconnectActivationResult(
+                    target: target,
+                    state: .rejected,
+                    reason: otaGate.reason,
+                    source: source,
+                    mode: mode,
+                    ownerDisposition: .rejected,
+                    sessionGeneration: sessionGeneration
+                )
+            }
             if mode == .unknown {
                 loggerE(msg: "autoReconnect activation rejected: config=\(target.belongConfig), reason=invalidMode")
                 return BleReconnectActivationResult(
@@ -529,7 +560,8 @@ extension BleManager {
                 guard var task = armReconnectTarget(
                     resolvedTarget,
                     source: source,
-                    sessionGeneration: sessionGeneration
+                    sessionGeneration: sessionGeneration,
+                    otaContext: otaContext
                 ) else {
                     return BleReconnectActivationResult(
                         target: target,
@@ -648,7 +680,8 @@ extension BleManager {
             guard var task = armReconnectTarget(
                 target,
                 source: source,
-                sessionGeneration: sessionGeneration
+                sessionGeneration: sessionGeneration,
+                otaContext: otaContext
             ) else {
                 return BleReconnectActivationResult(
                     target: target,
@@ -1357,7 +1390,9 @@ extension BleManager {
             // 配置被移除或关闭后，旧任务只保留日志，不再调度。
             return
         }
-        guard !upgradeStateRegistry.contains(uuid) else {
+        let otaAdmission = otaReconnectSchedulingAdmission(task: task, observedUuid: uuid)
+        guard otaAdmission.allowed,
+              otaAdmission.isOtaGranted || !upgradeStateRegistry.contains(uuid) else {
             // OTA/升级态由升级流程控制连接，避免自动回连打断升级状态机。
             return
         }
@@ -1432,6 +1467,12 @@ extension BleManager {
         guard let config = bleConfigs.first(where: { $0.name == task.belongConfig }), config.autoReconnect else {
             return
         }
+        let otaAdmission = otaReconnectSchedulingAdmission(task: task, observedUuid: task.uuid)
+        guard otaAdmission.allowed,
+              otaAdmission.isOtaGranted || !upgradeStateRegistry.contains(task.uuid) else {
+            loggerD(msg: "autoReconnect: \(task.uuid), begin rejected by ota gate reason=\(otaAdmission.reason)")
+            return
+        }
         guard centralManager.state == .poweredOn else {
             // poweredOff 期间不消耗 attempt，等待状态恢复后继续。
             task.pausedByBluetoothOff = true
@@ -1454,6 +1495,27 @@ extension BleManager {
         // 回连不再复用会发 connecting/启动短超时的前台 connect 路由。
         // 只从 CoreBluetooth 缓存/同时扫描结果取 peripheral，然后立即建立 pending 直连。
         beginDirectReconnectAttempt(task: task, config: config)
+    }
+
+    func otaReconnectSchedulingAdmission(
+        task: BleReconnectTask,
+        observedUuid: String
+    ) -> (allowed: Bool, isOtaGranted: Bool, reason: String) {
+        let endpointId = task.g2OtaRecoveryEndpointId
+            ?? reconnectIdentityAliases.resolvedCanonical(uuid: observedUuid)
+            ?? observedUuid
+        if let context = task.g2OtaRecoveryContext {
+            let gate = g2OtaTransactions.shouldAllowAdmission(
+                endpointId: endpointId,
+                otaContext: context,
+                purpose: .activation
+            )
+            return (gate.allowed, gate.allowed, gate.reason)
+        }
+        if g2OtaTransactions.isEndpointOwned(endpointId) {
+            return (false, false, "otaTransactionGate")
+        }
+        return (true, false, "")
     }
 
     /// 构造一条不经扫描前置、不提前起超时的 CoreBluetooth pending connect。

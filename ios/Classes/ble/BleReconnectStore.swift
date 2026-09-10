@@ -108,6 +108,13 @@ struct BleReconnectTask {
     var hasAttemptedPairingRecovery: Bool = false
     /// iOS 5403 保护写失败计数。只统计真实安全错误，不统计蓝牙关闭/后台/扫描 miss。
     var securityGateFailureCount: Int = 0
+    /// OTA 恢复 activation 的原生授权。后续 noDeviceFound/timeout/didDisconnect
+    /// 在 native 内部重调度时没有 MethodChannel 参数，必须复验这个 exact
+    /// transaction context，而不是用 UUID-only 入口穿过 OTA gate。
+    var g2OtaRecoveryContext: BleG2OtaContext?
+    /// 与上面的 transaction context 成对冻结的 OTA endpoint。iOS 可能在
+    /// name/alias 恢复中迁移 CoreBluetooth UUID，但权限仍只属于登记时的 endpoint。
+    var g2OtaRecoveryEndpointId: String?
 }
 
 /// 发送系统终态时使用的连接来源与代次，二者必须作为同一快照一起继承。

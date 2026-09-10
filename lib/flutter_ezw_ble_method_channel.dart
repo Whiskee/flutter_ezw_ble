@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_ezw_ble/core/models/ble_config.dart';
 import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
 import 'package:flutter_ezw_ble/core/models/ble_device.dart';
+import 'package:flutter_ezw_ble/core/models/ble_g2_ota_transaction.dart';
 import 'package:flutter_ezw_ble/core/models/ble_ota_recovery_disconnect_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_business_connection_attempt.dart';
@@ -130,16 +131,109 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
     String uuid, {
     int expectedSessionGeneration = 0,
     int expectedAttemptGeneration = 0,
+    BleG2OtaContext? otaContext,
   }) async {
     // OTA 写阻塞恢复必须由 native 按 exact owner 接受后才让 Dart 进入恢复链；
     // 未识别返回值统一 fail-closed 为 unavailable。
-    final raw =
-        await methodChannel.invokeMethod<String>("disconnectForOtaRecovery", {
+    final arguments = <String, Object?>{
       "uuid": uuid,
       "expectedSessionGeneration": expectedSessionGeneration,
       "expectedAttemptGeneration": expectedAttemptGeneration,
-    });
+    };
+    arguments.addAll(otaContext?.toMethodArguments() ?? const {});
+    final raw = await methodChannel.invokeMethod<String>(
+      "disconnectForOtaRecovery",
+      arguments,
+    );
     return bleOtaRecoveryDisconnectResultFromNative(raw);
+  }
+
+  @override
+  Future<BleG2OtaTransactionResult> beginG2OtaTransaction({
+    required String transactionId,
+    required int generation,
+    required String config,
+    required String sn,
+    required List<BleG2OtaEndpointIdentity> endpoints,
+  }) async {
+    final raw = await methodChannel.invokeMethod<Object?>(
+      'beginG2OtaTransaction',
+      <String, Object?>{
+        'transactionId': transactionId,
+        'generation': generation,
+        'config': config,
+        'sn': sn,
+        'endpoints': endpoints
+            .map((endpoint) => endpoint.toJson())
+            .toList(growable: false),
+      },
+    );
+    return BleG2OtaTransactionResult.fromNative(raw);
+  }
+
+  @override
+  Future<BleG2OtaTransactionResult> updateG2OtaEndpoint({
+    required BleG2OtaContext context,
+    required String uuid,
+    required BleG2OtaEndpointAction action,
+    int sessionGeneration = 0,
+    int attemptGeneration = 0,
+  }) async {
+    final raw = await methodChannel.invokeMethod<Object?>(
+      'updateG2OtaEndpoint',
+      <String, Object?>{
+        ...context.toJson(),
+        'uuid': uuid,
+        'action': action.name,
+        'sessionGeneration': sessionGeneration,
+        'attemptGeneration': attemptGeneration,
+      },
+    );
+    return BleG2OtaTransactionResult.fromNative(raw);
+  }
+
+  @override
+  Future<BleG2OtaTransactionResult> finishG2OtaTransaction({
+    required String transactionId,
+    required int generation,
+    required String reason,
+    required String config,
+    required String sn,
+    required List<BleG2OtaEndpointIdentity> endpoints,
+    String instanceId = '',
+  }) async {
+    final raw = await methodChannel.invokeMethod<Object?>(
+      'finishG2OtaTransaction',
+      <String, Object?>{
+        'transactionId': transactionId,
+        'generation': generation,
+        'instanceId': instanceId,
+        'reason': reason,
+        'config': config,
+        'sn': sn,
+        'endpoints': endpoints
+            .map((endpoint) => endpoint.toJson())
+            .toList(growable: false),
+      },
+    );
+    return BleG2OtaTransactionResult.fromNative(raw);
+  }
+
+  @override
+  Future<BleG2OtaTransactionResult> queryG2OtaTransaction({
+    required String transactionId,
+    required int generation,
+    String instanceId = '',
+  }) async {
+    final raw = await methodChannel.invokeMethod<Object?>(
+      'queryG2OtaTransaction',
+      <String, Object?>{
+        'transactionId': transactionId,
+        'generation': generation,
+        'instanceId': instanceId,
+      },
+    );
+    return BleG2OtaTransactionResult.fromNative(raw);
   }
 
   @override
@@ -195,14 +289,19 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
     BleConnectSource source = BleConnectSource.autoReconnect,
     BleReconnectActivationMode mode = BleReconnectActivationMode.initial,
     int sessionGeneration = 0,
+    BleG2OtaContext? otaContext,
   }) async {
-    final raw = await methodChannel
-        .invokeListMethod<Object?>("activateAutoReconnectTargets", {
+    final arguments = <String, Object?>{
       "devices": devices.map((device) => device.toJson()).toList(),
       "source": source.name,
       "mode": mode.name,
       "sessionGeneration": sessionGeneration,
-    });
+    };
+    if (otaContext != null) {
+      arguments.addAll(otaContext.toMethodArguments());
+    }
+    final raw = await methodChannel.invokeListMethod<Object?>(
+        "activateAutoReconnectTargets", arguments);
     return (raw ?? const <Object?>[])
         .map(BleReconnectActivationResult.fromNative)
         .toList(growable: false);
@@ -227,17 +326,23 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
     bool allowDuringUpgrade = false,
     int expectedSessionGeneration = 0,
     int expectedAttemptGeneration = 0,
-  }) async =>
-      methodChannel.invokeMethod<void>("sendCmd", {
-        "uuid": uuid,
-        "data": data,
-        "psType": psType,
-        "allowDuringUpgrade": allowDuringUpgrade,
-        // OTA START/INFORMATION/RESULT 等控制包若走 sendCmd 队列，也必须绑定本轮
-        // 物理 attempt；0/0 保持旧控制包调用兼容。
-        "expectedSessionGeneration": expectedSessionGeneration,
-        "expectedAttemptGeneration": expectedAttemptGeneration,
-      });
+    BleG2OtaContext? otaContext,
+  }) async {
+    final arguments = <String, Object?>{
+      "uuid": uuid,
+      "data": data,
+      "psType": psType,
+      "allowDuringUpgrade": allowDuringUpgrade,
+      // OTA START/INFORMATION/RESULT 等控制包若走 sendCmd 队列，也必须绑定本轮
+      // 物理 attempt；0/0 保持旧控制包调用兼容。
+      "expectedSessionGeneration": expectedSessionGeneration,
+      "expectedAttemptGeneration": expectedAttemptGeneration,
+    };
+    if (otaContext != null) {
+      arguments.addAll(otaContext.toMethodArguments());
+    }
+    return methodChannel.invokeMethod<void>("sendCmd", arguments);
+  }
 
   /// 发送数据 - 原始数据 - 不等待响应
   /// - Android: 走 `WRITE_TYPE_NO_RESPONSE`;
@@ -251,16 +356,22 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
     int psType = 0,
     int expectedSessionGeneration = 0,
     int expectedAttemptGeneration = 0,
-  }) async =>
-      methodChannel.invokeMethod<void>("sendCmdNoWait", {
-        "uuid": uuid,
-        "data": data,
-        "psType": psType,
-        // OTA 断连恢复会冻结本轮业务 session/物理 attempt。native 只在两者为正
-        // 且 psType==1 时启用 strict guard；旧调用保留 0 以维持兼容。
-        "expectedSessionGeneration": expectedSessionGeneration,
-        "expectedAttemptGeneration": expectedAttemptGeneration,
-      });
+    BleG2OtaContext? otaContext,
+  }) async {
+    final arguments = <String, Object?>{
+      "uuid": uuid,
+      "data": data,
+      "psType": psType,
+      // OTA 断连恢复会冻结本轮业务 session/物理 attempt。native 只在两者为正
+      // 且 psType==1 时启用 strict guard；旧调用保留 0 以维持兼容。
+      "expectedSessionGeneration": expectedSessionGeneration,
+      "expectedAttemptGeneration": expectedAttemptGeneration,
+    };
+    if (otaContext != null) {
+      arguments.addAll(otaContext.toMethodArguments());
+    }
+    return methodChannel.invokeMethod<void>("sendCmdNoWait", arguments);
+  }
 
   @override
   Future<void> enterUpgradeState(String uuid) =>

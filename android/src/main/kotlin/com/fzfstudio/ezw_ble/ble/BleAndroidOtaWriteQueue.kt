@@ -44,7 +44,7 @@ internal fun interface BleOtaWriteScheduler {
  */
 internal class BleAndroidOtaWriteQueue(
     private val endpoint: String,
-    private val submit: (ByteArray, Long, Long) -> BleOtaWriteSubmission,
+    private val submit: (ByteArray, Long, Long, String, Long, String) -> BleOtaWriteSubmission,
     private val scheduler: BleOtaWriteScheduler,
     private val nowMillis: () -> Long,
     private val logger: (String) -> Unit = {},
@@ -53,6 +53,9 @@ internal class BleAndroidOtaWriteQueue(
         val data: ByteArray,
         val sessionGeneration: Long,
         val attemptGeneration: Long,
+        val otaTransactionId: String,
+        val otaGeneration: Long,
+        val otaInstanceId: String,
         val completion: (BleOtaWriteError?) -> Unit,
     )
 
@@ -79,9 +82,22 @@ internal class BleAndroidOtaWriteQueue(
         data: ByteArray,
         sessionGeneration: Long = 0L,
         attemptGeneration: Long = 0L,
+        otaTransactionId: String = "",
+        otaGeneration: Long = 0L,
+        otaInstanceId: String = "",
         completion: (BleOtaWriteError?) -> Unit,
     ) {
-        pending.addLast(Item(data.copyOf(), sessionGeneration, attemptGeneration, completion))
+        pending.addLast(
+            Item(
+                data = data.copyOf(),
+                sessionGeneration = sessionGeneration,
+                attemptGeneration = attemptGeneration,
+                otaTransactionId = otaTransactionId,
+                otaGeneration = otaGeneration,
+                otaInstanceId = otaInstanceId,
+                completion = completion,
+            ),
+        )
         logger("[ezw_ble][ota][android] enqueued endpoint=$endpoint bytes=${data.size} pending=$queueDepth")
         pump()
     }
@@ -225,7 +241,14 @@ internal class BleAndroidOtaWriteQueue(
 
         while (pending.isNotEmpty()) {
             val head = pending.first()
-            val submission = submit(head.data, head.sessionGeneration, head.attemptGeneration)
+            val submission = submit(
+                head.data,
+                head.sessionGeneration,
+                head.attemptGeneration,
+                head.otaTransactionId,
+                head.otaGeneration,
+                head.otaInstanceId,
+            )
             when (submission.disposition) {
                 BleOtaWriteSubmission.Disposition.ACCEPTED -> {
                     pending.removeFirst()

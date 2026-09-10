@@ -264,16 +264,20 @@ Future<void> sendCmdNoWait(
 
 > **保留兼容性**: `sendCmd` / `sendCmdNoWait` / `quiteUpgradeState` 的
 > `expectedSessionGeneration/expectedAttemptGeneration` 默认均为 `0/0`，旧调用语义不变。
-> 上层 OTA 恢复传正 pair 后，native 才启用 exact attempt guard。
+> 上层 OTA 恢复传正 pair 后，native 才启用 exact attempt guard。G2 OTA transaction
+> 另外通过 nested `otaContext {transactionId, generation, instanceId}` 传入；
+> native 必须同时校验 transaction 和 physical pair，旧 UUID-only 或 physical-only 调用不能清理新事务。
 >
 > **成功语义**: `sendCmdNoWait(psType==1)` 的 Future 成功只表示 native 已经调用
 > `peripheral.writeValue(..., type: .withoutResponse)`,即提交到 CoreBluetooth transmit
 > queue;它不是设备收到包、写入 flash、CRC 通过或任何应用层 ACK。设备确认仍由 OTA
 > 协议自身的 CRC/状态回包/超时重试承担。
 
-Native OTA marker 由非可选 `BleUpgradeStateRegistry` 持有：进入升级态必须真实插入
-endpoint，普通 `sendCmdNoWait` 在 marker 存在时默认拒绝；退出时先消费 marker，再校验
-live peripheral 与 accepted epoch。这样 Bluetooth OFF 或迟到 OTA exit 都不能复活旧连接。
+Native OTA marker 由非可选 `BleUpgradeStateRegistry` 和 G2 OTA transaction registry 持有：
+进入升级态必须真实插入 endpoint，普通 `sendCmdNoWait` 在 marker 存在时默认拒绝；退出时先消费
+marker，再校验 live peripheral 与 accepted epoch。G2 首腿完成使用 transaction `park` 隔离旧
+transport；最终整组 `finish` 可在 CBPeripheral 已释放后凭已登记 transaction 退役旧资源。这样
+Bluetooth OFF 或迟到 OTA exit 都不能复活旧连接，也不能让旧清理作用于新 OTA。
 
 ---
 

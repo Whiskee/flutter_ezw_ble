@@ -50,8 +50,8 @@ void main() {
 
     expect(
         androidManager,
-        contains(
-            'autoReconnectSupervisor.activate(seedDevice, effectiveSource, mode, sessionGeneration)'));
+        matches(RegExp(
+            r'autoReconnectSupervisor\.activate\(\s*seedDevice,\s*effectiveSource,\s*mode,\s*sessionGeneration,\s*otaRecoveryContext,\s*\)')));
     expect(
         androidManager,
         contains(
@@ -92,14 +92,18 @@ void main() {
     );
     expect(
       androidSupervisor,
-      contains(
-        'invalidatePassiveGattForSessionRebind(device.uuid, exactGatt)',
-      ),
+      contains('invalidatePassiveGattForSessionRebind('),
+    );
+    expect(androidSupervisor, contains('task.otaRecoveryContext'));
+    expect(androidManager, contains('acceptsRecoveryPhysicalPair'));
+    expect(
+      androidManager,
+      contains('OTA recovery retired exact business owner'),
     );
     expect(androidSupervisor,
         contains('mode == BleReconnectActivationMode.RECONCILE'));
-    expect(androidSupervisor,
-        contains('BleReconnectOwnerDisposition.REPAIRED'));
+    expect(
+        androidSupervisor, contains('BleReconnectOwnerDisposition.REPAIRED'));
     expect(
       androidSupervisor,
       contains(
@@ -257,7 +261,20 @@ void main() {
         manager, contains('generation = expectedAdmission.sessionGeneration'));
     expect(
         manager, contains('attemptGeneration = expectedAdmission.generation'));
-    expect(manager, contains('autoReconnectSupervisor.schedule(uuid, state)'));
+    expect(
+      manager,
+      contains(
+        'val terminalGattBeforeState = connectedDeviceBeforeState?.myGatt',
+      ),
+    );
+    expect(
+      manager,
+      contains('terminalGattToDetach = terminalGattBeforeState'),
+    );
+    expect(
+      reconnect,
+      contains('task.passiveGatt === terminalGattToDetach'),
+    );
     expect(reconnect, contains('task.passiveGatt = null'));
     expect(
       reconnect,
