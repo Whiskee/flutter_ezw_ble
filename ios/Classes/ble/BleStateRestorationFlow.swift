@@ -57,7 +57,9 @@ extension BleManager {
         )
         loggerD(msg: "stateRestoration: escrow uuid=\(peripheral.identifier.uuidString), name=\(peripheral.name ?? ""), state=\(peripheral.state.rawValue), action=\(action)")
         if action == .rearm {
-            rearmStateRestorationEscrow(peripheral, reason: "willRestoreState disconnected")
+            // 标签跟随真实来源：connection event 拉起的进程没有 willRestoreState，
+            // 日志不能把它写成 willRestoreState（2026-09-09 排障曾因此误判）。
+            rearmStateRestorationEscrow(peripheral, reason: "\(source) disconnected")
         }
         // 系统 peerConnected 却仍是 `.connecting` 的 restored 对象：链路可能属于 ANCS /
         // 设置页等其它 owner，claim 后必须给 didConnect 一个有界宽限，而不是无限 keepPending。

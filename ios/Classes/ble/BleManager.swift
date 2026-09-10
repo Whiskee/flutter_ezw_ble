@@ -2144,16 +2144,20 @@ extension BleManager {
      * 无法恢复。这里只放行一次、只在 background + poweredOn + 未收到 willTerminate 时。
      */
     func canAttemptStateRestorationLaunchRetrieve(endpointId: String) -> Bool {
-        // UIScene 生命周期下 didFinishLaunching 的 launchOptions 恒为 nil，插件的
-        // bluetoothCentrals 标记不可靠（2026-09-07 20:26 真机：SR 拉起但标记为 false，
-        // 补查从未放行，左腿仍被延后到前台）。本进程发生过 willRestoreState 即是 SR 证据。
+        // 无 UI 拉起的三种证据，任一即可：
+        // 1. bluetoothCentrals launch option（UIScene 下 launchOptions 恒为 nil，基本拿不到；
+        //    2026-09-07 20:26 真机因此未放行）；
+        // 2. 本进程发生过 willRestoreState（iOS 26 重启后走此路）；
+        // 3. didFinishLaunching 首行 applicationState == .background（iOS 18 重启后只经
+        //    connection event 拉起、不回调 willRestoreState：2026-09-09 WK15 两次重启
+        //    escrow source 全是 connectionEvent，前两项都为 false，门禁未放行，左腿与 R1
+        //    延后到前台；同一时刻 keep-alive 日志证明 applicationState 就是 .background）。
+        let launchedHeadless = FlutterEzwBlePlugin.wasLaunchedHeadlessInBackground()
         let launchedForRestoration = FlutterEzwBlePlugin.wasLaunchedForBluetoothStateRestoration()
             || BleManager.didExperienceStateRestorationThisProcess
-        // UIScene 冷拉起：didFinishLaunching 时 applicationState 为 .background，但随后
-        // 系统可能在后台把 Scene 连上，applicationState 变成 .inactive（2026-09-09 10:51 /
-        // 10:54 WK15 两次重启：Dart 冻结时 lifecycle=inactive，门禁因要求 == .background
-        // 未放行，左腿与 R1 再次延后到前台）。补查只需要「不是 active」：active 窗口本就
-        // 允许同步 retrieve，不经此门。
+            || launchedHeadless
+        // 补查只要求当前「不是 active」：active 窗口本就允许同步 retrieve，不经此门；
+        // 无 UI 进程后续可能因 Scene 在后台挂上而变为 .inactive，不得要求 == .background。
         let applicationState = UIApplication.shared.applicationState
         let key = reconnectKey(uuid: endpointId)
         guard !allowsSynchronousCoreBluetoothLookup,
@@ -2163,7 +2167,7 @@ extension BleManager {
               centralManager.state == .poweredOn,
               UUID(uuidString: endpointId) != nil else {
             if stateRestorationLaunchRetrieveDenialsLogged.insert(key).inserted {
-                loggerD(msg: "appLifecycle: state restoration launch retrieve denied uuid=\(endpointId), syncLookup=\(allowsSynchronousCoreBluetoothLookup), launchedForRestoration=\(launchedForRestoration), willTerminate=\(hasReceivedWillTerminate), applicationState=\(applicationState.rawValue), central=\(centralManager.state.rawValue)")
+                loggerD(msg: "appLifecycle: state restoration launch retrieve denied uuid=\(endpointId), syncLookup=\(allowsSynchronousCoreBluetoothLookup), launchedForRestoration=\(launchedForRestoration), headlessLaunch=\(launchedHeadless), willRestoreState=\(BleManager.didExperienceStateRestorationThisProcess), willTerminate=\(hasReceivedWillTerminate), applicationState=\(applicationState.rawValue), central=\(centralManager.state.rawValue)")
             }
             return false
         }

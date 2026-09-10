@@ -26,12 +26,33 @@ void main() {
     // UIScene 下 launchOptions 恒为 nil，必须同时认 willRestoreState 的进程级事实。
     expect(gate, contains('FlutterEzwBlePlugin.wasLaunchedForBluetoothStateRestoration()'));
     expect(gate, contains('|| BleManager.didExperienceStateRestorationThisProcess'));
+    // iOS 18 可能只经 connection event 拉起而不回调 willRestoreState（2026-09-09 WK15），
+    // 启动瞬间 applicationState == .background 是第三种进程级证据。
+    expect(gate, contains('|| launchedHeadless'));
+    expect(gate, contains('FlutterEzwBlePlugin.wasLaunchedHeadlessInBackground()'));
+    expect(gate, contains('headlessLaunch=\\(launchedHeadless)'));
+    final plugin = File('ios/Classes/FlutterEzwBlePlugin.swift').readAsStringSync();
+    final capture = plugin.substring(
+      plugin.indexOf('public static func captureBluetoothStateRestorationLaunchOptions('),
+      plugin.indexOf('public static func register(with registrar: FlutterPluginRegistrar)'),
+    );
+    // 后台拉起证据必须在 bluetoothCentrals 守卫之前锁存，否则 launchOptions 为 nil 时永远拿不到。
+    final latch = capture.indexOf('launchedHeadlessInBackground = true');
+    final centralsGuard = capture.indexOf('guard centralIdentifiers.contains(');
+    expect(latch, greaterThan(0));
+    expect(centralsGuard, greaterThan(latch));
+    expect(capture, contains('UIApplication.shared.applicationState == .background'));
+    // escrow rearm 标签跟随真实来源，不得把 connectionEvent 写成 willRestoreState。
+    final flow = File('ios/Classes/ble/BleStateRestorationFlow.swift').readAsStringSync();
+    expect(flow, contains('reason: "\\(source) disconnected"'));
+    expect(flow, isNot(contains('reason: "willRestoreState disconnected"')));
     expect(gate, contains('launchedForRestoration,'));
     expect(gate, contains('!hasReceivedWillTerminate,'));
     // UIScene 冷拉起时 applicationState 可能已从 .background 变成 .inactive（2026-09-09
     // WK15 两次重启门禁未放行），补查只要求非 active。
     expect(gate, contains('applicationState != .active,'));
-    expect(gate, isNot(contains('applicationState == .background')));
+    // 守卫行不得再要求 == .background（注释里可以引用该字面量说明证据来源）。
+    expect(gate, isNot(contains('applicationState == .background,')));
     // 拒绝时每进程每 endpoint 记一次条件快照，沙盒日志据此指认具体条件。
     expect(gate, contains('stateRestorationLaunchRetrieveDenialsLogged.insert(key).inserted'));
     expect(gate, contains('state restoration launch retrieve denied uuid='));

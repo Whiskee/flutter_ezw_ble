@@ -12,6 +12,14 @@ public class FlutterEzwBlePlugin: NSObject, FlutterPlugin, FlutterApplicationLif
     /// option 恢复 central 会话，再由宿主重新提交长期连接目标。因此启动原因必须在
     /// App delegate 回调中独立锁存，不能依赖 peripheral escrow 是否仍然存在。
     private static var launchedForBluetoothStateRestoration = false
+    /// 当前进程是否以无 UI 的后台状态拉起（didFinishLaunching 首行 `applicationState == .background`）。
+    ///
+    /// iOS 18 可能只经 connection event 把进程拉起而不回调 `willRestoreState`
+    /// （2026-09-09 WK15 两次重启：escrow source 全是 connectionEvent，全天 0 次
+    /// willRestoreState），UIScene 下 launchOptions 又恒为 nil。此时唯一可靠的
+    /// 「无 UI 拉起」证据就是启动瞬间的 applicationState，与宿主 AppDelegate 冻结
+    /// Dart 启动模式用的是同一判定。
+    private static var launchedHeadlessInBackground = false
 
     /// 在 Flutter 注册 application delegate 前锁存一次性的 CoreBluetooth 启动参数。
     /// Flutter 3.41 的隐式 Engine 会在宿主 didFinishLaunching 之后才注册插件。
@@ -24,6 +32,14 @@ public class FlutterEzwBlePlugin: NSObject, FlutterPlugin, FlutterApplicationLif
         // willRestoreState 会把 peripheral 交给现有 escrow，等待 Flutter 业务认领。
         // 这里只做原生同步构造，不启动 Dart 业务，也不会给前台启动增加 await。
         let _ = BleManager.shared
+
+        if !launchedHeadlessInBackground,
+           UIApplication.shared.applicationState == .background {
+            launchedHeadlessInBackground = true
+            BleEC.logger.emit(
+                "[d]-stateRestoration: app launched headless in background (applicationState=background)"
+            )
+        }
 
         let centralIdentifiers = launchOptions?[.bluetoothCentrals] as? [String] ?? []
         guard centralIdentifiers.contains(BleManager.restorationIdentifier) else {
@@ -63,6 +79,12 @@ public class FlutterEzwBlePlugin: NSObject, FlutterPlugin, FlutterApplicationLif
     /// 只读返回当前进程的 CoreBluetooth 启动原因，不 claim peripheral、不启动 GATT。
     static func wasLaunchedForBluetoothStateRestoration() -> Bool {
         launchedForBluetoothStateRestoration
+    }
+
+    /// 只读返回当前进程是否以无 UI 后台状态拉起；与 bluetoothCentrals / willRestoreState
+    /// 一起构成 SR 拉起窗口补查的进程级证据。
+    static func wasLaunchedHeadlessInBackground() -> Bool {
+        launchedHeadlessInBackground
     }
    
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
