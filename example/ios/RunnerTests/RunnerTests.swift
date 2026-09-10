@@ -1978,7 +1978,8 @@ class RunnerTests: XCTestCase {
         hasConnectedCache: true,
         isPeripheralConnected: true,
         sessionGeneration: 21,
-        attemptGeneration: 22
+        attemptGeneration: 22,
+        isUpgrading: true
       )
     )
     XCTAssertEqual(finishDecision, BleG2OtaRetirementDecision(
@@ -1995,7 +1996,8 @@ class RunnerTests: XCTestCase {
         hasConnectedCache: false,
         isPeripheralConnected: false,
         sessionGeneration: 0,
-        attemptGeneration: 0
+        attemptGeneration: 0,
+        isUpgrading: false
       )
     )
     XCTAssertEqual(gattReleasedDecision, BleG2OtaRetirementDecision(
@@ -2022,7 +2024,8 @@ class RunnerTests: XCTestCase {
         hasConnectedCache: true,
         isPeripheralConnected: true,
         sessionGeneration: 21,
-        attemptGeneration: 23
+        attemptGeneration: 23,
+        isUpgrading: false
       )
     )
     XCTAssertEqual(lateDecision, BleG2OtaRetirementDecision(
@@ -2030,6 +2033,24 @@ class RunnerTests: XCTestCase {
       shouldIsolateCache: false,
       shouldInstallCancellationBarrier: false,
       shouldCancelPeripheral: false
+    ))
+
+    let leftoverDecision = BleG2OtaRetirementPolicy.decide(
+      snapshot: snapshot,
+      state: BleG2OtaRetirementEndpointState(
+        uuid: "left",
+        hasConnectedCache: true,
+        isPeripheralConnected: true,
+        sessionGeneration: 21,
+        attemptGeneration: 23,
+        isUpgrading: true
+      )
+    )
+    XCTAssertEqual(leftoverDecision, BleG2OtaRetirementDecision(
+      shouldClearLocalState: true,
+      shouldIsolateCache: true,
+      shouldInstallCancellationBarrier: true,
+      shouldCancelPeripheral: true
     ))
 
     let parkedScope = g2OtaScope(id: "tx-park-retire", generation: 11, endpoints: ["right": (31, 32)])
@@ -2052,7 +2073,8 @@ class RunnerTests: XCTestCase {
         hasConnectedCache: true,
         isPeripheralConnected: true,
         sessionGeneration: 31,
-        attemptGeneration: 32
+        attemptGeneration: 32,
+        isUpgrading: true
       )
     )
     XCTAssertEqual(parkedDecision, BleG2OtaRetirementDecision(

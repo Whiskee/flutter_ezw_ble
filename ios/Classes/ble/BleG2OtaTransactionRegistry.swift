@@ -222,6 +222,10 @@ struct BleG2OtaRetirementEndpointState: Equatable {
     let isPeripheralConnected: Bool
     let sessionGeneration: Int64
     let attemptGeneration: Int64
+    /// Leftover `enterUpgradeState` marker on this UUID. Post-finish afterUpgrade
+    /// owners never keep this flag; a finished leg that system-reconnected during
+    /// the peer transfer still does.
+    let isUpgrading: Bool
 }
 
 struct BleG2OtaRetirementDecision: Equatable {
@@ -251,7 +255,27 @@ enum BleG2OtaRetirementPolicy {
             snapshot?.attemptGeneration == state.attemptGeneration &&
             state.sessionGeneration > 0 &&
             state.attemptGeneration > 0
-        guard exactBoundPair else {
+        if exactBoundPair {
+            return BleG2OtaRetirementDecision(
+                shouldClearLocalState: true,
+                shouldIsolateCache: true,
+                shouldInstallCancellationBarrier: state.isPeripheralConnected,
+                shouldCancelPeripheral: state.isPeripheralConnected
+            )
+        }
+        // Finished-leg leftover: same session, a newer attempt, leftover
+        // upgrading marker. The first leg can reboot and be system-adopted
+        // while the peer is still transferring. Finish must consume that
+        // leftover so afterUpgrade can take a clean owner. A later
+        // afterUpgrade owner has upgrading=false and stays protected.
+        let leftoverOtaReconnect =
+            snapshot?.hasBoundPhysicalPair == true &&
+            snapshot?.sessionGeneration == state.sessionGeneration &&
+            state.sessionGeneration > 0 &&
+            (snapshot?.attemptGeneration ?? 0) > 0 &&
+            state.attemptGeneration > (snapshot?.attemptGeneration ?? 0) &&
+            state.isUpgrading
+        guard leftoverOtaReconnect else {
             return BleG2OtaRetirementDecision(
                 shouldClearLocalState: false,
                 shouldIsolateCache: false,
