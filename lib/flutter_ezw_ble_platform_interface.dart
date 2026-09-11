@@ -414,10 +414,52 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
 
   /// 重置蓝牙。
   ///
-  /// 这是中性 runtime teardown：释放扫描、连接和发送队列，但保留持久自动回连 owner，
-  /// 等待上层下次普通冷启动恢复流程重新 activate。
-  Future<void> resetBle() {
-    throw UnimplementedError('resetBle() has not been implemented.');
+  /// 冷启动使用 [preserveStateRestoration] 保留 iOS 已交还、但尚未被当前设备
+  /// activation 认领的 peripheral；登出/移除/用户真取消保持默认 hard reset。
+  Future<void> resetBle({bool preserveStateRestoration = false}) {
+    throw UnimplementedError(
+      'resetBle(preserveStateRestoration: $preserveStateRestoration) has not been implemented.',
+    );
+  }
+
+  /// 是否存在等待当前账号认领的 iOS State Restoration peripheral。
+  ///
+  /// 该查询只读取 native escrow，不会认领 peripheral、启动 GATT 或发布连接状态；
+  /// Android 固定返回 false。
+  Future<bool> hasPendingStateRestoration() {
+    throw UnimplementedError(
+      'hasPendingStateRestoration() has not been implemented.',
+    );
+  }
+
+  /// 当前进程是否由 iOS CoreBluetooth central restoration 启动。
+  ///
+  /// 该事实来自 `launchOptions.bluetoothCentrals`，与 `willRestoreState` escrow 是否
+  /// 仍有 peripheral 独立；不认领设备、不启动 GATT。Android 固定返回 false。
+  Future<bool> wasLaunchedForBluetoothStateRestoration() {
+    throw UnimplementedError(
+      'wasLaunchedForBluetoothStateRestoration() has not been implemented.',
+    );
+  }
+
+  /// 本进程是否发生过 iOS `willRestoreState` 回调。
+  ///
+  /// escrow 可能在 Dart 查询前已被 claim/finalize 消费清空，`hasPendingStateRestoration`
+  /// 因此不足以证明「经历过 SR」；该事实由原生一次性锁存、只读暴露，不认领设备、
+  /// 不启动 GATT。Android 固定返回 false。
+  Future<bool> didExperienceStateRestorationThisProcess() {
+    throw UnimplementedError(
+      'didExperienceStateRestorationThisProcess() has not been implemented.',
+    );
+  }
+
+  /// 结束冷启动 State Restoration 认领窗口。
+  ///
+  /// iOS 会取消未被当前业务设备认领的历史 peripheral；Android 为 no-op。
+  Future<void> finalizeStateRestorationClaims() {
+    throw UnimplementedError(
+      'finalizeStateRestorationClaims() has not been implemented.',
+    );
   }
 
   /// 清除连接缓存

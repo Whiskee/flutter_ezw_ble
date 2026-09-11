@@ -34,12 +34,13 @@ Map<String, dynamic> _$BleConnectModelToJson(BleConnectModel instance) =>
       'source': _$BleConnectSourceEnumMap[instance.source]!,
       'generation': instance.sessionGeneration,
       'attemptGeneration': instance.attemptGeneration,
-      'nativeTrace': instance.nativeTrace?.toJson(),
+      'nativeTrace': instance.nativeTrace,
     };
 
 const _$BleConnectSourceEnumMap = {
   BleConnectSource.unknown: 'unknown',
   BleConnectSource.autoReconnect: 'autoReconnect',
   BleConnectSource.manualReconnect: 'manualReconnect',
+  BleConnectSource.stateRestoration: 'stateRestoration',
   BleConnectSource.foreground: 'foreground',
 };
