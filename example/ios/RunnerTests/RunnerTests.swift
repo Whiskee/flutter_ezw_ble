@@ -871,6 +871,86 @@ class RunnerTests: XCTestCase {
     XCTAssertEqual(BleReconnectSourcePolicy.afterTransportReset(), .autoReconnect)
   }
 
+  func testBluetoothResetRecoveryRequiresANewerPositiveFinalSession() {
+    XCTAssertEqual(
+      BleRecoveryActivationGatePolicy.evaluate(
+        awaitingRecoveryActivation: true,
+        pausedByBluetoothOff: false,
+        isBluetoothPoweredOn: true,
+        currentRecoveryEpoch: 7,
+        incomingRecoveryEpoch: 7,
+        currentSessionGeneration: 41,
+        incomingSessionGeneration: 42
+      ),
+      .consume
+    )
+    XCTAssertEqual(
+      BleRecoveryActivationGatePolicy.evaluate(
+        awaitingRecoveryActivation: false,
+        pausedByBluetoothOff: true,
+        isBluetoothPoweredOn: true,
+        currentRecoveryEpoch: 7,
+        incomingRecoveryEpoch: 7,
+        currentSessionGeneration: 41,
+        incomingSessionGeneration: 42
+      ),
+      .consume,
+      "activation may win before the poweredOn delegate finishes marking the gate"
+    )
+    for staleGeneration in [Int64(0), 40, 41] {
+      XCTAssertEqual(
+        BleRecoveryActivationGatePolicy.evaluate(
+          awaitingRecoveryActivation: true,
+          pausedByBluetoothOff: false,
+          isBluetoothPoweredOn: true,
+          currentRecoveryEpoch: 7,
+          incomingRecoveryEpoch: 7,
+          currentSessionGeneration: 41,
+          incomingSessionGeneration: staleGeneration
+        ),
+        .reject
+      )
+    }
+    XCTAssertEqual(
+      BleRecoveryActivationGatePolicy.evaluate(
+        awaitingRecoveryActivation: true,
+        pausedByBluetoothOff: false,
+        isBluetoothPoweredOn: false,
+        currentRecoveryEpoch: 7,
+        incomingRecoveryEpoch: 7,
+        currentSessionGeneration: 41,
+        incomingSessionGeneration: 42
+      ),
+      .reject
+    )
+    XCTAssertEqual(
+      BleRecoveryActivationGatePolicy.evaluate(
+        awaitingRecoveryActivation: false,
+        pausedByBluetoothOff: false,
+        isBluetoothPoweredOn: true,
+        currentRecoveryEpoch: 0,
+        incomingRecoveryEpoch: 0,
+        currentSessionGeneration: 41,
+        incomingSessionGeneration: 41
+      ),
+      .notRequired,
+      "same-session reconcile remains valid outside a transport reset"
+    )
+    XCTAssertEqual(
+      BleRecoveryActivationGatePolicy.evaluate(
+        awaitingRecoveryActivation: true,
+        pausedByBluetoothOff: false,
+        isBluetoothPoweredOn: true,
+        currentRecoveryEpoch: 8,
+        incomingRecoveryEpoch: 7,
+        currentSessionGeneration: 41,
+        incomingSessionGeneration: 42
+      ),
+      .reject,
+      "the first reset cycle cannot consume the second reset cycle gate"
+    )
+  }
+
   func testBusinessConnectedSystemDisconnectReusesLastAcceptedExactOwner() {
     var task = BleReconnectTask(
       belongConfig: "ring_bcl_1",

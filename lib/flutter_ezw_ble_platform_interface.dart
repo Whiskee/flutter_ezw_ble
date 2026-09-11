@@ -49,6 +49,13 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     throw UnimplementedError('bleState() has not been implemented.');
   }
 
+  /// 读取当前进程 transport reset 周期，不产生连接或查询 peripheral 副作用。
+  ///
+  /// iOS final recovery activation 必须回传此值；Android 当前返回 0。
+  Future<int> bleRecoveryEpoch() {
+    throw UnimplementedError('bleRecoveryEpoch() has not been implemented.');
+  }
+
   /// 设置蓝牙配置
   ///
   /// - param configs 蓝牙配置
@@ -306,10 +313,11 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     BleConnectSource source = BleConnectSource.autoReconnect,
     BleReconnectActivationMode mode = BleReconnectActivationMode.initial,
     int sessionGeneration = 0,
+    int recoveryEpoch = 0,
     BleG2OtaContext? otaContext,
   }) {
     throw UnimplementedError(
-      'activateAutoReconnectTargets(devices: $devices, source: $source, mode: $mode, sessionGeneration: $sessionGeneration) has not been implemented.',
+      'activateAutoReconnectTargets(devices: $devices, source: $source, mode: $mode, sessionGeneration: $sessionGeneration, recoveryEpoch: $recoveryEpoch) has not been implemented.',
     );
   }
 

@@ -24,6 +24,8 @@ enum class BleMC {
     GET_PLATFORM_VERSION,
     /** 返回当前蓝牙状态缓存。 */
     BLE_STATE,
+    /** iOS transport reset epoch；Android 当前固定返回 0。 */
+    BLE_RECOVERY_EPOCH,
     /** 初始化 BLE 配置列表。 */
     INIT_CONFIGS,
     /** 开始扫描设备。 */
@@ -132,6 +134,9 @@ enum class BleMC {
             BLE_STATE -> {
                 // 主动查询必须穿透初始化缓存，权限弹窗返回后同一 Activity 也能立即得到新状态。
                 return result.success(BleManager.instance.refreshBleState("methodChannel.bleState"))
+            }
+            BLE_RECOVERY_EPOCH -> {
+                return result.success(0L)
             }
             INIT_CONFIGS -> {
                 // 1. Dart 传入的是 List<Map>，这里转换成原生配置模型。

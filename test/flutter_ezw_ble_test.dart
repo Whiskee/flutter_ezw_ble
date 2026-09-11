@@ -186,11 +186,17 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
+  Future<int> bleRecoveryEpoch() {
+    throw UnimplementedError();
+  }
+
+  @override
   Future<List<BleReconnectActivationResult>> activateAutoReconnectTargets(
     List<BleDevice> devices, {
     BleConnectSource source = BleConnectSource.autoReconnect,
     BleReconnectActivationMode mode = BleReconnectActivationMode.initial,
     int sessionGeneration = 0,
+    int recoveryEpoch = 0,
     BleG2OtaContext? otaContext,
   }) {
     throw UnimplementedError();

@@ -15,6 +15,8 @@ enum BleMC: String {
     case getPlatformVersion
     /// Query current CoreBluetooth state.
     case bleState
+    /// Query the process-local transport reset epoch without mutating owners.
+    case bleRecoveryEpoch
     /// Replace the native BLE configuration table.
     case initConfigs
     /// Start scan with optional pure scan mode.
@@ -103,6 +105,9 @@ enum BleMC: String {
             return
         case .bleState:
             result(BleManager.shared.currentBleState)
+            return
+        case .bleRecoveryEpoch:
+            result(BleManager.shared.currentBleRecoveryEpoch)
             return
         case .initConfigs:
             let jsonArray: Array<[String: Any]> = arguments as? Array<[String: Any]> ?? []
@@ -214,12 +219,14 @@ enum BleMC: String {
             let source = BleConnectSource(rawValue: data["source"] as? String ?? "") ?? .unknown
             let mode = BleReconnectActivationMode(rawValue: data["mode"] as? String ?? "") ?? .unknown
             let sessionGeneration = (data["sessionGeneration"] as? NSNumber)?.int64Value ?? 0
+            let recoveryEpoch = (data["recoveryEpoch"] as? NSNumber)?.int64Value ?? 0
             let otaContext = BleG2OtaContext(data: data["otaContext"] as? [String: Any])
             let acknowledgements = BleManager.shared.activateAutoReconnectTargets(
                 targets,
                 source: source,
                 mode: mode,
                 sessionGeneration: sessionGeneration,
+                recoveryEpoch: recoveryEpoch,
                 otaContext: otaContext
             )
             result(acknowledgements.map(\.raw))
