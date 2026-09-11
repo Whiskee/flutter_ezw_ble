@@ -181,6 +181,13 @@ class BleManager: NSObject {
     /// 同一设备的新 activation 会替换旧 token；迟到的查询闭包必须先复验 token 和
     /// reconnect task generation，不能把旧账号或旧 runtime 的 peripheral 注入新连接。
     var activeStartupReconciliationTokens: [String: String] = [:]
+    /// 当前进程 transport reset 周期；只在 poweredOn 离开沿时递增。
+    ///
+    /// Dart 在 available 后读取此值并随 activation 回传，防止连续 reset 时第一轮
+    /// 迟到 session 消费第二轮门禁。它只参与准入，不持久化也不替代 physical attempt。
+    private(set) var currentTransportRecoveryEpoch: Int64 = 0
+    /// 同一轮 resetting/unknown/poweredOff 连续状态只推进一次 epoch。
+    private var isTransportRecoveryCycleActive = false
     //  - 最近一次已输出的扫描配置签名，用于避免每次 startScan 都重复刷配置详情。
     private var lastLoggedScanConfigSignature: String?
     //  =========== Get/Set
@@ -190,6 +197,27 @@ class BleManager: NSObject {
             resumeReconnectTasksIfBluetoothOn(reason: "bleState-query")
             return centralManager.state.rawValue
         }
+    }
+
+    /// MethodChannel 只读快照；读取不恢复 task、不查询 peripheral。
+    var currentBleRecoveryEpoch: Int64 {
+        currentTransportRecoveryEpoch
+    }
+
+    /// 确保当前非 poweredOn 窗口拥有唯一 epoch。
+    ///
+    /// `central.state` 可能先变化、delegate 回调稍后才到；连接入口若先观察到不可用
+    /// 状态也必须取得同一周期 epoch，不能创建 recoveryEpoch=0 的暂停 task。
+    @discardableResult
+    func beginTransportRecoveryCycleIfNeeded() -> Int64 {
+        if !isTransportRecoveryCycleActive {
+            currentTransportRecoveryEpoch =
+                currentTransportRecoveryEpoch == Int64.max
+                    ? Int64.max
+                    : currentTransportRecoveryEpoch + 1
+            isTransportRecoveryCycleActive = true
+        }
+        return currentTransportRecoveryEpoch
     }
     
     /**
@@ -3733,6 +3761,7 @@ extension BleManager: CBCentralManagerDelegate {
         BleEC.bleState.emit(central.state.rawValue)
         //  1、如果蓝牙状态不是开启，则将所有已连接的设备设置为非连接状态
         if central.state != .poweredOn {
+            beginTransportRecoveryCycleIfNeeded()
             // CoreBluetooth 的 resetting / unauthorized / unsupported 同样会进入现有
             // teardown，但它们不是用户关闭 Adapter。只让真实 poweredOff 携带
             // bluetooth_adapter/4，避免分析侧把权限或协议栈重置误归因为手动关蓝牙。
@@ -3785,6 +3814,7 @@ extension BleManager: CBCentralManagerDelegate {
             rearmDeferredStateRestorationEscrowsAfterPowerOn()
             resumeConnectionAdmissionGateAfterBluetoothOn()
             resumeReconnectTasksAfterBluetoothOn()
+            isTransportRecoveryCycleActive = false
         }
         loggerD(msg: "centralManagerDidUpdateState: State = \(central.state.label), code = \(central.state.rawValue)")
     }

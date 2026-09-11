@@ -109,6 +109,7 @@ void main() {
     final arguments = captured?.arguments as Map<Object?, Object?>;
     expect(arguments['source'], 'autoReconnect');
     expect(arguments['mode'], 'initial');
+    expect(arguments['recoveryEpoch'], 0);
     expect(arguments['devices'], isA<List<Object?>>());
     expect(
       (arguments['devices'] as List<Object?>).single,
@@ -130,12 +131,27 @@ void main() {
       source: BleConnectSource.manualReconnect,
       mode: BleReconnectActivationMode.promotion,
       sessionGeneration: 37,
+      recoveryEpoch: 9,
     );
 
     final arguments = captured?.arguments as Map<Object?, Object?>;
     expect(arguments['source'], 'manualReconnect');
     expect(arguments['mode'], 'promotion');
     expect(arguments['sessionGeneration'], 37);
+    expect(arguments['recoveryEpoch'], 9);
+  });
+
+  test('transport recovery epoch query is read-only', () async {
+    MethodCall? captured;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      captured = call;
+      return 12;
+    });
+
+    expect(await platform.bleRecoveryEpoch(), 12);
+    expect(captured?.method, 'bleRecoveryEpoch');
+    expect(captured?.arguments, isNull);
   });
 
   test('pending State Restoration query is read-only and fails closed',
@@ -330,8 +346,8 @@ void main() {
     expect(target['name'], 'EVEN R1_2639B0');
     expect(target['mac'], 'ED:0E:DC:26:39:B0');
     expect(results.single.state, BleReconnectActivationState.identityPending);
-    expect(results.single.ownerDisposition,
-        BleReconnectOwnerDisposition.deferred);
+    expect(
+        results.single.ownerDisposition, BleReconnectOwnerDisposition.deferred);
     expect(results.single.isAccepted, isTrue);
   });
 

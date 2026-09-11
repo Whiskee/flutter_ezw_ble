@@ -341,7 +341,12 @@ extension BleManager {
         )
         // Session 只能向前推进。旧 Dart batch 的迟到 activation 不能把已安装 owner
         // 降回更小代次，否则 CoreBluetooth 成功回调会再次被上层 epoch guard 拒绝。
-        if sessionGeneration > task.sessionGeneration {
+        // Reset recovery 的 session 只能由显式 activation 消费门禁时写入。arm 可能来自
+        // initConfigs、旧 timer 或扫描身份补全，若在此提前覆盖就无法再证明 final batch
+        // 确实高于 reset 前 owner。
+        if sessionGeneration > task.sessionGeneration,
+           !task.awaitingRecoveryActivation,
+           !task.pausedByBluetoothOff {
             task.sessionGeneration = sessionGeneration
             // 新 recovery batch 必须淘汰旧 5 秒 timer，并从完整扫描窗口重新开始。
             if task.pairingRecoveryState == .waitingFreshAdvertisementRetry {
@@ -349,7 +354,6 @@ extension BleManager {
             }
         }
         task.attempt = 0
-        task.pausedByBluetoothOff = false
         if let otaContext {
             // MethodChannel context only exists at the initial OTA activation.
             // Store it on the exact native owner so internal retries can keep
@@ -370,6 +374,87 @@ extension BleManager {
         reconnectTasks[key] = task
         reconnectStore.upsert(target: effectiveTarget)
         return task
+    }
+
+    /// 显式 activation 原子消费 transport reset 门禁并安装最终 Dart session。
+    ///
+    /// `pausedByBluetoothOff` 也纳入门禁，是为了覆盖 poweredOn 已生效、但 delegate
+    /// 收尾尚未执行时先到达的 activation：胜出的显式请求清掉 pause 后，迟到的
+    /// poweredOn 收尾不会再次把同一 owner 阻塞。普通 cold-start activation 没有
+    /// transport 门禁，仍沿用既有 session 更新语义。
+    func consumeRecoveryActivationGate(
+        _ task: BleReconnectTask,
+        sessionGeneration: Int64,
+        recoveryEpoch: Int64
+    ) -> BleReconnectTask? {
+        let key = reconnectKey(uuid: task.uuid)
+        guard var current = reconnectTasks[key],
+              current.belongConfig == task.belongConfig,
+              current.name == task.name else {
+            return nil
+        }
+        let decision = BleRecoveryActivationGatePolicy.evaluate(
+            awaitingRecoveryActivation: current.awaitingRecoveryActivation,
+            pausedByBluetoothOff: current.pausedByBluetoothOff,
+            isBluetoothPoweredOn: centralManager.state == .poweredOn,
+            currentRecoveryEpoch: current.recoveryEpoch,
+            incomingRecoveryEpoch: recoveryEpoch,
+            currentSessionGeneration: current.sessionGeneration,
+            incomingSessionGeneration: sessionGeneration
+        )
+        guard decision != .notRequired else {
+            return task
+        }
+        guard decision == .consume else {
+            loggerD(msg: "autoReconnect: \(current.uuid)-\(current.name), recovery activation rejected incoming=\(sessionGeneration), previous=\(current.sessionGeneration), incomingEpoch=\(recoveryEpoch), currentEpoch=\(current.recoveryEpoch), bluetooth=\(centralManager.state.label)")
+            return nil
+        }
+        current.timer?.invalidate()
+        current.timer = nil
+        current.pausedByBluetoothOff = false
+        current.awaitingRecoveryActivation = false
+        current.sessionGeneration = sessionGeneration
+        reconnectTasks[key] = current
+        loggerD(msg: "autoReconnect: \(current.uuid)-\(current.name), recovery activation consumed session=\(sessionGeneration)")
+        return current
+    }
+
+    /// 在任何 activation 副作用前检查 reset recovery generation。
+    ///
+    /// 手动 activation 会清安全恢复标记，arm 会改 source/timer/持久 target；因此旧
+    /// batch 必须在这些动作之前被拒绝，不能等到最终 consume 时才发现 generation
+    /// 已失效。没有 transport 门禁的冷启动/普通 reconcile 保持原行为。
+    private func canMutateForRecoveryActivation(
+        _ target: BleReconnectTarget,
+        sessionGeneration: Int64,
+        recoveryEpoch: Int64
+    ) -> Bool {
+        let canonicalUuid =
+            reconnectIdentityAliases.resolvedCanonical(uuid: target.uuid) ?? target.uuid
+        let candidates = reconnectTasks.values.filter { task in
+            task.belongConfig == target.belongConfig &&
+                isSameConnectTarget(
+                    storedUuid: task.uuid,
+                    storedName: task.name,
+                    uuid: canonicalUuid,
+                    name: target.name
+                )
+        }
+        guard candidates.count <= 1 else {
+            return false
+        }
+        guard let current = candidates.first else {
+            return true
+        }
+        return BleRecoveryActivationGatePolicy.evaluate(
+            awaitingRecoveryActivation: current.awaitingRecoveryActivation,
+            pausedByBluetoothOff: current.pausedByBluetoothOff,
+            isBluetoothPoweredOn: centralManager.state == .poweredOn,
+            currentRecoveryEpoch: current.recoveryEpoch,
+            incomingRecoveryEpoch: recoveryEpoch,
+            currentSessionGeneration: current.sessionGeneration,
+            incomingSessionGeneration: sessionGeneration
+        ) != .reject
     }
 
     /// Code 14 停止标记只使用稳定 config+完整名称，不使用可能被 CoreBluetooth
@@ -435,6 +520,7 @@ extension BleManager {
         source: BleConnectSource = .autoReconnect,
         mode: BleReconnectActivationMode = .initial,
         sessionGeneration: Int64 = 0,
+        recoveryEpoch: Int64 = 0,
         scheduleActiveReconciliation: Bool = true,
         otaContext: BleG2OtaContext? = nil
     ) -> [BleReconnectActivationResult] {
@@ -497,6 +583,24 @@ extension BleManager {
                     target: target,
                     state: .rejected,
                     reason: "invalidMode",
+                    source: source,
+                    mode: mode,
+                    ownerDisposition: .rejected,
+                    sessionGeneration: sessionGeneration
+                )
+            }
+            // 必须早于手动恢复标记清理、restoration claim 和 arm。旧 batch 即使最终
+            // 会在 consume 失败，也无权先修改新 owner 的 source/timer/persistence。
+            guard canMutateForRecoveryActivation(
+                target,
+                sessionGeneration: sessionGeneration,
+                recoveryEpoch: recoveryEpoch
+            ) else {
+                loggerD(msg: "autoReconnect activation rejected before mutation: config=\(target.belongConfig), uuid=\(trimmedUuid), session=\(sessionGeneration), reason=staleRecoveryActivation")
+                return BleReconnectActivationResult(
+                    target: target,
+                    state: .rejected,
+                    reason: "staleRecoveryActivation",
                     source: source,
                     mode: mode,
                     ownerDisposition: .rejected,
@@ -600,6 +704,25 @@ extension BleManager {
                         sessionGeneration: sessionGeneration
                     )
                 }
+                guard let activatedTask = consumeRecoveryActivationGate(
+                    task,
+                    sessionGeneration: sessionGeneration,
+                    recoveryEpoch: recoveryEpoch
+                ) else {
+                    if let claimedRestoration {
+                        _ = restorationCoordinator.enqueue(claimedRestoration.peripheral)
+                    }
+                    return BleReconnectActivationResult(
+                        target: target,
+                        state: .rejected,
+                        reason: "staleRecoveryActivation",
+                        source: source,
+                        mode: mode,
+                        ownerDisposition: .rejected,
+                        sessionGeneration: sessionGeneration
+                    )
+                }
+                task = activatedTask
                 if source == .manualReconnect {
                     task.securityGateFailureCount = 0
                     task.pairingRecoveryState = .normal
@@ -754,6 +877,22 @@ extension BleManager {
                     sessionGeneration: sessionGeneration
                 )
             }
+            guard let activatedTask = consumeRecoveryActivationGate(
+                task,
+                sessionGeneration: sessionGeneration,
+                recoveryEpoch: recoveryEpoch
+            ) else {
+                return BleReconnectActivationResult(
+                    target: target,
+                    state: .rejected,
+                    reason: "staleRecoveryActivation",
+                    source: source,
+                    mode: mode,
+                    ownerDisposition: .rejected,
+                    sessionGeneration: sessionGeneration
+                )
+            }
+            task = activatedTask
             let manualTakesOverExistingFreshWait =
                 source == .manualReconnect &&
                 (task.pairingRecoveryState == .awaitingFreshAdvertisement ||
@@ -1101,9 +1240,26 @@ extension BleManager {
         mode: BleReconnectActivationMode = .initial,
         reconcileSystemConnected: Bool = false
     ) -> BleReconnectOwnerActivationOutcome {
+        // 所有隐式入口都必须重新读取当前 task。只有公开 activation 会先原子消费
+        // reset recovery 门禁；扫描、生命周期补偿和旧 continuation 只能保持 deferred。
+        let key = reconnectKey(uuid: task.uuid)
+        guard let currentTask = reconnectTasks[key],
+              currentTask.belongConfig == task.belongConfig,
+              currentTask.sessionGeneration == task.sessionGeneration else {
+            return BleReconnectOwnerActivationOutcome(
+                disposition: .rejected,
+                reason: "staleReconnectOwner"
+            )
+        }
+        guard !currentTask.awaitingRecoveryActivation,
+              !currentTask.pausedByBluetoothOff else {
+            return BleReconnectOwnerActivationOutcome(
+                disposition: .deferred,
+                reason: "awaitingRecoveryActivation"
+            )
+        }
         let deferredByAppInactivity = shouldDeferReconnectForAppInactivity(task)
         // 1、已有 admission 时优先判断是否可安全复用当前 pending session。
-        let key = reconnectKey(uuid: task.uuid)
         // 自动窗口之间的静默等待由 task.timer 独占。重复 activation 只确认 owner 仍在，
         // 不能提前开始扫描或 retrieve，也不能让共享扫描结果穿过等待门禁。
         if source != .manualReconnect,
@@ -1504,6 +1660,7 @@ extension BleManager {
      *  poweredOff 不是最终失败，不能把任务标记为 noDeviceFound；等待 poweredOn 后继续调度。
      */
     func pauseReconnectTasksForBluetoothOff() {
+        let recoveryEpoch = beginTransportRecoveryCycleIfNeeded()
         pausePeerPairingRecoveryForBluetoothOff()
         for key in reconnectTasks.keys {
             guard var task = reconnectTasks[key] else {
@@ -1513,6 +1670,10 @@ extension BleManager {
             task.timer?.invalidate()
             task.timer = nil
             task.pausedByBluetoothOff = true
+            task.recoveryEpoch = recoveryEpoch
+            // 每个非 poweredOn 状态都会重新冻结本轮 transport；等待标记只在
+            // poweredOn 时发布，避免 resetting 期间被误当成连接窗口。
+            task.awaitingRecoveryActivation = false
             task.source = BleReconnectSourcePolicy.afterTransportReset()
             reconnectTasks[key] = task
         }
@@ -1538,9 +1699,10 @@ extension BleManager {
     }
 
     /**
-     *  蓝牙恢复后继续被暂停的任务。
+     *  蓝牙恢复后发布显式 activation 门禁。
      *
-     *  这里统一进入 scheduleReconnect，保证恢复、系统断连、超时都复用同一套退避策略。
+     *  reset 前 session 已随 transport 失效；这里不得 schedule/begin。Dart 会把全部
+     *  G2/R1 endpoint 汇总到一个更高正 session，再由 activation 唯一消费门禁。
      */
     func resumeReconnectTasksAfterBluetoothOn() {
         let pausedTasks = reconnectTasks.values.filter { $0.pausedByBluetoothOff }
@@ -1548,19 +1710,14 @@ extension BleManager {
         guard pausedTasks.isNotEmpty else {
             return
         }
-        loggerD(msg: "autoReconnect: resume \(pausedTasks.count) paused task(s), bluetooth on")
+        loggerD(msg: "autoReconnect: \(pausedTasks.count) task(s) awaiting Dart recovery activation for final session")
         for task in pausedTasks {
             let key = reconnectKey(uuid: task.uuid)
             if var stored = reconnectTasks[key] {
                 stored.pausedByBluetoothOff = false
+                stored.awaitingRecoveryActivation = true
                 reconnectTasks[key] = stored
             }
-            scheduleReconnect(
-                uuid: task.uuid,
-                name: task.name,
-                state: .disconnectFromSys,
-                preserveAttemptSource: false
-            )
         }
     }
 
@@ -1835,6 +1992,10 @@ extension BleManager {
             // 没有 armed task 说明业务尚未确认 connected，原生不能自行接管长期回连。
             return
         }
+        guard !task.awaitingRecoveryActivation else {
+            loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), schedule deferred awaiting final recovery activation")
+            return
+        }
         // 2、终态后默认恢复 autoReconnect source；显式提升只保留当前 attempt 来源。
         if !preserveAttemptSource {
             task.source = BleReconnectSourcePolicy.afterTerminalAttempt()
@@ -1852,6 +2013,7 @@ extension BleManager {
         // 3、蓝牙不可用只记录暂停，poweredOn 后继续，不取消长期 intent。
         guard centralManager.state == .poweredOn else {
             task.pausedByBluetoothOff = true
+            task.recoveryEpoch = beginTransportRecoveryCycleIfNeeded()
             reconnectTasks[reconnectKey(uuid: task.uuid)] = task
             loggerD(msg: "autoReconnect: \(task.uuid), paused because bluetooth is unavailable")
             return
@@ -1917,6 +2079,10 @@ extension BleManager {
             // 任务可能已被用户 disconnect/remove 取消，忽略旧 timer 回调。
             return
         }
+        guard !task.awaitingRecoveryActivation else {
+            loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), begin deferred awaiting final recovery activation")
+            return
+        }
         guard let config = bleConfigs.first(where: { $0.name == task.belongConfig }), config.autoReconnect else {
             return
         }
@@ -1929,6 +2095,7 @@ extension BleManager {
         guard centralManager.state == .poweredOn else {
             // poweredOff 期间不消耗 attempt，等待状态恢复后继续。
             task.pausedByBluetoothOff = true
+            task.recoveryEpoch = beginTransportRecoveryCycleIfNeeded()
             reconnectTasks[key] = task
             return
         }
@@ -2382,6 +2549,7 @@ extension BleManager {
             resumed.timer = nil
             guard self.centralManager.state == .poweredOn else {
                 resumed.pausedByBluetoothOff = true
+                resumed.recoveryEpoch = self.beginTransportRecoveryCycleIfNeeded()
                 resumed.pairingRecoveryState = .awaitingFreshAdvertisement
                 self.reconnectTasks[key] = resumed
                 return
@@ -2416,6 +2584,7 @@ extension BleManager {
         guard centralManager.state == .poweredOn else {
             var paused = current
             paused.pausedByBluetoothOff = true
+            paused.recoveryEpoch = beginTransportRecoveryCycleIfNeeded()
             reconnectTasks[key] = paused
             return
         }
@@ -2488,6 +2657,7 @@ extension BleManager {
             task.pairingRecoveryState == .awaitingFreshAdvertisement &&
                 !task.deferredByAppInactivity &&
                 !task.pausedByBluetoothOff &&
+                !task.awaitingRecoveryActivation &&
                 pairingRecoveryScanTimers[key]?.sessionGeneration == task.sessionGeneration &&
                 task.belongConfig == belongConfig &&
                 !task.name.isEmpty &&
@@ -2561,6 +2731,11 @@ extension BleManager {
             // 用户硬取消或配置撤销后，系统旧 owner 也必须真的停止。
             centralManager.cancelPeripheralConnection(peripheral)
             loggerD(msg: "autoReconnect: \(uuid), reject system reconnect without authorized owner")
+            return
+        }
+        guard !task.awaitingRecoveryActivation,
+              !task.pausedByBluetoothOff else {
+            loggerD(msg: "autoReconnect: \(uuid), ignore system reconnect while awaiting final recovery activation")
             return
         }
         if let current = currentConnectionAdmission(uuid: uuid) {

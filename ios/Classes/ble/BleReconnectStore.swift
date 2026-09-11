@@ -88,6 +88,14 @@ struct BleReconnectTask {
     var timer: Timer?
     /// 蓝牙关闭期间暂停任务，poweredOn 后由系统状态回调恢复。
     var pausedByBluetoothOff: Bool = false
+    /// CoreBluetooth transport reset 后等待 Dart 提交最终 recovery session。
+    ///
+    /// poweredOn 只能设置该门禁，不能沿用 reset 前 session 抢跑 connect；只有显式
+    /// activation 携带更高正 generation 才能消费，timer/arm/生命周期补偿均须保留。
+    var awaitingRecoveryActivation: Bool = false
+    /// 当前 transport reset 周期。Dart 在 BLE available 后读取并随 activation 回传；
+    /// 连续 reset 时，即使第一轮 session 更高，也不能消费第二轮门禁。
+    var recoveryEpoch: Int64 = 0
     /// App inactive/background/terminating 时禁止同步 CoreBluetooth retrieve；该标记
     /// 保留 exact owner，等 didBecomeActive 复验 session 后补偿解析，不制造失败或 retry。
     var deferredByAppInactivity: Bool = false
@@ -115,6 +123,40 @@ struct BleReconnectTask {
     /// 与上面的 transaction context 成对冻结的 OTA endpoint。iOS 可能在
     /// name/alias 恢复中迁移 CoreBluetooth UUID，但权限仍只属于登记时的 endpoint。
     var g2OtaRecoveryEndpointId: String?
+}
+
+/// Transport reset 后显式 activation 的纯准入策略。
+///
+/// 把 poweredOn 早到/晚到、旧 batch 和同代重复请求从 CoreBluetooth 资源操作中拆出，
+/// XCTest 可直接验证门禁；真实 owner 的原子读写仍由 BleManager 主队列完成。
+enum BleRecoveryActivationGateDecision: Equatable {
+    case notRequired
+    case consume
+    case reject
+}
+
+enum BleRecoveryActivationGatePolicy {
+    static func evaluate(
+        awaitingRecoveryActivation: Bool,
+        pausedByBluetoothOff: Bool,
+        isBluetoothPoweredOn: Bool,
+        currentRecoveryEpoch: Int64,
+        incomingRecoveryEpoch: Int64,
+        currentSessionGeneration: Int64,
+        incomingSessionGeneration: Int64
+    ) -> BleRecoveryActivationGateDecision {
+        guard awaitingRecoveryActivation || pausedByBluetoothOff else {
+            return .notRequired
+        }
+        guard isBluetoothPoweredOn,
+              currentRecoveryEpoch > 0,
+              incomingRecoveryEpoch == currentRecoveryEpoch,
+              incomingSessionGeneration > 0,
+              incomingSessionGeneration > currentSessionGeneration else {
+            return .reject
+        }
+        return .consume
+    }
 }
 
 /// 发送系统终态时使用的连接来源与代次，二者必须作为同一快照一起继承。

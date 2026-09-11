@@ -446,6 +446,17 @@ preserved operation while the process is alive. If the process is reclaimed, the
 next app launch starts a new cold-start activation batch instead of claiming an
 old CoreBluetooth peripheral escrow.
 
+`CBManagerState.resetting` is a transport-loss boundary, not a connection
+window. Native pauses and invalidates the old attempt while the central is not
+`poweredOn`. When `poweredOn` returns, native marks each paused task
+`awaitingRecoveryActivation` but does not replay the pre-reset session. Only an
+explicit activation carrying a newer positive final recovery session and the
+exact current process-local `recoveryEpoch` may clear that flag and create the
+next pending connect. Dart reads the epoch after BLE becomes available and
+passes it unchanged with activation; another reset between the query and
+activation makes that request stale. Arm-only calls, connection events, old
+timers, and lifecycle compensation preserve the barrier.
+
 The central manager uses the main queue (`queue: nil`), so synchronous
 `retrieveConnectedPeripherals` and `retrievePeripherals` calls are allowed only
 while the host app is active. `willResignActive`, `didEnterBackground`, and

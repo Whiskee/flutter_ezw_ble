@@ -26,6 +26,10 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
   Future<int> bleState() async => await methodChannel.invokeMethod("bleState");
 
   @override
+  Future<int> bleRecoveryEpoch() async =>
+      await methodChannel.invokeMethod<int>("bleRecoveryEpoch") ?? 0;
+
+  @override
   Future<void> initConfigs(List<BleConfig> configs) async =>
       methodChannel.invokeMethod(
         "initConfigs",
@@ -289,6 +293,7 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
     BleConnectSource source = BleConnectSource.autoReconnect,
     BleReconnectActivationMode mode = BleReconnectActivationMode.initial,
     int sessionGeneration = 0,
+    int recoveryEpoch = 0,
     BleG2OtaContext? otaContext,
   }) async {
     final arguments = <String, Object?>{
@@ -296,6 +301,7 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       "source": source.name,
       "mode": mode.name,
       "sessionGeneration": sessionGeneration,
+      "recoveryEpoch": recoveryEpoch,
     };
     if (otaContext != null) {
       arguments.addAll(otaContext.toMethodArguments());
