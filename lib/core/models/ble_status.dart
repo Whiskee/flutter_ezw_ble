@@ -3,6 +3,9 @@ enum BleState {
   powerOff,
   unauthorized,
   noLocation,
+
+  /// iOS CoreBluetooth transport 正在重置；保持 unknown 兼容语义，但允许诊断层观测。
+  resetting,
   unknown,
 }
 
@@ -19,6 +22,8 @@ extension BleStateExt on BleState {
   ///
   static BleState from(int status) {
     switch (status) {
+      case 1:
+        return BleState.resetting;
       case 3:
         return BleState.unauthorized;
       case 4:
@@ -36,5 +41,8 @@ extension BleStateExt on BleState {
   bool get isBleOff => this == BleState.powerOff;
   bool get isBleUnauthorized => this == BleState.unauthorized;
   bool get isBleNoLocation => this == BleState.noLocation;
-  bool get isBleUnknown => this == BleState.unknown;
+
+  /// resetting 仍是瞬时不可判定态，业务门禁必须沿用历史 unknown 行为。
+  bool get isBleUnknown =>
+      this == BleState.unknown || this == BleState.resetting;
 }
