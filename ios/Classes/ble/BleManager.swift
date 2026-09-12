@@ -2820,56 +2820,61 @@ extension BleManager {
             }
         }
         //  4、不处理不在配置中的普通私有服务。独立 gate service 到这里即完成。
-        guard let privateService = bleConfig.privateServices.first(where: { uuid in
-            uuid.serviceUUID == service.uuid
-        }) else {
+        //  同一个 service 允许挂多组读写特征（G3 CTRL/BULK/AUDIO 共用 be220101），
+        //  必须遍历全部匹配项；只取第一条会让后续 psType 永远无法注册、readiness 凑不齐。
+        let matchedPrivateServices = bleConfig.privateServices.filter { privateService in
+            privateService.serviceUUID == service.uuid
+        }
+        guard !matchedPrivateServices.isEmpty else {
             return
         }
-        //  5、获取普通读写特征
-        let writeChars = service.characteristics?.first { write in
-            write.uuid == privateService.writeCharUUID
-        }
-        let readChars = service.characteristics?.first { read in
-            read.uuid == privateService.readCharUUID
-        }
-        if writeChars == nil || readChars == nil {
+        for privateService in matchedPrivateServices {
+            //  5、获取普通读写特征
+            let writeChars = service.characteristics?.first { write in
+                write.uuid == privateService.writeCharUUID
+            }
+            let readChars = service.characteristics?.first { read in
+                read.uuid == privateService.readCharUUID
+            }
+            if writeChars == nil || readChars == nil {
+                recordNativeTrace(
+                    uuid: peripheral.identifier.uuidString,
+                    stage: "characteristic_discovery",
+                    result: "failed",
+                    serviceType: "\(privateService.type)"
+                )
+                handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .charsFail, tag: tag)
+                loggerE(msg: "didDiscoverCharacteristicsFor: \(peripheral.identifier.uuidString), error = Chars not found, psType = \(privateService.type)")
+                return
+            }
+            if let connectedDevice = connectedDevices.first(where: { device in
+                device.peripheral.identifier.uuidString == peripheral.identifier.uuidString
+            }),
+               connectedDevice.writeCharsDic[privateService.type]?.uuid == writeChars!.uuid,
+               connectedDevice.readCharsDic[privateService.type]?.uuid == readChars!.uuid {
+                // 第二次及后续 SR 可能回放同一组缓存 characteristic，此时 notify 已由
+                // CoreBluetooth 保留，不保证再次触发 didUpdateNotificationStateFor。
+                // 重复缓存只能跳过字典替换，不能跳过当前 exact attempt 的 readiness 对账；
+                // updateConnectedDevice 会读取 isNotifying 或重新订阅，并由统一完成闸去重。
+                loggerD(msg: "didDiscoverCharacteristicsFor: \(peripheral.identifier.uuidString), psType = \(privateService.type), duplicate chars reconcile notify readiness, tag=\(tag)")
+                updateConnectedDevice(
+                    uuid: peripheral.identifier.uuidString,
+                    name: peripheral.name ?? "",
+                    writeChars: writeChars,
+                    readChars: readChars,
+                    psType: privateService.type
+                )
+                continue
+            }
             recordNativeTrace(
                 uuid: peripheral.identifier.uuidString,
                 stage: "characteristic_discovery",
-                result: "failed",
+                result: "success",
                 serviceType: "\(privateService.type)"
             )
-            handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .charsFail, tag: tag)
-            loggerE(msg: "didDiscoverCharacteristicsFor: \(peripheral.identifier.uuidString), error = Chars not found")
-            return
+            updateConnectedDevice(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", writeChars: writeChars, readChars: readChars, psType: privateService.type)
+            loggerD(msg: "didDiscoverCharacteristicsFor: \(peripheral.identifier.uuidString), psType = \(privateService.type), write = \(writeChars!.uuid.uuidString), read = \(readChars!.uuid.uuidString), tag=\(tag)")
         }
-        if let connectedDevice = connectedDevices.first(where: { device in
-            device.peripheral.identifier.uuidString == peripheral.identifier.uuidString
-        }),
-           connectedDevice.writeCharsDic[privateService.type]?.uuid == writeChars!.uuid,
-           connectedDevice.readCharsDic[privateService.type]?.uuid == readChars!.uuid {
-            // 第二次及后续 SR 可能回放同一组缓存 characteristic，此时 notify 已由
-            // CoreBluetooth 保留，不保证再次触发 didUpdateNotificationStateFor。
-            // 重复缓存只能跳过字典替换，不能跳过当前 exact attempt 的 readiness 对账；
-            // updateConnectedDevice 会读取 isNotifying 或重新订阅，并由统一完成闸去重。
-            loggerD(msg: "didDiscoverCharacteristicsFor: \(peripheral.identifier.uuidString), psType = \(privateService.type), duplicate chars reconcile notify readiness, tag=\(tag)")
-            updateConnectedDevice(
-                uuid: peripheral.identifier.uuidString,
-                name: peripheral.name ?? "",
-                writeChars: writeChars,
-                readChars: readChars,
-                psType: privateService.type
-            )
-            return
-        }
-        recordNativeTrace(
-            uuid: peripheral.identifier.uuidString,
-            stage: "characteristic_discovery",
-            result: "success",
-            serviceType: "\(privateService.type)"
-        )
-        updateConnectedDevice(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", writeChars: writeChars, readChars: readChars, psType: privateService.type)
-        loggerD(msg: "didDiscoverCharacteristicsFor: \(peripheral.identifier.uuidString), psType = \(privateService.type), write = \(writeChars!.uuid.uuidString), read = \(readChars!.uuid.uuidString), tag=\(tag)")
     }
     
     /**

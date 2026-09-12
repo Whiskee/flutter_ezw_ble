@@ -109,7 +109,13 @@ extension BleManager {
         var requireScanVisibility = false
 
         if let index = connectedDevices.firstIndex(where: { device in
-            device.peripheral.identifier.uuidString == easyConnect.uuid || device.peripheral.name == easyConnect.name
+            // 同名多设备（G3 左右腿广播名一致）时禁止 name 直接命中，稳定 UUID 只按 UUID 匹配。
+            isSameConnectTarget(
+                storedUuid: device.peripheral.identifier.uuidString,
+                storedName: device.peripheral.name ?? "",
+                uuid: easyConnect.uuid,
+                name: easyConnect.name
+            )
         }) {
             tag += "from connected device list"
             var device = connectedDevices[index]
@@ -171,7 +177,12 @@ extension BleManager {
                 connectedDevices[index] = device
             }
         } else if let temp = scanResultTemp.first(where: { info in
-            return info.0.uuid == easyConnect.uuid || info.1.name == easyConnect.name
+            return isSameConnectTarget(
+                storedUuid: info.0.uuid,
+                storedName: info.1.name ?? "",
+                uuid: easyConnect.uuid,
+                name: easyConnect.name
+            )
         }) {
             tag += "from scan result temp"
             oldPeripheral = temp.1

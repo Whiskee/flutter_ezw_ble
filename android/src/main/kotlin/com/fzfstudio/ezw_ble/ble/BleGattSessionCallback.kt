@@ -619,10 +619,16 @@ internal class BleGattSessionCallback(
         val item = descriptorQueue.poll() ?: return
         val descriptor = item.second
         inFlightDescriptorPsType = item.first
-        val isWrite = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothStatusCodes.SUCCESS
+        // indicate-only 特征（如 G3 CTRL 上行 be220103）写 NOTIFICATION 值不会让设备发送指示，按特征属性选值。
+        val cccdValue = if (descriptor.characteristic.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) {
+            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
         } else {
-            descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+        }
+        val isWrite = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            gatt.writeDescriptor(descriptor, cccdValue) == BluetoothStatusCodes.SUCCESS
+        } else {
+            descriptor.value = cccdValue
             gatt.writeDescriptor(descriptor)
         }
         sendLog(

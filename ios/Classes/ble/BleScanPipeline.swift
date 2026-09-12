@@ -516,7 +516,8 @@ extension BleManager {
             if isScanConnectExpired(connectDevice, bleConfig: bleConfig) {
                 handleConnectState(uuid: connectDevice.uuid, name: connectDevice.name, state: .noDeviceFound, tag: "scan timestamp fallback")
                 canRemove = true
-            } else if connectDevice.uuid == peripheral.identifier.uuidString || connectDevice.name == advertisedName || connectDevice.name == (peripheral.name ?? "") {
+            } else if isSameConnectTarget(storedUuid: connectDevice.uuid, storedName: connectDevice.name, uuid: peripheral.identifier.uuidString, name: advertisedName)
+                || isSameConnectTarget(storedUuid: connectDevice.uuid, storedName: connectDevice.name, uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "") {
                 connectFoundPeripheral(
                     peripheral,
                     advertisedName: advertisedName,
@@ -530,7 +531,7 @@ extension BleManager {
             // 3. 命中或超时的请求需要从等待队列移除；队列为空时停止扫描。
             if canRemove {
                 startConnectInfos.removeAll { info in
-                    info.uuid == connectDevice.uuid || info.name == connectDevice.name
+                    isSameConnectTarget(storedUuid: info.uuid, storedName: info.name, uuid: connectDevice.uuid, name: connectDevice.name)
                 }
                 if startConnectInfos.isEmpty {
                     stopScan()
