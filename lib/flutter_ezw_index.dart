@@ -27,3 +27,4 @@ export 'core/models/ble_scan_start_result.dart';
 export 'core/models/ble_sn_rule.dart';
 export 'core/models/ble_status.dart';
 export 'core/models/ble_device_hardware.dart';
+export 'core/models/ble_receive_identity.dart';

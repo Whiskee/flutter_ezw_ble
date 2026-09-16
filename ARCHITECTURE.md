@@ -183,7 +183,7 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `prepareBusinessConnection` | `Future<BleBusinessConnectionStatus> prepareBusinessConnection(BleBusinessConnectionAttempt attempt)` | G2 exact-attempt 预连接入口。`attempt` 必须来自同一次 `connectFinish` 的 `uuid/sessionGeneration/attemptGeneration`；同 token 幂等刷新有界鉴权宽限，不同 token 替换旧 lease。拒绝只返回状态，不取消长期 autoReconnect owner。 |
 | `commitBusinessConnection` | `Future<BleBusinessConnectionStatus> commitBusinessConnection(BleBusinessConnectionAttempt attempt)` | G2 exact-attempt 真连接入口。原生同时校验 prepare lease、当前 admission、物理连接、当前 GATT/CBPeripheral 身份，以及 write/read/notify readiness；只有成功发布 `connected` 后返回 `accepted`。 |
 | `abortBusinessConnection` | `Future<bool> abortBusinessConnection(BleBusinessConnectionAttempt attempt)` | 只撤销完全匹配的 prepare lease；旧 token abort 不能删除新 lease，也不能断开 GATT、移除 autoReconnect owner 或伪造用户断连。 |
-| `sendCmd` | `Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0, bool allowDuringUpgrade = false, int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0, BleG2OtaContext? otaContext})` | 写特征值，等待原生层 write 完成。`psType` 是"私有服务类型"，对应 `BlePrivateService.type`（0=基础，1=OTA，2+=自定义）。升级态默认阻断非 OTA 写入；只有上层协议白名单确认的 AUTH、时间同步等恢复控制指令可显式传 `allowDuringUpgrade=true`。OTA 控制包携带正 `expectedSessionGeneration/expectedAttemptGeneration` 时，native 必须在实际 dispatch 前按当前物理 owner 校验；携带 `otaContext` 时还必须命中当前 G2 OTA transaction，避免旧 START/INFORMATION/RESULT 写入新 GATT 或越权清理。 |
+| `sendCmd` | `Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0, bool allowDuringUpgrade = false, int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0, BleG2OtaContext? otaContext, BleBusinessConnectionAttempt? expectedAttempt})` | 普通命令 Future 到 channel/入队边界；可选 expectedAttempt 在 Android 原队列 dequeue 时复验 exact GATT。`psType` 是"私有服务类型"，对应 `BlePrivateService.type`（0=基础，1=OTA，2+=自定义）。升级态默认阻断非 OTA 写入；只有上层协议白名单确认的 AUTH、时间同步等恢复控制指令可显式传 `allowDuringUpgrade=true`。OTA 控制包携带正 `expectedSessionGeneration/expectedAttemptGeneration` 时，native 必须在实际 dispatch 前按当前物理 owner 校验；携带 `otaContext` 时还必须命中当前 G2 OTA transaction，避免旧 START/INFORMATION/RESULT 写入新 GATT 或越权清理。 |
 | `sendCmdNoWait` | `Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0, int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0, BleG2OtaContext? otaContext})` | OTA 连发入口。Android：`psType == 1` 走 per-endpoint `WRITE_TYPE_NO_RESPONSE` 队列；同步 BUSY 保留原包，Future 等本包 `onCharacteristicWrite` 成功后返回，4s 停滞/teardown typed fail，避免固定延时撞 GATT 单槽位。iOS：`psType == 1` 走 `WriteWithoutResponse` + `canSendWriteWithoutResponse` 背压队列（见 `ios/Classes/ble/OtaWriteQueue.swift` 与 `docs/IOS_OTA_NOWAIT_SPEC.md`）。OTA RAW 携带正 expected pair 时，native 在入队/提交前按当前物理 owner 校验；携带 `otaContext` 时还必须命中当前 G2 OTA transaction。其它 `psType` 保持历史 no-wait 语义。 |
 | `beginG2OtaTransaction` | `Future<BleG2OtaTransactionResult> beginG2OtaTransaction({required String transactionId, required int generation, required String config, required String sn, required List<BleG2OtaEndpointIdentity> endpoints})` | 在首条 G2 OTA 指令前原子登记本轮事务、完整 endpoint 集合和初始物理 identity。重复相同 scope 幂等返回同一 native instance；参数冲突、空 identity、非正 generation 或旧 tombstone 必须拒绝。 |
 | `updateG2OtaEndpoint` | `Future<BleG2OtaTransactionResult> updateG2OtaEndpoint({required BleG2OtaContext context, required String uuid, required BleG2OtaEndpointAction action, int sessionGeneration = 0, int attemptGeneration = 0})` | 在同一事务内绑定真实连接、进入 recover，或将完成 endpoint 转为 `parked`。更新请求不重复携带 `config/SN/endpoints`；native 必须按 exact context 读取 begin 已冻结的 scope，不能把缺失的重复字段当成无效请求，也不能信任调用方补传的可变副本。`bind` 需要 live exact pair；`recover` 需要已登记旧 pair 的真实断连，或从未绑定的 waiting endpoint；`park` 使用已登记的正 exact pair，可在 GATT 已释放时隔离旧 transport。 |
@@ -227,7 +227,7 @@ enum BleEventChannel {
 | `bleState` | `int`（iOS CoreBluetooth state 值，扩展 `6 = noLocation` 给 Android） | `BleState` | 蓝牙开关、定位权限变化。Android 主动查询、Activity start/resume 与扫描入口都会重新读取实时权限和开关，仅在状态变化时 push。 |
 | `scanResult` | JSON 字符串 | `BleMatchDevice.fromJson` | 一次扫描命中（按 `BleScan.matchCount` 已聚合好的"组合设备"）。 |
 | `connectStatus` | JSON 字符串 | `BleConnectModel.fromJson` | 连接流程的每一步推进（见 §8）；携带 `source`、兼容键 `generation`、`sessionGeneration` 与 `attemptGeneration`。`generation` 始终序列化为 Dart session generation；旧 payload 分别回退为 `unknown` / `0`。 |
-| `receiveData` | Map：`{uuid, psType, data:Base64, isSuccess, sessionGeneration, attemptGeneration, otaTransactionId, otaGeneration, otaInstanceId}` | `BleCmd.receiveMap` | 来自原生的特征值数据。**注意 `data` 字段是 Base64**，业务侧拿到的 `BleCmd.data` 已经是 `Uint8List`，背后由 `flutter_ezw_utils.encodeBase64()` 解码。`sessionGeneration/attemptGeneration` 仅对 native 能确认物理 owner 的 OTA response 为正，旧事件和非 OTA 默认为 0。G2 OTA 事务持有期间还会附带 transaction 字段；Dart 必须同时校验 transaction 与 physical pair 后才消费 ACK/Notify。 |
+| `receiveData` | Map：`{uuid, psType, data:Base64, isSuccess, sessionGeneration, attemptGeneration, otaTransactionId, otaGeneration, otaInstanceId}` | `BleCmd.receiveMap` | 来自原生的特征值数据。**注意 `data` 字段是 Base64**，业务侧拿到的 `BleCmd.data` 已经是 `Uint8List`，背后由 `flutter_ezw_utils.encodeBase64()` 解码。`sessionGeneration/attemptGeneration` 由 Android 原 callback 冻结 exact GATT owner 后发布，旧事件或 unknown 为 0；非 OTA 同样保留 known identity。G2 OTA 事务持有期间还会附带 transaction 字段；Dart 必须同时校验 transaction 与 physical pair 后才消费 ACK/Notify。 |
 | `logger` | String，含 `[d]-` / `[e]-` 前缀 | `String` | 仅 iOS 主动 push；业务侧自行根据前缀分级。 |
 
 iOS 的非 `poweredOn` 状态继续沿用既有连接 teardown；但只有公开状态
@@ -368,10 +368,15 @@ class BleCmd {
   final int      psType;
   final Uint8List? data;     // receiveMap 解 Base64 后填进来
   final bool     isSuccess;
+  final BleReceiveIdentity? receiveIdentity;
 }
 ```
 
 接收端调用静态构造 `BleCmd.receiveMap(Map)` 走 Base64 解码；发送端直接构造对象但目前没有发送序列化路径——发送统一走 `EzwBle.to.bleMC.sendCmd(uuid, Uint8List)`。
+
+`BleReceiveIdentity` 是 immutable `{uuid, sessionGeneration, attemptGeneration}` 值；仅非空 UUID 和正整数 pair 为 known，缺失/非法 metadata 返回 null。JSON 嵌套 round-trip 保留 metadata，固件 payload 不变。来源只取原 callback 的 exact retained/admitted GATT，不从 terminal trace 或稍后当前连接反查。
+
+普通 `sendCmd(expectedAttempt: ...)` 校验同 UUID/正整数 pair，Android 在原队列实际取出时再次校验 exact retained GATT。过期项丢弃，不发 UUID-only 失败污染新请求，不触发重连。它不是取消/物理排空 API；iOS 显式返回 `owned_write_unsupported`，省略参数维持旧行为，OTA no-wait 契约不变。
 
 ### 7.8 `BleDeviceHardware`
 
@@ -601,7 +606,7 @@ App 启动
   └─ UI 1 分钟超时只结束展示；点击取消才清长期回连 owner 与 pending session
 
 通信
-  ├─ EzwBle.to.bleMC.sendCmd(uuid, bytes, psType: 0)   ▶ write，等 callback；升级态默认阻断
+  ├─ EzwBle.to.bleMC.sendCmd(uuid, bytes, psType: 0)   ▶ 普通 channel/入队边界；升级态默认阻断
   ├─ EzwBle.to.bleMC.sendCmdNoWait(...)                ▶ Android OTA：WRITE_TYPE_NO_RESPONSE
   │                                                       + 同步 BUSY 原包重试
   │                                                       + onCharacteristicWrite 后完成 Future

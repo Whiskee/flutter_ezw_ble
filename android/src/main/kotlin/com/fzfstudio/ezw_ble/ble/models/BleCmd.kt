@@ -1,6 +1,7 @@
 package com.fzfstudio.ezw_ble.ble.models
 
 import android.util.Base64
+import com.fzfstudio.ezw_ble.ble.BleBusinessConnectionAttempt
 
 /**
  * 原生 GATT 指令发送结果。
@@ -27,6 +28,9 @@ data class BleCmd(
     val otaGeneration: Long = 0L,
     /** G2 OTA native registry 实例标识；非事务包保持空字符串。 */
     val otaInstanceId: String = "",
+    /** Receive evidence and outgoing intent have separate lifetimes and meanings. */
+    val receiveIdentity: BleBusinessConnectionAttempt? = null,
+    val expectedAttempt: BleBusinessConnectionAttempt? = null,
 ) {
 
     companion object {
@@ -58,7 +62,11 @@ data class BleCmd(
         "otaTransactionId" to otaTransactionId,
         "otaGeneration" to otaGeneration,
         "otaInstanceId" to otaInstanceId,
-    )
+
+    ) + (receiveIdentity?.let { mapOf(
+        "sessionGeneration" to it.sessionGeneration,
+        "attemptGeneration" to it.attemptGeneration,
+    ) } ?: emptyMap())
 
     /**
      * 比较两个指令结果是否等价。
@@ -88,6 +96,7 @@ data class BleCmd(
             if (!data.contentEquals(other.data)) return false
         } else if (other.data != null) return false
         if (isSuccess != other.isSuccess) return false
+        if (receiveIdentity != other.receiveIdentity || expectedAttempt != other.expectedAttempt) return false
 
         return true
     }
@@ -108,6 +117,8 @@ data class BleCmd(
         result = 31 * result + otaTransactionId.hashCode()
         result = 31 * result + otaGeneration.hashCode()
         result = 31 * result + otaInstanceId.hashCode()
+        result = 31 * result + (receiveIdentity?.hashCode() ?: 0)
+        result = 31 * result + (expectedAttempt?.hashCode() ?: 0)
         return result
     }
 

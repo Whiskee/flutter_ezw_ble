@@ -86,6 +86,8 @@ internal class BleGattSessionCallback(
     private val emitReceiveData: (Map<String, Any?>) -> Unit,
     /** 统一日志出口，保证所有 GATT 日志仍带 BleManager 前缀。 */
     private val sendLog: (BleLoggerTag, String) -> Unit,
+    /** Freeze only an actually retained GATT's pair before asynchronous delivery. */
+    private val captureReceiveIdentity: (BluetoothGatt) -> BleBusinessConnectionAttempt? = { null },
 ) : BluetoothGattCallback() {
 
     /** 私有服务是否已全部解析完成；未完成时 descriptor/MTU 回调不应推进连接完成。 */
@@ -470,11 +472,13 @@ internal class BleGattSessionCallback(
         } else {
             null
         }
+        val identity = captureReceiveIdentity(gatt)
         val bleCmdMap = BleCmd(
             gatt.device.address,
             privateService.type,
-            characteristic.value,
+            characteristic.value.copyOf(),
             true,
+            receiveIdentity = identity,
             sessionGeneration = sessionGeneration,
             attemptGeneration = attemptGeneration,
             otaTransactionId = otaContext?.transactionId ?: "",
