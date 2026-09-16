@@ -1,4 +1,5 @@
 import 'dart:typed_data';
+import 'ble_receive_identity.dart';
 
 import 'package:flutter_ezw_utils/extension/string_ext.dart';
 import 'package:flutter_ezw_utils/json/unit8list_converter.dart';
@@ -6,7 +7,7 @@ import 'package:json_annotation/json_annotation.dart';
 
 part 'ble_cmd.g.dart';
 
-@JsonSerializable()
+@JsonSerializable(explicitToJson: true)
 class BleCmd {
   final String uuid;
   final int psType;
@@ -19,9 +20,14 @@ class BleCmd {
   final int otaGeneration;
   final String otaInstanceId;
 
+  /// Original native source, never inferred from the current UUID at delivery.
+  @JsonKey(fromJson: BleReceiveIdentity.fromJson)
+  final BleReceiveIdentity? receiveIdentity;
+
   BleCmd(
     this.uuid,
     this.psType, {
+    this.receiveIdentity,
     this.data,
     this.isSuccess = false,
     this.sessionGeneration = 0,
@@ -71,6 +77,7 @@ class BleCmd {
       otaTransactionId: otaTransactionId is String ? otaTransactionId : '',
       otaGeneration: otaGeneration is num ? otaGeneration.toInt() : 0,
       otaInstanceId: otaInstanceId is String ? otaInstanceId : '',
+      receiveIdentity: BleReceiveIdentity.fromJson({...data, 'uuid': uuid}),
     );
   }
 }

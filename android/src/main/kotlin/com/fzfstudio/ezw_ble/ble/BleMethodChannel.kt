@@ -371,6 +371,20 @@ enum class BleMC {
                 val psType = jsonMap?.get("psType") as Int? ?: 0
                 val allowDuringUpgrade =
                     jsonMap?.get("allowDuringUpgrade") as? Boolean ?: false
+                // Presence is significant: malformed/partial intent cannot use legacy dispatch.
+                val expected = if (jsonMap?.containsKey("expectedAttempt") == true) {
+                    val map = jsonMap["expectedAttempt"] as? Map<*, *>
+                    val session = map?.get("sessionGeneration")
+                    val attempt = map?.get("attemptGeneration")
+                    if (map?.get("uuid") != uuid || uuid.isBlank() ||
+                        (session !is Int && session !is Long) ||
+                        (attempt !is Int && attempt !is Long) ||
+                        (session as Number).toLong() <= 0 || (attempt as Number).toLong() <= 0) {
+                        result.error("owned_write_invalid_arguments", "Invalid expected BLE attempt", null)
+                        return
+                    }
+                    BleBusinessConnectionAttempt(uuid, session.toLong(), attempt.toLong())
+                } else null
                 val expectedSessionGeneration = jsonMap?.get("expectedSessionGeneration").toStrictLongOrDefault()
                 val expectedAttemptGeneration = jsonMap?.get("expectedAttemptGeneration").toStrictLongOrDefault()
                 val otaContext = jsonMap?.get("otaContext") as? Map<*, *>
@@ -381,6 +395,7 @@ enum class BleMC {
                     allowDuringUpgrade,
                     expectedSessionGeneration,
                     expectedAttemptGeneration,
+                    expectedAttempt = expected,
                     otaTransactionId = otaContext?.get("transactionId") as? String ?: "",
                     otaGeneration = otaContext?.get("generation").toStrictLongOrDefault(),
                     otaInstanceId = otaContext?.get("instanceId") as? String ?: "",

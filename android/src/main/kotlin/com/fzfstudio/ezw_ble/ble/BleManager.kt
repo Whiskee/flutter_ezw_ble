@@ -550,6 +550,7 @@ class BleManager private constructor() {
         return device
     }
 
+    @Synchronized
     private fun writeNextCommand(uuid: String) {
         val key = reconnectKey(uuid)
         val queue = sendCmdQueues[key] ?: return
@@ -565,6 +566,14 @@ class BleManager private constructor() {
                 return
             }
             val device = findConnectedDevice(cmd.uuid)
+            // Same lock as replacement/teardown, immediately before the actual
+            // write. Dropping A must not emit a UUID-only failure against B.
+            if (cmd.expectedAttempt != null &&
+                (device?.myGatt?.let { captureReceiveIdentity(it) } != cmd.expectedAttempt)) {
+                queue.poll()
+                sendLog(BleLoggerTag.d, "Send cmd: stale expected attempt dropped")
+                continue
+            }
             if (device != null && cmd.psType == 1) {
                 val transactionAccepted = validateG2OtaContextForWrite(
                     uuid = cmd.uuid,
@@ -631,6 +640,25 @@ class BleManager private constructor() {
             queue.poll()
             sendLog(BleLoggerTag.e, "Send cmd: ${cmd.uuid}, write start failed, drop queued command")
         }
+    }
+
+    /** Positive evidence requires the exact live GATT, never a terminal epoch cache. */
+    @Synchronized
+    internal fun captureReceiveIdentity(gatt: BluetoothGatt): BleBusinessConnectionAttempt? {
+        val uuid = gatt.device.address
+        val key = reconnectKey(uuid)
+        if (findConnectedDevice(uuid)?.myGatt !== gatt) return null
+        val current = currentAdmissions[key]
+        val admission = if (current != null) {
+            if (admittedGattSessions[current.sessionId]?.gatt !== gatt) return null
+            current
+        } else {
+            val retained = businessConnectedGattSessions[key] ?: return null
+            if (retained.gatt !== gatt) return null
+            retained.admission
+        }
+        if (admission.sessionGeneration <= 0 || admission.generation <= 0) return null
+        return BleBusinessConnectionAttempt(uuid, admission.sessionGeneration, admission.generation)
     }
 
     /** 创建单 endpoint OTA 队列；每次提交都重新解析 live device，禁止复用旧 GATT session。 */
@@ -2738,6 +2766,7 @@ class BleManager private constructor() {
      *  @param allowDuringUpgrade 上层协议已确认可与 OTA 共存的恢复控制指令
      *
      */
+    @Synchronized
     fun sendCmd(
         uuid: String,
         data: ByteArray,
@@ -2748,7 +2777,10 @@ class BleManager private constructor() {
         otaTransactionId: String = "",
         otaGeneration: Long = 0L,
         otaInstanceId: String = "",
+        expectedAttempt: BleBusinessConnectionAttempt? = null,
     ) {
+        require(expectedAttempt == null || (expectedAttempt.uuid == uuid && uuid.isNotBlank() &&
+            expectedAttempt.sessionGeneration > 0 && expectedAttempt.attemptGeneration > 0))
         if (!checkIsFunctionCanBeCalled() || uuid.isEmpty()) {
             return
         }
@@ -2773,8 +2805,9 @@ class BleManager private constructor() {
             BleCmd(
                 uuid,
                 psType,
-                data,
+                data.copyOf(),
                 false,
+                expectedAttempt = expectedAttempt,
                 sessionGeneration = expectedSessionGeneration,
                 attemptGeneration = expectedAttemptGeneration,
                 otaTransactionId = otaTransactionId,
@@ -4087,6 +4120,7 @@ class BleManager private constructor() {
                     BleEC.RECEIVE_DATA.event?.success(map)
                 }
             },
+            captureReceiveIdentity = { gatt -> captureReceiveIdentity(gatt) },
             sendLog = { tag, message ->
                 // 10. 日志仍走 manager 统一出口，保持原有 BleManager:: 前缀和 EventChannel 推送。
                 sendLog(tag, message)

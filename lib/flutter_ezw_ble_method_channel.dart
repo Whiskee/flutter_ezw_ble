@@ -333,12 +333,22 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
     int expectedSessionGeneration = 0,
     int expectedAttemptGeneration = 0,
     BleG2OtaContext? otaContext,
+    BleBusinessConnectionAttempt? expectedAttempt,
   }) async {
+    // A supplied intent must never silently become an unguarded write.
+    if (expectedAttempt != null &&
+        (expectedAttempt.uuid != uuid ||
+            uuid.trim().isEmpty ||
+            expectedAttempt.sessionGeneration <= 0 ||
+            expectedAttempt.attemptGeneration <= 0)) {
+      throw ArgumentError('Invalid expected BLE attempt');
+    }
     final arguments = <String, Object?>{
       "uuid": uuid,
       "data": data,
       "psType": psType,
       "allowDuringUpgrade": allowDuringUpgrade,
+      if (expectedAttempt != null) 'expectedAttempt': expectedAttempt.toJson(),
       // OTA START/INFORMATION/RESULT 等控制包若走 sendCmd 队列，也必须绑定本轮
       // 物理 attempt；0/0 保持旧控制包调用兼容。
       "expectedSessionGeneration": expectedSessionGeneration,

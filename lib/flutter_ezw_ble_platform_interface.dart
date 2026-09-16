@@ -354,6 +354,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     int expectedSessionGeneration = 0,
     int expectedAttemptGeneration = 0,
     BleG2OtaContext? otaContext,
+    BleBusinessConnectionAttempt? expectedAttempt,
   }) {
     throw UnimplementedError('sendCmd() has not been implemented.');
   }

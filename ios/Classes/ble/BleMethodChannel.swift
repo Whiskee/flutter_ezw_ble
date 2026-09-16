@@ -306,6 +306,12 @@ enum BleMC: String {
             return
         case .sendCmd:
             let jsonData: [String: Any] = arguments as? [String: Any] ?? [:]
+            // CoreBluetooth subscription provenance is not yet an owned-write contract.
+            if jsonData.keys.contains("expectedAttempt") {
+                result(FlutterError(code: "owned_write_unsupported",
+                    message: "Expected-attempt writes are unavailable on iOS", details: nil))
+                return
+            }
             let uuid: String = jsonData["uuid"] as? String ?? ""
             let psType: Int = jsonData["psType"] as? Int ?? 0
             // 默认 false；只有上层协议白名单可以显式放行 OTA 恢复控制指令。
