@@ -30,16 +30,33 @@ class BleReceiptCallbackTest {
         var current = true
         val events = mutableListOf<Map<String, Any?>>()
         val callback = BleGattSessionCallback(
-            expectedUuid = uuid, currentDeviceForGatt = { _, _ -> if (current) device else null },
+            // Match the retained GATT admission. These are physical owner values,
+            // not diagnostic trace IDs; replacement must not restamp a receipt.
+            expectedUuid = uuid, sessionGeneration = 7L, attemptGeneration = 11L,
+            currentDeviceForGatt = { source, _ ->
+                if (current && source === gatt) device else null
+            },
             handleConnectState = { _, _, _, _ -> }, recordTraceStep = { _, _, _, _, _, _ -> },
             recordTraceMtu = { _, _, _, _ -> }, updateTraceRssi = { _, _ -> },
+            markTraceRssiRequested = { }, markTraceRssiFailed = { },
+            recordPhysicalTrace = { _, _ -> error("Notify must not create a physical connection event") },
             updateTracePhy = { _, _ -> }, updateTraceRequestedPriority = { _, _, _ -> },
             recordTracePhyPolicy = { _, _, _, _ -> }, onPhysicalConnected = { _, _ -> },
             onSessionTerminal = { _, _, _ -> }, isBluetoothEnabled = { true },
             recoverInsufficientAuthorization = { _, _ -> }, consumeDisconnectingState = { null },
+            // This fixture receives ordinary R1 data on an already-ready GATT;
+            // security admission must never be advanced by a notification.
+            securityGateAttempts = BleAndroidSecurityGateAttemptRegistry(),
+            securityGateOwner = { source -> BleAndroidSecurityGateOwner(uuid, 7L, 11L, 1L, source) },
+            onSecurityGateFailure = { _, _, _, _ -> error("Notify must not fail security admission") },
+            onSecurityGatePassed = { error("Notify must not pass security admission") },
+            onSecurityGateUnavailable = { _, _ -> error("Notify must not start fallback bonding") },
+            activeG2OtaContextForEndpoint = { error("Ordinary R1 data must not claim an OTA transaction") },
             onCharacteristicWriteComplete = { _, _, _, _ -> }, emitReceiveData = { events.add(it) },
             sendLog = { _, _ -> },
-            captureReceiveIdentity = { if (current) BleBusinessConnectionAttempt(uuid, 7, 11) else null },
+            captureReceiveIdentity = { source ->
+                if (current && source === gatt) BleBusinessConnectionAttempt(uuid, 7, 11) else null
+            },
         )
         Mockito.mockStatic(Base64::class.java).use { base64 ->
             base64.`when`<String> { Base64.encodeToString(bytes, Base64.NO_WRAP) }.thenAnswer {
