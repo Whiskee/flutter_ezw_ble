@@ -4103,7 +4103,11 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
         )
         loggerE(msg: "security gate: \(admission.endpointId), result=\(trigger.rawValue), attempts=\(persistedFailureCount.map { String($0) } ?? "manual"), action=\(recoveryAction?.rawValue ?? "boundFail"), sessionGeneration=\(admission.sessionGeneration), attemptGeneration=\(admission.generation)")
 
-        if recoveryAction == .retryFreshAdvertisement {
+        // 第 1～4 次自动失败：只拆掉本 exact attempt，不在这里直接 connect。顺序：
+        // cancellation barrier → CoreBluetooth 终态或 2 秒 watchdog → teardown 保留预算并
+        // scheduleReconnect(.disconnectFromSys) → 同一 owner 注册新 attempt/admission 后
+        // connect。直接 connect 会与旧 cancel 在 HCI 上重叠并绕过 exact admission。
+        if recoveryAction == .retryPendingConnect {
             handleConnectState(
                 uuid: admission.endpointId,
                 name: name,
