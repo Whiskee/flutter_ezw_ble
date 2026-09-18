@@ -135,14 +135,17 @@ class RunnerTests: XCTestCase {
   }
 
   func testSecurityGateFailurePolicyStopsAutomaticAttemptFiveAndManualAttemptOne() {
-    for failureCount in 1..<BlePeerPairingRecoveryPolicy.maxSecurityGateAttempts {
-      XCTAssertEqual(
-        BlePeerPairingRecoveryPolicy.actionAfterSecurityGateFailure(
-          source: .autoReconnect,
+    // 自动来源（含 SR 拉起的 stateRestoration）第 1～4 次必须由同一 owner 重建
+    // pending connect，不能复用 R1 Code 14 的新鲜广播恢复（ANCS 右腿永不广播）。
+    for source in [BleConnectSource.autoReconnect, .stateRestoration] {
+      for failureCount in 1..<BlePeerPairingRecoveryPolicy.maxSecurityGateAttempts {
+        let action = BlePeerPairingRecoveryPolicy.actionAfterSecurityGateFailure(
+          source: source,
           failureCount: failureCount
-        ),
-        .retryFreshAdvertisement
-      )
+        )
+        XCTAssertEqual(action, .retryPendingConnect)
+        XCTAssertNotEqual(action, .retryFreshAdvertisement)
+      }
     }
     XCTAssertEqual(
       BlePeerPairingRecoveryPolicy.actionAfterSecurityGateFailure(
@@ -181,6 +184,7 @@ class RunnerTests: XCTestCase {
       sessionGeneration: 901
     ))
 
+    let key = manager.reconnectKey(uuid: target.uuid)
     for failureCount in 1..<BlePeerPairingRecoveryPolicy.maxSecurityGateAttempts {
       XCTAssertEqual(
         manager.registerSecurityGateFailure(
@@ -188,9 +192,20 @@ class RunnerTests: XCTestCase {
           name: target.name,
           source: .autoReconnect
         ),
-        .retryFreshAdvertisement,
+        .retryPendingConnect,
         "attempt \(failureCount) must keep the exact automatic owner"
       )
+      // 每次失败都先落盘计数，owner 保持 normal 阶段由 pending connect 驱动下一次 Gate。
+      XCTAssertEqual(manager.reconnectTasks[key]?.pairingRecoveryState, .normal)
+      XCTAssertEqual(manager.reconnectTasks[key]?.hasAttemptedPairingRecovery, false)
+      XCTAssertEqual(
+        manager.reconnectStore.securityRecoveryRecord(
+          belongConfig: configName,
+          name: target.name
+        )?.failureCount,
+        failureCount
+      )
+      XCTAssertNotNil(manager.reconnectStore.target(uuid: target.uuid, name: target.name))
     }
     XCTAssertEqual(
       manager.registerSecurityGateFailure(
@@ -210,6 +225,182 @@ class RunnerTests: XCTestCase {
     XCTAssertEqual(attemptSix?.state, .rejected)
     XCTAssertEqual(attemptSix?.reason, "securityRecoveryExhaustedPersisted")
     XCTAssertNil(manager.reconnectTasks[target.uuid.lowercased()])
+  }
+
+  /// 为 5403 恢复回归用例准备独立 config/target。名称带 UUID，避免与 UserDefaults 中的
+  /// 持久化预算记录串扰；返回的清理闭包会取消 owner（同时清掉预算记录）并恢复全局状态。
+  private func armIsolatedSecurityTarget(
+    source: BleConnectSource,
+    sessionGeneration: Int64
+  ) -> (BleManager, BleReconnectTarget, String, () -> Void) {
+    let manager = BleManager.shared
+    let originalConfigs = manager.bleConfigs
+    let originalLookup = manager.allowsSynchronousCoreBluetoothLookup
+    let configName = "security-pending-retry-\(UUID().uuidString)"
+    let target = BleReconnectTarget(
+      belongConfig: configName,
+      uuid: UUID().uuidString,
+      name: "Even G2_R_\(UUID().uuidString)"
+    )
+    manager.bleConfigs = [makeConfig(name: configName, autoReconnect: true)]
+    XCTAssertNotNil(manager.armReconnectTarget(
+      target,
+      source: source,
+      sessionGeneration: sessionGeneration
+    ))
+    let cleanup = {
+      manager.cancelReconnectTask(uuid: target.uuid, name: target.name)
+      manager.reconnectStore.remove(uuid: target.uuid, name: target.name)
+      manager.bleConfigs = originalConfigs
+      manager.allowsSynchronousCoreBluetoothLookup = originalLookup
+    }
+    return (manager, target, configName, cleanup)
+  }
+
+  /// 2026-09-18 真机回归（iOS 26.5.2 重启后 SR 后台拉起）：右腿 5403 超时一次后，旧实现把
+  /// owner 送进只在 App active 时扫描的新鲜广播恢复；右腿是 ANCS 客户端、链路被系统持有
+  /// 永不广播，整段后台单腿 2 小时。新语义：非 active 时同样保持 normal、不起扫描租约，
+  /// 由同一 owner 经 barrier teardown 重建 pending connect（复用进程内 peripheral）。
+  func testSecurityGateRetryWhileInactiveStaysOutOfFreshAdvertisementRecovery() {
+    let (manager, target, configName, cleanup) = armIsolatedSecurityTarget(
+      source: .stateRestoration,
+      sessionGeneration: 1
+    )
+    defer { cleanup() }
+    manager.allowsSynchronousCoreBluetoothLookup = false
+    let key = manager.reconnectKey(uuid: target.uuid)
+
+    XCTAssertEqual(
+      manager.registerSecurityGateFailure(
+        uuid: target.uuid,
+        name: target.name,
+        source: .stateRestoration
+      ),
+      .retryPendingConnect
+    )
+    let task = manager.reconnectTasks[key]
+    XCTAssertEqual(task?.pairingRecoveryState, .normal)
+    XCTAssertEqual(task?.hasAttemptedPairingRecovery, false)
+    XCTAssertNil(task?.timer)
+    XCTAssertNil(manager.pairingRecoveryScanTimers[key])
+    XCTAssertEqual(
+      manager.reconnectStore.securityRecoveryRecord(
+        belongConfig: configName,
+        name: target.name
+      )?.failureCount,
+      1
+    )
+    XCTAssertNotNil(manager.reconnectStore.target(uuid: target.uuid, name: target.name))
+  }
+
+  /// 5403 失败不再写入 hasAttemptedPairingRecovery：之后真实的首个 Code 14 仍按 R1 语义
+  /// 获得一次新鲜广播恢复，新 peripheral 再次 Code 14 才停止自动 owner。
+  func testCode14AfterSecurityGateRetryIsTreatedAsFirstCode14() {
+    let (manager, target, configName, cleanup) = armIsolatedSecurityTarget(
+      source: .autoReconnect,
+      sessionGeneration: 11
+    )
+    defer { cleanup() }
+    let key = manager.reconnectKey(uuid: target.uuid)
+
+    XCTAssertEqual(
+      manager.registerSecurityGateFailure(
+        uuid: target.uuid,
+        name: target.name,
+        source: .autoReconnect
+      ),
+      .retryPendingConnect
+    )
+    XCTAssertEqual(
+      manager.reconnectStore.securityRecoveryRecord(
+        belongConfig: configName,
+        name: target.name
+      )?.failureCount,
+      1
+    )
+    XCTAssertEqual(
+      manager.registerPeerPairingFailure(
+        uuid: target.uuid,
+        name: target.name,
+        source: .autoReconnect
+      ),
+      .retryFreshAdvertisement
+    )
+    XCTAssertEqual(manager.reconnectTasks[key]?.pairingRecoveryState, .awaitingFreshAdvertisement)
+    XCTAssertEqual(
+      manager.registerPeerPairingFailure(
+        uuid: target.uuid,
+        name: target.name,
+        source: .autoReconnect
+      ),
+      .stopAttempt
+    )
+  }
+
+  /// Code 14 恢复连上新 peripheral 后若 5403 失败：链路已证明可达，回到 normal 由 pending
+  /// connect 驱动；但「已做过一次新鲜广播恢复」的事实保留，之后的 Code 14 仍立即停止。
+  func testSecurityGateRetryReturnsCode14RecoveryToNormalButKeepsAttemptedFact() {
+    let (manager, target, _, cleanup) = armIsolatedSecurityTarget(
+      source: .autoReconnect,
+      sessionGeneration: 21
+    )
+    defer { cleanup() }
+    let key = manager.reconnectKey(uuid: target.uuid)
+    XCTAssertEqual(
+      manager.registerPeerPairingFailure(
+        uuid: target.uuid,
+        name: target.name,
+        source: .autoReconnect
+      ),
+      .retryFreshAdvertisement
+    )
+    // 模拟新鲜广播命中后，恢复 attempt 正在连接新 peripheral。
+    manager.reconnectTasks[key]?.pairingRecoveryState = .foregroundRecoveryConnecting
+
+    XCTAssertEqual(
+      manager.registerSecurityGateFailure(
+        uuid: target.uuid,
+        name: target.name,
+        source: .autoReconnect
+      ),
+      .retryPendingConnect
+    )
+    XCTAssertEqual(manager.reconnectTasks[key]?.pairingRecoveryState, .normal)
+    XCTAssertEqual(manager.reconnectTasks[key]?.hasAttemptedPairingRecovery, true)
+    XCTAssertEqual(
+      manager.registerPeerPairingFailure(
+        uuid: target.uuid,
+        name: target.name,
+        source: .autoReconnect
+      ),
+      .stopAttempt
+    )
+  }
+
+  /// 5403 失败回到 normal 时必须撤销 Code 14 等待阶段遗留的 5 秒 retry timer，
+  /// 否则 timer 到期会把 owner 重新拉回新鲜广播扫描。
+  func testSecurityGateRetryCancelsWaitingFreshAdvertisementTimer() {
+    let (manager, target, _, cleanup) = armIsolatedSecurityTarget(
+      source: .autoReconnect,
+      sessionGeneration: 31
+    )
+    defer { cleanup() }
+    let key = manager.reconnectKey(uuid: target.uuid)
+    let timer = Timer(timeInterval: 60, repeats: false) { _ in }
+    manager.reconnectTasks[key]?.pairingRecoveryState = .waitingFreshAdvertisementRetry
+    manager.reconnectTasks[key]?.timer = timer
+
+    XCTAssertEqual(
+      manager.registerSecurityGateFailure(
+        uuid: target.uuid,
+        name: target.name,
+        source: .autoReconnect
+      ),
+      .retryPendingConnect
+    )
+    XCTAssertFalse(timer.isValid)
+    XCTAssertNil(manager.reconnectTasks[key]?.timer)
+    XCTAssertEqual(manager.reconnectTasks[key]?.pairingRecoveryState, .normal)
   }
 
   func testSecurityGateTimeoutAndCallbackCanConsumeExactAttemptOnlyOnce() {

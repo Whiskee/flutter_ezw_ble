@@ -335,14 +335,32 @@ Automatic recovery is scoped by endpoint, recovery episode, positive
 `sessionGeneration`, and positive `attemptGeneration`:
 
 - Only actual Security Gate failures count: CBATT security errors from the
-  5403 write and peer-pairing-removed equivalents. Bluetooth off, App
-  inactive/background, scan misses, ordinary connection timeout, and missing or
-  unsupported 5403 do not consume the budget.
-- The first failed 5403 write is attempt 1. Attempts 1 through 4 cancel the old
-  attempt, wait for the exact CoreBluetooth callback/barrier, purge stale scan
-  cache, open a 10-second fresh-advertisement scan window, then connect using a
-  new exact generation. A 5-second silent wait is used only when the fresh scan
-  window misses.
+  5403 write, peer-pairing-removed equivalents, and (iOS) a connect timeout that
+  fires while the exact 5403 write is still in flight — the timeout and the
+  write callback consume the same exact attempt atomically, whichever comes
+  first. Bluetooth off, App inactive/background, scan misses, ordinary connection
+  timeout before the write, and missing or unsupported 5403 do not consume the
+  budget.
+- The first failed 5403 write is attempt 1. On iOS, automatic attempts 1
+  through 4 (including `stateRestoration` owners) persist the count, cancel the
+  old attempt through the cancellation barrier, and — after the exact
+  CoreBluetooth terminal callback or the 2-second barrier watchdog — let the
+  same reconnect owner reschedule `disconnectFromSys`, register a new exact
+  attempt/admission and issue an ordinary CoreBluetooth pending connect
+  (`retryPendingConnect`). While the App is inactive this reuses only the
+  in-process `CBPeripheral`; no synchronous retrieve and no scan is involved.
+  If the link is still held at system level the connect completes immediately
+  and a fresh exact 5403 runs; if the link dropped, the pending connect waits
+  for the next connectable advertisement without consuming budget.
+- G2 5403 recovery must not reuse the R1 Code 14 fresh-advertisement recovery.
+  The G2 right leg is the iOS ANCS client: `com.apple.BTLEServer` keeps its link
+  up even after the App cancels its own connection, so it never advertises,
+  and the fresh-advertisement scan only runs while the App is active
+  (2026-09-18 device incident: one 5403 timeout during an SR headless launch
+  left the glasses single-legged for 2 h 11 min; a manual connect over the same
+  system-held link passed 5403 in 49 ms). A 5403 failure also does not mark the
+  owner as having used its Code 14 recovery, so a later first Code 14 still gets
+  one fresh-advertisement window.
 - The fifth real 5403 security failure publishes
   `securityRecoveryExhausted`, removes that endpoint's automatic owner, and
   must not create a sixth automatic connection.
@@ -350,9 +368,17 @@ Automatic recovery is scoped by endpoint, recovery episode, positive
   counter and stopped marker for that endpoint. Manual connect does not run the
   five-attempt silent loop; its first final Security Gate failure maps to the
   existing `boundFail` path so the app can show the current repair dialog.
-- App inactive/background pauses retrieve, scan, and connection work. Returning
-  active resumes only exact owners that still match config, endpoint, and
-  session generation.
+- App inactive/background pauses synchronous retrieve and scan work. A 5403
+  retry whose owner still holds an in-process peripheral keeps going as a
+  pending connect; owners without one are deferred. Returning active resumes
+  only exact owners that still match config, endpoint, and session generation.
+- iOS active cold-start reconciliation hands a resolved system object to the
+  exact activation path in both branches (with or without an existing physical
+  session). It must not escrow and re-arm the object first: a re-armed
+  `connect` is issued before any owner claims it, so an owner that declines to
+  connect (Code 14 fresh-advertisement wait, transport recovery gate, Bluetooth
+  pause, OTA gate) left a system-held link to complete `didConnect` with no
+  active request and report `noBleConfigFound` with generation 0.
 
 Android and iOS both execute the Security Gate and may emit
 `securityRecoveryExhausted`. Android additionally treats an explicit rejection
