@@ -14,6 +14,8 @@ import Foundation
 ///
 /// 这里只描述首次 Code 14 后的新鲜广播恢复，不表示 App 正在等待用户处理。自动来源
 /// 会在扫描窗口之间保留 owner；只有新 peripheral 再次 Code 14 才结束自动恢复。
+/// G2 5403 安全门禁失败不再进入这里的任何非 normal 阶段：它由同一 owner 直接重建
+/// pending connect（见 `BlePeerPairingFailureAction.retryPendingConnect`）。
 enum BlePeerPairingRecoveryState: String {
     case normal
     case awaitingFreshAdvertisement
@@ -47,6 +49,10 @@ enum BlePeerPairingRecoveryPolicy {
 
     /// Resolves the terminal action after one exact 5403 attempt has failed.
     /// Manual attempts never enter the silent automatic retry budget.
+    ///
+    /// 手动首次失败 → stopAttempt（Dart 侧映射 boundFail）；自动来源（含 stateRestoration）
+    /// 第 1～4 次 → retryPendingConnect，由同一 owner 重建 CoreBluetooth pending connect；
+    /// 第 5 次 → securityRecoveryExhausted。5403 不复用 Code 14 的新鲜广播恢复。
     static func actionAfterSecurityGateFailure(
         source: BleConnectSource,
         failureCount: Int
@@ -56,14 +62,25 @@ enum BlePeerPairingRecoveryPolicy {
         }
         return failureCount >= maxSecurityGateAttempts
             ? .securityRecoveryExhausted
-            : .retryFreshAdvertisement
+            : .retryPendingConnect
     }
 }
 
-/// 当前 Code 14 回调对本次 attempt 的处置动作。
+/// 当前 Code 14 / 5403 安全失败对本次 attempt 的处置动作。
 enum BlePeerPairingFailureAction: String {
-    /// 被动自动回连首次失败：允许一次新鲜广播恢复。
+    /// 被动自动回连首次失败：允许一次新鲜广播恢复。只服务 R1 Code 14。
     case retryFreshAdvertisement
+    /// G2 5403 自动安全失败第 1～4 次：预算已先落盘，cancellation barrier 拆掉本 exact
+    /// attempt 后，经普通 disconnectFromSys 调度由同一 owner 立即重建 pending connect；
+    /// inactive 只复用进程内 peripheral，不做同步 retrieve，也不扫描。
+    ///
+    /// 为什么不复用 Code 14 的新鲜广播恢复：G2 右腿是 iOS 通知（ANCS）客户端，链路由
+    /// com.apple.BTLEServer 持有，App cancel 只撤销本 central 的意图，物理链路不断、设备
+    /// 不广播；新鲜广播扫描又只在 App active 时运行。2026-09-18 真机（iOS 26.5.2，重启后
+    /// SR 后台拉起）：右腿 5403 超时一次后等广播 2 小时 11 分钟无果，手动点击后同一系统
+    /// 链路 49 ms 通过。pending connect 对两种情况都成立：链路仍被系统持有时立即
+    /// didConnect；链路已断时等下一次可连接广播，同样不消耗预算。
+    case retryPendingConnect
     /// 手动连接失败或自动恢复已经消耗：结束本轮，不保留物理连接 owner。
     case stopAttempt
     /// 自动安全门禁预算耗尽：静默发布专用终态，并停止该 endpoint 自动 owner。

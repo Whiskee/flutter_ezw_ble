@@ -334,3 +334,14 @@ SR 本身没有「最多两个外设」的限制：`willRestoreState` 交还的�
 真机现象：第二次重启后 `willRestoreState` 交还双腿均 `.connected`。左腿 claim 即 granted 并 `discoverServices`；250 ms 后系统 `peerDisconnected`，再 200 ms `peerConnected` + `didConnect`。CoreBluetooth 没有回 `didDisconnect`，已发出的 discovery 随旧链路作废，`onPhysicalConnected` 对同 session 返回 `.duplicate`，插件记「duplicate physical callback ignored」后无人重启 pipeline；左腿 20 秒 `timeout`，右腿从 claim 起一直 `queued` 拿不到 Gate。前一次重启（18:19:35）链路未抖动，双腿 3 秒内 connected。
 
 规则：系统 `peerDisconnected` 落在 exact session 物理接触之后、业务 connected 之前时，标记 `linkDroppedSinceContact`；随后的 `didConnect` 若来自当前 Gate active owner 且带该标记，必须清标记并重新执行 `startGrantedGattPipeline`（重装 delegate、重发 discovery，连接超时沿用原计时），事件 `ios_gate_pipeline_restarted`。没有掉链证据、或该 session 只是排队而非 active owner 时，仍按重复回调忽略；业务已 connected 后的链路终止仍只由 `didDisconnectPeripheral` 收口。
+
+## G2 5403 失败后 ANCS 右腿不得等新鲜广播（2026-09-18 真机修正）
+
+真机现象（iPhone 15 Pro / iOS 26.5.2，宿主 2.3.1(1045)）：12:08 重启手机，未解锁前 `com.apple.BTLEServer` 已把 G2 右腿（ANCS 客户端）连上并加密；12:35:45 首次解锁，bluetoothd 恢复会话后 6 秒拉起 App。右腿以 `.connected` 交还并认领，5403 保护写已由 bluetoothd 发出，但宿主主线程随后卡住约 27 秒（进程始终 `running-active`，原因另查），连接超时 timer 在主线程恢复时立即触发，按规则计为第 1 次安全失败。旧实现把 5403 第 1～4 次失败送进 R1 Code 14 的新鲜广播恢复：`beginDirectReconnectAttempt` 在 `awaitingFreshAdvertisement` 阶段只启动扫描而不 connect，扫描又只在 active 时运行，后台被 `appInactiveDeferred` 延后；右腿链路由系统持有（之后仍持续收到 ANCS 通知与 LE Data 唤醒），永不广播，眼镜单腿 2 小时 11 分钟。14:47 回到前台，恢复扫描 10 秒未见右腿；`systemConnected` 认领因 owner 处于新鲜广播阶段而得到 `nativeOwnerUnavailable`；冷启动对账的 escrow rearm 在 owner 认领前直接 `connect`，系统已持有的链路立即 `didConnect`，因无 active request 上报 `noBleConfigFound`（generation 0）并留下无主链路。14:48 手动点击后同一系统链路的 5403 在 49 ms 内通过。
+
+修复：
+
+1. 5403 自动失败第 1～4 次改为 `retryPendingConnect`：先落盘计数，保持 `normal` 阶段，经 cancellation barrier 拆掉本 attempt 后由同一 owner 按 `disconnectFromSys` 重调度并建立新的 exact attempt/admission 与 pending connect。inactive 只复用进程内 `CBPeripheral`（仍在 `connectedDevices` 缓存中）；链路被系统持有时立即 `didConnect` 并重跑 5403。若 5403 发生在 Code 14 恢复的新 peripheral 上，同时撤销本 owner 的扫描租约与 5 秒 timer；不写 `hasAttemptedPairingRecovery`，之后真实的首个 Code 14 仍获得一次新鲜广播恢复。
+2. 冷启动前台对账无 physical session 的分支与有 session 分支一样直接走 exact activation，不再 escrow + rearm + connection event 续接：owner 登记 request/admission 之后才 `connect`，owner 拒绝时不会发出任何 connect。
+
+不变量：5 次预算、在途超时与写回调原子消费、第 5 次先落盘再静默耗尽、手动首次失败走 `boundFail` 均不变；R1 Code 14 的新鲜广播恢复不变；不在后台做同步 retrieve 或扫描；不把系统 already-connected 直接投影成业务 connected。连接超时 timer 被宿主主线程卡顿放大的问题不在本次修正范围内。

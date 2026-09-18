@@ -1150,17 +1150,34 @@ extension BleManager {
                     )
                     return
                 }
-                self.escrowStateRestorationPeripheral(
-                    peripheral,
-                    source: "activeColdStartReconciliation"
+                // 无 physical session 时同样只走 exact activation，不再「escrow + rearm +
+                // resumeConnectionEvent」：rearm 会在 owner 认领前就对该对象直接 connect，
+                // activation 取走 escrow 后若 owner 处于不发起连接的阶段（新鲜广播恢复、
+                // transport 恢复门禁、蓝牙暂停、OTA 门禁等），系统已持有的链路会立即
+                // didConnect，因没有 active request 而上报 noBleConfigFound(generation 0)
+                // 并留下无主链路（2026-09-18 真机 14:47:22 右腿）。
+                // 顺序：构造 resolved target → activation 先认领真实 SR escrow，再在 active
+                // 窗口内由 beginDirectReconnectAttempt 经 findPeripheralFromConnected /
+                // retrieve 取得对象 → owner 登记 request/admission 之后才 connect；owner
+                // 拒绝时不会出现任何 connect。参数与上方 existingPhysicalSession 分支一致。
+                let resolvedTarget = BleReconnectTarget(
+                    belongConfig: target.belongConfig,
+                    uuid: peripheral.identifier.uuidString,
+                    name: peripheral.name ?? expectedName,
+                    expectedMacSuffix: target.expectedMacSuffix
                 )
+                let result = self.activateAutoReconnectTargets(
+                    [resolvedTarget],
+                    source: source,
+                    sessionGeneration: sessionGeneration,
+                    scheduleActiveReconciliation: false
+                ).first
                 self.recordAutoReconnectEvent(
                     type: "ios_active_startup_reconcile_resolved",
                     uuid: peripheral.identifier.uuidString,
                     name: peripheral.name ?? expectedName,
-                    detail: "attempt=\(index + 1), state=\(peripheral.state.rawValue), sessionGeneration=\(task.sessionGeneration)"
+                    detail: "attempt=\(index + 1), state=\(peripheral.state.rawValue), result=\(String(describing: result?.state)), sessionGeneration=\(task.sessionGeneration)"
                 )
-                self.resumeAutoReconnectFromConnectionEvent(peripheral)
                 return
             }
             self.runActiveStartupReconciliation(
@@ -2413,8 +2430,14 @@ extension BleManager {
     }
 
     /// Records a real iOS 5403 protected-write security failure for the active
-    /// endpoint. Attempts 1...4 reuse the existing fresh-advertisement recovery;
-    /// attempt 5 silently retires this automatic owner and lets Dart stop UI noise.
+    /// endpoint. Attempts 1...4 rebuild an exact pending connect through the same
+    /// owner (`retryPendingConnect`); attempt 5 silently retires this automatic
+    /// owner and lets Dart stop UI noise.
+    ///
+    /// 流程顺序：先落盘本次计数 → 第 5 次删除目标并返回 exhausted；第 1～4 次保持
+    /// normal 阶段返回 retryPendingConnect，由 BleManager 走 disconnectFromSys
+    /// (preserveSecurityGateRecovery) → barrier 终态/2 秒 watchdog → scheduleReconnect
+    /// → beginDirectReconnectAttempt 注册新的 exact attempt 并 connect。
     @discardableResult
     func registerSecurityGateFailure(
         uuid: String,
@@ -2470,12 +2493,23 @@ extension BleManager {
             stopPeerPairingRecoveryTask(task, reason: "securityRecoveryExhausted")
             return .securityRecoveryExhausted
         }
-        task.hasAttemptedPairingRecovery = true
-        task.pairingRecoveryState = .awaitingFreshAdvertisement
+        // 第 1～4 次：预算已在上面先落盘，重试交给同一 owner 的普通 pending connect。
+        // 1、不进入 awaitingFreshAdvertisement：新鲜广播恢复只在 App active 时扫描，而
+        //    G2 右腿作为 ANCS 客户端被系统持有链路、永不广播，SR 后台拉起时会整段单腿。
+        // 2、若本次 5403 发生在 Code 14 恢复的新 peripheral 上，撤销本 owner 的扫描租约
+        //    与 5 秒 timer 并回到 normal；5403 已证明链路可达，后续由 pending connect 驱动。
+        // 3、不改 hasAttemptedPairingRecovery：5403 本身不等于 Code 14，之后首个 Code 14
+        //    仍按原语义获得一次新鲜广播恢复；已经恢复过的 owner 仍保留该事实。
+        // 4、不清扫描缓存：inactive 时只能复用进程内 peripheral，缓存是其来源之一。
+        if task.pairingRecoveryState != .normal {
+            cancelPairingRecoveryDiscovery(key: key)
+            task.timer?.invalidate()
+            task.timer = nil
+            task.pairingRecoveryState = .normal
+        }
         reconnectTasks[key] = task
-        purgeStaleScanCache(uuid: task.uuid, name: task.name)
-        loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), security gate failure \(failureCount)/\(BlePeerPairingRecoveryPolicy.maxSecurityGateAttempts); wait fresh advertisement")
-        return .retryFreshAdvertisement
+        loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), security gate failure \(failureCount)/\(BlePeerPairingRecoveryPolicy.maxSecurityGateAttempts); retry exact pending connect")
+        return .retryPendingConnect
     }
 
     /// Passing 5403 proves the current automatic episode has repaired security.
