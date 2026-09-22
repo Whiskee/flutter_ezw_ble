@@ -9,11 +9,15 @@ part of 'ble_cmd.dart';
 BleCmd _$BleCmdFromJson(Map<String, dynamic> json) => BleCmd(
       json['uuid'] as String,
       (json['psType'] as num).toInt(),
+      receiveIdentity: BleReceiveIdentity.fromJson(json['receiveIdentity']),
       data: _$JsonConverterFromJson<String, Uint8List>(
           json['data'], const Uint8ListConverter().fromJson),
       isSuccess: json['isSuccess'] as bool? ?? false,
       sessionGeneration: (json['sessionGeneration'] as num?)?.toInt() ?? 0,
       attemptGeneration: (json['attemptGeneration'] as num?)?.toInt() ?? 0,
+      otaTransactionId: json['otaTransactionId'] as String? ?? '',
+      otaGeneration: (json['otaGeneration'] as num?)?.toInt() ?? 0,
+      otaInstanceId: json['otaInstanceId'] as String? ?? '',
     );
 
 Map<String, dynamic> _$BleCmdToJson(BleCmd instance) => <String, dynamic>{
@@ -24,6 +28,10 @@ Map<String, dynamic> _$BleCmdToJson(BleCmd instance) => <String, dynamic>{
       'isSuccess': instance.isSuccess,
       'sessionGeneration': instance.sessionGeneration,
       'attemptGeneration': instance.attemptGeneration,
+      'otaTransactionId': instance.otaTransactionId,
+      'otaGeneration': instance.otaGeneration,
+      'otaInstanceId': instance.otaInstanceId,
+      'receiveIdentity': instance.receiveIdentity?.toJson(),
     };
 
 Value? _$JsonConverterFromJson<Json, Value>(

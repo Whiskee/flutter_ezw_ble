@@ -50,8 +50,8 @@ void main() {
 
     expect(
         androidManager,
-        contains(
-            'autoReconnectSupervisor.activate(seedDevice, source, sessionGeneration)'));
+        matches(RegExp(
+            r'autoReconnectSupervisor\.activate\(\s*seedDevice,\s*effectiveSource,\s*mode,\s*sessionGeneration,\s*otaRecoveryContext,\s*\)')));
     expect(
         androidManager,
         contains(
@@ -92,10 +92,18 @@ void main() {
     );
     expect(
       androidSupervisor,
-      contains(
-        'invalidatePassiveGattForSessionRebind(device.uuid, exactGatt)',
-      ),
+      contains('invalidatePassiveGattForSessionRebind('),
     );
+    expect(androidSupervisor, contains('task.otaRecoveryContext'));
+    expect(androidManager, contains('acceptsRecoveryPhysicalPair'));
+    expect(
+      androidManager,
+      contains('OTA recovery retired exact business owner'),
+    );
+    expect(androidSupervisor,
+        contains('mode == BleReconnectActivationMode.RECONCILE'));
+    expect(
+        androidSupervisor, contains('BleReconnectOwnerDisposition.REPAIRED'));
     expect(
       androidSupervisor,
       contains(
@@ -106,7 +114,7 @@ void main() {
     expect(androidManager, contains('"sessionNotInstalled"'));
     expect(
       androidManager,
-      contains('sessionGeneration = installedSessionGeneration'),
+      contains('sessionGeneration = activation.sessionGeneration'),
     );
 
     // iOS 同样先登记 cancellation barrier，再让 replacement admission
@@ -125,6 +133,29 @@ void main() {
       iosReconnect,
       contains('beginReconnectAttempt(uuid: task.uuid)'),
     );
+  });
+
+  test('reconcile requires durable authorization and repairs exact orphan GATT',
+      () {
+    final androidManager = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleManager.kt',
+    ).readAsStringSync();
+    final androidModels = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleReconnectModels.kt',
+    ).readAsStringSync();
+    final iosReconnect =
+        File('ios/Classes/ble/BleAutoReconnectCoordinator.swift')
+            .readAsStringSync();
+
+    expect(androidManager, contains('hasPersistedAuthorization'));
+    expect(androidManager, contains('reason = "authorizationRevoked"'));
+    expect(androidManager, contains('reason = "otaInProgress"'));
+    expect(androidManager, contains('repairOrphanManagerGattForReconcile'));
+    expect(androidManager, contains('device.myGatt !== expectedGatt'));
+    expect(androidManager, contains('autoReconnectSupervisor.cancel('));
+    expect(androidModels, contains('val hasPassiveGatt: Boolean'));
+    expect(iosReconnect, contains('mode == .reconcile'));
+    expect(iosReconnect, contains('reason: "authorizationRevoked"'));
   });
 
   test('iOS name-only activation owns identity before normal MAC filtering',
@@ -230,7 +261,20 @@ void main() {
         manager, contains('generation = expectedAdmission.sessionGeneration'));
     expect(
         manager, contains('attemptGeneration = expectedAdmission.generation'));
-    expect(manager, contains('autoReconnectSupervisor.schedule(uuid, state)'));
+    expect(
+      manager,
+      contains(
+        'val terminalGattBeforeState = connectedDeviceBeforeState?.myGatt',
+      ),
+    );
+    expect(
+      manager,
+      contains('terminalGattToDetach = terminalGattBeforeState'),
+    );
+    expect(
+      reconnect,
+      contains('task.passiveGatt === terminalGattToDetach'),
+    );
     expect(reconnect, contains('task.passiveGatt = null'));
     expect(
       reconnect,
@@ -322,7 +366,9 @@ void main() {
     expect(flow,
         contains('manualPendingReplacementThreshold: TimeInterval { 20.0 }'));
     expect(flow, contains('!session.hasObservedPhysicalContact'));
-    expect(flow, contains('elapsed >= manualPendingReplacementThreshold'));
+    // 阈值判断已按 trigger 分派；manual 触发仍必须落在 20 秒 manual 阈值上。
+    expect(flow, contains('replacementThreshold = manualPendingReplacementThreshold'));
+    expect(flow, contains('elapsed >= replacementThreshold'));
     expect(flow, contains('!hasPeripheralCancellationBarrier(peripheral)'));
     expect(flow,
         contains('deferConnectionAdmissionReleaseUntilPeripheralTerminal('));

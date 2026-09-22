@@ -88,6 +88,7 @@ enum BleConnectSource: String, Codable {
     case unknown
     case autoReconnect
     case manualReconnect
+    case stateRestoration
     case foreground
 
     init(from decoder: Decoder) throws {

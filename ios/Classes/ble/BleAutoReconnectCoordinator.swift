@@ -166,6 +166,8 @@ extension BleManager {
             task.lastConnectedGeneration = generation
             task.lastConnectedAttemptGeneration = attemptGeneration
             task.sessionGeneration = generation
+            task.g2OtaRecoveryContext = nil
+            task.g2OtaRecoveryEndpointId = nil
         }
         task.attempt = 0
         task.pausedByBluetoothOff = false
@@ -249,7 +251,8 @@ extension BleManager {
     func armReconnectTarget(
         _ target: BleReconnectTarget,
         source: BleConnectSource,
-        sessionGeneration: Int64 = 0
+        sessionGeneration: Int64 = 0,
+        otaContext: BleG2OtaContext? = nil
     ) -> BleReconnectTask? {
         // A cold-start automatic arm must honor the durable fifth-failure latch
         // before it recreates either a reconnect target or a CoreBluetooth owner.
@@ -338,7 +341,12 @@ extension BleManager {
         )
         // Session 只能向前推进。旧 Dart batch 的迟到 activation 不能把已安装 owner
         // 降回更小代次，否则 CoreBluetooth 成功回调会再次被上层 epoch guard 拒绝。
-        if sessionGeneration > task.sessionGeneration {
+        // Reset recovery 的 session 只能由显式 activation 消费门禁时写入。arm 可能来自
+        // initConfigs、旧 timer 或扫描身份补全，若在此提前覆盖就无法再证明 final batch
+        // 确实高于 reset 前 owner。
+        if sessionGeneration > task.sessionGeneration,
+           !task.awaitingRecoveryActivation,
+           !task.pausedByBluetoothOff {
             task.sessionGeneration = sessionGeneration
             // 新 recovery batch 必须淘汰旧 5 秒 timer，并从完整扫描窗口重新开始。
             if task.pairingRecoveryState == .waitingFreshAdvertisementRetry {
@@ -346,7 +354,16 @@ extension BleManager {
             }
         }
         task.attempt = 0
-        task.pausedByBluetoothOff = false
+        if let otaContext {
+            // MethodChannel context only exists at the initial OTA activation.
+            // Store it on the exact native owner so internal retries can keep
+            // passing the transaction gate until park/finish/revoke invalidates it.
+            task.g2OtaRecoveryContext = otaContext
+            task.g2OtaRecoveryEndpointId = effectiveTarget.uuid
+        } else if source == .manualReconnect {
+            task.g2OtaRecoveryContext = nil
+            task.g2OtaRecoveryEndpointId = nil
+        }
         let preservesCurrentRecoveryWait = source != .manualReconnect &&
             task.pairingRecoveryState == .waitingFreshAdvertisementRetry &&
             task.sessionGeneration == previousSessionGeneration
@@ -357,6 +374,87 @@ extension BleManager {
         reconnectTasks[key] = task
         reconnectStore.upsert(target: effectiveTarget)
         return task
+    }
+
+    /// 显式 activation 原子消费 transport reset 门禁并安装最终 Dart session。
+    ///
+    /// `pausedByBluetoothOff` 也纳入门禁，是为了覆盖 poweredOn 已生效、但 delegate
+    /// 收尾尚未执行时先到达的 activation：胜出的显式请求清掉 pause 后，迟到的
+    /// poweredOn 收尾不会再次把同一 owner 阻塞。普通 cold-start activation 没有
+    /// transport 门禁，仍沿用既有 session 更新语义。
+    func consumeRecoveryActivationGate(
+        _ task: BleReconnectTask,
+        sessionGeneration: Int64,
+        recoveryEpoch: Int64
+    ) -> BleReconnectTask? {
+        let key = reconnectKey(uuid: task.uuid)
+        guard var current = reconnectTasks[key],
+              current.belongConfig == task.belongConfig,
+              current.name == task.name else {
+            return nil
+        }
+        let decision = BleRecoveryActivationGatePolicy.evaluate(
+            awaitingRecoveryActivation: current.awaitingRecoveryActivation,
+            pausedByBluetoothOff: current.pausedByBluetoothOff,
+            isBluetoothPoweredOn: centralManager.state == .poweredOn,
+            currentRecoveryEpoch: current.recoveryEpoch,
+            incomingRecoveryEpoch: recoveryEpoch,
+            currentSessionGeneration: current.sessionGeneration,
+            incomingSessionGeneration: sessionGeneration
+        )
+        guard decision != .notRequired else {
+            return task
+        }
+        guard decision == .consume else {
+            loggerD(msg: "autoReconnect: \(current.uuid)-\(current.name), recovery activation rejected incoming=\(sessionGeneration), previous=\(current.sessionGeneration), incomingEpoch=\(recoveryEpoch), currentEpoch=\(current.recoveryEpoch), bluetooth=\(centralManager.state.label)")
+            return nil
+        }
+        current.timer?.invalidate()
+        current.timer = nil
+        current.pausedByBluetoothOff = false
+        current.awaitingRecoveryActivation = false
+        current.sessionGeneration = sessionGeneration
+        reconnectTasks[key] = current
+        loggerD(msg: "autoReconnect: \(current.uuid)-\(current.name), recovery activation consumed session=\(sessionGeneration)")
+        return current
+    }
+
+    /// 在任何 activation 副作用前检查 reset recovery generation。
+    ///
+    /// 手动 activation 会清安全恢复标记，arm 会改 source/timer/持久 target；因此旧
+    /// batch 必须在这些动作之前被拒绝，不能等到最终 consume 时才发现 generation
+    /// 已失效。没有 transport 门禁的冷启动/普通 reconcile 保持原行为。
+    private func canMutateForRecoveryActivation(
+        _ target: BleReconnectTarget,
+        sessionGeneration: Int64,
+        recoveryEpoch: Int64
+    ) -> Bool {
+        let canonicalUuid =
+            reconnectIdentityAliases.resolvedCanonical(uuid: target.uuid) ?? target.uuid
+        let candidates = reconnectTasks.values.filter { task in
+            task.belongConfig == target.belongConfig &&
+                isSameConnectTarget(
+                    storedUuid: task.uuid,
+                    storedName: task.name,
+                    uuid: canonicalUuid,
+                    name: target.name
+                )
+        }
+        guard candidates.count <= 1 else {
+            return false
+        }
+        guard let current = candidates.first else {
+            return true
+        }
+        return BleRecoveryActivationGatePolicy.evaluate(
+            awaitingRecoveryActivation: current.awaitingRecoveryActivation,
+            pausedByBluetoothOff: current.pausedByBluetoothOff,
+            isBluetoothPoweredOn: centralManager.state == .poweredOn,
+            currentRecoveryEpoch: current.recoveryEpoch,
+            incomingRecoveryEpoch: recoveryEpoch,
+            currentSessionGeneration: current.sessionGeneration,
+            incomingSessionGeneration: sessionGeneration
+        ) != .reject
     }
 
     /// Code 14 停止标记只使用稳定 config+完整名称，不使用可能被 CoreBluetooth
@@ -420,8 +518,30 @@ extension BleManager {
     func activateAutoReconnectTargets(
         _ targets: [BleReconnectTarget],
         source: BleConnectSource = .autoReconnect,
-        sessionGeneration: Int64 = 0
+        mode: BleReconnectActivationMode = .initial,
+        sessionGeneration: Int64 = 0,
+        recoveryEpoch: Int64 = 0,
+        scheduleActiveReconciliation: Bool = true,
+        otaContext: BleG2OtaContext? = nil
     ) -> [BleReconnectActivationResult] {
+        // activation 开始即把当前已知 escrow 纳入认领窗口；本批次收口的 finalize
+        // 只允许取消窗口内未认领对象，窗口后新交来的系统连接对象保留给下一轮。
+        restorationCoordinator.markClaimWindowSnapshot()
+        // 普通前台冷启动可能只收到一腿 willRestoreState；另一腿即使已在系统层连接，
+        // 也不会自动进入当前 CBCentralManager。仅在 active 窗口做有界 exact 对账，
+        // 后台 SR 仍只消费 restoration / connection event，绝不执行同步 retrieve。
+        if scheduleActiveReconciliation, source != .manualReconnect {
+            scheduleActiveStartupReconciliation(
+                targets,
+                source: source,
+                sessionGeneration: sessionGeneration
+            )
+            // activation 的 map 会在当前调用栈内 arm task；下一轮主队列再刷新 UUID
+            // connection-event 注册，保证拿到完整的当前账号 owner 集合。
+            DispatchQueue.main.async { [weak self] in
+                self?.registerForConfiguredConnectionEventsIfNeeded()
+            }
+        }
         // 1、逐目标校验配置和身份，保持一次 activation 的目标快照稳定。
         return targets.map { target in
             // 1.1、关闭 autoReconnect 或缺少稳定 identity 时只返回结果，不创建 GATT。
@@ -433,11 +553,75 @@ extension BleManager {
                     state: .rejected,
                     reason: "invalidConfig",
                     source: source,
+                    mode: mode,
+                    ownerDisposition: .rejected,
                     sessionGeneration: sessionGeneration
                 )
             }
             let trimmedUuid = target.uuid.trimmingCharacters(in: .whitespacesAndNewlines)
             let trimmedName = target.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let otaGate = g2OtaTransactions.shouldAllowAdmission(
+                endpointId: reconnectIdentityAliases.resolvedCanonical(uuid: trimmedUuid) ?? trimmedUuid,
+                otaContext: otaContext,
+                purpose: .activation
+            )
+            guard otaGate.allowed else {
+                loggerD(msg: "autoReconnect activation rejected: config=\(target.belongConfig), uuid=\(trimmedUuid), reason=\(otaGate.reason)")
+                return BleReconnectActivationResult(
+                    target: target,
+                    state: .rejected,
+                    reason: otaGate.reason,
+                    source: source,
+                    mode: mode,
+                    ownerDisposition: .rejected,
+                    sessionGeneration: sessionGeneration
+                )
+            }
+            if mode == .unknown {
+                loggerE(msg: "autoReconnect activation rejected: config=\(target.belongConfig), reason=invalidMode")
+                return BleReconnectActivationResult(
+                    target: target,
+                    state: .rejected,
+                    reason: "invalidMode",
+                    source: source,
+                    mode: mode,
+                    ownerDisposition: .rejected,
+                    sessionGeneration: sessionGeneration
+                )
+            }
+            // 必须早于手动恢复标记清理、restoration claim 和 arm。旧 batch 即使最终
+            // 会在 consume 失败，也无权先修改新 owner 的 source/timer/persistence。
+            guard canMutateForRecoveryActivation(
+                target,
+                sessionGeneration: sessionGeneration,
+                recoveryEpoch: recoveryEpoch
+            ) else {
+                loggerD(msg: "autoReconnect activation rejected before mutation: config=\(target.belongConfig), uuid=\(trimmedUuid), session=\(sessionGeneration), reason=staleRecoveryActivation")
+                return BleReconnectActivationResult(
+                    target: target,
+                    state: .rejected,
+                    reason: "staleRecoveryActivation",
+                    source: source,
+                    mode: mode,
+                    ownerDisposition: .rejected,
+                    sessionGeneration: sessionGeneration
+                )
+            }
+            // Reconcile 只能修复仍由持久化 owner 授权的端点。主动断开、解绑或安全
+            // 恢复耗尽删除记录后，旧 Dart batch 不得重新 arm CoreBluetooth owner。
+            if mode == .reconcile,
+               reconnectStore.target(uuid: trimmedUuid, name: trimmedName) == nil {
+                loggerD(msg: "autoReconnect reconcile rejected: config=\(target.belongConfig), uuid=\(trimmedUuid), reason=authorizationRevoked")
+                return BleReconnectActivationResult(
+                    target: target,
+                    state: .rejected,
+                    reason: "authorizationRevoked",
+                    source: source,
+                    mode: mode,
+                    ownerDisposition: .rejected,
+                    sessionGeneration: sessionGeneration
+                )
+            }
             // 1.2、一次性自动恢复已经结束后不再后台重建 owner。只有下一次手动
             // 点击可以开始新 attempt；这里返回 rejected 只结束当前 batch，不触发 UI。
             let manualTakesOverStoppedRecovery =
@@ -465,15 +649,21 @@ extension BleManager {
                     state: .rejected,
                     reason: rejectionReason,
                     source: source,
+                    mode: mode,
+                    ownerDisposition: .rejected,
                     sessionGeneration: sessionGeneration
                 )
             }
-            // 1.3、冷启动缓存里只有完整名称时，active 窗口可先接管系统已连接对象。
-            // 这保留普通后台 BLE / ANCS 连接能力，但不再依赖跨进程
-            // escrow 或 claim 窗口。
+            // 1.3、SR 可能早于 Dart 当前设备加载，先让当前账号 target 精确认领 escrow。
+            // App active 时仍需对稳定 UUID 查询系统已连接对象：restoration escrow 中的
+            // peripheral 可能长期停在 connecting，而 iOS 已用另一个实例持有真实连接。
+            let claimedRestoration = restorationCoordinator.claimPendingPeripheral(
+                uuid: trimmedUuid,
+                name: trimmedName,
+                nameFilters: config.scan.nameFilters
+            )
             let systemConnectedPeripheral: CBPeripheral? = {
-                guard trimmedUuid.isEmpty,
-                      allowsSynchronousCoreBluetoothLookup else {
+                guard allowsSynchronousCoreBluetoothLookup else {
                     return nil
                 }
                 return findPeripheralFromConnected(
@@ -483,7 +673,7 @@ extension BleManager {
                     requireUniqueMatch: true
                 )
             }()
-            if let resolvedPeripheral = systemConnectedPeripheral {
+            if let resolvedPeripheral = systemConnectedPeripheral ?? claimedRestoration?.peripheral {
                 let resolvedUuid = resolvedPeripheral.identifier.uuidString
                 let resolvedName = trimmedName.isEmpty
                     ? (resolvedPeripheral.name ?? "")
@@ -497,16 +687,42 @@ extension BleManager {
                 guard var task = armReconnectTarget(
                     resolvedTarget,
                     source: source,
-                    sessionGeneration: sessionGeneration
+                    sessionGeneration: sessionGeneration,
+                    otaContext: otaContext
                 ) else {
+                    // claim 后若配置同步失效，把对象放回 escrow，由统一 hard reset 收口。
+                    if let claimedRestoration {
+                        _ = restorationCoordinator.enqueue(claimedRestoration.peripheral)
+                    }
                     return BleReconnectActivationResult(
                         target: target,
                         state: .rejected,
-                        reason: "nativeArmRejectedAfterSystemConnected",
+                        reason: "nativeArmRejectedAfterRestorationClaim",
                         source: source,
+                        mode: mode,
+                        ownerDisposition: .rejected,
                         sessionGeneration: sessionGeneration
                     )
                 }
+                guard let activatedTask = consumeRecoveryActivationGate(
+                    task,
+                    sessionGeneration: sessionGeneration,
+                    recoveryEpoch: recoveryEpoch
+                ) else {
+                    if let claimedRestoration {
+                        _ = restorationCoordinator.enqueue(claimedRestoration.peripheral)
+                    }
+                    return BleReconnectActivationResult(
+                        target: target,
+                        state: .rejected,
+                        reason: "staleRecoveryActivation",
+                        source: source,
+                        mode: mode,
+                        ownerDisposition: .rejected,
+                        sessionGeneration: sessionGeneration
+                    )
+                }
+                task = activatedTask
                 if source == .manualReconnect {
                     task.securityGateFailureCount = 0
                     task.pairingRecoveryState = .normal
@@ -529,16 +745,66 @@ extension BleManager {
                     ),
                     resolvedPeripheral
                 ))
-                let resolutionSource = "systemConnected"
-                loggerD(msg: "autoReconnect system-connected claim: config=\(target.belongConfig), requestedUuid=\(trimmedUuid), resolvedUuid=\(resolvedUuid), name=\(resolvedName), state=\(resolvedPeripheral.state.rawValue), sessionGeneration=\(task.sessionGeneration)")
-                activateArmedReconnectTask(task, source: source)
+                let resolutionSource = systemConnectedPeripheral != nil
+                    ? "systemConnected"
+                    : "stateRestoration"
+                loggerD(msg: "autoReconnect restoration claim: config=\(target.belongConfig), requestedUuid=\(trimmedUuid), resolvedUuid=\(resolvedUuid), name=\(resolvedName), state=\(resolvedPeripheral.state.rawValue), source=\(resolutionSource), mode=\(mode.rawValue), sessionGeneration=\(task.sessionGeneration)")
+                let activation: BleReconnectOwnerActivationOutcome
+                let claimedSystemPeripheral: Bool
+                if systemConnectedPeripheral != nil {
+                    activation = activateArmedReconnectTask(
+                        task,
+                        source: source,
+                        ownerExistedBeforeActivation: false,
+                        mode: mode,
+                        reconcileSystemConnected: true
+                    )
+                    switch activation.disposition {
+                    case .created, .reused, .repaired:
+                        claimedSystemPeripheral = true
+                    case .deferred, .rejected:
+                        claimedSystemPeripheral = false
+                    }
+                } else if let claimedRestoration {
+                    activateClaimedStateRestoration(
+                        task: task,
+                        config: config,
+                        claim: claimedRestoration
+                    )
+                    recordAutoReconnectEvent(
+                        type: "ios_restore_escrow_claimed",
+                        uuid: resolvedUuid,
+                        name: resolvedName,
+                        detail: "state=\(claimedRestoration.state), sessionGeneration=\(task.sessionGeneration)"
+                    )
+                    // SR 交还对象的 exact owner 由 claim 自身建立（connected 进 Gate、
+                    // pending 挂 watchdog、idle 重新 connect），链路可靠性另由 escrow /
+                    // 宽限 / barrier 收口，这里不按瞬时 peripheral 状态改写 ACK。
+                    activation = BleReconnectOwnerActivationOutcome(
+                        disposition: mode == .reconcile ? .repaired : .created,
+                        reason: "restoredPeripheralClaimed"
+                    )
+                    claimedSystemPeripheral = false
+                } else {
+                    activation = activateArmedReconnectTask(
+                        task,
+                        source: source,
+                        ownerExistedBeforeActivation: false,
+                        mode: mode
+                    )
+                    claimedSystemPeripheral = false
+                }
                 return BleReconnectActivationResult(
                     // ack 保留 Dart 原始 target identity，避免 batch 在回执期把 name-key
                     // 突然切成 uuid-key；resolvedUuid 作为独立字段供上层记录和回填。
                     target: target,
-                    state: .resolved,
-                    reason: "systemConnectedPeripheralClaimed",
+                    state: activation.disposition == .rejected ? .rejected : .resolved,
+                    reason: claimedSystemPeripheral
+                        ? "systemConnectedPeripheralClaimed"
+                        : activation.reason,
                     source: source,
+                    mode: mode,
+                    ownerDisposition: activation.disposition,
                     sessionGeneration: task.sessionGeneration,
                     resolvedUuid: resolvedUuid,
                     resolutionSource: resolutionSource
@@ -552,6 +818,8 @@ extension BleManager {
                         state: .rejected,
                         reason: "emptyIdentity",
                         source: source,
+                        mode: mode,
+                        ownerDisposition: .rejected,
                         sessionGeneration: sessionGeneration
                     )
                 }
@@ -585,23 +853,46 @@ extension BleManager {
                     state: .identityPending,
                     reason: pendingReason,
                     source: source,
+                    mode: mode,
+                    ownerDisposition: .deferred,
                     sessionGeneration: sessionGeneration
                 )
             }
             // 2、稳定 UUID 目标先 arm 长期 owner，再进入统一 activation。
+            let previousTask = reconnectTasks[reconnectKey(uuid: target.uuid)]
+            let hadTask = previousTask != nil
             guard var task = armReconnectTarget(
                 target,
                 source: source,
-                sessionGeneration: sessionGeneration
+                sessionGeneration: sessionGeneration,
+                otaContext: otaContext
             ) else {
                 return BleReconnectActivationResult(
                     target: target,
                     state: .rejected,
                     reason: "nativeArmRejected",
                     source: source,
+                    mode: mode,
+                    ownerDisposition: .rejected,
                     sessionGeneration: sessionGeneration
                 )
             }
+            guard let activatedTask = consumeRecoveryActivationGate(
+                task,
+                sessionGeneration: sessionGeneration,
+                recoveryEpoch: recoveryEpoch
+            ) else {
+                return BleReconnectActivationResult(
+                    target: target,
+                    state: .rejected,
+                    reason: "staleRecoveryActivation",
+                    source: source,
+                    mode: mode,
+                    ownerDisposition: .rejected,
+                    sessionGeneration: sessionGeneration
+                )
+            }
+            task = activatedTask
             let manualTakesOverExistingFreshWait =
                 source == .manualReconnect &&
                 (task.pairingRecoveryState == .awaitingFreshAdvertisement ||
@@ -639,16 +930,25 @@ extension BleManager {
                     state: .resolved,
                     reason: "freshPairingRecoveryStarted",
                     source: source,
+                    mode: mode,
+                    ownerDisposition: .created,
                     sessionGeneration: freshTask.sessionGeneration
                 )
             }
             // 3、复用已有 pending owner，或创建同一 Gate 管理的新 attempt。
-            let deferredByAppInactivity = activateArmedReconnectTask(task, source: source)
+            let activation = activateArmedReconnectTask(
+                task,
+                source: source,
+                ownerExistedBeforeActivation: hadTask,
+                mode: mode
+            )
             return BleReconnectActivationResult(
                 target: target,
-                state: .resolved,
-                reason: deferredByAppInactivity ? "appInactiveDeferred" : "",
+                state: activation.disposition == .rejected ? .rejected : .resolved,
+                reason: activation.reason,
                 source: source,
+                mode: mode,
+                ownerDisposition: activation.disposition,
                 sessionGeneration: task.sessionGeneration
             )
         }
@@ -656,20 +956,350 @@ extension BleManager {
 
     /// 激活一个已经拥有稳定 UUID 的 task；MethodChannel 与扫描身份解析共用此顺序。
     @discardableResult
+    /**
+     *  普通前台冷启动对缺失 peripheral 做有界系统对象对账。
+     *
+     *  该流程不是 GATT retry：它不增加 reconnect attempt，不发布失败终态，只在 App
+     *  active 时把系统已知对象送回既有 exact activation。查询窗口结束后保留原 pending
+     *  connect/scan，避免改变后台 SR、Code 14 或 FlowPolicy 的历史行为。
+     */
+    private func scheduleActiveStartupReconciliation(
+        _ targets: [BleReconnectTarget],
+        source: BleConnectSource,
+        sessionGeneration: Int64
+    ) {
+        guard allowsSynchronousCoreBluetoothLookup else {
+            return
+        }
+        let delays: [TimeInterval] = [0.05, 0.15, 0.3, 0.5, 1, 2, 4]
+        targets.forEach { target in
+            let uuid = target.uuid.trimmingCharacters(in: .whitespacesAndNewlines)
+            let name = target.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !uuid.isEmpty || !name.isEmpty else {
+                return
+            }
+            let key = [
+                target.belongConfig,
+                uuid.lowercased(),
+                name,
+                String(sessionGeneration)
+            ].joined(separator: "|")
+            let token = UUID().uuidString
+            activeStartupReconciliationTokens[key] = token
+            runActiveStartupReconciliation(
+                target: target,
+                source: source,
+                sessionGeneration: sessionGeneration,
+                key: key,
+                token: token,
+                delays: delays,
+                index: 0
+            )
+        }
+    }
+
+    private func runActiveStartupReconciliation(
+        target: BleReconnectTarget,
+        source: BleConnectSource,
+        sessionGeneration: Int64,
+        key: String,
+        token: String,
+        delays: [TimeInterval],
+        index: Int
+    ) {
+        guard index < delays.count else {
+            if activeStartupReconciliationTokens[key] == token {
+                activeStartupReconciliationTokens.removeValue(forKey: key)
+                recordAutoReconnectEvent(
+                    type: "ios_active_startup_reconcile_exhausted",
+                    uuid: target.uuid,
+                    name: target.name,
+                    detail: "sessionGeneration=\(sessionGeneration)"
+                )
+            }
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delays[index]) { [weak self] in
+            guard let self,
+                  self.activeStartupReconciliationTokens[key] == token else {
+                return
+            }
+            guard self.allowsSynchronousCoreBluetoothLookup,
+                  self.centralManager.state == .poweredOn else {
+                self.activeStartupReconciliationTokens.removeValue(forKey: key)
+                self.recordAutoReconnectEvent(
+                    type: "ios_active_startup_reconcile_cancelled",
+                    uuid: target.uuid,
+                    name: target.name,
+                    detail: "reason=appInactiveOrBluetoothUnavailable, sessionGeneration=\(sessionGeneration)"
+                )
+                return
+            }
+            let expectedUuid = target.uuid.trimmingCharacters(in: .whitespacesAndNewlines)
+            let expectedName = target.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let matchingTasks = self.reconnectTasks.values.filter { task in
+                task.belongConfig == target.belongConfig &&
+                    BleReconnectIdentityPolicy.matchesSystemConnectedPeripheral(
+                        taskUuid: task.uuid,
+                        taskName: task.name,
+                        peripheralUuid: expectedUuid,
+                        peripheralName: expectedName
+                    )
+            }
+            guard matchingTasks.count == 1, let task = matchingTasks.first,
+                  sessionGeneration <= 0 || task.sessionGeneration == sessionGeneration else {
+                self.activeStartupReconciliationTokens.removeValue(forKey: key)
+                return
+            }
+            let existingPhysicalSession = self.peripheralConnectionSessions.values.first(where: {
+                BleReconnectIdentityPolicy.matchesSystemConnectedPeripheral(
+                    taskUuid: task.uuid,
+                    taskName: task.name,
+                    peripheralUuid: $0.peripheral.identifier.uuidString,
+                    peripheralName: $0.peripheral.name ?? ""
+                )
+            })
+            // 已收到真实 didConnect/contact 的 pipeline 不再参与启动对账；尚未接触物理层的
+            // pending 则继续查询系统 connected 对象，避免长期 owner 把前台冷启动拖到 60 秒。
+            if existingPhysicalSession?.hasObservedPhysicalContact == true {
+                self.activeStartupReconciliationTokens.removeValue(forKey: key)
+                return
+            }
+            guard let config = self.bleConfigs.first(where: {
+                $0.name == target.belongConfig && $0.autoReconnect
+            }) else {
+                self.activeStartupReconciliationTokens.removeValue(forKey: key)
+                return
+            }
+            // 延迟重试闭包执行时 App 可能已离开 active 窗口；同步 retrieve 必须经
+            // active-only 包装器，inactive 时返回空视为 deferred，由后续重试或
+            // didBecomeActive 补偿，不得据此产生终态。
+            var peripherals: [CBPeripheral] = []
+            if let identifier = UUID(uuidString: expectedUuid) {
+                peripherals.append(contentsOf: self.retrievePeripheralsWhenAppActive(
+                    withIdentifiers: [identifier],
+                    context: "startup reconciliation uuid"
+                ))
+            }
+            let serviceUUIDs = config.privateServices.map { $0.serviceUUID }
+            if !serviceUUIDs.isEmpty {
+                peripherals.append(contentsOf: self.retrieveConnectedPeripheralsWhenAppActive(
+                    withServices: serviceUUIDs,
+                    context: "startup reconciliation services"
+                ))
+            }
+            var seenIdentifiers = Set<UUID>()
+            let uniquePeripherals = peripherals.filter {
+                seenIdentifiers.insert($0.identifier).inserted
+            }
+            let uuidMatches = uniquePeripherals.filter {
+                !expectedUuid.isEmpty &&
+                    $0.identifier.uuidString.caseInsensitiveCompare(expectedUuid) == .orderedSame
+            }
+            let nameMatches = uniquePeripherals.filter {
+                !expectedName.isEmpty &&
+                    $0.name?.trimmingCharacters(in: .whitespacesAndNewlines) == expectedName
+            }
+            let identityMatches = uuidMatches.isEmpty ? nameMatches : uuidMatches
+            // 当前已有无物理接触的 pending 时，普通 disconnected/connecting retrieve
+            // 仍是同一个长期 owner，不足以触发替换；只有系统明确 connected 才是接管证据。
+            let matches = existingPhysicalSession == nil
+                ? identityMatches
+                : identityMatches.filter { $0.state == .connected }
+            if matches.count == 1, let peripheral = matches.first {
+                if let existingPhysicalSession,
+                   existingPhysicalSession.peripheral !== peripheral {
+                    let elapsed = Date().timeIntervalSince(
+                        existingPhysicalSession.pendingConnectStartedAt
+                    )
+                    if elapsed < self.foregroundSystemConnectedReplacementThreshold {
+                        self.runActiveStartupReconciliation(
+                            target: target,
+                            source: source,
+                            sessionGeneration: sessionGeneration,
+                            key: key,
+                            token: token,
+                            delays: delays,
+                            index: index + 1
+                        )
+                        return
+                    }
+                }
+                self.activeStartupReconciliationTokens.removeValue(forKey: key)
+                if existingPhysicalSession != nil {
+                    // 直接走现有 activation，让 systemConnectedReconcile 在 exact
+                    // admission/barrier 内替换旧对象；不能先塞 restoration escrow，
+                    // 否则 resumeConnectionEvent 会因同 UUID session 已存在而静默忽略。
+                    let resolvedTarget = BleReconnectTarget(
+                        belongConfig: target.belongConfig,
+                        uuid: peripheral.identifier.uuidString,
+                        name: peripheral.name ?? expectedName,
+                        expectedMacSuffix: target.expectedMacSuffix
+                    )
+                    let result = self.activateAutoReconnectTargets(
+                        [resolvedTarget],
+                        source: source,
+                        sessionGeneration: sessionGeneration,
+                        scheduleActiveReconciliation: false
+                    ).first
+                    self.recordAutoReconnectEvent(
+                        type: "ios_active_startup_reconcile_takeover",
+                        uuid: peripheral.identifier.uuidString,
+                        name: peripheral.name ?? expectedName,
+                        detail: "attempt=\(index + 1), state=\(peripheral.state.rawValue), result=\(String(describing: result?.state)), sessionGeneration=\(task.sessionGeneration)"
+                    )
+                    return
+                }
+                // 无 physical session 时同样只走 exact activation，不再「escrow + rearm +
+                // resumeConnectionEvent」：rearm 会在 owner 认领前就对该对象直接 connect，
+                // activation 取走 escrow 后若 owner 处于不发起连接的阶段（新鲜广播恢复、
+                // transport 恢复门禁、蓝牙暂停、OTA 门禁等），系统已持有的链路会立即
+                // didConnect，因没有 active request 而上报 noBleConfigFound(generation 0)
+                // 并留下无主链路（2026-09-18 真机 14:47:22 右腿）。
+                // 顺序：构造 resolved target → activation 先认领真实 SR escrow，再在 active
+                // 窗口内由 beginDirectReconnectAttempt 经 findPeripheralFromConnected /
+                // retrieve 取得对象 → owner 登记 request/admission 之后才 connect；owner
+                // 拒绝时不会出现任何 connect。参数与上方 existingPhysicalSession 分支一致。
+                let resolvedTarget = BleReconnectTarget(
+                    belongConfig: target.belongConfig,
+                    uuid: peripheral.identifier.uuidString,
+                    name: peripheral.name ?? expectedName,
+                    expectedMacSuffix: target.expectedMacSuffix
+                )
+                let result = self.activateAutoReconnectTargets(
+                    [resolvedTarget],
+                    source: source,
+                    sessionGeneration: sessionGeneration,
+                    scheduleActiveReconciliation: false
+                ).first
+                self.recordAutoReconnectEvent(
+                    type: "ios_active_startup_reconcile_resolved",
+                    uuid: peripheral.identifier.uuidString,
+                    name: peripheral.name ?? expectedName,
+                    detail: "attempt=\(index + 1), state=\(peripheral.state.rawValue), result=\(String(describing: result?.state)), sessionGeneration=\(task.sessionGeneration)"
+                )
+                return
+            }
+            self.runActiveStartupReconciliation(
+                target: target,
+                source: source,
+                sessionGeneration: sessionGeneration,
+                key: key,
+                token: token,
+                delays: delays,
+                index: index + 1
+            )
+        }
+    }
+
+    /**
+     *  系统 connection event 到达后，尝试唤醒已经存在的 exact reconnect owner。
+     *
+     *  事件早于 Dart target 时只保留 restoration escrow，后续正常 activation 会认领；
+     *  事件晚于 target 时按 UUID 或唯一完整名称找到同一 owner，并复用原 activation，
+     *  从而保留 source/session generation、admission Gate 与 GATT/AUTH 约束。
+     */
+    func resumeAutoReconnectFromConnectionEvent(_ peripheral: CBPeripheral) {
+        let uuid = peripheral.identifier.uuidString
+        let name = peripheral.name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if peripheralConnectionSessions.values.contains(where: {
+            $0.peripheral.identifier == peripheral.identifier
+        }) {
+            recordAutoReconnectEvent(
+                type: "ios_connection_event_ignored",
+                uuid: uuid,
+                name: name,
+                detail: "reason=physicalSessionExists"
+            )
+            return
+        }
+        let candidates = reconnectTasks.values.filter { task in
+            task.uuid.caseInsensitiveCompare(uuid) == .orderedSame ||
+                (!name.isEmpty && task.name == name)
+        }
+        guard candidates.count == 1, let task = candidates.first else {
+            recordAutoReconnectEvent(
+                type: "ios_connection_event_deferred",
+                uuid: uuid,
+                name: name,
+                detail: "candidateCount=\(candidates.count)"
+            )
+            return
+        }
+        let expectedMacSuffix = persistedReconnectTarget(
+            uuid: task.uuid,
+            name: task.name
+        )?.expectedMacSuffix ?? ""
+        let target = BleReconnectTarget(
+            belongConfig: task.belongConfig,
+            uuid: uuid,
+            name: name.isEmpty ? task.name : name,
+            expectedMacSuffix: expectedMacSuffix
+        )
+        let results = activateAutoReconnectTargets(
+            [target],
+            source: task.source,
+            sessionGeneration: task.sessionGeneration,
+            scheduleActiveReconciliation: false
+        )
+        recordAutoReconnectEvent(
+            type: "ios_connection_event_activation",
+            uuid: uuid,
+            name: target.name,
+            detail: "result=\(String(describing: results.first?.state)), sessionGeneration=\(task.sessionGeneration)"
+        )
+    }
+
     private func activateArmedReconnectTask(
         _ task: BleReconnectTask,
-        source: BleConnectSource
-    ) -> Bool {
+        source: BleConnectSource,
+        ownerExistedBeforeActivation: Bool = true,
+        mode: BleReconnectActivationMode = .initial,
+        reconcileSystemConnected: Bool = false
+    ) -> BleReconnectOwnerActivationOutcome {
+        // 所有隐式入口都必须重新读取当前 task。只有公开 activation 会先原子消费
+        // reset recovery 门禁；扫描、生命周期补偿和旧 continuation 只能保持 deferred。
+        let key = reconnectKey(uuid: task.uuid)
+        guard let currentTask = reconnectTasks[key],
+              currentTask.belongConfig == task.belongConfig,
+              currentTask.sessionGeneration == task.sessionGeneration else {
+            return BleReconnectOwnerActivationOutcome(
+                disposition: .rejected,
+                reason: "staleReconnectOwner"
+            )
+        }
+        guard !currentTask.awaitingRecoveryActivation,
+              !currentTask.pausedByBluetoothOff else {
+            return BleReconnectOwnerActivationOutcome(
+                disposition: .deferred,
+                reason: "awaitingRecoveryActivation"
+            )
+        }
         let deferredByAppInactivity = shouldDeferReconnectForAppInactivity(task)
         // 1、已有 admission 时优先判断是否可安全复用当前 pending session。
-        let key = reconnectKey(uuid: task.uuid)
         // 自动窗口之间的静默等待由 task.timer 独占。重复 activation 只确认 owner 仍在，
         // 不能提前开始扫描或 retrieve，也不能让共享扫描结果穿过等待门禁。
         if source != .manualReconnect,
            task.pairingRecoveryState == .waitingFreshAdvertisementRetry {
-            return deferredByAppInactivity
+            return BleReconnectOwnerActivationOutcome(
+                disposition: .deferred,
+                reason: deferredByAppInactivity ? "appInactiveDeferred" : "pendingRetryDeferred"
+            )
         }
         if let current = currentConnectionAdmission(uuid: task.uuid) {
+            if reconcileSystemConnected,
+               source != .manualReconnect,
+               current.sessionGeneration == task.sessionGeneration {
+                // active 前台已经确认系统持有该 peripheral。仍复用当前 task/session，
+                // 只让 direct reconnect 在 exact admission 下认领或替换陈旧对象。
+                loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), reconcile system-connected peripheral with exact session=\(task.sessionGeneration)")
+                beginReconnectAttempt(uuid: task.uuid)
+                return reconnectActivationOutcomeAfterAttempt(
+                    task: task,
+                    successDisposition: .reused,
+                    successReason: "systemConnectedReconciled"
+                )
+            }
             let pendingTeardown = pendingConnectionAdmissionTeardowns[key]
             let currentIsPendingTeardown = pendingTeardown.map {
                 $0.admission.generation == current.generation &&
@@ -682,7 +1312,11 @@ extension BleManager {
                    currentIsPendingTeardown: currentIsPendingTeardown
                ) {
                 beginReconnectAttempt(uuid: task.uuid)
-                return deferredByAppInactivity
+                return reconnectActivationOutcomeAfterAttempt(
+                    task: task,
+                    successDisposition: .repaired,
+                    successReason: "manualOwnerReplaced"
+                )
             }
             if task.sessionGeneration > current.sessionGeneration {
                 // 1.1、更高 Dart session 不能只覆盖 task 元数据：当前 CoreBluetooth
@@ -700,7 +1334,47 @@ extension BleManager {
                 }
                 loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), session owner replacement old=\(current.sessionGeneration), incoming=\(task.sessionGeneration), pendingTeardown=\(currentIsPendingTeardown)")
                 beginReconnectAttempt(uuid: task.uuid)
-                return deferredByAppInactivity
+                return reconnectActivationOutcomeAfterAttempt(
+                    task: task,
+                    successDisposition: .repaired,
+                    successReason: "sessionOwnerReplaced"
+                )
+            }
+
+            let session = peripheralConnectionSessions[current.sessionId]
+            let peripheralStateIsLive = session.map {
+                $0.peripheral.state == .connecting || $0.peripheral.state == .connected
+            } ?? false
+            let health = BleReconnectPendingOwnerPolicy.evaluate(
+                taskSessionGeneration: task.sessionGeneration,
+                admissionSessionGeneration: current.sessionGeneration,
+                hasSession: session != nil,
+                sessionMatchesAdmission: session?.admission == current,
+                peripheralIsConnectedOrConnecting: peripheralStateIsLive,
+                pendingTeardown: currentIsPendingTeardown
+            )
+            switch health {
+            case .healthy:
+                break
+            case .teardownPending:
+                beginReconnectAttempt(uuid: task.uuid)
+                return reconnectActivationOutcomeAfterAttempt(
+                    task: task,
+                    successDisposition: .repaired,
+                    successReason: "teardownReplacementRegistered"
+                )
+            case .missingSession, .sessionMismatch, .stalePeripheral:
+                repairStaleReconnectOwner(
+                    task: task,
+                    admission: current,
+                    session: session,
+                    health: health
+                )
+                return reconnectActivationOutcomeAfterAttempt(
+                    task: task,
+                    successDisposition: .repaired,
+                    successReason: "staleOwnerRepaired"
+                )
             }
             if source != .manualReconnect || !currentIsPendingTeardown {
                 if source == .manualReconnect {
@@ -713,17 +1387,85 @@ extension BleManager {
                        replaceStalePendingManualAttemptIfNeeded(session.peripheral) {
                         loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), manual stale pending replacement requested")
                         beginReconnectAttempt(uuid: task.uuid)
-                        return deferredByAppInactivity
+                        return reconnectActivationOutcomeAfterAttempt(
+                            task: task,
+                            successDisposition: .repaired,
+                            successReason: "manualStaleOwnerReplaced"
+                        )
                     }
                     _ = promotePendingAttempt(uuid: task.uuid)
                 }
-                return false
+                return BleReconnectOwnerActivationOutcome(disposition: .reused, reason: "")
             }
         }
         // 2、cancellation barrier 内的手动请求不能提升即将销毁的旧 session；继续创建
         // 新 generation，并由旧 didDisconnect/watchdog 释放后原子启动。
         beginReconnectAttempt(uuid: task.uuid)
-        return deferredByAppInactivity
+        let createdDisposition: BleReconnectOwnerDisposition =
+            ownerExistedBeforeActivation || mode == .reconcile ? .repaired : .created
+        return reconnectActivationOutcomeAfterAttempt(
+            task: task,
+            successDisposition: createdDisposition,
+            successReason: createdDisposition == .created ? "ownerCreated" : "ownerRepaired"
+        )
+    }
+
+    /// 陈旧 admission 只回收 exact endpoint/session。仍有 CoreBluetooth 请求时先建立
+    /// cancellation barrier；已经 disconnected 或 session 丢失时同步释放 Gate 再重建。
+    private func repairStaleReconnectOwner(
+        task: BleReconnectTask,
+        admission: BleConnectionAdmission,
+        session: BlePeripheralConnectionSession?,
+        health: BleReconnectPendingOwnerHealth
+    ) {
+        removeActiveConnectRequest(uuid: task.uuid, name: task.name)
+        if let session,
+           session.peripheral.state != .disconnected {
+            deferConnectionAdmissionReleaseUntilPeripheralTerminal(
+                admission: admission,
+                peripheral: session.peripheral,
+                deviceName: session.deviceName,
+                terminalState: .disconnectFromSys
+            )
+            centralManager.cancelPeripheralConnection(session.peripheral)
+        } else {
+            releaseConnectionAdmissionAndStartNext(admission, invalidateEndpoint: true)
+        }
+        loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), stale owner repair health=\(health), sessionGeneration=\(task.sessionGeneration)")
+        beginReconnectAttempt(uuid: task.uuid)
+    }
+
+    /// ACK 只描述方法返回时的实际 owner：live admission 为成功，生命周期/蓝牙/timer
+    /// 等待为 deferred，其它无资源状态 fail-closed。
+    private func reconnectActivationOutcomeAfterAttempt(
+        task: BleReconnectTask,
+        successDisposition: BleReconnectOwnerDisposition,
+        successReason: String
+    ) -> BleReconnectOwnerActivationOutcome {
+        let hasLiveOwner: Bool = {
+            guard let admission = currentConnectionAdmission(uuid: task.uuid),
+                  let session = peripheralConnectionSessions[admission.sessionId],
+                  session.admission == admission,
+                  admission.sessionGeneration == task.sessionGeneration else {
+                return false
+            }
+            return session.peripheral.state == .connecting ||
+                session.peripheral.state == .connected
+        }()
+        let current = reconnectTasks[reconnectKey(uuid: task.uuid)]
+        let hasDeferredWork = current?.deferredByAppInactivity == true ||
+            current?.pausedByBluetoothOff == true ||
+            current?.timer != nil ||
+            pendingConnectionAdmissionTeardowns[reconnectKey(uuid: task.uuid)] != nil
+        return BleReconnectActivationDispositionPolicy.resolve(
+            hasLiveOwner: hasLiveOwner,
+            hasDeferredWork: hasDeferredWork,
+            successDisposition: successDisposition,
+            successReason: successReason,
+            deferredReason: current?.deferredByAppInactivity == true
+                ? "appInactiveDeferred"
+                : "nativeOwnerDeferred"
+        )
     }
 
     /// 手动点击接管正在使用新 peripheral 的自动恢复时，旧自动 admission 必须先进入
@@ -751,6 +1493,71 @@ extension BleManager {
         }
         loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), manual takeover waits for automatic pairing recovery teardown sessionGeneration=\(task.sessionGeneration)")
         return true
+    }
+
+    /// 把 escrow 的物理状态接入正式 exact owner；connecting 时只挂 admission，避免重复 connect。
+    private func activateClaimedStateRestoration(
+        task: BleReconnectTask,
+        config: BleConfig,
+        claim: BleStateRestorationEscrowClaim
+    ) {
+        let peripheral = claim.peripheral
+        var request = BleEasyConnect(
+            configName: task.belongConfig,
+            uuid: peripheral.identifier.uuidString,
+            name: task.name,
+            afterUpgrade: false,
+            directConnect: true,
+            time: Date().timeIntervalSince1970
+        )
+        request.bleConfig = config
+        upsertActiveConnectRequest(request)
+        peripheral.delegate = self
+        replaceConnectionCache(
+            peripheral: peripheral,
+            config: config,
+            reason: "state restoration escrow claimed"
+        )
+        guard let admission = registerConnectionAttempt(
+            peripheral: peripheral,
+            config: config,
+            deviceName: task.name,
+            afterUpgrade: false,
+            source: task.source == .manualReconnect ? .manualReconnect : .stateRestoration,
+            sessionGeneration: task.sessionGeneration
+        ) else { return }
+
+        switch claim.state {
+        case .connected:
+            if peripheral.state == .connected {
+                enqueuePhysicalConnectionThroughGate(peripheral)
+            } else {
+                connectPeripheralAfterCancellationBarrier(peripheral, autoReconnect: true)
+            }
+        case .pending:
+            if peripheral.state == .connected {
+                enqueuePhysicalConnectionThroughGate(peripheral)
+            } else if peripheral.state == .connecting {
+                startPendingPhysicalConnectWatchdog(
+                    peripheral,
+                    admission: admission,
+                    autoReconnect: true
+                )
+                if claim.peerConnectedObservedAt != nil {
+                    // escrow 期间系统已宣告 peerConnected，restored pending 请求却没有完成：
+                    // 60 秒观察 watchdog 只会 keep，必须另给有界宽限后替换失效请求。
+                    armPeerConnectedContactGrace(
+                        peripheral,
+                        reason: "stateRestoration claim after peerConnected"
+                    )
+                }
+            } else {
+                connectPeripheralAfterCancellationBarrier(peripheral, autoReconnect: true)
+            }
+        case .idle:
+            connectPeripheralAfterCancellationBarrier(peripheral, autoReconnect: true)
+        }
+        loggerD(msg: "stateRestoration: escrow claimed uuid=\(peripheral.identifier.uuidString), state=\(claim.state), physical=\(peripheral.state.rawValue), sessionGeneration=\(task.sessionGeneration)")
     }
 
     /// 扫描仅为已声明的 name-only owner 补齐 UUID，不把普通空 manufacturer 广播暴露给 Dart。
@@ -870,6 +1677,7 @@ extension BleManager {
      *  poweredOff 不是最终失败，不能把任务标记为 noDeviceFound；等待 poweredOn 后继续调度。
      */
     func pauseReconnectTasksForBluetoothOff() {
+        let recoveryEpoch = beginTransportRecoveryCycleIfNeeded()
         pausePeerPairingRecoveryForBluetoothOff()
         for key in reconnectTasks.keys {
             guard var task = reconnectTasks[key] else {
@@ -879,6 +1687,10 @@ extension BleManager {
             task.timer?.invalidate()
             task.timer = nil
             task.pausedByBluetoothOff = true
+            task.recoveryEpoch = recoveryEpoch
+            // 每个非 poweredOn 状态都会重新冻结本轮 transport；等待标记只在
+            // poweredOn 时发布，避免 resetting 期间被误当成连接窗口。
+            task.awaitingRecoveryActivation = false
             task.source = BleReconnectSourcePolicy.afterTransportReset()
             reconnectTasks[key] = task
         }
@@ -904,9 +1716,10 @@ extension BleManager {
     }
 
     /**
-     *  蓝牙恢复后继续被暂停的任务。
+     *  蓝牙恢复后发布显式 activation 门禁。
      *
-     *  这里统一进入 scheduleReconnect，保证恢复、系统断连、超时都复用同一套退避策略。
+     *  reset 前 session 已随 transport 失效；这里不得 schedule/begin。Dart 会把全部
+     *  G2/R1 endpoint 汇总到一个更高正 session，再由 activation 唯一消费门禁。
      */
     func resumeReconnectTasksAfterBluetoothOn() {
         let pausedTasks = reconnectTasks.values.filter { $0.pausedByBluetoothOff }
@@ -914,19 +1727,14 @@ extension BleManager {
         guard pausedTasks.isNotEmpty else {
             return
         }
-        loggerD(msg: "autoReconnect: resume \(pausedTasks.count) paused task(s), bluetooth on")
+        loggerD(msg: "autoReconnect: \(pausedTasks.count) task(s) awaiting Dart recovery activation for final session")
         for task in pausedTasks {
             let key = reconnectKey(uuid: task.uuid)
             if var stored = reconnectTasks[key] {
                 stored.pausedByBluetoothOff = false
+                stored.awaitingRecoveryActivation = true
                 reconnectTasks[key] = stored
             }
-            scheduleReconnect(
-                uuid: task.uuid,
-                name: task.name,
-                state: .disconnectFromSys,
-                preserveAttemptSource: false
-            )
         }
     }
 
@@ -983,7 +1791,12 @@ extension BleManager {
     /// inactive/background/terminating 只在没有内存 peripheral 时 defer。
     /// 这不是失败 attempt，不递增 retry，不发布 noDeviceFound，也不删除长期 owner。
     private func shouldDeferReconnectForAppInactivity(_ task: BleReconnectTask) -> Bool {
-        !allowsSynchronousCoreBluetoothLookup && inMemoryReconnectPeripheral(task) == nil
+        guard !allowsSynchronousCoreBluetoothLookup,
+              inMemoryReconnectPeripheral(task) == nil else {
+            return false
+        }
+        // SR 后台拉起窗口内仍可用一次 identifier 补查建立 pending connect，不算无对象可用。
+        return !canAttemptStateRestorationLaunchRetrieve(endpointId: task.uuid)
     }
 
     /// 把 exact reconnect task 标记为等待前台；旧 generation 或已取消 owner 无法写回。
@@ -1113,6 +1926,7 @@ extension BleManager {
     /// 进程退出宽限期绝不允许同步 retrieve 阻塞主线程。
     @objc func handleAppWillTerminate() {
         allowsSynchronousCoreBluetoothLookup = false
+        hasReceivedWillTerminate = true
         pausePeerPairingRecoveryForAppInactivity(reason: "willTerminate")
         loggerD(msg: "appLifecycle: synchronous CoreBluetooth lookup disabled reason=willTerminate")
     }
@@ -1124,10 +1938,40 @@ extension BleManager {
      */
     @objc func handleAppDidBecomeActive() {
         allowsSynchronousCoreBluetoothLookup = true
+        // inactive activation 只保留 exact owner，CoreBluetooth 的 system-connected
+        // peripheral 可能在 didBecomeActive 之后才可查询。先冻结本次 deferred 快照，
+        // 恢复 owner 后为每个仍同代的端点重启有界对账，避免一次瞬时 retrieve 未命中
+        // 后只连接主腿，并把这个不完整物理状态继续保存到下一次 SR。
+        let deferredSnapshot = reconnectTasks.values.filter { $0.deferredByAppInactivity }
         // name-only owner 先尝试接管 ANCS/system-connected identity，再恢复 UUID owner；
         // 两条路径都复用原有 pending/Gate，不增加 MethodChannel 状态或 retry。
         resolveAppInactivePendingIdentities()
         resumeAppInactiveDeferredReconnects()
+        deferredSnapshot.forEach { deferred in
+            let key = reconnectKey(uuid: deferred.uuid)
+            guard let current = reconnectTasks[key],
+                  current.sessionGeneration == deferred.sessionGeneration,
+                  current.belongConfig == deferred.belongConfig,
+                  bleConfigs.contains(where: {
+                      $0.name == current.belongConfig && $0.autoReconnect
+                  }) else {
+                return
+            }
+            let expectedMacSuffix = reconnectStore.target(
+                uuid: current.uuid,
+                name: current.name
+            )?.expectedMacSuffix ?? ""
+            scheduleActiveStartupReconciliation(
+                [BleReconnectTarget(
+                    belongConfig: current.belongConfig,
+                    uuid: current.uuid,
+                    name: current.name,
+                    expectedMacSuffix: expectedMacSuffix
+                )],
+                source: current.source,
+                sessionGeneration: current.sessionGeneration
+            )
+        }
         resumeReconnectTasksIfBluetoothOn(reason: "didBecomeActive")
     }
 
@@ -1165,6 +2009,10 @@ extension BleManager {
             // 没有 armed task 说明业务尚未确认 connected，原生不能自行接管长期回连。
             return
         }
+        guard !task.awaitingRecoveryActivation else {
+            loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), schedule deferred awaiting final recovery activation")
+            return
+        }
         // 2、终态后默认恢复 autoReconnect source；显式提升只保留当前 attempt 来源。
         if !preserveAttemptSource {
             task.source = BleReconnectSourcePolicy.afterTerminalAttempt()
@@ -1173,13 +2021,16 @@ extension BleManager {
             // 配置被移除或关闭后，旧任务只保留日志，不再调度。
             return
         }
-        guard !upgradeStateRegistry.contains(uuid) else {
+        let otaAdmission = otaReconnectSchedulingAdmission(task: task, observedUuid: uuid)
+        guard otaAdmission.allowed,
+              otaAdmission.isOtaGranted || !upgradeStateRegistry.contains(uuid) else {
             // OTA/升级态由升级流程控制连接，避免自动回连打断升级状态机。
             return
         }
         // 3、蓝牙不可用只记录暂停，poweredOn 后继续，不取消长期 intent。
         guard centralManager.state == .poweredOn else {
             task.pausedByBluetoothOff = true
+            task.recoveryEpoch = beginTransportRecoveryCycleIfNeeded()
             reconnectTasks[reconnectKey(uuid: task.uuid)] = task
             loggerD(msg: "autoReconnect: \(task.uuid), paused because bluetooth is unavailable")
             return
@@ -1245,12 +2096,23 @@ extension BleManager {
             // 任务可能已被用户 disconnect/remove 取消，忽略旧 timer 回调。
             return
         }
+        guard !task.awaitingRecoveryActivation else {
+            loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), begin deferred awaiting final recovery activation")
+            return
+        }
         guard let config = bleConfigs.first(where: { $0.name == task.belongConfig }), config.autoReconnect else {
+            return
+        }
+        let otaAdmission = otaReconnectSchedulingAdmission(task: task, observedUuid: task.uuid)
+        guard otaAdmission.allowed,
+              otaAdmission.isOtaGranted || !upgradeStateRegistry.contains(task.uuid) else {
+            loggerD(msg: "autoReconnect: \(task.uuid), begin rejected by ota gate reason=\(otaAdmission.reason)")
             return
         }
         guard centralManager.state == .poweredOn else {
             // poweredOff 期间不消耗 attempt，等待状态恢复后继续。
             task.pausedByBluetoothOff = true
+            task.recoveryEpoch = beginTransportRecoveryCycleIfNeeded()
             reconnectTasks[key] = task
             return
         }
@@ -1272,6 +2134,27 @@ extension BleManager {
         beginDirectReconnectAttempt(task: task, config: config)
     }
 
+    func otaReconnectSchedulingAdmission(
+        task: BleReconnectTask,
+        observedUuid: String
+    ) -> (allowed: Bool, isOtaGranted: Bool, reason: String) {
+        let endpointId = task.g2OtaRecoveryEndpointId
+            ?? reconnectIdentityAliases.resolvedCanonical(uuid: observedUuid)
+            ?? observedUuid
+        if let context = task.g2OtaRecoveryContext {
+            let gate = g2OtaTransactions.shouldAllowAdmission(
+                endpointId: endpointId,
+                otaContext: context,
+                purpose: .activation
+            )
+            return (gate.allowed, gate.allowed, gate.reason)
+        }
+        if g2OtaTransactions.isEndpointOwned(endpointId) {
+            return (false, false, "otaTransactionGate")
+        }
+        return (true, false, "")
+    }
+
     /// 构造一条不经扫描前置、不提前起超时的 CoreBluetooth pending connect。
     func beginDirectReconnectAttempt(task: BleReconnectTask, config: BleConfig) {
         // 1、先以真实物理连接状态短路，避免重复建立 GATT。
@@ -1290,6 +2173,9 @@ extension BleManager {
             startPairingRecoveryDiscoveryIfNeeded(task)
             return
         }
+        // retrieveConnectedPeripherals 命中说明 iOS 已持有该外设的系统链路；exact
+        // pending attempt 若仍无物理接触，其对象状态永远不会自行变成 `.connected`。
+        var systemConnectedTakeover = false
         let cachedPeripheral: CBPeripheral? = {
             // Code 14 后必须优先消费本轮 didDiscover 写入的 peripheral，而不是先从
             // retrievePeripherals 取回刚被 iOS 拒绝的旧缓存对象。
@@ -1305,6 +2191,15 @@ extension BleManager {
                 loggerD(msg: "appLifecycle: reuse in-memory peripheral while inactive uuid=\(held.identifier.uuidString), owner=\(task.uuid)")
                 return held
             }
+            // iOS 未随 willRestoreState 交还的当前目标腿：SR 后台拉起窗口内允许一次
+            // identifier 补查，随后与其它腿同样注册 admission 并建立系统 pending connect。
+            if !allowsSynchronousCoreBluetoothLookup,
+               let restored = retrievePeripheralForStateRestorationLaunch(
+                   endpointId: task.uuid,
+                   context: "auto reconnect by UUID during SR launch"
+               ) {
+                return restored
+            }
             // App 重装会让服务端/业务缓存中的 CoreBluetooth UUID 失效。若目标已被
             // iOS/ANCS 持有连接，它可能停止广播，必须在旧 UUID retrieve 和扫描缓存前
             // 通过配置私有服务 + ANCS 接管系统连接，再复用下方同一条 Gate/GATT 流程。
@@ -1314,6 +2209,7 @@ extension BleManager {
                 serviceUUIDs: config.privateServices.map { $0.serviceUUID }
             ) {
                 loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), system-connected identity takeover current=\(systemConnected.identifier.uuidString)")
+                systemConnectedTakeover = true
                 return systemConnected
             }
             if let identifier = UUID(uuidString: task.uuid),
@@ -1355,7 +2251,7 @@ extension BleManager {
         let key = reconnectKey(uuid: activeTask.uuid)
         if let current = currentConnectionAdmission(uuid: activeTask.uuid) {
             let pendingTeardown = pendingConnectionAdmissionTeardowns[key]
-            let currentIsPendingTeardown = pendingTeardown.map {
+            var currentIsPendingTeardown = pendingTeardown.map {
                 $0.admission.generation == current.generation &&
                     $0.admission.sessionId == current.sessionId
             } == true
@@ -1368,6 +2264,45 @@ extension BleManager {
             if activeTask.source == .manualReconnect,
                replaceStalePendingManualAttemptIfNeeded(peripheral) {
                 loggerD(msg: "autoReconnect: \(activeTask.uuid)-\(activeTask.name), direct manual stale pending replacement requested")
+            }
+            if !currentIsPendingTeardown,
+               activeTask.source != .manualReconnect,
+               current.sessionGeneration == activeTask.sessionGeneration,
+               let session = peripheralConnectionSessions[current.sessionId],
+               !session.hasObservedPhysicalContact {
+                if peripheral.state == .connected {
+                    if session.peripheral === peripheral {
+                        loggerD(msg: "autoReconnect: \(activeTask.uuid)-\(activeTask.name), current pending object is now system-connected; enter exact Gate")
+                        enqueuePhysicalConnectionThroughGate(peripheral)
+                        return
+                    }
+                    // retrieveConnectedPeripherals 可能返回同 UUID 的新 CBPeripheral 实例。
+                    // 旧 pending 必须先走既有 20 秒/no-contact/barrier 边界，随后新实例
+                    // 才能注册下一 native attempt；禁止并行 GATT 或直接发布业务成功。
+                    if replaceStalePendingAttemptIfNeeded(
+                        session.peripheral,
+                        trigger: .systemConnectedReconcile
+                    ) {
+                        currentIsPendingTeardown = true
+                        loggerD(msg: "autoReconnect: \(activeTask.uuid)-\(activeTask.name), system-connected peripheral replaces stale pending object")
+                    }
+                } else if systemConnectedTakeover,
+                          systemConnectedStalledReplacementAt[key].map({
+                              Date().timeIntervalSince($0) >= systemConnectedStalledReplacementMinInterval
+                          }) ?? true,
+                          replaceStalePendingAttemptIfNeeded(
+                              session.peripheral,
+                              trigger: .systemConnectedReconcile
+                          ) {
+                    // iOS 已持有系统链路（设置页 / ANCS），但本 central 视角对象仍是
+                    // `.connecting` / `.disconnected` 且长期没有 didConnect：这是 restored /
+                    // 陈旧 pending 请求失效，不是设备不在范围内。此前这里静默 return，
+                    // 造成系统显示已连接而 App 永远不连（2026-09-03 真机戒指）。
+                    // 最小间隔限制替换节奏，避免 App 重试把它变成 cancel/connect 风暴。
+                    systemConnectedStalledReplacementAt[key] = Date()
+                    currentIsPendingTeardown = true
+                    loggerD(msg: "autoReconnect: \(activeTask.uuid)-\(activeTask.name), system-connected peripheral replaces stalled pending connect state=\(peripheral.state.rawValue)")
+                }
             }
             let barrierBlocking = hasPeripheralCancellationBarrier(peripheral)
 
@@ -1495,8 +2430,14 @@ extension BleManager {
     }
 
     /// Records a real iOS 5403 protected-write security failure for the active
-    /// endpoint. Attempts 1...4 reuse the existing fresh-advertisement recovery;
-    /// attempt 5 silently retires this automatic owner and lets Dart stop UI noise.
+    /// endpoint. Attempts 1...4 rebuild an exact pending connect through the same
+    /// owner (`retryPendingConnect`); attempt 5 silently retires this automatic
+    /// owner and lets Dart stop UI noise.
+    ///
+    /// 流程顺序：先落盘本次计数 → 第 5 次删除目标并返回 exhausted；第 1～4 次保持
+    /// normal 阶段返回 retryPendingConnect，由 BleManager 走 disconnectFromSys
+    /// (preserveSecurityGateRecovery) → barrier 终态/2 秒 watchdog → scheduleReconnect
+    /// → beginDirectReconnectAttempt 注册新的 exact attempt 并 connect。
     @discardableResult
     func registerSecurityGateFailure(
         uuid: String,
@@ -1552,12 +2493,23 @@ extension BleManager {
             stopPeerPairingRecoveryTask(task, reason: "securityRecoveryExhausted")
             return .securityRecoveryExhausted
         }
-        task.hasAttemptedPairingRecovery = true
-        task.pairingRecoveryState = .awaitingFreshAdvertisement
+        // 第 1～4 次：预算已在上面先落盘，重试交给同一 owner 的普通 pending connect。
+        // 1、不进入 awaitingFreshAdvertisement：新鲜广播恢复只在 App active 时扫描，而
+        //    G2 右腿作为 ANCS 客户端被系统持有链路、永不广播，SR 后台拉起时会整段单腿。
+        // 2、若本次 5403 发生在 Code 14 恢复的新 peripheral 上，撤销本 owner 的扫描租约
+        //    与 5 秒 timer 并回到 normal；5403 已证明链路可达，后续由 pending connect 驱动。
+        // 3、不改 hasAttemptedPairingRecovery：5403 本身不等于 Code 14，之后首个 Code 14
+        //    仍按原语义获得一次新鲜广播恢复；已经恢复过的 owner 仍保留该事实。
+        // 4、不清扫描缓存：inactive 时只能复用进程内 peripheral，缓存是其来源之一。
+        if task.pairingRecoveryState != .normal {
+            cancelPairingRecoveryDiscovery(key: key)
+            task.timer?.invalidate()
+            task.timer = nil
+            task.pairingRecoveryState = .normal
+        }
         reconnectTasks[key] = task
-        purgeStaleScanCache(uuid: task.uuid, name: task.name)
-        loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), security gate failure \(failureCount)/\(BlePeerPairingRecoveryPolicy.maxSecurityGateAttempts); wait fresh advertisement")
-        return .retryFreshAdvertisement
+        loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), security gate failure \(failureCount)/\(BlePeerPairingRecoveryPolicy.maxSecurityGateAttempts); retry exact pending connect")
+        return .retryPendingConnect
     }
 
     /// Passing 5403 proves the current automatic episode has repaired security.
@@ -1631,6 +2583,7 @@ extension BleManager {
             resumed.timer = nil
             guard self.centralManager.state == .poweredOn else {
                 resumed.pausedByBluetoothOff = true
+                resumed.recoveryEpoch = self.beginTransportRecoveryCycleIfNeeded()
                 resumed.pairingRecoveryState = .awaitingFreshAdvertisement
                 self.reconnectTasks[key] = resumed
                 return
@@ -1665,6 +2618,7 @@ extension BleManager {
         guard centralManager.state == .poweredOn else {
             var paused = current
             paused.pausedByBluetoothOff = true
+            paused.recoveryEpoch = beginTransportRecoveryCycleIfNeeded()
             reconnectTasks[key] = paused
             return
         }
@@ -1737,6 +2691,7 @@ extension BleManager {
             task.pairingRecoveryState == .awaitingFreshAdvertisement &&
                 !task.deferredByAppInactivity &&
                 !task.pausedByBluetoothOff &&
+                !task.awaitingRecoveryActivation &&
                 pairingRecoveryScanTimers[key]?.sessionGeneration == task.sessionGeneration &&
                 task.belongConfig == belongConfig &&
                 !task.name.isEmpty &&
@@ -1810,6 +2765,11 @@ extension BleManager {
             // 用户硬取消或配置撤销后，系统旧 owner 也必须真的停止。
             centralManager.cancelPeripheralConnection(peripheral)
             loggerD(msg: "autoReconnect: \(uuid), reject system reconnect without authorized owner")
+            return
+        }
+        guard !task.awaitingRecoveryActivation,
+              !task.pausedByBluetoothOff else {
+            loggerD(msg: "autoReconnect: \(uuid), ignore system reconnect while awaiting final recovery activation")
             return
         }
         if let current = currentConnectionAdmission(uuid: uuid) {

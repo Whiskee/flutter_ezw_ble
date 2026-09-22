@@ -64,6 +64,12 @@ internal data class BleReconnectTask(
      * `even_connect` 的新 recovery batch 关闭重建。
      */
     var awaitingRecoveryActivation: Boolean = false,
+    /**
+     * G2 OTA 内部恢复 grant。普通 autoReconnect 仍会被 OTA gate 拒绝；只有
+     * even_connect 已把 endpoint 转入 recovering 且 native registry 仍接受同一
+     * transaction/instance 时，supervisor 的后续 retry/visible wake 才能继续建链。
+     */
+    var otaRecoveryContext: BleG2OtaNativeContext? = null,
     /** 当前 pending session 的来源；手动点击可提升但不会新建重复 GATT。 */
     var source: BleConnectSource = BleConnectSource.AUTO_RECONNECT,
     /** Dart reconnect batch generation forwarded unchanged on status callbacks. */
@@ -158,6 +164,8 @@ internal data class BleReconnectOwnerSnapshot(
     val sn: String,
     val source: BleConnectSource,
     val sessionGeneration: Long,
+    val hasPassiveGatt: Boolean,
+    val hasRetryTimer: Boolean,
 )
 
 /**
@@ -264,12 +272,58 @@ internal enum class BleReconnectActivationState(val flutterValue: String) {
     REJECTED("rejected"),
 }
 
+/** MethodChannel activation 的语义模式；未知值不能复用旧 owner。 */
+internal enum class BleReconnectActivationMode(val flutterValue: String) {
+    INITIAL("initial"),
+    RECONCILE("reconcile"),
+    PROMOTION("promotion"),
+    UNKNOWN("unknown");
+
+    companion object {
+        fun fromFlutterValue(value: String?): BleReconnectActivationMode =
+            entries.firstOrNull { it.flutterValue == value } ?: UNKNOWN
+    }
+}
+
+/** Reconcile 的授权/transport 门禁。测试直接覆盖拒绝矩阵，Manager 只负责提供实时事实。 */
+internal object BleReconnectActivationGuardPolicy {
+    fun rejectionReason(
+        mode: BleReconnectActivationMode,
+        hasPersistedAuthorization: Boolean,
+        isUpgradeDevice: Boolean,
+    ): String? = when {
+        mode == BleReconnectActivationMode.UNKNOWN -> "invalidMode"
+        mode == BleReconnectActivationMode.RECONCILE && !hasPersistedAuthorization ->
+            "authorizationRevoked"
+        isUpgradeDevice -> "otaInProgress"
+        else -> null
+    }
+}
+
+/** 单目标 activation 后 native owner 的实时处置结果。 */
+internal enum class BleReconnectOwnerDisposition(val flutterValue: String) {
+    CREATED("created"),
+    REUSED("reused"),
+    REPAIRED("repaired"),
+    DEFERRED("deferred"),
+    REJECTED("rejected"),
+}
+
+/** Supervisor 的内部 activation 结果，避免用 session 数字隐藏 owner 健康状态。 */
+internal data class BleReconnectActivationOutcome(
+    val sessionGeneration: Long,
+    val ownerDisposition: BleReconnectOwnerDisposition,
+    val reason: String = "",
+)
+
 /** MethodChannel 单目标回执，防止 Dart 把被过滤的空 address 误判成长期 owner。 */
 internal data class BleReconnectActivationResult(
     val target: BleReconnectSeed,
     val state: BleReconnectActivationState,
     val reason: String,
     val source: BleConnectSource,
+    val mode: BleReconnectActivationMode,
+    val ownerDisposition: BleReconnectOwnerDisposition,
     val sessionGeneration: Long,
 ) {
     fun toFlutterMap(): Map<String, Any> = mapOf(
@@ -279,6 +333,8 @@ internal data class BleReconnectActivationResult(
         "state" to state.flutterValue,
         "reason" to reason,
         "source" to source.flutterValue,
+        "mode" to mode.flutterValue,
+        "ownerDisposition" to ownerDisposition.flutterValue,
         "sessionGeneration" to sessionGeneration,
     )
 }

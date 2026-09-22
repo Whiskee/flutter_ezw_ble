@@ -14,6 +14,8 @@ import Foundation
 ///
 /// 这里只描述首次 Code 14 后的新鲜广播恢复，不表示 App 正在等待用户处理。自动来源
 /// 会在扫描窗口之间保留 owner；只有新 peripheral 再次 Code 14 才结束自动恢复。
+/// G2 5403 安全门禁失败不再进入这里的任何非 normal 阶段：它由同一 owner 直接重建
+/// pending connect（见 `BlePeerPairingFailureAction.retryPendingConnect`）。
 enum BlePeerPairingRecoveryState: String {
     case normal
     case awaitingFreshAdvertisement
@@ -47,6 +49,10 @@ enum BlePeerPairingRecoveryPolicy {
 
     /// Resolves the terminal action after one exact 5403 attempt has failed.
     /// Manual attempts never enter the silent automatic retry budget.
+    ///
+    /// 手动首次失败 → stopAttempt（Dart 侧映射 boundFail）；自动来源（含 stateRestoration）
+    /// 第 1～4 次 → retryPendingConnect，由同一 owner 重建 CoreBluetooth pending connect；
+    /// 第 5 次 → securityRecoveryExhausted。5403 不复用 Code 14 的新鲜广播恢复。
     static func actionAfterSecurityGateFailure(
         source: BleConnectSource,
         failureCount: Int
@@ -56,14 +62,25 @@ enum BlePeerPairingRecoveryPolicy {
         }
         return failureCount >= maxSecurityGateAttempts
             ? .securityRecoveryExhausted
-            : .retryFreshAdvertisement
+            : .retryPendingConnect
     }
 }
 
-/// 当前 Code 14 回调对本次 attempt 的处置动作。
+/// 当前 Code 14 / 5403 安全失败对本次 attempt 的处置动作。
 enum BlePeerPairingFailureAction: String {
-    /// 被动自动回连首次失败：允许一次新鲜广播恢复。
+    /// 被动自动回连首次失败：允许一次新鲜广播恢复。只服务 R1 Code 14。
     case retryFreshAdvertisement
+    /// G2 5403 自动安全失败第 1～4 次：预算已先落盘，cancellation barrier 拆掉本 exact
+    /// attempt 后，经普通 disconnectFromSys 调度由同一 owner 立即重建 pending connect；
+    /// inactive 只复用进程内 peripheral，不做同步 retrieve，也不扫描。
+    ///
+    /// 为什么不复用 Code 14 的新鲜广播恢复：G2 右腿是 iOS 通知（ANCS）客户端，链路由
+    /// com.apple.BTLEServer 持有，App cancel 只撤销本 central 的意图，物理链路不断、设备
+    /// 不广播；新鲜广播扫描又只在 App active 时运行。2026-09-18 真机（iOS 26.5.2，重启后
+    /// SR 后台拉起）：右腿 5403 超时一次后等广播 2 小时 11 分钟无果，手动点击后同一系统
+    /// 链路 49 ms 通过。pending connect 对两种情况都成立：链路仍被系统持有时立即
+    /// didConnect；链路已断时等下一次可连接广播，同样不消耗预算。
+    case retryPendingConnect
     /// 手动连接失败或自动恢复已经消耗：结束本轮，不保留物理连接 owner。
     case stopAttempt
     /// 自动安全门禁预算耗尽：静默发布专用终态，并停止该 endpoint 自动 owner。
@@ -88,6 +105,14 @@ struct BleReconnectTask {
     var timer: Timer?
     /// 蓝牙关闭期间暂停任务，poweredOn 后由系统状态回调恢复。
     var pausedByBluetoothOff: Bool = false
+    /// CoreBluetooth transport reset 后等待 Dart 提交最终 recovery session。
+    ///
+    /// poweredOn 只能设置该门禁，不能沿用 reset 前 session 抢跑 connect；只有显式
+    /// activation 携带更高正 generation 才能消费，timer/arm/生命周期补偿均须保留。
+    var awaitingRecoveryActivation: Bool = false
+    /// 当前 transport reset 周期。Dart 在 BLE available 后读取并随 activation 回传；
+    /// 连续 reset 时，即使第一轮 session 更高，也不能消费第二轮门禁。
+    var recoveryEpoch: Int64 = 0
     /// App inactive/background/terminating 时禁止同步 CoreBluetooth retrieve；该标记
     /// 保留 exact owner，等 didBecomeActive 复验 session 后补偿解析，不制造失败或 retry。
     var deferredByAppInactivity: Bool = false
@@ -108,6 +133,47 @@ struct BleReconnectTask {
     var hasAttemptedPairingRecovery: Bool = false
     /// iOS 5403 保护写失败计数。只统计真实安全错误，不统计蓝牙关闭/后台/扫描 miss。
     var securityGateFailureCount: Int = 0
+    /// OTA 恢复 activation 的原生授权。后续 noDeviceFound/timeout/didDisconnect
+    /// 在 native 内部重调度时没有 MethodChannel 参数，必须复验这个 exact
+    /// transaction context，而不是用 UUID-only 入口穿过 OTA gate。
+    var g2OtaRecoveryContext: BleG2OtaContext?
+    /// 与上面的 transaction context 成对冻结的 OTA endpoint。iOS 可能在
+    /// name/alias 恢复中迁移 CoreBluetooth UUID，但权限仍只属于登记时的 endpoint。
+    var g2OtaRecoveryEndpointId: String?
+}
+
+/// Transport reset 后显式 activation 的纯准入策略。
+///
+/// 把 poweredOn 早到/晚到、旧 batch 和同代重复请求从 CoreBluetooth 资源操作中拆出，
+/// XCTest 可直接验证门禁；真实 owner 的原子读写仍由 BleManager 主队列完成。
+enum BleRecoveryActivationGateDecision: Equatable {
+    case notRequired
+    case consume
+    case reject
+}
+
+enum BleRecoveryActivationGatePolicy {
+    static func evaluate(
+        awaitingRecoveryActivation: Bool,
+        pausedByBluetoothOff: Bool,
+        isBluetoothPoweredOn: Bool,
+        currentRecoveryEpoch: Int64,
+        incomingRecoveryEpoch: Int64,
+        currentSessionGeneration: Int64,
+        incomingSessionGeneration: Int64
+    ) -> BleRecoveryActivationGateDecision {
+        guard awaitingRecoveryActivation || pausedByBluetoothOff else {
+            return .notRequired
+        }
+        guard isBluetoothPoweredOn,
+              currentRecoveryEpoch > 0,
+              incomingRecoveryEpoch == currentRecoveryEpoch,
+              incomingSessionGeneration > 0,
+              incomingSessionGeneration > currentSessionGeneration else {
+            return .reject
+        }
+        return .consume
+    }
 }
 
 /// 发送系统终态时使用的连接来源与代次，二者必须作为同一快照一起继承。
@@ -584,12 +650,97 @@ enum BleReconnectActivationState: String {
     case rejected
 }
 
+/// MethodChannel activation 的语义模式；未知值在入口处逐目标 rejected。
+enum BleReconnectActivationMode: String {
+    case initial
+    case reconcile
+    case promotion
+    case unknown
+}
+
+/// Native owner 的实时对账处置，供 Dart 区分历史 ACK 与当前 owner。
+enum BleReconnectOwnerDisposition: String {
+    case created
+    case reused
+    case repaired
+    case deferred
+    case rejected
+}
+
+/// iOS activation 的内部结果必须来自当前 CoreBluetooth owner，而不是历史 task 是否存在。
+/// MethodChannel 只消费 disposition/reason；该值也让测试可以覆盖无 peripheral、orphan
+/// admission 与健康 pending owner，而无需伪造 CoreBluetooth 对象。
+struct BleReconnectOwnerActivationOutcome: Equatable {
+    let disposition: BleReconnectOwnerDisposition
+    let reason: String
+}
+
+enum BleReconnectActivationDispositionPolicy {
+    /// `successDisposition` records whether this activation created or repaired the live owner;
+    /// a historical task without a current owner can only be deferred or rejected.
+    static func resolve(
+        hasLiveOwner: Bool,
+        hasDeferredWork: Bool,
+        successDisposition: BleReconnectOwnerDisposition,
+        successReason: String,
+        deferredReason: String
+    ) -> BleReconnectOwnerActivationOutcome {
+        if hasLiveOwner {
+            return BleReconnectOwnerActivationOutcome(
+                disposition: successDisposition,
+                reason: successReason
+            )
+        }
+        if hasDeferredWork {
+            return BleReconnectOwnerActivationOutcome(
+                disposition: .deferred,
+                reason: deferredReason
+            )
+        }
+        return BleReconnectOwnerActivationOutcome(
+            disposition: .rejected,
+            reason: "nativeOwnerUnavailable"
+        )
+    }
+}
+
+/// admission 与 session 的纯状态判定。真实资源修复仍由 BleManager 执行；把判定拆开后，
+/// 每一种 owner 漂移都可以在 XCTest 中作为可执行行为验证，而不是扫描源码字符串。
+enum BleReconnectPendingOwnerHealth: Equatable {
+    case healthy
+    case teardownPending
+    case missingSession
+    case sessionMismatch
+    case stalePeripheral
+}
+
+enum BleReconnectPendingOwnerPolicy {
+    static func evaluate(
+        taskSessionGeneration: Int64,
+        admissionSessionGeneration: Int64,
+        hasSession: Bool,
+        sessionMatchesAdmission: Bool,
+        peripheralIsConnectedOrConnecting: Bool,
+        pendingTeardown: Bool
+    ) -> BleReconnectPendingOwnerHealth {
+        if pendingTeardown { return .teardownPending }
+        guard hasSession else { return .missingSession }
+        guard sessionMatchesAdmission,
+              taskSessionGeneration == admissionSessionGeneration else {
+            return .sessionMismatch
+        }
+        return peripheralIsConnectedOrConnecting ? .healthy : .stalePeripheral
+    }
+}
+
 /// MethodChannel 对单个目标的同步回执；上层据此区分真 owner 与静默丢弃。
 struct BleReconnectActivationResult {
     let target: BleReconnectTarget
     let state: BleReconnectActivationState
     let reason: String
     let source: BleConnectSource
+    let mode: BleReconnectActivationMode
+    let ownerDisposition: BleReconnectOwnerDisposition
     let sessionGeneration: Int64
     let resolvedUuid: String
     let resolutionSource: String
@@ -599,6 +750,8 @@ struct BleReconnectActivationResult {
         state: BleReconnectActivationState,
         reason: String,
         source: BleConnectSource,
+        mode: BleReconnectActivationMode = .initial,
+        ownerDisposition: BleReconnectOwnerDisposition,
         sessionGeneration: Int64,
         resolvedUuid: String = "",
         resolutionSource: String = ""
@@ -607,6 +760,8 @@ struct BleReconnectActivationResult {
         self.state = state
         self.reason = reason
         self.source = source
+        self.mode = mode
+        self.ownerDisposition = ownerDisposition
         self.sessionGeneration = sessionGeneration
         self.resolvedUuid = resolvedUuid
         self.resolutionSource = resolutionSource
@@ -620,6 +775,8 @@ struct BleReconnectActivationResult {
             "state": state.rawValue,
             "reason": reason,
             "source": source.rawValue,
+            "mode": mode.rawValue,
+            "ownerDisposition": ownerDisposition.rawValue,
             "sessionGeneration": sessionGeneration,
             "resolvedUuid": resolvedUuid,
             "resolutionSource": resolutionSource

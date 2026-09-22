@@ -1135,3 +1135,49 @@ Owner:
   owner.
 - `even_connect` owns rejecting terminal events that do not match the active
   endpoint/session/attempt.
+
+## Android G2 OTA: recovery is admitted but no replacement GATT starts
+
+Symptoms:
+
+- One leg completes and parks at 50%, then the peer enters OTA recovery.
+- Native logs say the transaction admitted recovery, but every activation ends
+  with `session rebind not installed requested=<new> actual=<old>`.
+- The three recovery rounds expire without a new physical `connectGatt` attempt.
+
+Root cause:
+
+- The reconnect supervisor still retained the pre-reboot business GATT and its
+  old session generation.
+- Higher-session activation correctly selected physical-owner rebuild, but the
+  generic business-GATT guard rejected teardown unconditionally. It therefore
+  deadlocked the already-authorized OTA recovery behind its own stale owner.
+
+Fix:
+
+- Forward the native OTA transaction credential into exact session rebind.
+- Permit business-GATT retirement only while the same native instance and OTA
+  generation own that endpoint in `RECOVERING`, and only when its frozen positive
+  session/attempt pair matches the retained business owner.
+- Reject ordinary activation, stale/wrong credentials, `ACTIVE`/`PARKED`
+  endpoints, and any endpoint that already has a newer admission in flight.
+- Neutral-retire only the matching endpoint's lease, queues, attempt generation,
+  and GATT. The supervisor then installs the requested session and creates one
+  replacement owner; it must not disconnect the peer or schedule a generic retry.
+- Repeating the old teardown is a no-op, so a late activation cannot close the
+  replacement GATT.
+
+Validation:
+
+- Manager, transaction-registry, and reconnect-supervisor regression tests cover
+  exact acceptance, wrong/stale/default identities, concurrent admission,
+  duplicate teardown, peer isolation, and single replacement creation.
+- The complete Android native unit suite passes. A real dual-leg OTA interruption
+  remains required before treating device recovery timing as verified.
+
+Owner:
+
+- Native Android `flutter_ezw_ble` owns exact old-GATT retirement and replacement
+  session installation.
+- `even_connect` owns the bounded three-round OTA recovery transaction and may not
+  fall back to ordinary activation when native rejects the credential.

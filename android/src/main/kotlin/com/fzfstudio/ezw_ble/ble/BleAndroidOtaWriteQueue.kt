@@ -47,7 +47,7 @@ internal fun interface BleOtaWriteScheduler {
  */
 internal class BleAndroidOtaWriteQueue(
     private val endpoint: String,
-    private val submit: (ByteArray, Long, Long) -> BleOtaWriteSubmission,
+    private val submit: (ByteArray, Long, Long, String, Long, String) -> BleOtaWriteSubmission,
     private val scheduler: BleOtaWriteScheduler,
     private val nowMillis: () -> Long,
     private val logger: (String) -> Unit = {},
@@ -72,6 +72,9 @@ internal class BleAndroidOtaWriteQueue(
         val data: ByteArray,
         val sessionGeneration: Long,
         val attemptGeneration: Long,
+        val otaTransactionId: String,
+        val otaGeneration: Long,
+        val otaInstanceId: String,
         val completion: (BleOtaWriteError?) -> Unit,
         val batch: OtaWriteBatch? = null,
     )
@@ -99,24 +102,35 @@ internal class BleAndroidOtaWriteQueue(
         data: ByteArray,
         sessionGeneration: Long = 0L,
         attemptGeneration: Long = 0L,
+        otaTransactionId: String = "",
+        otaGeneration: Long = 0L,
+        otaInstanceId: String = "",
         completion: (BleOtaWriteError?) -> Unit,
     ) {
-        pending.addLast(Item(data.copyOf(), sessionGeneration, attemptGeneration, completion))
+        pending.addLast(
+            Item(
+                data = data.copyOf(),
+                sessionGeneration = sessionGeneration,
+                attemptGeneration = attemptGeneration,
+                otaTransactionId = otaTransactionId,
+                otaGeneration = otaGeneration,
+                otaInstanceId = otaInstanceId,
+                completion = completion,
+            ),
+        )
         logger("[ezw_ble][$channel][android] enqueued endpoint=$endpoint bytes=${data.size} pending=$queueDepth")
         pump()
     }
 
-    /**
-     * 一次入队一组已封装小包，但仍保持 GATT 单槽位。
-     *
-     * 第 N 包失败会立刻丢掉本批剩余 pending，并且只结算一次 Future；不能把入队成功
-     * 当成整批已写入，否则 even_connect 的 5s ACK 计时会提前启动。
-     */
+    /** 一批小包共享一个完成回调，但每包仍携带 exact OTA transaction identity。 */
     @Synchronized
     fun enqueueBatch(
         packets: List<ByteArray>,
         sessionGeneration: Long = 0L,
         attemptGeneration: Long = 0L,
+        otaTransactionId: String = "",
+        otaGeneration: Long = 0L,
+        otaInstanceId: String = "",
         completion: (BleOtaWriteError?) -> Unit,
     ) {
         if (packets.isEmpty()) {
@@ -125,7 +139,18 @@ internal class BleAndroidOtaWriteQueue(
         }
         val batch = OtaWriteBatch(completion, remaining = packets.size)
         packets.forEach { packet ->
-            pending.addLast(Item(packet.copyOf(), sessionGeneration, attemptGeneration, completion = {}, batch = batch))
+            pending.addLast(
+                Item(
+                    data = packet.copyOf(),
+                    sessionGeneration = sessionGeneration,
+                    attemptGeneration = attemptGeneration,
+                    otaTransactionId = otaTransactionId,
+                    otaGeneration = otaGeneration,
+                    otaInstanceId = otaInstanceId,
+                    completion = {},
+                    batch = batch,
+                ),
+            )
         }
         logger(
             "[ezw_ble][$channel][android] batch enqueued endpoint=$endpoint " +
@@ -277,7 +302,14 @@ internal class BleAndroidOtaWriteQueue(
 
         while (pending.isNotEmpty()) {
             val head = pending.first()
-            val submission = submit(head.data, head.sessionGeneration, head.attemptGeneration)
+            val submission = submit(
+                head.data,
+                head.sessionGeneration,
+                head.attemptGeneration,
+                head.otaTransactionId,
+                head.otaGeneration,
+                head.otaInstanceId,
+            )
             when (submission.disposition) {
                 BleOtaWriteSubmission.Disposition.ACCEPTED -> {
                     pending.removeFirst()

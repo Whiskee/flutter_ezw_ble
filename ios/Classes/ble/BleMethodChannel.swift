@@ -15,6 +15,8 @@ enum BleMC: String {
     case getPlatformVersion
     /// Query current CoreBluetooth state.
     case bleState
+    /// Query the process-local transport reset epoch without mutating owners.
+    case bleRecoveryEpoch
     /// Replace the native BLE configuration table.
     case initConfigs
     /// Start scan with optional pure scan mode.
@@ -33,6 +35,16 @@ enum BleMC: String {
     case reconcileBusinessConnections
     /// OTA reboot teardown: disconnect physical transport without revoking reconnect intent.
     case disconnectForOtaReboot
+    /// OTA write-stall recovery teardown: exact physical disconnect, owner preserved.
+    case disconnectForOtaRecovery
+    /// Register a native-owned G2 OTA transaction before the first OTA command.
+    case beginG2OtaTransaction
+    /// Bind, recover, or park one endpoint under the native OTA transaction.
+    case updateG2OtaEndpoint
+    /// Atomically retire the full native G2 OTA transaction.
+    case finishG2OtaTransaction
+    /// Query active or terminal state for a native G2 OTA transaction.
+    case queryG2OtaTransaction
     /// Mark business-layer auth as about to complete.
     case devicePreConnected
     /// Mark business-layer auth as complete and arm auto reconnect.
@@ -71,6 +83,14 @@ enum BleMC: String {
     case cleanConnectCache
     /// Drain native reconnect events buffered before Dart listeners.
     case drainAutoReconnectEvents
+    /// Query whether iOS still owns unclaimed State Restoration escrow.
+    case hasPendingStateRestoration
+    /// Query whether CoreBluetooth launched this process for the registered central id.
+    case wasLaunchedForBluetoothStateRestoration
+    /// Query whether this process ever received willRestoreState (escrow-independent).
+    case didExperienceStateRestorationThisProcess
+    /// Cancel restored peripherals not claimed by the current startup targets.
+    case finalizeStateRestorationClaims
     /// Reset native BLE state.
     case resetBle
     /// Unknown method fallback.
@@ -89,6 +109,9 @@ enum BleMC: String {
             return
         case .bleState:
             result(BleManager.shared.currentBleState)
+            return
+        case .bleRecoveryEpoch:
+            result(BleManager.shared.currentBleRecoveryEpoch)
             return
         case .initConfigs:
             let jsonArray: Array<[String: Any]> = arguments as? Array<[String: Any]> ?? []
@@ -198,11 +221,17 @@ enum BleMC: String {
                 )
             }
             let source = BleConnectSource(rawValue: data["source"] as? String ?? "") ?? .unknown
+            let mode = BleReconnectActivationMode(rawValue: data["mode"] as? String ?? "") ?? .unknown
             let sessionGeneration = (data["sessionGeneration"] as? NSNumber)?.int64Value ?? 0
+            let recoveryEpoch = (data["recoveryEpoch"] as? NSNumber)?.int64Value ?? 0
+            let otaContext = BleG2OtaContext(data: data["otaContext"] as? [String: Any])
             let acknowledgements = BleManager.shared.activateAutoReconnectTargets(
                 targets,
                 source: source,
-                sessionGeneration: sessionGeneration
+                mode: mode,
+                sessionGeneration: sessionGeneration,
+                recoveryEpoch: recoveryEpoch,
+                otaContext: otaContext
             )
             result(acknowledgements.map(\.raw))
             return
@@ -254,14 +283,46 @@ enum BleMC: String {
                 expectedAttemptGeneration: expectedAttemptGeneration
             )
             break
+        case .disconnectForOtaRecovery:
+            let jsonData = arguments as? [String: Any] ?? [:]
+            let uuid: String = jsonData["uuid"] as? String ?? ""
+            let expectedSessionGeneration = (jsonData["expectedSessionGeneration"] as? NSNumber)?.int64Value ?? 0
+            let expectedAttemptGeneration = (jsonData["expectedAttemptGeneration"] as? NSNumber)?.int64Value ?? 0
+            let otaContext = BleG2OtaContext(data: jsonData["otaContext"] as? [String: Any])
+            result(BleManager.shared.disconnectForOtaRecovery(
+                uuid: uuid,
+                expectedSessionGeneration: expectedSessionGeneration,
+                expectedAttemptGeneration: expectedAttemptGeneration,
+                otaContext: otaContext
+            ))
+            return
+        case .beginG2OtaTransaction:
+            result(BleManager.shared.beginG2OtaTransaction(arguments as? [String: Any] ?? [:]).raw)
+            return
+        case .updateG2OtaEndpoint:
+            result(BleManager.shared.updateG2OtaEndpoint(arguments as? [String: Any] ?? [:]).raw)
+            return
+        case .finishG2OtaTransaction:
+            result(BleManager.shared.finishG2OtaTransaction(arguments as? [String: Any] ?? [:]).raw)
+            return
+        case .queryG2OtaTransaction:
+            result(BleManager.shared.queryG2OtaTransaction(arguments as? [String: Any] ?? [:]).raw)
+            return
         case .sendCmd:
             let jsonData: [String: Any] = arguments as? [String: Any] ?? [:]
+            // CoreBluetooth subscription provenance is not yet an owned-write contract.
+            if jsonData.keys.contains("expectedAttempt") {
+                result(FlutterError(code: "owned_write_unsupported",
+                    message: "Expected-attempt writes are unavailable on iOS", details: nil))
+                return
+            }
             let uuid: String = jsonData["uuid"] as? String ?? ""
             let psType: Int = jsonData["psType"] as? Int ?? 0
             // 默认 false；只有上层协议白名单可以显式放行 OTA 恢复控制指令。
             let allowDuringUpgrade: Bool = jsonData["allowDuringUpgrade"] as? Bool ?? false
             let expectedSessionGeneration = (jsonData["expectedSessionGeneration"] as? NSNumber)?.int64Value ?? 0
             let expectedAttemptGeneration = (jsonData["expectedAttemptGeneration"] as? NSNumber)?.int64Value ?? 0
+            let otaContext = BleG2OtaContext(data: jsonData["otaContext"] as? [String: Any])
             if let data = jsonData["data"] as? FlutterStandardTypedData {
                 BleManager.shared.sendCmd(
                     uuid: uuid,
@@ -269,7 +330,8 @@ enum BleMC: String {
                     psType: psType,
                     allowDuringUpgrade: allowDuringUpgrade,
                     expectedSessionGeneration: expectedSessionGeneration,
-                    expectedAttemptGeneration: expectedAttemptGeneration
+                    expectedAttemptGeneration: expectedAttemptGeneration,
+                    otaContext: otaContext
                 )
             }
             // CoreBluetooth does not expose a reliable per-packet success callback here;
@@ -282,6 +344,7 @@ enum BleMC: String {
             let psType: Int = jsonData["psType"] as? Int ?? 0
             let expectedSessionGeneration = (jsonData["expectedSessionGeneration"] as? NSNumber)?.int64Value ?? 0
             let expectedAttemptGeneration = (jsonData["expectedAttemptGeneration"] as? NSNumber)?.int64Value ?? 0
+            let otaContext = BleG2OtaContext(data: jsonData["otaContext"] as? [String: Any])
             guard let data = jsonData["data"] as? FlutterStandardTypedData else {
                 result(nil)
                 return
@@ -292,6 +355,7 @@ enum BleMC: String {
                 psType: psType,
                 expectedSessionGeneration: expectedSessionGeneration,
                 expectedAttemptGeneration: expectedAttemptGeneration,
+                otaContext: otaContext,
                 result: result
             )
             return
@@ -305,6 +369,7 @@ enum BleMC: String {
                 psType: psType,
                 expectedSessionGeneration: (jsonData["expectedSessionGeneration"] as? NSNumber)?.int64Value ?? 0,
                 expectedAttemptGeneration: (jsonData["expectedAttemptGeneration"] as? NSNumber)?.int64Value ?? 0,
+                otaContext: BleG2OtaContext(data: jsonData["otaContext"] as? [String: Any]),
                 result: result
             )
             return
@@ -343,9 +408,30 @@ enum BleMC: String {
         case .drainAutoReconnectEvents:
             result(BleManager.shared.drainAutoReconnectEvents())
             return
+        case .hasPendingStateRestoration:
+            // 只读查询用于 Dart 决定是否提前加载账号缓存，不能在这里认领或 finalize。
+            result(BleManager.shared.hasPendingStateRestoration())
+            return
+        case .wasLaunchedForBluetoothStateRestoration:
+            // launch option 与 escrow 生命周期独立；该查询只返回进程启动事实。
+            result(FlutterEzwBlePlugin.wasLaunchedForBluetoothStateRestoration())
+            return
+        case .didExperienceStateRestorationThisProcess:
+            // escrow 被 claim/finalize 清空后该事实仍可查；只读，不触发任何恢复动作。
+            result(BleManager.didExperienceStateRestorationThisProcess)
+            return
+        case .finalizeStateRestorationClaims:
+            // 1、当前设备 activation 已逐端点认领完毕；其余 restored peripheral
+            // 属于历史设备，必须显式取消，不能继续占用系统连接或留在内存。
+            BleManager.shared.finalizeStateRestorationClaims()
+            break
         case .resetBle:
-            // 1、reset 只清理当前 runtime；持久 reconnect owner 保留给下次普通恢复流程。
-            BleManager.shared.reset()
+            // 冷启动可保留尚待当前账号认领的 restoration escrow；账号退出仍走 hard reset。
+            let data = arguments as? [String: Any] ?? [:]
+            let preserveStateRestoration = data["preserveStateRestoration"] as? Bool ?? false
+            BleManager.shared.reset(
+                preserveStateRestoration: preserveStateRestoration
+            )
             break
         case .openBleSettings:
             if let url = URL(string: "App-Prefs:root=Bluetooth"), UIApplication.shared.canOpenURL(url) {

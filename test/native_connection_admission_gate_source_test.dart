@@ -61,6 +61,11 @@ void main() {
       contains('awaiting Dart recovery activation for final session'),
       reason: 'Android must reset source without replaying the old session',
     );
-    expect(ios, contains('preserveAttemptSource: false'));
+    expect(
+      ios,
+      contains('awaiting Dart recovery activation for final session'),
+      reason: 'iOS must reset source without replaying the old session',
+    );
+    expect(ios, contains('current.awaitingRecoveryActivation = false'));
   });
 }

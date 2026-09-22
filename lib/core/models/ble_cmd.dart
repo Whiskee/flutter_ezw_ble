@@ -1,4 +1,5 @@
 import 'dart:typed_data';
+import 'ble_receive_identity.dart';
 
 import 'package:flutter_ezw_utils/extension/string_ext.dart';
 import 'package:flutter_ezw_utils/json/unit8list_converter.dart';
@@ -6,7 +7,7 @@ import 'package:json_annotation/json_annotation.dart';
 
 part 'ble_cmd.g.dart';
 
-@JsonSerializable()
+@JsonSerializable(explicitToJson: true)
 class BleCmd {
   final String uuid;
   final int psType;
@@ -15,14 +16,25 @@ class BleCmd {
   final bool isSuccess;
   final int sessionGeneration;
   final int attemptGeneration;
+  final String otaTransactionId;
+  final int otaGeneration;
+  final String otaInstanceId;
+
+  /// Original native source, never inferred from the current UUID at delivery.
+  @JsonKey(fromJson: BleReceiveIdentity.fromJson)
+  final BleReceiveIdentity? receiveIdentity;
 
   BleCmd(
     this.uuid,
     this.psType, {
+    this.receiveIdentity,
     this.data,
     this.isSuccess = false,
     this.sessionGeneration = 0,
     this.attemptGeneration = 0,
+    this.otaTransactionId = '',
+    this.otaGeneration = 0,
+    this.otaInstanceId = '',
   });
 
   factory BleCmd.fromJson(Map<String, dynamic> json) => _$BleCmdFromJson(json);
@@ -50,6 +62,9 @@ class BleCmd {
     final uuid = data["uuid"] ?? data["a"] ?? data["e"];
     final sessionGeneration = data["sessionGeneration"];
     final attemptGeneration = data["attemptGeneration"];
+    final otaTransactionId = data["otaTransactionId"];
+    final otaGeneration = data["otaGeneration"];
+    final otaInstanceId = data["otaInstanceId"];
     return BleCmd(
       uuid is String ? uuid : uuid?.toString() ?? "",
       psType is num ? psType.toInt() : 0,
@@ -59,6 +74,10 @@ class BleCmd {
           sessionGeneration is num ? sessionGeneration.toInt() : 0,
       attemptGeneration:
           attemptGeneration is num ? attemptGeneration.toInt() : 0,
+      otaTransactionId: otaTransactionId is String ? otaTransactionId : '',
+      otaGeneration: otaGeneration is num ? otaGeneration.toInt() : 0,
+      otaInstanceId: otaInstanceId is String ? otaInstanceId : '',
+      receiveIdentity: BleReceiveIdentity.fromJson({...data, 'uuid': uuid}),
     );
   }
 }

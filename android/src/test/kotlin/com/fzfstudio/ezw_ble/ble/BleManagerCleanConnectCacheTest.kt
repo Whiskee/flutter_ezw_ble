@@ -161,6 +161,55 @@ class BleManagerCleanConnectCacheTest {
         assertEquals(BleConnectionAdmissionDecision.GRANTED, gate.onPhysicalConnected(fresh))
     }
 
+    @Test
+    fun `reconcile orphan repair closes exact manager gatt and preserves peer`() {
+        val manager = BleManager.instance
+        manager.cleanConnectCache()
+        val devices = managerField<MutableList<BleDevice>>(manager, "connectedDevices")
+        devices.clear()
+        val config = BleConfig.empty().copy(name = "g2", autoReconnect = true)
+        val targetGatt = Mockito.mock(BluetoothGatt::class.java)
+        val peerGatt = Mockito.mock(BluetoothGatt::class.java)
+        val target = BleDevice(
+            config,
+            "Even G2_L",
+            "AA:BB:CC:DD:EE:21",
+            "sn-left",
+            0,
+            BleConnectState.NONE,
+        ).also { it.update(targetGatt) }
+        val peer = BleDevice(
+            config,
+            "Even G2_R",
+            "AA:BB:CC:DD:EE:22",
+            "sn-right",
+            0,
+            BleConnectState.CONNECTED,
+        ).also { it.update(peerGatt) }
+        devices += target
+        devices += peer
+
+        val method = BleManager::class.java.getDeclaredMethod(
+            "repairOrphanManagerGattForReconcile",
+            String::class.java,
+            BluetoothGatt::class.java,
+        )
+        method.isAccessible = true
+        val repaired = Mockito.mockStatic(Log::class.java).use {
+            method.invoke(manager, target.uuid, targetGatt) as Boolean
+        }
+
+        assertTrue(repaired)
+        Mockito.verify(targetGatt).disconnect()
+        Mockito.verify(targetGatt).close()
+        assertNull(target.myGatt)
+        assertEquals(BleConnectState.NONE, target.connectState)
+        assertEquals(BleConnectState.CONNECTED, peer.connectState)
+        assertTrue(peer.myGatt === peerGatt)
+        Mockito.verifyNoInteractions(peerGatt)
+        devices.clear()
+    }
+
     private fun invalidateAttempts(
         manager: BleManager,
         endpoints: Set<String>,

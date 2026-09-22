@@ -33,17 +33,28 @@ back to scan-first because this flag is false.
 Public methods:
 
 - `armAutoReconnectTargets(devices)` records long-lived owners only.
-- `activateAutoReconnectTargets(devices, source)` immediately opens or reuses a
-  pending direct connection for every target. `source` is `autoReconnect` or
-  `manualReconnect`; manual activation promotes the same pending session rather
-  than opening a duplicate connection. On iOS it first resolves a matching
-  stable UUID or unique exact endpoint name, then either enters the Gate or
-  attaches the current pending admission without issuing a duplicate `connect`.
-  It returns one acknowledgement per target: `resolved` means native owns a stable UUID/address,
-  `identityPending` means iOS owns an exact config/name identity awaiting a
-  CoreBluetooth UUID, and `rejected` means no native reconnect owner exists.
-  Callers must not treat desired targets as active until an acknowledgement is
-  accepted; missing, duplicated, or unknown acknowledgement states fail closed.
+- `activateAutoReconnectTargets(devices, source, mode, sessionGeneration, otaContext?)` immediately opens,
+  reuses, or reconciles a pending direct connection for every target. `source`
+  is `autoReconnect` or `manualReconnect`; `mode` is `initial`, `reconcile`, or
+  `promotion`. `initial` may create a persisted owner, `reconcile` must compare
+  the requested endpoint/session with the realtime native owner, and
+  `promotion` uses the manual source semantics for an existing pending owner
+  instead of opening a duplicate connection. On iOS activation first resolves a
+  matching stable UUID or unique exact endpoint name, then either enters the
+  Gate or attaches the current pending admission without issuing a duplicate
+  `connect`. It returns one acknowledgement per target: `resolved` means native
+  owns a stable UUID/address, `identityPending` means iOS owns an exact
+  config/name identity awaiting a CoreBluetooth UUID, and `rejected` means no
+  native reconnect owner exists. Every acknowledgement also carries
+  `ownerDisposition`: `created`, `reused`, `repaired`, `deferred`, or
+  `rejected`. Callers must not treat desired targets as active until both the
+  compatibility state and owner disposition are accepted; missing, duplicated,
+  or unknown acknowledgement states/dispositions fail closed. When `otaContext`
+  is present, activation is an internal G2 OTA recovery path: native must verify
+  the transaction is active, the endpoint belongs to the frozen set, the
+  endpoint is not parked/retired, and recovery was authorized by the existing
+  supervisor owner. Ordinary activation without this context remains blocked by
+  active/waiting/parked/retiring OTA ownership.
 - `notifyAutoReconnectTargetVisible(uuid, name)` is a scan hint, not a second
   connection owner. Android returns `true` only when it takes over that exact
   target's pre-physical passive GATT or pending retry and queues one serialized
@@ -324,14 +335,32 @@ Automatic recovery is scoped by endpoint, recovery episode, positive
 `sessionGeneration`, and positive `attemptGeneration`:
 
 - Only actual Security Gate failures count: CBATT security errors from the
-  5403 write and peer-pairing-removed equivalents. Bluetooth off, App
-  inactive/background, scan misses, ordinary connection timeout, and missing or
-  unsupported 5403 do not consume the budget.
-- The first failed 5403 write is attempt 1. Attempts 1 through 4 cancel the old
-  attempt, wait for the exact CoreBluetooth callback/barrier, purge stale scan
-  cache, open a 10-second fresh-advertisement scan window, then connect using a
-  new exact generation. A 5-second silent wait is used only when the fresh scan
-  window misses.
+  5403 write, peer-pairing-removed equivalents, and (iOS) a connect timeout that
+  fires while the exact 5403 write is still in flight — the timeout and the
+  write callback consume the same exact attempt atomically, whichever comes
+  first. Bluetooth off, App inactive/background, scan misses, ordinary connection
+  timeout before the write, and missing or unsupported 5403 do not consume the
+  budget.
+- The first failed 5403 write is attempt 1. On iOS, automatic attempts 1
+  through 4 (including `stateRestoration` owners) persist the count, cancel the
+  old attempt through the cancellation barrier, and — after the exact
+  CoreBluetooth terminal callback or the 2-second barrier watchdog — let the
+  same reconnect owner reschedule `disconnectFromSys`, register a new exact
+  attempt/admission and issue an ordinary CoreBluetooth pending connect
+  (`retryPendingConnect`). While the App is inactive this reuses only the
+  in-process `CBPeripheral`; no synchronous retrieve and no scan is involved.
+  If the link is still held at system level the connect completes immediately
+  and a fresh exact 5403 runs; if the link dropped, the pending connect waits
+  for the next connectable advertisement without consuming budget.
+- G2 5403 recovery must not reuse the R1 Code 14 fresh-advertisement recovery.
+  The G2 right leg is the iOS ANCS client: `com.apple.BTLEServer` keeps its link
+  up even after the App cancels its own connection, so it never advertises,
+  and the fresh-advertisement scan only runs while the App is active
+  (2026-09-18 device incident: one 5403 timeout during an SR headless launch
+  left the glasses single-legged for 2 h 11 min; a manual connect over the same
+  system-held link passed 5403 in 49 ms). A 5403 failure also does not mark the
+  owner as having used its Code 14 recovery, so a later first Code 14 still gets
+  one fresh-advertisement window.
 - The fifth real 5403 security failure publishes
   `securityRecoveryExhausted`, removes that endpoint's automatic owner, and
   must not create a sixth automatic connection.
@@ -339,9 +368,17 @@ Automatic recovery is scoped by endpoint, recovery episode, positive
   counter and stopped marker for that endpoint. Manual connect does not run the
   five-attempt silent loop; its first final Security Gate failure maps to the
   existing `boundFail` path so the app can show the current repair dialog.
-- App inactive/background pauses retrieve, scan, and connection work. Returning
-  active resumes only exact owners that still match config, endpoint, and
-  session generation.
+- App inactive/background pauses synchronous retrieve and scan work. A 5403
+  retry whose owner still holds an in-process peripheral keeps going as a
+  pending connect; owners without one are deferred. Returning active resumes
+  only exact owners that still match config, endpoint, and session generation.
+- iOS active cold-start reconciliation hands a resolved system object to the
+  exact activation path in both branches (with or without an existing physical
+  session). It must not escrow and re-arm the object first: a re-armed
+  `connect` is issued before any owner claims it, so an owner that declines to
+  connect (Code 14 fresh-advertisement wait, transport recovery gate, Bluetooth
+  pause, OTA gate) left a system-held link to complete `didConnect` with no
+  active request and report `noBleConfigFound` with generation 0.
 
 Android and iOS both execute the Security Gate and may emit
 `securityRecoveryExhausted`. Android additionally treats an explicit rejection
@@ -394,7 +431,37 @@ On Bluetooth-on, Android does not replay paused tasks by itself. It waits for
 the Dart recovery activation carrying the final `sessionGeneration`; ordinary
 `arm` calls cannot consume this barrier. Manual promotion also classifies the
 native owner first. A stale `passiveGatt` is repaired or dropped instead of
-being reported as reusable, while a real Gate/business owner is never closed.
+being reported as reusable. A real Gate/business owner is never closed by an
+ordinary activation. The only business-GATT replacement exception is a current
+G2 OTA endpoint already in `RECOVERING`: the native transaction credential and
+the frozen positive `sessionGeneration/attemptGeneration` must both match the
+old business session. Manager then retires that exact GATT without emitting or
+scheduling a generic disconnect, and the same supervisor activation installs
+the requested higher session before creating one replacement. Missing/stale
+credentials, a mismatched physical pair, and active/parked/retired endpoints
+remain rejected.
+
+If a system terminal callback reaches Manager before the ordinary OTA gate
+check, Android must first exact-match the callback GATT against the supervisor's
+current `passiveGatt` and neutralize only that handle. The subsequent gate may
+still reject ordinary reconnect while OTA is active; rejection must leave no
+stale `passiveGatt` and must not create a generic retry.
+Repeated `reconcile` activation follows the same exact endpoint/session check:
+healthy task/GATT/Gate owners return `reused`, missing runtime tasks with a
+valid persisted authorization recreate a single pending GATT and return `repaired`, and
+orphan Supervisor/GATT state is first invalidated through Manager/Gate before
+the replacement returns `repaired`. Unbound targets, explicit disconnects, OTA
+owners, persisted security exhaustion, disabled configs, Bluetooth-off barriers,
+and stale/lower sessions never resurrect a closed owner.
+
+On iOS the activation ACK is computed from the owner visible when the
+MethodChannel call returns. A reconnect task alone is not a live owner.
+`reused` requires an exact admission/session pair whose `CBPeripheral` is still
+connecting or connected. A missing session, mismatched session generation, or
+disconnected peripheral is repaired only for that endpoint; an in-flight
+CoreBluetooth request first enters the existing cancellation barrier. If no
+peripheral is available in the active lifecycle window, the task remains armed
+and the ACK is `deferred`, never `reused`.
 
 ## iOS Strategy
 
@@ -404,6 +471,17 @@ After a previously business-connected device disconnects, the app hands a known
 preserved operation while the process is alive. If the process is reclaimed, the
 next app launch starts a new cold-start activation batch instead of claiming an
 old CoreBluetooth peripheral escrow.
+
+`CBManagerState.resetting` is a transport-loss boundary, not a connection
+window. Native pauses and invalidates the old attempt while the central is not
+`poweredOn`. When `poweredOn` returns, native marks each paused task
+`awaitingRecoveryActivation` but does not replay the pre-reset session. Only an
+explicit activation carrying a newer positive final recovery session and the
+exact current process-local `recoveryEpoch` may clear that flag and create the
+next pending connect. Dart reads the epoch after BLE becomes available and
+passes it unchanged with activation; another reset between the query and
+activation makes that request stale. Arm-only calls, connection events, old
+timers, and lifecycle compensation preserve the barrier.
 
 The central manager uses the main queue (`queue: nil`), so synchronous
 `retrieveConnectedPeripherals` and `retrievePeripherals` calls are allowed only
@@ -499,8 +577,11 @@ hard cancel reachability without linear memory growth.
 
 1. Enable `autoReconnect` on the desired `BleConfig`.
 2. On cold start, Bluetooth recovery, or reconnect entry, call
-   `activateAutoReconnectTargets` once with all bound endpoints. Use
-   `manualReconnect` only for a user click; otherwise use `autoReconnect`.
+   `activateAutoReconnectTargets` with all bound endpoints. Use `mode=initial`
+   for the first batch, `mode=reconcile` when reusing a recovery batch whose
+   business endpoint is not connected, and `mode=promotion` only for a user
+   click. Use `manualReconnect` only for a user click; otherwise use
+   `autoReconnect`.
    Keep desired, activation-in-flight, and native-accepted targets separate so
    a rejected or lost acknowledgement cannot leave a phantom active batch.
    While Bluetooth is unavailable, system-disconnect callbacks may update

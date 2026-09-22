@@ -10,9 +10,8 @@
 
 - `ARCHITECTURE.md`：插件契约、MethodChannel/EventChannel API、模型、原生职责和扩展规则。
 - `docs/AUTO_RECONNECT_SPEC.md`：改自动回连、长期 reconnect intent、GATT readiness gate 前必须阅读。
-- `docs/IOS_STATE_RESTORATION_SPEC.md`：改 iOS CoreBluetooth State Preservation / Restoration 前必须阅读。
 - `docs/IOS_OTA_NOWAIT_SPEC.md`：改 iOS OTA `WriteWithoutResponse` 行为前必须阅读。
-- `docs/ble/BLE_ISSUE_PLAYBOOK.md`：排查扫描、连接、重连、State Restoration 和 example 启动问题时优先查看。
+- `docs/ble/BLE_ISSUE_PLAYBOOK.md`：排查扫描、连接、重连和 example 启动问题时优先查看。
 - `README.md`：排障说明和 HCI 错误码参考。
 
 ## 关键边界
@@ -26,8 +25,8 @@
 - `ios/Classes/**` 是 iOS CoreBluetooth 实现，包含 `BleManager`、`BleChannel` 和 `OtaWriteQueue`。
 - 原生自动回连只在业务调用 `deviceConnected(uuid)` 后启用；`connectFinish` 只表示 GATT ready，不表示业务 connected。
 - `timeout`、`noDeviceFound`、`serviceFail`、`charsFail` 是单次尝试失败，不是长期回连停止条件；只有用户/业务主动断连、移除、reset、清缓存、配置关闭或插件释放才能取消 reconnect intent。
-- iOS State Restoration 只能恢复进程内 BLE 工作和 CoreBluetooth peripheral；私有服务、notify/CCCD、业务认证指令必须重新执行，不承诺把 App UI 拉到前台。
-- iOS `CBCentralManager(queue: nil)` 的 `retrieveConnectedPeripherals` / `retrievePeripherals` 只允许经 active 生命周期门禁调用；inactive/background/terminating 时只能复用 restoration/内存 peripheral，缺失时保留 exact deferred owner，不得制造 `noDeviceFound` 或增加 retry。`didBecomeActive` 补偿必须复验 config、owner 和 session generation。
+- iOS `CBCentralManager(queue: nil)` 的 `retrieveConnectedPeripherals` / `retrievePeripherals` 只允许经 active 生命周期门禁调用；inactive/background/terminating 时只能复用进程内 peripheral，缺失时保留 exact deferred owner，不得制造 `noDeviceFound` 或增加 retry。`didBecomeActive` 补偿必须复验 config、owner 和 session generation。
+- Android 蓝牙重开与 iOS `resetting → poweredOn` 都必须等待 Dart 汇总后的更高正 recovery session：native powered-on 只设置 `awaitingRecoveryActivation`，不得使用 reset 前 session 抢跑 GATT/pending connect；iOS activation 还必须匹配 available 后只读取得的当前 transport recovery epoch，连续 reset 的旧 epoch 必须 fail-closed。arm、旧 timer、connection event 与生命周期补偿均不得消费门禁。
 - iOS 业务 `connected` 释放 Gate 前必须把已接受的 `sessionGeneration + attemptGeneration` 成对保存在 reconnect owner；随后的 CoreBluetooth `didDisconnect` / 蓝牙关闭终态必须回传该 exact pair。禁止只恢复 session 而把 attempt 降为 0，显式取消、替换、移除 owner 必须同时使该快照不可达。
 - Android/iOS G2 `securityGate`（5403）必须在普通业务 Notify 订阅和 `connectFinish` 前完成一次有响应保护写。Android G2 必须配置 `initiateBinding=true`：exact admission 先通过 `createBond()` 唯一拉起系统配对，Bond 完成后再发现服务并写 5403 验证当前链路密钥，避免主动 Bond 与受保护写分别触发配对弹窗；已 Bond 设备不得重复 `createBond()`，5403 缺失/不支持时按旧固件路径继续普通 readiness。真实 Gate/Bond 安全失败按每 endpoint 每 episode 最多 5 次恢复，第 5 次发布静默 `securityRecoveryExhausted`；手动第一次安全失败仍走 `boundFail`。
 - iOS R1 自动回连首次收到 CoreBluetooth Code 14 后，只能使用新广告中的真实 `CBPeripheral` 恢复：App active 且蓝牙可用时按 10 秒扫描、5 秒静默等待无限循环，扫描 miss 不得删除 owner、发送 Dart 终态或制造 attempt 0；新 peripheral 再次 Code 14 才停止自动 owner并保持静默。手动点击必须 exact 接管并使用独立正 generation，只有当前手动物理 attempt 的真实 Code 14 才能上报 `alreadyBound`；生命周期暂停、共享扫描和迟到 callback 不得跨 owner 生效。
@@ -42,13 +41,12 @@
 - 不要手工编辑 `*.g.dart`。修改源模型后运行 build_runner。
 - `receiveData` 的二进制 payload 跨 Method/EventChannel 时保持 Base64 约定。
 - Android `onConnectionStateChange` 的 status 使用 HCI/controller 断连语义；characteristic/descriptor 回调才使用 ATT/GATT 操作语义。数值 `8` 在前者是连接超时，严禁触发授权恢复/cache refresh/`needsScanBeforeConnect`；在后者是授权不足，必须走授权恢复后再按回调阶段终止。
+- 原生连接 Trace 默认关闭，只能由 `setConnectionTraceEnabled(bool)` 显式打开；关闭仅清进程内 Trace/RSSI 诊断缓存，不能断开设备、取消/调度 autoReconnect 或补造当前链路。`nativeTrace.attemptId` 是诊断 UUID，不能替代 `sessionGeneration/attemptGeneration` owner 校验；step 快照最多 32 条，溢出必须用连续 `stepSeq` + `trace/gap.droppedCount` 表达缺口。
+- Trace 发生时间必须在原生生产处用同一 wall/monotonic 锚点冻结；快照/重放不得改写，墙钟跳变仅标记 `clock_changed`。`physicalConnectionEvent` 只能由 exact owner 的真实物理回调写入，reset/取消/状态投影不得伪造；RSSI 只复用既有读请求。
 - iOS OTA 中 `psType == 1` 的 `sendCmdNoWait` 必须与 `OtaWriteQueue`、`canSendWriteWithoutResponse` 和 `docs/IOS_OTA_NOWAIT_SPEC.md` 对齐。
-- iOS OTA RAW batch 的 `ready`、`canSend=false` 和 soft-throttle 属于高频热路径，只能在 batch 内累计并于完成时输出一条汇总；每个 episode 最多一次的 grace/resumed 状态变化、terminal stall、取消和能力错误仍即时记录。禁止恢复逐包 EventChannel 日志，否则会让诊断出口参与传输调度。
-- `sendOtaPacketBatch` 只接受 already-framed OTA 小包；Future 等最后一包提交成功，Android 禁止并发 GATT write，失败必须丢掉剩余包。批次必须冻结调用方的 `expectedSessionGeneration + expectedAttemptGeneration`，每包实际提交前复验；背压或重连不得让旧 RAW 批次借用新 owner。
-- `sendFilePacketBatch`（`psType=3`）与 OTA 批次共用队列实现但**实例必须独立**：`quiteUpgradeState` 只能取消 OTA attempt，共用 pending 会打断进行中的文件传输；升级态仍 fail closed 拒绝文件批次。Android 三条发送路径（普通队列 / OTA 批次 / 文件批次）共用 GATT 单槽位，回调归属只能由 `BleGattWriteCallbackOwnerPolicy` 判定，普通队列在任一批次占槽时不得写出；物理 session 失效与整机 teardown 必须同时释放两条批次通道的 Dart await。typed error code 按通道前缀区分（`ota_write_*` / `file_write_*`），不得混用。
-- Android GATT ready 与进入 OTA 后必须请求 LE 2M PHY（`setPreferredPhy`）；`connectGatt` 的 `PHY_LE_2M` hint 不能当成已切到 2M。PHY 失败不得阻断连接或传输。iOS 无公开 PHY API，只记日志。
-- 改 auto reconnect 或 iOS State Restoration 时，同步更新 `docs/AUTO_RECONNECT_SPEC.md`、`docs/IOS_STATE_RESTORATION_SPEC.md`、`ARCHITECTURE.md` 和相关测试/排障记录。
-- G2 OTA 的 `sendCmd` / `sendCmdNoWait` / `quiteUpgradeState` / `disconnectForOtaReboot` 支持 `expectedSessionGeneration + expectedAttemptGeneration`；调用方传正数时，native 必须在实际写入、清理或 reboot teardown 前按当前物理 owner fail-closed。`disconnectForOtaReboot` 的迟到断连 suppression 只能被同一 pair 消费，旧 teardown 不得屏蔽新 attempt。`receiveData` 的 OTA response 必须尽量携带同一 pair；Android 以 callback 冻结 admission + GATT handle 过滤为准，iOS 只能基于当前 connected peripheral 与 reconnect owner metadata stamp，CoreBluetooth 不提供每条 notification 的底层连接句柄，因此不能宣称具备 Android 同级 GATT handle identity。
+- `sendOtaPacketBatch` / `sendFilePacketBatch` 只接受 already-framed 小包；Future 必须等最后一包提交成功。两通道共用队列实现但实例独立，每包提交前复验冻结的 `expectedSessionGeneration + expectedAttemptGeneration`，Android 普通/OTA/文件写仍共享 GATT 单槽位，typed error 使用各自通道前缀。
+- G2 OTA 的 `beginG2OtaTransaction` / `updateG2OtaEndpoint` / `finishG2OtaTransaction` / `queryG2OtaTransaction` 是 native 所有权边界；所有 OTA `sendCmd` / `sendCmdNoWait` / recovery activation / park / finish 都必须携带 transaction context，并继续用 `expectedSessionGeneration + expectedAttemptGeneration` 校验实际写入和断开。begin 冻结 transaction/config/SN/endpoint 集合，session/attempt 只属于可变 physical lease；恢复重绑后 finish 不得因调用方仍持有 begin 的旧 pair 拒绝同一事务，实际 teardown 必须使用 registry 当前 exact pair。调用方传正数时，native 必须在实际写入、清理或 reboot teardown 前按当前 transaction 和物理 owner fail-closed。旧 UUID-only/physical-only 接口不得清理新 G2 transaction；首腿完成进入 `parked`，最终 `finish` 整组退役，只有 `committed` / `alreadyCommitted` 证明退役成功。`receiveData` 的 OTA response 必须尽量携带同一 pair 和 transaction；Android 以 callback 冻结 admission + GATT handle 过滤为准，iOS 只能基于当前 connected peripheral、reconnect owner metadata 与 transaction stamp，CoreBluetooth 不提供每条 notification 的底层连接句柄，因此不能宣称具备 Android 同级 GATT handle identity。
+- 改 auto reconnect 时，同步更新 `docs/AUTO_RECONNECT_SPEC.md`、`ARCHITECTURE.md` 和相关测试/排障记录。
 - BLE 行为变化通常需要同时审视 Dart 和原生两端，不要假设 Android 与 iOS 可以共享实现细节。
 
 ## 常用命令

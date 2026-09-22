@@ -15,6 +15,51 @@ class BleManager: NSObject {
 
     //  使用静态常量来保证实例的唯一性
     static let shared = BleManager()
+    // 插件 application delegate 必须用同一个 identifier 校验 bluetoothCentrals
+    // launch option；保持模块内可见，禁止宿主复制字符串形成双重事实源。
+    static let restorationIdentifier = "com.fzfstudio.ezwble.central"
+    /// 本进程是否发生过 `willRestoreState`。
+    ///
+    /// escrow 可能在 Dart 查询前就被 claim/finalize 消费清空，`hasPendingStateRestoration`
+    /// 因此不足以作为「经历过 SR」的证据；该事实必须独立一次性锁存、只读暴露。
+    private(set) static var didExperienceStateRestorationThisProcess = false
+    private static let bluetoothCentralBackgroundMode = "bluetooth-central"
+    // 缺少后台模式时输出可执行的排障提示，避免开发者误以为 iOS State Restoration 已经生效。
+    private static let stateRestorationMissingBluetoothCentralWarning =
+        "stateRestoration: WARNING disabled because host Info.plist is missing UIBackgroundModes bluetooth-central. " +
+        "If you expect iOS background reconnect or CoreBluetooth State Restoration, add UIBackgroundModes -> bluetooth-central to Runner/Info.plist."
+
+    /**
+     * 当前宿主是否声明了 CoreBluetooth State Restoration 所需的后台模式。
+     *
+     * iOS 会在 `CBCentralManagerOptionRestoreIdentifierKey` 与缺失
+     * `UIBackgroundModes.bluetooth-central` 同时出现时直接抛 NSException。
+     * 插件必须先检查宿主 Info.plist；未声明时降级为普通前台 central manager，
+     * 让 App 至少能正常启动并使用前台 BLE。
+     */
+    private static var canEnableStateRestoration: Bool {
+        let modes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String]
+        return modes?.contains(bluetoothCentralBackgroundMode) == true
+    }
+
+    /**
+     * 构造 CBCentralManager 初始化参数。
+     *
+     * 只有宿主显式声明 `bluetooth-central` 后才传 restore identifier；否则返回 nil，
+     * 避免系统异常，同时保留扫描、连接和前台自动回连能力。
+     */
+    private static func centralManagerOptions() -> [String: Any]? {
+        guard canEnableStateRestoration else {
+            // 降级必须显式可见：宿主漏配后台模式时 SR 静默失效的排障成本极高。
+            // BleEC 在 EventChannel 未订阅时会缓冲该日志，冷启动早期发射也不丢失。
+            NSLog("%@", stateRestorationMissingBluetoothCentralWarning)
+            BleEC.logger.emit("[e]-\(stateRestorationMissingBluetoothCentralWarning)")
+            return nil
+        }
+        return [
+            CBCentralManagerOptionRestoreIdentifierKey: restorationIdentifier
+        ]
+    }
     
     //  =========== Constants
     //  - 蓝牙管理工具
@@ -44,6 +89,9 @@ class BleManager: NSObject {
     private lazy var scanConnectTimeoutTimers: [(String, String, Timer)] = []
     //  - Native OTA marker 与写入门禁的唯一状态源；非可选集合保证首次 enter 必定落盘。
     let upgradeStateRegistry = BleUpgradeStateRegistry()
+    //  - G2 OTA 事务所有权。marker 只说明 endpoint 处于升级态；事务 registry 决定
+    //    begin/update/finish/recovery/cleanup 哪个 Dart owner 仍有权限操作这些 marker。
+    let g2OtaTransactions = BleG2OtaTransactionRegistry()
     //  - 预连接设备集合（使用uuid作为key）
     lazy var preConnectedDevices: Set<String> = []
     //  - OTA WriteWithoutResponse 写队列(key: peripheral.identifier.uuidString)
@@ -57,6 +105,14 @@ class BleManager: NSObject {
     //  - CBCentralManager 使用主队列；同步 retrieve 只允许在 App active 窗口执行，
     //    避免退出宽限期主线程卡在 CoreBluetooth XPC 同步查询并触发 0x8BADF00D。
     var allowsSynchronousCoreBluetoothLookup = false
+    //  - willTerminate 后的退出宽限期是同步 retrieve 唯一真正危险的窗口；SR 后台拉起
+    //    本身不是退出，这里单独记录以便区分。
+    var hasReceivedWillTerminate = false
+    //  - SR 后台拉起窗口内，每个 endpoint 只允许一次 identifier 补查（每进程一次），
+    //    用于补建 iOS 未随 willRestoreState 交还的当前目标腿的 pending connect。
+    var stateRestorationLaunchRetrieveAttempts: Set<String> = []
+    /// 补查门禁拒绝只记一次日志（每进程每 endpoint），沙盒日志据此指认具体条件。
+    var stateRestorationLaunchRetrieveDenialsLogged: Set<String> = []
     /// Code 14 新鲜广播窗口按 exact session 持有扫描 lease；只有本任务启动的扫描
     /// 才能由它停止，旧窗口回调也不得移除新 owner 的 timer。
     var pairingRecoveryScanTimers: [String: (timer: Timer, ownsScan: Bool, sessionGeneration: Int64)] = [:]
@@ -93,6 +149,12 @@ class BleManager: NSObject {
     //  - 辅助扫描命中只为 exact 长期 pending owner 提供一次受控恢复机会；
     //    与 60 秒观测 watchdog 分离，避免重复提示把恢复窗口向后顺延。
     let visiblePendingRecoveryWatchdogs = BleVisiblePendingRecoveryWatchdogRegistry()
+    //  - 系统 peerConnected connection event 后仍无 didConnect 的 exact pending attempt
+    //    只给一次有界宽限；到期经 barrier 替换失效的 restored / 长期 pending 请求。
+    let peerConnectedContactGraceWatchdogs = BlePendingPhysicalConnectWatchdogRegistry()
+    //  - 前台系统连接对账替换失效 pending 的最近时刻；App 重试节奏不得把它变成
+    //    每 3 秒一次的 cancel/connect 风暴。
+    var systemConnectedStalledReplacementAt: [String: Date] = [:]
     let deferredPeripheralReconnectRegistry = BleDeferredPeripheralReconnectRegistry()
     var pendingConnectionAdmissionTeardowns: [String: BlePendingConnectionAdmissionTeardown] = [:]
     // Business-auth leases are exact session/attempt tokens. A new prepare for
@@ -110,6 +172,25 @@ class BleManager: NSObject {
     /// Trace 专用的前一连接状态，仅用于区分 Bond 恢复超时/取消与普通连接终态。
     var nativeTraceLastConnectStates: [String: BleConnectState] = [:]
     let reconnectStore = BleReconnectStore()
+    // CoreBluetooth 恢复对象只能由当前账号的 exact target 认领。
+    let restorationCoordinator = BleStateRestorationCoordinator()
+    /// 当前进程已注册的 CoreBluetooth connection-event 服务集合。
+    ///
+    /// `initConfigs` 与 `centralManagerDidUpdateState` 都可能先到；用稳定签名保证两条
+    /// 启动路径只注册一次，同时允许配置集合变化后更新匹配范围。
+    private var connectionEventRegistrationSignature = ""
+    /// 前台冷启动系统对象对账的 exact token。
+    ///
+    /// 同一设备的新 activation 会替换旧 token；迟到的查询闭包必须先复验 token 和
+    /// reconnect task generation，不能把旧账号或旧 runtime 的 peripheral 注入新连接。
+    var activeStartupReconciliationTokens: [String: String] = [:]
+    /// 当前进程 transport reset 周期；只在 poweredOn 离开沿时递增。
+    ///
+    /// Dart 在 available 后读取此值并随 activation 回传，防止连续 reset 时第一轮
+    /// 迟到 session 消费第二轮门禁。它只参与准入，不持久化也不替代 physical attempt。
+    private(set) var currentTransportRecoveryEpoch: Int64 = 0
+    /// 同一轮 resetting/unknown/poweredOff 连续状态只推进一次 epoch。
+    private var isTransportRecoveryCycleActive = false
     //  - 最近一次已输出的扫描配置签名，用于避免每次 startScan 都重复刷配置详情。
     private var lastLoggedScanConfigSignature: String?
     //  =========== Get/Set
@@ -120,6 +201,27 @@ class BleManager: NSObject {
             return centralManager.state.rawValue
         }
     }
+
+    /// MethodChannel 只读快照；读取不恢复 task、不查询 peripheral。
+    var currentBleRecoveryEpoch: Int64 {
+        currentTransportRecoveryEpoch
+    }
+
+    /// 确保当前非 poweredOn 窗口拥有唯一 epoch。
+    ///
+    /// `central.state` 可能先变化、delegate 回调稍后才到；连接入口若先观察到不可用
+    /// 状态也必须取得同一周期 epoch，不能创建 recoveryEpoch=0 的暂停 task。
+    @discardableResult
+    func beginTransportRecoveryCycleIfNeeded() -> Int64 {
+        if !isTransportRecoveryCycleActive {
+            currentTransportRecoveryEpoch =
+                currentTransportRecoveryEpoch == Int64.max
+                    ? Int64.max
+                    : currentTransportRecoveryEpoch + 1
+            isTransportRecoveryCycleActive = true
+        }
+        return currentTransportRecoveryEpoch
+    }
     
     /**
      * 私有化初始化 BLE 管理器，确保全局只存在一个 CoreBluetooth central manager。
@@ -129,10 +231,11 @@ class BleManager: NSObject {
      */
     private override init() {
         super.init()
+        let options = BleManager.centralManagerOptions()
         self.centralManager = CBCentralManager(
             delegate: self,
             queue: nil,
-            options: nil
+            options: options
         )
         // 插件可能在 didBecomeActive 之后才初始化；此时允许继承当前 active 事实。
         // 后续所有切换仍只由 UIApplication 生命周期通知更新。
@@ -194,9 +297,64 @@ extension BleManager {
         // MethodChannel 调用必须尽快返回 Flutter，auto reconnect 补偿放到下一轮主队列，
         // 避免在 initConfigs 的 await 边界内同步启动 GATT。
         DispatchQueue.main.async { [weak self] in
+            self?.registerForConfiguredConnectionEventsIfNeeded()
             // 1、蓝牙已恢复但任务被 poweredOff 暂停时，在配置就绪后补偿恢复。
             self?.resumeReconnectTasksIfBluetoothOn(reason: "initConfigs")
         }
+    }
+
+    /**
+     *  注册系统级 peripheral 连接事件，补齐没有 `willRestoreState` 对象的 SR 启动。
+     *
+     *  这里只订阅配置声明的私有服务，不同步调用 retrieve，也不直接发布业务连接；
+     *  真正的设备身份、账号 owner 与 GATT/AUTH 仍由 autoReconnect activation 校验。
+     */
+    func registerForConfiguredConnectionEventsIfNeeded() {
+        guard #available(iOS 13.0, *), centralManager.state == .poweredOn else {
+            return
+        }
+        var servicesByIdentifier: [String: CBUUID] = [:]
+        for config in bleConfigs {
+            for service in config.privateServices {
+                servicesByIdentifier[service.serviceUUID.uuidString.uppercased()] = service.serviceUUID
+            }
+        }
+        let identifiers = servicesByIdentifier.keys.sorted()
+        // 新进程的 centralManagerDidUpdateState 早于 Dart initConfigs/activation。此时
+        // reconnectTasks 仍为空，但业务 connected 时持久化的 exact endpoint 已经足够
+        // 注册系统连接事件。这里只扩大物理事件匹配范围，不创建 admission/GATT/AUTH；
+        // 当前账号仍必须在 Dart 就绪后通过 restoration escrow 精确认领 peripheral。
+        let runtimePeripheralIdentifiers = reconnectTasks.values.compactMap {
+            UUID(uuidString: $0.uuid.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        let persistedPeripheralIdentifiers = reconnectStore.targets().compactMap {
+            UUID(uuidString: $0.uuid.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        let peripheralIdentifiers = Array(Set(
+            runtimePeripheralIdentifiers + persistedPeripheralIdentifiers
+        )).sorted { $0.uuidString < $1.uuidString }
+        guard !identifiers.isEmpty || !peripheralIdentifiers.isEmpty else {
+            return
+        }
+        let signature = identifiers.joined(separator: "|") + "#" +
+            peripheralIdentifiers.map(\.uuidString).joined(separator: "|")
+        guard signature != connectionEventRegistrationSignature else {
+            return
+        }
+        var options: [CBConnectionEventMatchingOption: Any] = [:]
+        if !identifiers.isEmpty {
+            options[.serviceUUIDs] = identifiers.compactMap { servicesByIdentifier[$0] }
+        }
+        if !peripheralIdentifiers.isEmpty {
+            options[.peripheralUUIDs] = peripheralIdentifiers
+        }
+        centralManager.registerForConnectionEvents(options: options)
+        connectionEventRegistrationSignature = signature
+        recordAutoReconnectEvent(
+            type: "ios_connection_event_registered",
+            detail: "serviceCount=\(identifiers.count), peripheralCount=\(peripheralIdentifiers.count), persistedCount=\(persistedPeripheralIdentifiers.count)"
+        )
+        loggerD(msg: "connectionEvent registration: serviceCount=\(identifiers.count), peripheralCount=\(peripheralIdentifiers.count), persistedCount=\(persistedPeripheralIdentifiers.count)")
     }
 
     /**
@@ -280,6 +438,12 @@ extension BleManager {
         upgradeStateRegistry.removeAll {
             endpointKeys.contains(reconnectKey(uuid: $0))
         }
+        // Revoking a reconnect config also revokes any native OTA transaction that
+        // owns the same endpoint.  The whole group is retired so late finish/query
+        // calls cannot mutate resources for a removed target.
+        let revokedOtaSnapshots = g2OtaTransactions.endpointSnapshots(endpointIds: Array(endpointIds))
+        let revokedOtaContexts = g2OtaTransactions.endpointContexts(endpointIds: Array(endpointIds))
+        let revokedOtaEndpoints = g2OtaTransactions.revokeEndpoints(endpointIds)
         var shouldStopOwnedPairingRecoveryScan = false
         endpointKeys.forEach { key in
             otaWriteQueues.removeValue(forKey: key)?.cancelAll(reason: "initConfigs revoked")
@@ -296,9 +460,13 @@ extension BleManager {
         }
         pendingPhysicalConnectWatchdogs.remove(endpointIds: endpointIds).forEach { $0.cancel() }
         visiblePendingRecoveryWatchdogs.remove(endpointIds: endpointIds).forEach { $0.cancel() }
+        peerConnectedContactGraceWatchdogs.remove(endpointIds: endpointIds).forEach { $0.cancel() }
+        endpointIds.forEach { systemConnectedStalledReplacementAt.removeValue(forKey: reconnectKey(uuid: $0)) }
         deferredPeripheralReconnectRegistry.remove(endpointIds: endpointIds)
         peripheralCancellationBarrierGate.discard(endpointIds: endpointIds)
         securityGateAttempts.cancel(endpointIds: endpointIds)
+        retireG2OtaEndpoints(revokedOtaEndpoints, reason: "initConfigs revoked", snapshots: revokedOtaSnapshots)
+        clearG2OtaRecoveryGrants(contextsByEndpoint: revokedOtaContexts)
 
         // 4. map 全部失效后再触发 CoreBluetooth cancel；后续 callback 只能走 stale 路径。
         var cancelledPeripherals = Set<ObjectIdentifier>()
@@ -318,6 +486,288 @@ extension BleManager {
      */
     func drainAutoReconnectEvents() -> [[String: Any]] {
         reconnectStore.drainEvents()
+    }
+
+    /**
+     * Register the native G2 OTA transaction before Dart sends START/INFO/RAW.
+     *
+     * The marker is installed for the full frozen endpoint set here, not later
+     * at the first write, so a firmware-triggered disconnect between Dart's
+     * begin call and its success ACK is still covered by the OTA gate.
+     */
+    func beginG2OtaTransaction(_ data: [String: Any]) -> BleG2OtaTransactionResult {
+        if !g2OtaTransactions.hasKnownTransaction(data: data),
+           let scope = BleG2OtaTransactionScope(data: data),
+           let rejection = validateG2OtaBeginScope(scope) {
+            loggerE(msg: "g2 ota transaction begin rejected transactionId=\(scope.transactionId), reason=\(rejection)")
+            return BleG2OtaTransactionResult(
+                status: .staleOwner,
+                transactionId: scope.transactionId,
+                generation: scope.generation,
+                instanceId: g2OtaTransactions.nativeInstanceId,
+                reason: rejection
+            )
+        }
+        let result = g2OtaTransactions.begin(data: data)
+        if result.status == .accepted {
+            for endpointId in g2OtaTransactions.scopeEndpointIds(data: data) {
+                upgradeStateRegistry.enter(endpointId)
+            }
+        }
+        loggerD(msg: "g2 ota transaction begin status=\(result.status.rawValue), transactionId=\(result.transactionId), generation=\(result.generation)")
+        return result
+    }
+
+    private func validateG2OtaBeginScope(_ scope: BleG2OtaTransactionScope) -> String? {
+        guard let bleConfig = bleConfigs.first(where: { $0.name == scope.config }) else {
+            return "nativeConfigUnknown"
+        }
+        guard BleG2OtaConfigPolicy.supportsG2Ota(
+            privateServices: bleConfig.privateServices.map { (type: $0.type, service: $0.service) }
+        ) else {
+            return "nativeConfigUnsupported"
+        }
+        let states = Dictionary(uniqueKeysWithValues: scope.endpoints.map { endpoint in
+            (endpoint.key, nativeG2OtaEndpointState(endpoint: endpoint, config: scope.config))
+        })
+        return BleG2OtaNativeBeginPolicy.rejectionReason(scope: scope, states: states)
+    }
+
+    private func nativeG2OtaEndpointState(
+        endpoint: BleG2OtaEndpoint,
+        config: String
+    ) -> BleG2OtaNativeEndpointState {
+        nativeG2OtaEndpointState(uuid: endpoint.uuid, name: endpoint.name, config: config)
+    }
+
+    private func nativeG2OtaEndpointState(
+        uuid endpointUuid: String,
+        name endpointName: String,
+        config: String
+    ) -> BleG2OtaNativeEndpointState {
+        let device = connectedDevices.first { device in
+            device.belongConfig.name == config &&
+                isSameConnectTarget(
+                    storedUuid: device.peripheral.identifier.uuidString,
+                    storedName: device.peripheral.name ?? "",
+                    uuid: endpointUuid,
+                    name: endpointName
+                )
+        }
+        let request = findActiveConnectRequest(uuid: endpointUuid, name: endpointName)
+        let reconnectTask = reconnectTasks.values.first { task in
+            task.belongConfig == config &&
+                isSameConnectTarget(
+                    storedUuid: task.uuid,
+                    storedName: task.name,
+                    uuid: endpointUuid,
+                    name: endpointName
+                )
+        }
+        let physicalUuid = device?.peripheral.identifier.uuidString ?? reconnectTask?.uuid ?? endpointUuid
+        let metadata = BleExplicitCancellationMetadataPolicy.resolve(
+            currentAdmission: currentConnectionAdmission(uuid: physicalUuid),
+            reconnectTask: reconnectTask
+        )
+        return BleG2OtaNativeEndpointState(
+            uuid: endpointUuid,
+            name: endpointName,
+            belongConfig: device?.belongConfig.name ?? reconnectTask?.belongConfig ?? request?.belongConfig ?? "",
+            isNativeKnown: device != nil || reconnectTask != nil || request != nil,
+            isBusinessConnected: device?.isConnected == true,
+            isPeripheralConnected: device?.peripheral.state == .connected,
+            sessionGeneration: metadata?.sessionGeneration ?? 0,
+            attemptGeneration: metadata?.attemptGeneration ?? 0
+        )
+    }
+
+    /**
+     * Update one endpoint inside the current native-owned G2 OTA transaction.
+     *
+     * `park` is the first-leg success path: it isolates the old transport and
+     * suppresses normal reconnect scheduling while the peer leg is still moving.
+     */
+    func updateG2OtaEndpoint(_ data: [String: Any]) -> BleG2OtaTransactionResult {
+        if let rejection = validateG2OtaEndpointUpdateBeforeRegistry(data) {
+            loggerE(msg: "g2 ota transaction update rejected before registry status=\(rejection.status.rawValue), transactionId=\(rejection.transactionId), reason=\(rejection.reason ?? "")")
+            return rejection
+        }
+        let result = g2OtaTransactions.update(data: data)
+        guard result.status == .accepted else {
+            loggerE(msg: "g2 ota transaction update rejected status=\(result.status.rawValue), transactionId=\(result.transactionId), reason=\(result.reason ?? "")")
+            return result
+        }
+        let uuid = data["uuid"] as? String ?? ""
+        let action = data["action"] as? String ?? ""
+        if action == BleG2OtaUpdateAction.bind.rawValue || action == BleG2OtaUpdateAction.recover.rawValue {
+            upgradeStateRegistry.enter(uuid)
+        } else if action == BleG2OtaUpdateAction.park.rawValue {
+            let snapshots = g2OtaTransactions.endpointSnapshots(endpointIds: [uuid])
+            retireG2OtaEndpoints([uuid], reason: "g2 ota transaction park", snapshots: snapshots)
+        }
+        loggerD(msg: "g2 ota transaction update status=\(result.status.rawValue), action=\(action), uuid=\(uuid), transactionId=\(result.transactionId)")
+        return result
+    }
+
+    private func validateG2OtaEndpointUpdateBeforeRegistry(_ data: [String: Any]) -> BleG2OtaTransactionResult? {
+        guard let context = BleG2OtaContext(data: data),
+              let action = BleG2OtaUpdateAction(rawValue: data["action"] as? String ?? ""),
+              action == .bind || action == .recover else {
+            return nil
+        }
+        let transactionId = context.transactionId
+        let generation = context.generation
+        let instanceId = context.instanceId
+        guard let scope = g2OtaTransactions.activeScope(for: context) else {
+            // Let the registry return the authoritative missing/stale owner
+            // result instead of inventing a structural validation failure.
+            return nil
+        }
+        guard let uuid = (data["uuid"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !uuid.isEmpty,
+              let sessionGeneration = BleG2OtaInteger.parseRequired(data["sessionGeneration"]),
+              let attemptGeneration = BleG2OtaInteger.parseRequired(data["attemptGeneration"]),
+              sessionGeneration >= 0,
+              attemptGeneration >= 0,
+              (sessionGeneration == 0) == (attemptGeneration == 0) else {
+            return BleG2OtaTransactionResult(
+                status: .invalidRequest,
+                transactionId: transactionId,
+                generation: generation,
+                instanceId: instanceId,
+                reason: "invalidPhysicalPair"
+            )
+        }
+        let key = reconnectKey(uuid: uuid)
+        let snapshots = g2OtaTransactions.endpointSnapshots(endpointIds: [uuid])
+        guard let snapshot = snapshots[key] else {
+            return nil
+        }
+        // The MethodChannel update contract carries only context + endpoint
+        // identity. Config is immutable authority owned by the accepted begin.
+        let config = scope.config
+
+        if action == .recover && sessionGeneration == 0 && attemptGeneration == 0 {
+            // A never-bound waiting endpoint may enter recovery to let the
+            // supervisor rebuild readiness.  It still cannot write until bind
+            // verifies a positive live physical pair.
+            guard snapshot.phase == .waiting, !snapshot.hasBoundPhysicalPair else {
+                return BleG2OtaTransactionResult(
+                    status: .invalidRequest,
+                    transactionId: transactionId,
+                    generation: generation,
+                    instanceId: instanceId,
+                    reason: "recoverWithoutWaiting"
+                )
+            }
+            return nil
+        }
+
+        guard sessionGeneration > 0, attemptGeneration > 0 else {
+            return BleG2OtaTransactionResult(
+                status: .invalidRequest,
+                transactionId: transactionId,
+                generation: generation,
+                instanceId: instanceId,
+                reason: "invalidPhysicalPair"
+            )
+        }
+
+        let state = nativeG2OtaEndpointState(uuid: snapshot.uuid, name: snapshot.name, config: config)
+        switch action {
+        case .bind:
+            guard state.belongConfig == config,
+                  state.isNativeKnown,
+                  state.isBusinessConnected,
+                  state.isPeripheralConnected,
+                  state.sessionGeneration == sessionGeneration,
+                  state.attemptGeneration == attemptGeneration else {
+                return BleG2OtaTransactionResult(
+                    status: .staleOwner,
+                    transactionId: transactionId,
+                    generation: generation,
+                    instanceId: instanceId,
+                    reason: "nativePhysicalOwnerMismatch"
+                )
+            }
+        case .recover:
+            guard snapshot.hasBoundPhysicalPair,
+                  snapshot.sessionGeneration == sessionGeneration,
+                  snapshot.attemptGeneration == attemptGeneration else {
+                return BleG2OtaTransactionResult(
+                    status: .staleOwner,
+                    transactionId: transactionId,
+                    generation: generation,
+                    instanceId: instanceId,
+                    reason: "recoverPhysicalMismatch"
+                )
+            }
+            guard state.isNativeKnown,
+                  state.sessionGeneration == sessionGeneration,
+                  state.attemptGeneration == attemptGeneration else {
+                return BleG2OtaTransactionResult(
+                    status: .staleOwner,
+                    transactionId: transactionId,
+                    generation: generation,
+                    instanceId: instanceId,
+                    reason: "nativeDisconnectOwnerMismatch"
+                )
+            }
+            guard !(state.isBusinessConnected && state.isPeripheralConnected) else {
+                return BleG2OtaTransactionResult(
+                    status: .staleOwner,
+                    transactionId: transactionId,
+                    generation: generation,
+                    instanceId: instanceId,
+                    reason: "missingDisconnectEvidence"
+                )
+            }
+        case .park:
+            break
+        }
+        return nil
+    }
+
+    /**
+     * Retire the complete native G2 OTA transaction in one local critical section.
+     *
+     * The method does not wait for CoreBluetooth didDisconnect.  It first removes
+     * old queues and markers for every frozen endpoint, then records a terminal
+     * ledger result so lost MethodChannel ACKs can be replayed without a second
+     * detach or reconnect wake.
+     */
+    func finishG2OtaTransaction(_ data: [String: Any]) -> BleG2OtaTransactionResult {
+        var committedEndpointCount = 0
+        let result = BleG2OtaFinishOrchestrator.finish(
+            data: data,
+            registry: g2OtaTransactions,
+            retire: { [weak self] endpointIds, snapshots, contexts, preparedResult in
+                committedEndpointCount = endpointIds.count
+                // Keep the transaction gate held while native resources are detached.
+                // CoreBluetooth callbacks can re-enter scheduling synchronously; releasing
+                // the ledger before teardown would allow generic activation to observe an
+                // open gate while stale queues/callbacks still belong to the old OTA.
+                self?.retireG2OtaEndpoints(
+                    endpointIds,
+                    reason: "g2 ota transaction finish \(preparedResult.reason ?? "")",
+                    snapshots: snapshots
+                )
+                self?.clearG2OtaRecoveryGrants(contextsByEndpoint: contexts)
+            },
+            wake: { [weak self] endpointIds in
+                self?.wakeG2OtaReconnectOwnersOnce(endpointIds: endpointIds, reason: "g2 ota transaction finish")
+            }
+        )
+        if result.status != .committed {
+            loggerD(msg: "g2 ota transaction finish status=\(result.status.rawValue), transactionId=\(result.transactionId), reason=\(result.reason ?? "")")
+        } else {
+            loggerD(msg: "g2 ota transaction finish committed transactionId=\(result.transactionId), generation=\(result.generation), endpoints=\(committedEndpointCount)")
+        }
+        return result
+    }
+
+    func queryG2OtaTransaction(_ data: [String: Any]) -> BleG2OtaTransactionResult {
+        g2OtaTransactions.query(data: data)
     }
     
     /**
@@ -799,6 +1249,9 @@ extension BleManager {
 
         // 3. Remove every stale endpoint from the Gate as one operation and delay the next owner.
         let next = connectionAdmissionGate.cancelEndpoints(endpointIds)
+        let revokedOtaSnapshots = g2OtaTransactions.endpointSnapshots(endpointIds: Array(endpointIds))
+        let revokedOtaContexts = g2OtaTransactions.endpointContexts(endpointIds: Array(endpointIds))
+        let revokedOtaEndpoints = g2OtaTransactions.revokeEndpoints(endpointIds)
 
         // 4. Existing disconnect owns task/store/request/peripheral cleanup and installs a
         // cancellation barrier before CoreBluetooth can deliver a late terminal callback.
@@ -809,12 +1262,145 @@ extension BleManager {
                 cancellationMetadata: metadata
             )
         }
+        retireG2OtaEndpoints(revokedOtaEndpoints, reason: "cancel auto reconnect targets", snapshots: revokedOtaSnapshots)
+        clearG2OtaRecoveryGrants(contextsByEndpoint: revokedOtaContexts)
 
         // 5. Only after all old targets have been revoked may a surviving owner enter GATT.
         if let next {
             startGrantedGattPipeline(next)
         }
         loggerD(msg: "cancel auto reconnect targets: endpoints=\(endpointIds), reason=\(reason)")
+    }
+
+    /**
+     * Group finish removes every frozen endpoint's old upgrade resources before
+     * any ordinary owner can re-enter scheduling. Missing GATT/cache is still a
+     * successful local retirement because authority comes from the transaction.
+     */
+    private func retireG2OtaEndpoints(
+        _ endpointIds: [String],
+        reason: String,
+        snapshots: [String: BleG2OtaEndpointSnapshot] = [:]
+    ) {
+        let endpointKeys = Set(endpointIds.map(reconnectKey))
+        guard !endpointKeys.isEmpty else { return }
+        var locallyClearedKeys = Set<String>()
+        for index in connectedDevices.indices {
+            var device = connectedDevices[index]
+            let uuid = device.peripheral.identifier.uuidString
+            let key = reconnectKey(uuid: uuid)
+            guard endpointKeys.contains(key) else { continue }
+            let reconnectTask = reconnectTasks.values.first { task in
+                endpointKeys.contains(reconnectKey(uuid: task.uuid)) &&
+                    isSameConnectTarget(
+                        storedUuid: task.uuid,
+                        storedName: task.name,
+                        uuid: uuid,
+                        name: device.peripheral.name ?? ""
+                    )
+            }
+            let metadata = BleExplicitCancellationMetadataPolicy.resolve(
+                currentAdmission: currentConnectionAdmission(uuid: uuid),
+                reconnectTask: reconnectTask
+            )
+            let state = BleG2OtaRetirementEndpointState(
+                uuid: uuid,
+                hasConnectedCache: true,
+                isPeripheralConnected: device.peripheral.state != .disconnected,
+                sessionGeneration: metadata?.sessionGeneration ?? 0,
+                attemptGeneration: metadata?.attemptGeneration ?? 0,
+                isUpgrading: upgradeStateRegistry.contains(uuid)
+            )
+            let decision = BleG2OtaRetirementPolicy.decide(
+                snapshot: snapshots[key],
+                state: state
+            )
+            if decision.shouldClearLocalState {
+                clearG2OtaLocalEndpointState(endpointId: uuid, reason: reason)
+                locallyClearedKeys.insert(key)
+            }
+            if decision.shouldIsolateCache {
+                device.isConnected = false
+                device.isBleFlowCompleted = false
+                device.securityGateWriteChar = nil
+                device.securityGateDiscoveryComplete = false
+                device.readCharsNotify = 0
+                device.notifiedReadCharUUIDs.removeAll()
+                connectedDevices[index] = device
+            }
+            if decision.shouldInstallCancellationBarrier {
+                beginPeripheralCancellationBarrier(device.peripheral)
+            }
+            if decision.shouldCancelPeripheral {
+                centralManager.cancelPeripheralConnection(device.peripheral)
+            }
+        }
+        // If CoreBluetooth already dropped the old GATT/cache, transaction
+        // ownership is still enough to clear only this OTA's queues/markers.
+        // Missing or pair-mismatched snapshots intentionally do nothing so a
+        // stale UUID-only cleanup cannot erase a newer owner.
+        for key in endpointKeys.subtracting(locallyClearedKeys) {
+            guard let snapshot = snapshots[key] else { continue }
+            let decision = BleG2OtaRetirementPolicy.decide(
+                snapshot: snapshot,
+                state: BleG2OtaRetirementEndpointState(
+                    uuid: snapshot.uuid,
+                    hasConnectedCache: false,
+                    isPeripheralConnected: false,
+                    sessionGeneration: 0,
+                    attemptGeneration: 0,
+                    isUpgrading: upgradeStateRegistry.contains(snapshot.uuid)
+                )
+            )
+            guard decision.shouldClearLocalState else { continue }
+            clearG2OtaLocalEndpointState(endpointId: snapshot.uuid, reason: reason)
+        }
+    }
+
+    private func clearG2OtaLocalEndpointState(endpointId: String, reason: String) {
+        let key = reconnectKey(uuid: endpointId)
+        otaWriteQueues.removeValue(forKey: endpointId)?.cancelAll(reason: reason)
+        if key != endpointId {
+            otaWriteQueues.removeValue(forKey: key)?.cancelAll(reason: reason)
+        }
+        upgradeStateRegistry.consume(endpointId)
+        if key != endpointId {
+            upgradeStateRegistry.consume(key)
+        }
+        otaRebootDisconnectWatchdogs.removeValue(forKey: key)?.cancel()
+        otaRebootDisconnectSuppressions.removeValue(forKey: key)
+    }
+
+    func clearG2OtaRecoveryGrants(contextsByEndpoint: [String: BleG2OtaContext]) {
+        guard !contextsByEndpoint.isEmpty else { return }
+        for (key, task) in reconnectTasks {
+            guard let taskContext = task.g2OtaRecoveryContext else { continue }
+            let frozenEndpointKey = reconnectKey(uuid: task.g2OtaRecoveryEndpointId ?? task.uuid)
+            guard let expectedContext = contextsByEndpoint[frozenEndpointKey],
+                  expectedContext == taskContext else {
+                continue
+            }
+            var updated = task
+            updated.g2OtaRecoveryContext = nil
+            updated.g2OtaRecoveryEndpointId = nil
+            reconnectTasks[key] = updated
+            loggerD(msg: "g2 ota transaction cleared recovery grant endpoint=\(frozenEndpointKey), transactionId=\(taskContext.transactionId), generation=\(taskContext.generation)")
+        }
+    }
+
+    /**
+     * Commit-time reconnect wake is intentionally single-shot and scoped to
+     * existing reconnect owners.  Idempotent finish replay does not call this
+     * helper, so ACK loss cannot create duplicate reconnect attempts.
+     */
+    private func wakeG2OtaReconnectOwnersOnce(endpointIds: [String], reason: String) {
+        guard centralManager.state == .poweredOn else { return }
+        let endpointKeys = Set(endpointIds.map(reconnectKey))
+        for task in reconnectTasks.values where endpointKeys.contains(reconnectKey(uuid: task.uuid)) {
+            guard currentConnectionAdmission(uuid: task.uuid) == nil else { continue }
+            loggerD(msg: "g2 ota transaction wake reconnect owner: \(task.uuid), reason=\(reason)")
+            beginReconnectAttempt(uuid: task.uuid)
+        }
     }
 
     /**
@@ -830,6 +1416,10 @@ extension BleManager {
         expectedSessionGeneration: Int64 = 0,
         expectedAttemptGeneration: Int64 = 0
     ) {
+        guard g2OtaTransactions.shouldAllowLegacyCleanup(endpointId: uuid) else {
+            loggerE(msg: "ota reboot disconnect rejected: \(uuid)-\(name), active transaction requires finishG2OtaTransaction")
+            return
+        }
         let effectiveUuid = reconnectIdentityAliases.resolvedCanonical(uuid: uuid) ?? uuid
         guard let device = connectedDevices.first(where: { device in
             isSameConnectTarget(
@@ -883,6 +1473,93 @@ extension BleManager {
         loggerD(msg: "ota reboot disconnect: \(physicalUuid)-\(physicalName), owner preserved")
     }
 
+    /**
+     * OTA 写阻塞恢复专用断开。
+     *
+     * 与 reboot teardown 不同，本方法不伪造连接状态、不注册 suppression；它只在
+     * exact session/attempt 仍持有当前 CBPeripheral 时，先废止旧写队列和升级 marker，
+     * 再发起真实 CoreBluetooth disconnect，让 didDisconnect 驱动 even_connect 的恢复链。
+     */
+    func disconnectForOtaRecovery(
+        uuid: String,
+        expectedSessionGeneration: Int64 = 0,
+        expectedAttemptGeneration: Int64 = 0,
+        otaContext: BleG2OtaContext? = nil
+    ) -> String {
+        if let otaContext {
+            let otaGate = g2OtaTransactions.shouldAllowAdmission(
+                endpointId: uuid,
+                otaContext: otaContext,
+                purpose: .activation
+            )
+            guard otaGate.allowed else {
+                loggerE(msg: "ota recovery disconnect rejected: \(uuid), reason=\(otaGate.reason)")
+                return "staleIdentity"
+            }
+        } else if !g2OtaTransactions.shouldAllowLegacyCleanup(endpointId: uuid) {
+            loggerE(msg: "ota recovery disconnect rejected: \(uuid), active transaction requires otaContext")
+            return "staleIdentity"
+        }
+        guard expectedSessionGeneration > 0, expectedAttemptGeneration > 0 else {
+            loggerE(msg: "ota recovery disconnect rejected: \(uuid), missing exact identity")
+            return "unavailable"
+        }
+        let effectiveUuid = reconnectIdentityAliases.resolvedCanonical(uuid: uuid) ?? uuid
+        // 先按 endpoint owner 证明 exact pair，再观察当前物理链路；否则 connectedDevices
+        // miss 时会把旧 session/attempt 误判为可恢复的 alreadyDisconnected。
+        let reconnectTask = reconnectTasks.values.first { task in
+            isSameConnectTarget(
+                storedUuid: task.uuid,
+                storedName: task.name,
+                uuid: effectiveUuid,
+                name: ""
+            )
+        }
+        let metadata = BleExplicitCancellationMetadataPolicy.resolve(
+            currentAdmission: currentConnectionAdmission(uuid: effectiveUuid)
+                ?? reconnectTask.flatMap { currentConnectionAdmission(uuid: $0.uuid) },
+            reconnectTask: reconnectTask
+        )
+        guard let metadata = metadata else {
+            loggerE(msg: "ota recovery disconnect unavailable: \(uuid), no exact owner")
+            return "unavailable"
+        }
+        guard metadata.sessionGeneration == expectedSessionGeneration,
+              metadata.attemptGeneration == expectedAttemptGeneration else {
+            loggerE(msg: "ota recovery disconnect stale: \(effectiveUuid), expected session=\(expectedSessionGeneration) attempt=\(expectedAttemptGeneration), current session=\(metadata.sessionGeneration) attempt=\(metadata.attemptGeneration)")
+            return "staleIdentity"
+        }
+        guard let device = connectedDevices.first(where: { device in
+            isSameConnectTarget(
+                storedUuid: device.peripheral.identifier.uuidString,
+                storedName: device.peripheral.name ?? "",
+                uuid: effectiveUuid,
+                name: ""
+            )
+        }) else {
+            otaWriteQueues.removeValue(forKey: effectiveUuid)?.cancelAll(reason: "ota recovery already disconnected")
+            if let ownerUuid = reconnectTask?.uuid, ownerUuid != effectiveUuid {
+                otaWriteQueues.removeValue(forKey: ownerUuid)?.cancelAll(reason: "ota recovery already disconnected")
+                upgradeStateRegistry.consume(ownerUuid)
+            }
+            upgradeStateRegistry.consume(effectiveUuid)
+            loggerD(msg: "ota recovery disconnect: \(effectiveUuid), already disconnected after exact identity match")
+            return "alreadyDisconnected"
+        }
+        let physicalUuid = device.peripheral.identifier.uuidString
+        guard device.peripheral.state != .disconnected else {
+            otaWriteQueues.removeValue(forKey: physicalUuid)?.cancelAll(reason: "ota recovery already disconnected")
+            upgradeStateRegistry.consume(physicalUuid)
+            loggerD(msg: "ota recovery disconnect: \(physicalUuid), already disconnected after identity match")
+            return "alreadyDisconnected"
+        }
+        otaWriteQueues.removeValue(forKey: physicalUuid)?.cancelAll(reason: "ota recovery")
+        upgradeStateRegistry.consume(physicalUuid)
+        centralManager.cancelPeripheralConnection(device.peripheral)
+        loggerD(msg: "ota recovery disconnect accepted: \(physicalUuid), session=\(expectedSessionGeneration), attempt=\(expectedAttemptGeneration)")
+        return "accepted"
+    }
+
     /// 标记/消费 OTA 主动 cancel 的唯一 CoreBluetooth 确认回调，禁止跨越到新会话。
     private func markOtaRebootDisconnectSuppression(
         peripheral: CBPeripheral,
@@ -934,7 +1611,8 @@ extension BleManager {
         psType: Int = 0,
         allowDuringUpgrade: Bool = false,
         expectedSessionGeneration: Int64 = 0,
-        expectedAttemptGeneration: Int64 = 0
+        expectedAttemptGeneration: Int64 = 0,
+        otaContext: BleG2OtaContext? = nil
     ) {
         guard checkIsFunctionCanBeCalled() else {
             return
@@ -967,7 +1645,8 @@ extension BleManager {
                uuid: uuid,
                device: device,
                expectedSessionGeneration: expectedSessionGeneration,
-               expectedAttemptGeneration: expectedAttemptGeneration
+               expectedAttemptGeneration: expectedAttemptGeneration,
+               otaContext: otaContext
            ) {
             loggerE(msg: "sendCmd: \(uuid), type=\(psType), \(identityError.message ?? "attempt identity mismatch")")
             return
@@ -996,6 +1675,7 @@ extension BleManager {
         psType: Int,
         expectedSessionGeneration: Int64 = 0,
         expectedAttemptGeneration: Int64 = 0,
+        otaContext: BleG2OtaContext? = nil,
         result: @escaping FlutterResult
     ) {
         let isOtaChannel = (psType == 1)
@@ -1048,7 +1728,8 @@ extension BleManager {
                uuid: uuid,
                device: device,
                expectedSessionGeneration: expectedSessionGeneration,
-               expectedAttemptGeneration: expectedAttemptGeneration
+               expectedAttemptGeneration: expectedAttemptGeneration,
+               otaContext: otaContext
            ) {
             result(identityError)
             return
@@ -1074,7 +1755,8 @@ extension BleManager {
                               uuid: uuid,
                               device: device,
                               expectedSessionGeneration: expectedSessionGeneration,
-                              expectedAttemptGeneration: expectedAttemptGeneration
+                              expectedAttemptGeneration: expectedAttemptGeneration,
+                              otaContext: otaContext
                           ) == nil else {
                         self?.loggerE(msg: "[ezw_ble][ota] submit rejected uuid=\(uuid) reason=attempt identity mismatch")
                         return false
@@ -1087,7 +1769,13 @@ extension BleManager {
                 }
             )
             loggerD(msg: "[ezw_ble][ota] enqueued uuid=\(uuid) bytes=\(data.count) canSend=\(device.peripheral.canSendWriteWithoutResponse) queueDepth=\(queue.queueDepth)")
-            queue.enqueue(data: data, target: target, result: result)
+            queue.enqueue(
+                data: data,
+                target: target,
+                expectedSessionGeneration: expectedSessionGeneration,
+                expectedAttemptGeneration: expectedAttemptGeneration,
+                result: result
+            )
         } else if isOtaChannel {
             //  - 4.3、OTA 不支持 WriteWithoutResponse 时 fail closed，不能回退成
             //  -- 看似成功的旧路径，否则 Dart 继续推进会制造 OTA 死锁/错判。
@@ -1118,6 +1806,7 @@ extension BleManager {
         psType: Int,
         expectedSessionGeneration: Int64 = 0,
         expectedAttemptGeneration: Int64 = 0,
+        otaContext: BleG2OtaContext? = nil,
         result: @escaping FlutterResult
     ) {
         guard psType == BlePsTypeValue.ota else {
@@ -1135,6 +1824,7 @@ extension BleManager {
             channel: OtaWriteChannel.ota,
             expectedSessionGeneration: expectedSessionGeneration,
             expectedAttemptGeneration: expectedAttemptGeneration,
+            otaContext: otaContext,
             existingQueue: { [weak self] in self?.otaWriteQueues[uuid] },
             storeQueue: { [weak self] queue in self?.otaWriteQueues[uuid] = queue },
             result: result
@@ -1181,6 +1871,7 @@ extension BleManager {
         channel: String,
         expectedSessionGeneration: Int64 = 0,
         expectedAttemptGeneration: Int64 = 0,
+        otaContext: BleG2OtaContext? = nil,
         existingQueue: () -> OtaWriteQueue?,
         storeQueue: (OtaWriteQueue) -> Void,
         result: @escaping FlutterResult
@@ -1235,6 +1926,17 @@ extension BleManager {
             ))
             return
         }
+        if psType == BlePsTypeValue.ota,
+           let identityError = validateOtaWriteIdentity(
+               uuid: uuid,
+               device: device,
+               expectedSessionGeneration: expectedSessionGeneration,
+               expectedAttemptGeneration: expectedAttemptGeneration,
+               otaContext: otaContext
+           ) {
+            result(identityError)
+            return
+        }
         let queue = existingQueue() ?? OtaWriteQueue(
             peripheral: device.peripheral,
             logger: { [weak self] msg in
@@ -1252,7 +1954,8 @@ extension BleManager {
                           uuid: uuid,
                           device: device,
                           expectedSessionGeneration: expectedSessionGeneration,
-                          expectedAttemptGeneration: expectedAttemptGeneration
+                          expectedAttemptGeneration: expectedAttemptGeneration,
+                          otaContext: otaContext
                       ) == nil else {
                     return false
                 }
@@ -1263,7 +1966,13 @@ extension BleManager {
                 return true
             }
         )
-        queue.enqueueBatch(packets: packets, target: target, result: result)
+        queue.enqueueBatch(
+            packets: packets,
+            target: target,
+            expectedSessionGeneration: expectedSessionGeneration,
+            expectedAttemptGeneration: expectedAttemptGeneration,
+            result: result
+        )
     }
 
     /// OTA 错误 details 需要带上当前 native pending 深度，帮助区分“尚未提交”和“已提交后设备无 ack”。
@@ -1277,8 +1986,41 @@ extension BleManager {
         uuid: String,
         device: BleConnectedDevice,
         expectedSessionGeneration: Int64,
-        expectedAttemptGeneration: Int64
+        expectedAttemptGeneration: Int64,
+        otaContext: BleG2OtaContext? = nil
     ) -> FlutterError? {
+        let isTransactionWrite = otaContext != nil || g2OtaTransactions.isEndpointOwned(uuid)
+        if let otaContext {
+            let otaGate = g2OtaTransactions.shouldAllowAdmission(
+                endpointId: uuid,
+                otaContext: otaContext,
+                purpose: .write
+            )
+            guard otaGate.allowed else {
+                loggerE(msg: "[ezw_ble][ota] transaction mismatch uuid=\(uuid) reason=\(otaGate.reason)")
+                return OtaWriteQueue.unavailableError(
+                    endpoint: uuid,
+                    reason: otaGate.reason,
+                    pending: queueDepthForOta(uuid: uuid)
+                )
+            }
+        } else if g2OtaTransactions.isEndpointOwned(uuid) {
+            loggerE(msg: "[ezw_ble][ota] transaction mismatch uuid=\(uuid) reason=missing otaContext")
+            return OtaWriteQueue.unavailableError(
+                endpoint: uuid,
+                reason: "missing otaContext",
+                pending: queueDepthForOta(uuid: uuid)
+            )
+        }
+        if isTransactionWrite,
+           (expectedSessionGeneration <= 0 || expectedAttemptGeneration <= 0) {
+            loggerE(msg: "[ezw_ble][ota] transaction write rejected uuid=\(uuid) reason=missing exact identity")
+            return OtaWriteQueue.unavailableError(
+                endpoint: uuid,
+                reason: "missing exact identity",
+                pending: queueDepthForOta(uuid: uuid)
+            )
+        }
         if expectedSessionGeneration <= 0, expectedAttemptGeneration <= 0 {
             return nil
         }
@@ -1362,6 +2104,10 @@ extension BleManager {
         expectedSessionGeneration: Int64 = 0,
         expectedAttemptGeneration: Int64 = 0
     ) {
+        guard g2OtaTransactions.shouldAllowLegacyCleanup(endpointId: uuid) else {
+            loggerE(msg: "quiteUpgradeState rejected: \(uuid), active transaction requires update/finish")
+            return
+        }
         let connectedDevice = connectedDevices.first(where: { $0.peripheral.identifier.uuidString == uuid })
         if let connectedDevice {
             if let identityError = validateOtaWriteIdentity(
@@ -1415,6 +2161,7 @@ extension BleManager {
      * 清除连接缓存
      */
     func cleanConnectCache() {
+        cancelAllStateRestorationEscrow(reason: "cleanConnectCache")
         cancelAllConnectionAdmissions(reason: "cleanConnectCache")
         businessConnectionLeases.clear()
         securityGateAttempts.removeAll()
@@ -1437,11 +2184,16 @@ extension BleManager {
     /**
      * 重置
      */
-    func reset() {
+    func reset(preserveStateRestoration: Bool = false) {
         stopScan()
         cancelAllConnectionAdmissions(reason: "reset")
         businessConnectionLeases.clear()
         securityGateAttempts.removeAll()
+        let invalidatedOtaSnapshots = g2OtaTransactions.allEndpointSnapshots()
+        let invalidatedOtaContexts = g2OtaTransactions.allEndpointContexts()
+        let invalidatedOtaEndpoints = g2OtaTransactions.clearActive(reason: .revoked)
+        retireG2OtaEndpoints(invalidatedOtaEndpoints, reason: "reset", snapshots: invalidatedOtaSnapshots)
+        clearG2OtaRecoveryGrants(contextsByEndpoint: invalidatedOtaContexts)
         connectedDevices.forEach { device in
             centralManager.cancelPeripheralConnection(device.peripheral)
         }
@@ -1458,6 +2210,11 @@ extension BleManager {
         scanConnectTimeoutTimers.removeAll()
         upgradeStateRegistry.clear()
         preConnectedDevices.removeAll()
+        // 冷启动 reset 发生在 willRestoreState 和账号 target 加载之间时保留 escrow；
+        // 登出、解绑和显式清理继续取消全部历史恢复对象。
+        if !preserveStateRestoration {
+            cancelAllStateRestorationEscrow(reason: "hard reset")
+        }
         cancelAllReconnectTasks()
         // resetBle 是中性 runtime teardown：持久 owner/autoReconnect 配置必须保留，
         // 由 Dart 下一次普通 cold_start/autoReconnect activate 建立全新 generation。
@@ -1470,7 +2227,7 @@ extension BleManager {
         nativeTraceRssiInFlightAttemptIds.removeAll()
         nativeTraceLastConnectStates.removeAll()
         nativeConnectionTraces.removeAll()
-        loggerD(msg: "Reset: success")
+        loggerD(msg: "Reset: success, preserveStateRestoration=\(preserveStateRestoration)")
     }
     
 }
@@ -1596,6 +2353,69 @@ extension BleManager {
             return []
         }
         return centralManager.retrievePeripherals(withIdentifiers: identifiers)
+    }
+
+    /**
+     * SR 后台拉起窗口内，对当前目标中 iOS 未交还的 endpoint 是否还允许一次 identifier 补查。
+     *
+     * 同步 retrieve 的禁令针对退出宽限期（0x8BADF00D）；由 `bluetoothCentrals` 拉起的
+     * 后台进程既非退出也无前台窗口，若 iOS 只交还了一条腿（2026-09-07 真机：重启后只
+     * 交还右腿），另一条腿没有进程内对象就永远建不起 pending connect，headless 期间整机
+     * 无法恢复。这里只放行一次、只在 background + poweredOn + 未收到 willTerminate 时。
+     */
+    func canAttemptStateRestorationLaunchRetrieve(endpointId: String) -> Bool {
+        // 无 UI 拉起的三种证据，任一即可：
+        // 1. bluetoothCentrals launch option（UIScene 下 launchOptions 恒为 nil，基本拿不到；
+        //    2026-09-07 20:26 真机因此未放行）；
+        // 2. 本进程发生过 willRestoreState（iOS 26 重启后走此路）；
+        // 3. didFinishLaunching 首行 applicationState == .background（iOS 18 重启后只经
+        //    connection event 拉起、不回调 willRestoreState：2026-09-09 WK15 两次重启
+        //    escrow source 全是 connectionEvent，前两项都为 false，门禁未放行，左腿与 R1
+        //    延后到前台；同一时刻 keep-alive 日志证明 applicationState 就是 .background）。
+        let launchedHeadless = FlutterEzwBlePlugin.wasLaunchedHeadlessInBackground()
+        let launchedForRestoration = FlutterEzwBlePlugin.wasLaunchedForBluetoothStateRestoration()
+            || BleManager.didExperienceStateRestorationThisProcess
+            || launchedHeadless
+        // 补查只要求当前「不是 active」：active 窗口本就允许同步 retrieve，不经此门；
+        // 无 UI 进程后续可能因 Scene 在后台挂上而变为 .inactive，不得要求 == .background。
+        let applicationState = UIApplication.shared.applicationState
+        let key = reconnectKey(uuid: endpointId)
+        guard !allowsSynchronousCoreBluetoothLookup,
+              launchedForRestoration,
+              !hasReceivedWillTerminate,
+              applicationState != .active,
+              centralManager.state == .poweredOn,
+              UUID(uuidString: endpointId) != nil else {
+            if stateRestorationLaunchRetrieveDenialsLogged.insert(key).inserted {
+                loggerD(msg: "appLifecycle: state restoration launch retrieve denied uuid=\(endpointId), syncLookup=\(allowsSynchronousCoreBluetoothLookup), launchedForRestoration=\(launchedForRestoration), headlessLaunch=\(launchedHeadless), willRestoreState=\(BleManager.didExperienceStateRestorationThisProcess), willTerminate=\(hasReceivedWillTerminate), applicationState=\(applicationState.rawValue), central=\(centralManager.state.rawValue)")
+            }
+            return false
+        }
+        return !stateRestorationLaunchRetrieveAttempts.contains(key)
+    }
+
+    /// 消费一次 SR 拉起窗口的 identifier 补查；返回 nil 表示不满足放行条件。
+    func retrievePeripheralForStateRestorationLaunch(
+        endpointId: String,
+        context: String
+    ) -> CBPeripheral? {
+        guard canAttemptStateRestorationLaunchRetrieve(endpointId: endpointId),
+              let identifier = UUID(uuidString: endpointId) else {
+            return nil
+        }
+        stateRestorationLaunchRetrieveAttempts.insert(reconnectKey(uuid: endpointId))
+        // 同步 XPC 是后台唯一可能阻塞主线程的调用：进入前先落一条日志，若进程随后
+        // 静默，沙盒日志的最后一行就能指认它（2026-09-07 18:22 进程静默原因待证）。
+        loggerD(msg: "appLifecycle: state restoration launch retrieve begin uuid=\(endpointId), context=\(context)")
+        let retrieved = centralManager.retrievePeripherals(withIdentifiers: [identifier]).first
+        recordAutoReconnectEvent(
+            type: "ios_sr_launch_retrieve",
+            uuid: endpointId,
+            name: retrieved?.name ?? "",
+            detail: "found=\(retrieved != nil), state=\(retrieved?.state.rawValue ?? -1), context=\(context)"
+        )
+        loggerD(msg: "appLifecycle: state restoration launch retrieve uuid=\(endpointId), found=\(retrieved != nil), state=\(retrieved?.state.rawValue ?? -1), context=\(context)")
+        return retrieved
     }
     
     
@@ -1838,6 +2658,21 @@ extension BleManager {
         )
     }
 
+    /// Physical evidence is accepted only for the current peripheral owner. Synthetic
+    /// resets and didFailToConnect never enter this path and cannot forge link time.
+    private func recordPhysicalTrace(_ peripheral: CBPeripheral, event: String) {
+        guard connectionTraceEnabled else { return }
+        let uuid = peripheral.identifier.uuidString
+        if let admission = currentConnectionAdmission(uuid: uuid) {
+            guard peripheralConnectionSessions[admission.sessionId]?.peripheral === peripheral else { return }
+        } else {
+            guard connectedDevices.contains(where: { $0.peripheral === peripheral }) else { return }
+        }
+        nativeConnectionTraces[reconnectKey(uuid: uuid)]?.record(
+            stage: "physical_connection", result: event, physicalConnectionEvent: event
+        )
+    }
+
     func nativeTraceSnapshot(uuid: String) -> BleNativeConnectionTrace? {
         guard connectionTraceEnabled else { return nil }
         return nativeConnectionTraces[reconnectKey(uuid: uuid)]?.snapshot()
@@ -1995,6 +2830,7 @@ extension BleManager {
             return
         }
         nativeTraceRssiInFlightAttemptIds[key] = expectedAttemptId
+        trace.markRssiRequested()
         peripheral.readRSSI()
     }
 
@@ -2045,6 +2881,11 @@ extension BleManager {
             handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .serviceFail, tag: tag)
             return
         }
+        // SR 交还的 CBService/CBCharacteristic 是当前 restored central 的状态快照。
+        // 服务 discovery 仍会重新执行，但已有 characteristic 时必须直接消费；对缓存
+        // characteristic 再调用 discoverCharacteristics 并不保证 CoreBluetooth 重放回调，
+        // 会让 exact admission 永久停在 searchChars（安全门禁通过后的普通服务发现同样
+        // 经 discoverOrdinaryPrivateCharacteristics 走这条缓存路径）。
         //  2、只获取需要注册的服务。iOS 安全门禁存在时必须先处理 gate service，
         //  5403 写成功前不得订阅普通业务 notify，避免 AUTH 跑在加密建立之前。
         let ordinaryServices = services.filter { service in
@@ -2073,7 +2914,7 @@ extension BleManager {
                 tag: "\(tag) gate service missing"
             )
         }
-        loggerD(msg: "didDiscoverServices: \(peripheral.identifier.uuidString)-\(peripheral.name ?? ""), total=\(services.count), matched=\(ordinaryServices.count), expected=\(bleConfig.privateServices.count), tag=\(tag)")
+        loggerD(msg: "didDiscoverServices: \(peripheral.identifier.uuidString)-\(peripheral.name ?? ""), total=\(services.count), matched=\(ordinaryServices.count), expected=\(bleConfig.privateServices.count), restorationAdmission=\(isStateRestorationAdmission(peripheral)), tag=\(tag)")
         recordNativeTrace(uuid: peripheral.identifier.uuidString, stage: "service_discovery", result: "success")
         handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .searchChars, tag: tag)
         discoverOrdinaryPrivateCharacteristics(
@@ -2081,6 +2922,11 @@ extension BleManager {
             services: ordinaryServices,
             tag: tag
         )
+    }
+
+    /// 当前 admission 是否来自 State Restoration（交还的 characteristic 快照必须直接消费）。
+    private func isStateRestorationAdmission(_ peripheral: CBPeripheral) -> Bool {
+        currentConnectionAdmission(uuid: peripheral.identifier.uuidString)?.source == .stateRestoration
     }
 
     /// Continues ordinary GATT setup only after the optional security gate has
@@ -2091,14 +2937,18 @@ extension BleManager {
         services: [CBService],
         tag: String
     ) {
+        let restorationAdmission = isStateRestorationAdmission(peripheral)
         services.forEach { service in
             loggerD(msg: "didDiscoverServices: \(peripheral.identifier.uuidString), service = \(service.uuid.uuidString), charsCached=\(service.characteristics?.count ?? 0), tag=\(tag)")
             if let characteristics = service.characteristics, characteristics.isNotEmpty {
+                let cacheTag = restorationAdmission
+                    ? "\(tag) restored cached"
+                    : "\(tag) cached"
                 processDiscoveredCharacteristics(
                     peripheral: peripheral,
                     service: service,
                     error: nil,
-                    tag: "\(tag) cached",
+                    tag: cacheTag,
                     deferOrdinaryUntilSecurityGate: false
                 )
             } else {
@@ -2188,7 +3038,18 @@ extension BleManager {
         }),
            connectedDevice.writeCharsDic[privateService.type]?.uuid == writeChars!.uuid,
            connectedDevice.readCharsDic[privateService.type]?.uuid == readChars!.uuid {
-            loggerD(msg: "didDiscoverCharacteristicsFor: \(peripheral.identifier.uuidString), psType = \(privateService.type), duplicate chars ignored, tag=\(tag)")
+            // 第二次及后续 SR 可能回放同一组缓存 characteristic，此时 notify 已由
+            // CoreBluetooth 保留，不保证再次触发 didUpdateNotificationStateFor。
+            // 重复缓存只能跳过字典替换，不能跳过当前 exact attempt 的 readiness 对账；
+            // updateConnectedDevice 会读取 isNotifying 或重新订阅，并由统一完成闸去重。
+            loggerD(msg: "didDiscoverCharacteristicsFor: \(peripheral.identifier.uuidString), psType = \(privateService.type), duplicate chars reconcile notify readiness, tag=\(tag)")
+            updateConnectedDevice(
+                uuid: peripheral.identifier.uuidString,
+                name: peripheral.name ?? "",
+                writeChars: writeChars,
+                readChars: readChars,
+                psType: privateService.type
+            )
             return
         }
         recordNativeTrace(
@@ -2578,14 +3439,28 @@ extension BleManager {
         //  - 设置读
         if let readChars = readChars {
             connectedDevice.readCharsDic[psType] = readChars
-            //  CoreBluetooth 恢复/缓存路径可能已经处于 notifying，不一定再触发一次回调。
+            let requiresStateRestorationNotifyRearm =
+                currentConnectionAdmission(uuid: uuid)?.source == .stateRestoration
+            // willRestoreState 交还的是当前 restored central 的原生状态。若 characteristic
+            // 已经 notifying，CoreBluetooth 可能不会再次回调 didUpdateNotificationStateFor；
+            // 此时必须先把 restored subscription 计入本 attempt readiness，否则业务层
+            // 永远收不到 connectFinish。额外 setNotifyValue(true) 只做幂等重申，不作为
+            // readiness 的唯一来源；非 restoration 缓存路径保持原有行为。
             if readChars.isNotifying {
                 connectedDevice.notifiedReadCharUUIDs.insert(readChars.uuid.uuidString)
                 connectedDevice.readCharsNotify = connectedDevice.notifiedReadCharUUIDs.count
-                loggerD(msg: "updateConnectedDevice: \(uuid), read char already notifying, char=\(readChars.uuid.uuidString), notifyProgress=\(connectedDevice.readCharsNotify)")
+                if requiresStateRestorationNotifyRearm {
+                    connectedDevice.peripheral.setNotifyValue(true, for: readChars)
+                    loggerD(msg: "stateRestoration: restored notify accepted uuid=\(uuid), char=\(readChars.uuid.uuidString), notifyProgress=\(connectedDevice.readCharsNotify)")
+                } else {
+                    loggerD(msg: "updateConnectedDevice: \(uuid), read char already notifying, char=\(readChars.uuid.uuidString), notifyProgress=\(connectedDevice.readCharsNotify)")
+                }
             } else {
                 //  - 开始订阅读特征变化值，即开启接收设备数据
                 connectedDevice.peripheral.setNotifyValue(true, for: readChars)
+                if requiresStateRestorationNotifyRearm {
+                    loggerD(msg: "stateRestoration: subscribe missing notify uuid=\(uuid), char=\(readChars.uuid.uuidString)")
+                }
             }
         }
         //  - 设置连接状态
@@ -3091,6 +3966,7 @@ extension BleManager: CBCentralManagerDelegate {
         BleEC.bleState.emit(central.state.rawValue)
         //  1、如果蓝牙状态不是开启，则将所有已连接的设备设置为非连接状态
         if central.state != .poweredOn {
+            beginTransportRecoveryCycleIfNeeded()
             // CoreBluetooth 的 resetting / unauthorized / unsupported 同样会进入现有
             // teardown，但它们不是用户关闭 Adapter。只让真实 poweredOff 携带
             // bluetooth_adapter/4，避免分析侧把权限或协议栈重置误归因为手动关蓝牙。
@@ -3099,6 +3975,11 @@ extension BleManager: CBCentralManagerDelegate {
             let transportOffSnapshots = bluetoothOffConnectionSnapshots()
             pauseReconnectTasksForBluetoothOff()
             suspendConnectionAdmissionGateForBluetoothOff()
+            let invalidatedOtaSnapshots = g2OtaTransactions.allEndpointSnapshots()
+            let invalidatedOtaContexts = g2OtaTransactions.allEndpointContexts()
+            let invalidatedOtaEndpoints = g2OtaTransactions.clearActive(reason: .revoked)
+            retireG2OtaEndpoints(invalidatedOtaEndpoints, reason: "central \(central.state.label)", snapshots: invalidatedOtaSnapshots)
+            clearG2OtaRecoveryGrants(contextsByEndpoint: invalidatedOtaContexts)
             //  - 1.1、移除所有升级设备，避免退出OTA时，重置会连接状态的设备
             upgradeStateRegistry.clear()
             //  - 1.2、系统级蓝牙关闭：把连接中/已连接端点标记为 .disconnectFromSys，
@@ -3133,8 +4014,12 @@ extension BleManager: CBCentralManagerDelegate {
             }
             scanConnectTimeoutTimers.removeAll()
         } else {
+            registerForConfiguredConnectionEventsIfNeeded()
+            // willRestoreState 期间被挂起的 escrow rearm 在 poweredOn 后补偿执行。
+            rearmDeferredStateRestorationEscrowsAfterPowerOn()
             resumeConnectionAdmissionGateAfterBluetoothOn()
             resumeReconnectTasksAfterBluetoothOn()
+            isTransportRecoveryCycleActive = false
         }
         loggerD(msg: "centralManagerDidUpdateState: State = \(central.state.label), code = \(central.state.rawValue)")
     }
@@ -3149,18 +4034,81 @@ extension BleManager: CBCentralManagerDelegate {
         // 1. 保持 delegate 层极薄，扫描领域逻辑全部下沉到 BleScanPipeline。
         handleDiscoveredPeripheral(peripheral, advertisementData: advertisementData, rssi: RSSI)
     }
+
+    func centralManager(_ central: CBCentralManager, willRestoreState dict: [String : Any]) {
+        // 一次性锁存进程级 SR 事实：escrow 随后可能被 claim/finalize 清空，
+        // Dart 侧仍必须能查询到「本进程经历过 willRestoreState」。
+        BleManager.didExperienceStateRestorationThisProcess = true
+        let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] ?? []
+        recordAutoReconnectEvent(
+            type: "ios_will_restore_state",
+            detail: "peripherals=\(peripherals.count), keys=\(Array(dict.keys))"
+        )
+        loggerD(msg: "stateRestoration: willRestoreState id=\(BleManager.restorationIdentifier), peripherals=\(peripherals.count), keys=\(Array(dict.keys))")
+        peripherals.forEach { peripheral in
+            escrowStateRestorationPeripheral(peripheral, source: "willRestoreState")
+        }
+    }
     
     func centralManager(_ central: CBCentralManager, didUpdateANCSAuthorizationFor peripheral: CBPeripheral) {
         loggerE(msg: "didUpdateANCSAuthorizationFor")
     }
     
     func centralManager(_ central: CBCentralManager, connectionEventDidOccur event: CBConnectionEvent, for peripheral: CBPeripheral) {
-        loggerE(msg: "connectionEventDidOccur: event = \(event.rawValue)")
+        let uuid = peripheral.identifier.uuidString
+        let name = peripheral.name ?? ""
+        recordAutoReconnectEvent(
+            type: "ios_connection_event",
+            uuid: uuid,
+            name: name,
+            detail: "event=\(event.rawValue), state=\(peripheral.state.rawValue)"
+        )
+        switch event {
+        case .peerConnected:
+            // 已有 exact owner 的 pending attempt（claim 后 admission 已提交 central.connect）
+            // 时，系统 connection event 只是该 attempt 物理完成的前奏，紧随的 didConnect
+            // 必须走 findActiveConnectRequest → Gate。此处若再入 escrow，didConnect 会被
+            // 当成 claim 前的 "hold before claim" 吞掉，直到 60 s pending watchdog 才发现
+            // （2026-09-02 真机 SR：左腿系统连上后 21 s 才进 GATT，题词 / Dashboard 因
+            // 单腿未连失败）。watchdog 仍是丢回调时的兜底，此处不改变它。
+            if findActiveConnectRequest(peripheral: peripheral) != nil {
+                recordAutoReconnectEvent(
+                    type: "ios_connection_event_ignored",
+                    uuid: uuid,
+                    name: name,
+                    detail: "reason=activeConnectRequest"
+                )
+                loggerD(msg: "connectionEvent peer connected: uuid=\(uuid), name=\(name), active connect request owns it, skip escrow")
+                // 系统已建立链路却迟迟没有 didConnect 时，restored / 长期 pending 请求已失效
+                // （2026-09-03 真机：戒指 SR 后系统显示已连接、App 26 分钟无 didConnect）。
+                // 宽限内正常 didConnect 会取消它；到期才经 barrier 替换并重新 connect。
+                armPeerConnectedContactGrace(peripheral, reason: "connectionEvent peerConnected")
+                return
+            }
+            // connection event 只提供物理对象；先进入 escrow，再由现有 exact owner
+            // activation 接入 admission/GATT/AUTH，禁止把系统连接直接投影成业务成功。
+            escrowStateRestorationPeripheral(peripheral, source: "connectionEvent")
+            resumeAutoReconnectFromConnectionEvent(peripheral)
+        case .peerDisconnected:
+            // 业务断连终态仍只由 didDisconnectPeripheral 收口，避免双重 teardown。
+            // escrow 中尚未认领对象的 peerConnected 证据随链路终止一起作废。
+            restorationCoordinator.clearPeerConnectedObservation(uuid: uuid)
+            markLinkDroppedBeforeReadiness(peripheral)
+            loggerD(msg: "connectionEvent peer disconnected: uuid=\(uuid), name=\(name)")
+        @unknown default:
+            loggerE(msg: "connectionEventDidOccur: unknown event=\(event.rawValue), uuid=\(uuid)")
+        }
     }
     
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, timestamp: CFAbsoluteTime, isReconnecting: Bool, error: (any Error)?) {
         loggerE(msg: "didDisconnectPeripheral: timestamp = \(timestamp), isReconnecting = \(isReconnecting), error = \(String(describing: error))")
         if consumePeripheralCancellationBarrier(peripheral) { return }
+        recordPhysicalTrace(peripheral, event: "disconnected")
+        if handleStateRestorationEscrowTerminal(
+            peripheral,
+            systemIsReconnecting: isReconnecting,
+            reason: "didDisconnect isReconnecting=\(isReconnecting)"
+        ) { return }
         if isReconnecting {
             // 系统已持有 reconnect 时只结束旧业务 session 并重建 admission；再次 connect/cancel
             // 会破坏 CoreBluetooth 的自动回连 rendezvous。
@@ -3188,6 +4136,7 @@ extension BleManager: CBCentralManagerDelegate {
             loggerD(msg: "admission gate: \(peripheral.identifier.uuidString), stale didConnect blocked by cancellation barrier")
             return
         }
+        if handleStateRestorationEscrowDidConnect(peripheral) { return }
         //  1、检查是否获取到了蓝牙配置
         guard let connectRequest = findActiveConnectRequest(peripheral: peripheral),
               let bleConfig = connectRequest.bleConfig else {
@@ -3196,6 +4145,7 @@ extension BleManager: CBCentralManagerDelegate {
         }
         //  2、真实 didConnect 只提交 Gate；排队期间不启动 timeout/service discovery。
         loggerD(msg: "didConnect: \(peripheral.identifier.uuidString)-\(peripheral.name ?? ""), requestName=\(connectRequest.name), config=\(bleConfig.name)")
+        recordPhysicalTrace(peripheral, event: "connected")
         enqueuePhysicalConnectionThroughGate(peripheral)
     }
 
@@ -3204,6 +4154,11 @@ extension BleManager: CBCentralManagerDelegate {
      */
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         if consumePeripheralCancellationBarrier(peripheral) { return }
+        if handleStateRestorationEscrowTerminal(
+            peripheral,
+            systemIsReconnecting: false,
+            reason: "didFailToConnect error=\(String(describing: error))"
+        ) { return }
         handleConnectError(peripheral: peripheral, error: error, formMethod: "didFailToConnect")
     }
 
@@ -3212,6 +4167,12 @@ extension BleManager: CBCentralManagerDelegate {
      */
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         if consumePeripheralCancellationBarrier(peripheral) { return }
+        recordPhysicalTrace(peripheral, event: "disconnected")
+        if handleStateRestorationEscrowTerminal(
+            peripheral,
+            systemIsReconnecting: false,
+            reason: "didDisconnect legacy error=\(String(describing: error))"
+        ) { return }
         handleConnectError(peripheral: peripheral, error: error, formMethod: "didDisconnectPeripheral")
     }
     
@@ -3346,7 +4307,11 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
         )
         loggerE(msg: "security gate: \(admission.endpointId), result=\(trigger.rawValue), attempts=\(persistedFailureCount.map { String($0) } ?? "manual"), action=\(recoveryAction?.rawValue ?? "boundFail"), sessionGeneration=\(admission.sessionGeneration), attemptGeneration=\(admission.generation)")
 
-        if recoveryAction == .retryFreshAdvertisement {
+        // 第 1～4 次自动失败：只拆掉本 exact attempt，不在这里直接 connect。顺序：
+        // cancellation barrier → CoreBluetooth 终态或 2 秒 watchdog → teardown 保留预算并
+        // scheduleReconnect(.disconnectFromSys) → 同一 owner 注册新 attempt/admission 后
+        // connect。直接 connect 会与旧 cancel 在 HCI 上重叠并绕过 exact admission。
+        if recoveryAction == .retryPendingConnect {
             handleConnectState(
                 uuid: admission.endpointId,
                 name: name,
@@ -3482,6 +4447,7 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
         }
         if let error = error {
             let nsError = error as NSError
+            trace.markRssiFailed()
             loggerE(msg: "connection trace RSSI: \(uuid), read failed domain=\(nsError.domain), code=\(nsError.code)")
             return
         }
@@ -3527,6 +4493,9 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             loggerE(msg: "cmd response(char): \(peripheral.identifier.uuidString), drop OTA response without exact identity")
             return
         }
+        let otaContext = privateService.type == 1
+            ? g2OtaTransactions.activeContext(for: peripheral.identifier.uuidString)
+            : nil
         //  4、发送指令到flutter。OTA response 必须带 exact pair，供 Dart 绑定当前恢复轮次。
         let bleCmdMap = BleCmd(
             uuid: peripheral.identifier.uuidString,
@@ -3534,7 +4503,10 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             data: data,
             isSuccess: error == nil,
             sessionGeneration: responseIdentity?.sessionGeneration ?? 0,
-            attemptGeneration: responseIdentity?.attemptGeneration ?? 0
+            attemptGeneration: responseIdentity?.attemptGeneration ?? 0,
+            otaTransactionId: otaContext?.transactionId ?? "",
+            otaGeneration: otaContext?.generation ?? 0,
+            otaInstanceId: otaContext?.instanceId ?? ""
         ).toMap()
         BleEC.receiveData.emit(bleCmdMap)
         loggerD(msg: "cmd response(char): \(peripheral.identifier.uuidString), chars = \(characteristic.uuid.uuidString), data length = \(data.count)")

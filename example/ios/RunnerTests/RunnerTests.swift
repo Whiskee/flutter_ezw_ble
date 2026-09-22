@@ -11,6 +11,112 @@ import XCTest
 
 class RunnerTests: XCTestCase {
 
+  func testReconnectOwnerHealthRequiresExactLiveAdmissionSession() {
+    XCTAssertEqual(
+      BleReconnectPendingOwnerPolicy.evaluate(
+        taskSessionGeneration: 41,
+        admissionSessionGeneration: 41,
+        hasSession: true,
+        sessionMatchesAdmission: true,
+        peripheralIsConnectedOrConnecting: true,
+        pendingTeardown: false
+      ),
+      .healthy
+    )
+
+    XCTAssertEqual(
+      BleReconnectPendingOwnerPolicy.evaluate(
+        taskSessionGeneration: 41,
+        admissionSessionGeneration: 41,
+        hasSession: false,
+        sessionMatchesAdmission: false,
+        peripheralIsConnectedOrConnecting: false,
+        pendingTeardown: false
+      ),
+      .missingSession
+    )
+    XCTAssertEqual(
+      BleReconnectPendingOwnerPolicy.evaluate(
+        taskSessionGeneration: 42,
+        admissionSessionGeneration: 41,
+        hasSession: true,
+        sessionMatchesAdmission: true,
+        peripheralIsConnectedOrConnecting: true,
+        pendingTeardown: false
+      ),
+      .sessionMismatch
+    )
+    XCTAssertEqual(
+      BleReconnectPendingOwnerPolicy.evaluate(
+        taskSessionGeneration: 41,
+        admissionSessionGeneration: 41,
+        hasSession: true,
+        sessionMatchesAdmission: false,
+        peripheralIsConnectedOrConnecting: true,
+        pendingTeardown: false
+      ),
+      .sessionMismatch
+    )
+    XCTAssertEqual(
+      BleReconnectPendingOwnerPolicy.evaluate(
+        taskSessionGeneration: 41,
+        admissionSessionGeneration: 41,
+        hasSession: true,
+        sessionMatchesAdmission: true,
+        peripheralIsConnectedOrConnecting: false,
+        pendingTeardown: false
+      ),
+      .stalePeripheral
+    )
+    XCTAssertEqual(
+      BleReconnectPendingOwnerPolicy.evaluate(
+        taskSessionGeneration: 41,
+        admissionSessionGeneration: 41,
+        hasSession: true,
+        sessionMatchesAdmission: true,
+        peripheralIsConnectedOrConnecting: true,
+        pendingTeardown: true
+      ),
+      .teardownPending
+    )
+  }
+
+  func testReconnectActivationDispositionNeverReusesTaskWithoutLiveOwner() {
+    XCTAssertEqual(
+      BleReconnectActivationDispositionPolicy.resolve(
+        hasLiveOwner: true,
+        hasDeferredWork: false,
+        successDisposition: .reused,
+        successReason: "",
+        deferredReason: "nativeOwnerDeferred"
+      ).disposition,
+      .reused
+    )
+    XCTAssertEqual(
+      BleReconnectActivationDispositionPolicy.resolve(
+        hasLiveOwner: false,
+        hasDeferredWork: true,
+        successDisposition: .reused,
+        successReason: "",
+        deferredReason: "nativeOwnerDeferred"
+      ),
+      BleReconnectOwnerActivationOutcome(
+        disposition: .deferred,
+        reason: "nativeOwnerDeferred"
+      )
+    )
+    XCTAssertEqual(
+      BleReconnectActivationDispositionPolicy.resolve(
+        hasLiveOwner: false,
+        hasDeferredWork: false,
+        successDisposition: .reused,
+        successReason: "",
+        deferredReason: "nativeOwnerDeferred"
+      ).disposition,
+      .rejected
+    )
+  }
+
   func testAutomaticPairingRecoveryUsesTenSecondWindowsAndFiveSecondRetryDelay() {
     XCTAssertEqual(BlePeerPairingRecoveryPolicy.scanWindow(for: .autoReconnect), 10)
     XCTAssertEqual(BlePeerPairingRecoveryPolicy.retryDelay, 5)
@@ -29,14 +135,17 @@ class RunnerTests: XCTestCase {
   }
 
   func testSecurityGateFailurePolicyStopsAutomaticAttemptFiveAndManualAttemptOne() {
-    for failureCount in 1..<BlePeerPairingRecoveryPolicy.maxSecurityGateAttempts {
-      XCTAssertEqual(
-        BlePeerPairingRecoveryPolicy.actionAfterSecurityGateFailure(
-          source: .autoReconnect,
+    // 自动来源（含 SR 拉起的 stateRestoration）第 1～4 次必须由同一 owner 重建
+    // pending connect，不能复用 R1 Code 14 的新鲜广播恢复（ANCS 右腿永不广播）。
+    for source in [BleConnectSource.autoReconnect, .stateRestoration] {
+      for failureCount in 1..<BlePeerPairingRecoveryPolicy.maxSecurityGateAttempts {
+        let action = BlePeerPairingRecoveryPolicy.actionAfterSecurityGateFailure(
+          source: source,
           failureCount: failureCount
-        ),
-        .retryFreshAdvertisement
-      )
+        )
+        XCTAssertEqual(action, .retryPendingConnect)
+        XCTAssertNotEqual(action, .retryFreshAdvertisement)
+      }
     }
     XCTAssertEqual(
       BlePeerPairingRecoveryPolicy.actionAfterSecurityGateFailure(
@@ -75,6 +184,7 @@ class RunnerTests: XCTestCase {
       sessionGeneration: 901
     ))
 
+    let key = manager.reconnectKey(uuid: target.uuid)
     for failureCount in 1..<BlePeerPairingRecoveryPolicy.maxSecurityGateAttempts {
       XCTAssertEqual(
         manager.registerSecurityGateFailure(
@@ -82,9 +192,20 @@ class RunnerTests: XCTestCase {
           name: target.name,
           source: .autoReconnect
         ),
-        .retryFreshAdvertisement,
+        .retryPendingConnect,
         "attempt \(failureCount) must keep the exact automatic owner"
       )
+      // 每次失败都先落盘计数，owner 保持 normal 阶段由 pending connect 驱动下一次 Gate。
+      XCTAssertEqual(manager.reconnectTasks[key]?.pairingRecoveryState, .normal)
+      XCTAssertEqual(manager.reconnectTasks[key]?.hasAttemptedPairingRecovery, false)
+      XCTAssertEqual(
+        manager.reconnectStore.securityRecoveryRecord(
+          belongConfig: configName,
+          name: target.name
+        )?.failureCount,
+        failureCount
+      )
+      XCTAssertNotNil(manager.reconnectStore.target(uuid: target.uuid, name: target.name))
     }
     XCTAssertEqual(
       manager.registerSecurityGateFailure(
@@ -104,6 +225,182 @@ class RunnerTests: XCTestCase {
     XCTAssertEqual(attemptSix?.state, .rejected)
     XCTAssertEqual(attemptSix?.reason, "securityRecoveryExhaustedPersisted")
     XCTAssertNil(manager.reconnectTasks[target.uuid.lowercased()])
+  }
+
+  /// 为 5403 恢复回归用例准备独立 config/target。名称带 UUID，避免与 UserDefaults 中的
+  /// 持久化预算记录串扰；返回的清理闭包会取消 owner（同时清掉预算记录）并恢复全局状态。
+  private func armIsolatedSecurityTarget(
+    source: BleConnectSource,
+    sessionGeneration: Int64
+  ) -> (BleManager, BleReconnectTarget, String, () -> Void) {
+    let manager = BleManager.shared
+    let originalConfigs = manager.bleConfigs
+    let originalLookup = manager.allowsSynchronousCoreBluetoothLookup
+    let configName = "security-pending-retry-\(UUID().uuidString)"
+    let target = BleReconnectTarget(
+      belongConfig: configName,
+      uuid: UUID().uuidString,
+      name: "Even G2_R_\(UUID().uuidString)"
+    )
+    manager.bleConfigs = [makeConfig(name: configName, autoReconnect: true)]
+    XCTAssertNotNil(manager.armReconnectTarget(
+      target,
+      source: source,
+      sessionGeneration: sessionGeneration
+    ))
+    let cleanup = {
+      manager.cancelReconnectTask(uuid: target.uuid, name: target.name)
+      manager.reconnectStore.remove(uuid: target.uuid, name: target.name)
+      manager.bleConfigs = originalConfigs
+      manager.allowsSynchronousCoreBluetoothLookup = originalLookup
+    }
+    return (manager, target, configName, cleanup)
+  }
+
+  /// 2026-09-18 真机回归（iOS 26.5.2 重启后 SR 后台拉起）：右腿 5403 超时一次后，旧实现把
+  /// owner 送进只在 App active 时扫描的新鲜广播恢复；右腿是 ANCS 客户端、链路被系统持有
+  /// 永不广播，整段后台单腿 2 小时。新语义：非 active 时同样保持 normal、不起扫描租约，
+  /// 由同一 owner 经 barrier teardown 重建 pending connect（复用进程内 peripheral）。
+  func testSecurityGateRetryWhileInactiveStaysOutOfFreshAdvertisementRecovery() {
+    let (manager, target, configName, cleanup) = armIsolatedSecurityTarget(
+      source: .stateRestoration,
+      sessionGeneration: 1
+    )
+    defer { cleanup() }
+    manager.allowsSynchronousCoreBluetoothLookup = false
+    let key = manager.reconnectKey(uuid: target.uuid)
+
+    XCTAssertEqual(
+      manager.registerSecurityGateFailure(
+        uuid: target.uuid,
+        name: target.name,
+        source: .stateRestoration
+      ),
+      .retryPendingConnect
+    )
+    let task = manager.reconnectTasks[key]
+    XCTAssertEqual(task?.pairingRecoveryState, .normal)
+    XCTAssertEqual(task?.hasAttemptedPairingRecovery, false)
+    XCTAssertNil(task?.timer)
+    XCTAssertNil(manager.pairingRecoveryScanTimers[key])
+    XCTAssertEqual(
+      manager.reconnectStore.securityRecoveryRecord(
+        belongConfig: configName,
+        name: target.name
+      )?.failureCount,
+      1
+    )
+    XCTAssertNotNil(manager.reconnectStore.target(uuid: target.uuid, name: target.name))
+  }
+
+  /// 5403 失败不再写入 hasAttemptedPairingRecovery：之后真实的首个 Code 14 仍按 R1 语义
+  /// 获得一次新鲜广播恢复，新 peripheral 再次 Code 14 才停止自动 owner。
+  func testCode14AfterSecurityGateRetryIsTreatedAsFirstCode14() {
+    let (manager, target, configName, cleanup) = armIsolatedSecurityTarget(
+      source: .autoReconnect,
+      sessionGeneration: 11
+    )
+    defer { cleanup() }
+    let key = manager.reconnectKey(uuid: target.uuid)
+
+    XCTAssertEqual(
+      manager.registerSecurityGateFailure(
+        uuid: target.uuid,
+        name: target.name,
+        source: .autoReconnect
+      ),
+      .retryPendingConnect
+    )
+    XCTAssertEqual(
+      manager.reconnectStore.securityRecoveryRecord(
+        belongConfig: configName,
+        name: target.name
+      )?.failureCount,
+      1
+    )
+    XCTAssertEqual(
+      manager.registerPeerPairingFailure(
+        uuid: target.uuid,
+        name: target.name,
+        source: .autoReconnect
+      ),
+      .retryFreshAdvertisement
+    )
+    XCTAssertEqual(manager.reconnectTasks[key]?.pairingRecoveryState, .awaitingFreshAdvertisement)
+    XCTAssertEqual(
+      manager.registerPeerPairingFailure(
+        uuid: target.uuid,
+        name: target.name,
+        source: .autoReconnect
+      ),
+      .stopAttempt
+    )
+  }
+
+  /// Code 14 恢复连上新 peripheral 后若 5403 失败：链路已证明可达，回到 normal 由 pending
+  /// connect 驱动；但「已做过一次新鲜广播恢复」的事实保留，之后的 Code 14 仍立即停止。
+  func testSecurityGateRetryReturnsCode14RecoveryToNormalButKeepsAttemptedFact() {
+    let (manager, target, _, cleanup) = armIsolatedSecurityTarget(
+      source: .autoReconnect,
+      sessionGeneration: 21
+    )
+    defer { cleanup() }
+    let key = manager.reconnectKey(uuid: target.uuid)
+    XCTAssertEqual(
+      manager.registerPeerPairingFailure(
+        uuid: target.uuid,
+        name: target.name,
+        source: .autoReconnect
+      ),
+      .retryFreshAdvertisement
+    )
+    // 模拟新鲜广播命中后，恢复 attempt 正在连接新 peripheral。
+    manager.reconnectTasks[key]?.pairingRecoveryState = .foregroundRecoveryConnecting
+
+    XCTAssertEqual(
+      manager.registerSecurityGateFailure(
+        uuid: target.uuid,
+        name: target.name,
+        source: .autoReconnect
+      ),
+      .retryPendingConnect
+    )
+    XCTAssertEqual(manager.reconnectTasks[key]?.pairingRecoveryState, .normal)
+    XCTAssertEqual(manager.reconnectTasks[key]?.hasAttemptedPairingRecovery, true)
+    XCTAssertEqual(
+      manager.registerPeerPairingFailure(
+        uuid: target.uuid,
+        name: target.name,
+        source: .autoReconnect
+      ),
+      .stopAttempt
+    )
+  }
+
+  /// 5403 失败回到 normal 时必须撤销 Code 14 等待阶段遗留的 5 秒 retry timer，
+  /// 否则 timer 到期会把 owner 重新拉回新鲜广播扫描。
+  func testSecurityGateRetryCancelsWaitingFreshAdvertisementTimer() {
+    let (manager, target, _, cleanup) = armIsolatedSecurityTarget(
+      source: .autoReconnect,
+      sessionGeneration: 31
+    )
+    defer { cleanup() }
+    let key = manager.reconnectKey(uuid: target.uuid)
+    let timer = Timer(timeInterval: 60, repeats: false) { _ in }
+    manager.reconnectTasks[key]?.pairingRecoveryState = .waitingFreshAdvertisementRetry
+    manager.reconnectTasks[key]?.timer = timer
+
+    XCTAssertEqual(
+      manager.registerSecurityGateFailure(
+        uuid: target.uuid,
+        name: target.name,
+        source: .autoReconnect
+      ),
+      .retryPendingConnect
+    )
+    XCTAssertFalse(timer.isValid)
+    XCTAssertNil(manager.reconnectTasks[key]?.timer)
+    XCTAssertEqual(manager.reconnectTasks[key]?.pairingRecoveryState, .normal)
   }
 
   func testSecurityGateTimeoutAndCallbackCanConsumeExactAttemptOnlyOnce() {
@@ -765,6 +1062,86 @@ class RunnerTests: XCTestCase {
     XCTAssertEqual(BleReconnectSourcePolicy.afterTransportReset(), .autoReconnect)
   }
 
+  func testBluetoothResetRecoveryRequiresANewerPositiveFinalSession() {
+    XCTAssertEqual(
+      BleRecoveryActivationGatePolicy.evaluate(
+        awaitingRecoveryActivation: true,
+        pausedByBluetoothOff: false,
+        isBluetoothPoweredOn: true,
+        currentRecoveryEpoch: 7,
+        incomingRecoveryEpoch: 7,
+        currentSessionGeneration: 41,
+        incomingSessionGeneration: 42
+      ),
+      .consume
+    )
+    XCTAssertEqual(
+      BleRecoveryActivationGatePolicy.evaluate(
+        awaitingRecoveryActivation: false,
+        pausedByBluetoothOff: true,
+        isBluetoothPoweredOn: true,
+        currentRecoveryEpoch: 7,
+        incomingRecoveryEpoch: 7,
+        currentSessionGeneration: 41,
+        incomingSessionGeneration: 42
+      ),
+      .consume,
+      "activation may win before the poweredOn delegate finishes marking the gate"
+    )
+    for staleGeneration in [Int64(0), 40, 41] {
+      XCTAssertEqual(
+        BleRecoveryActivationGatePolicy.evaluate(
+          awaitingRecoveryActivation: true,
+          pausedByBluetoothOff: false,
+          isBluetoothPoweredOn: true,
+          currentRecoveryEpoch: 7,
+          incomingRecoveryEpoch: 7,
+          currentSessionGeneration: 41,
+          incomingSessionGeneration: staleGeneration
+        ),
+        .reject
+      )
+    }
+    XCTAssertEqual(
+      BleRecoveryActivationGatePolicy.evaluate(
+        awaitingRecoveryActivation: true,
+        pausedByBluetoothOff: false,
+        isBluetoothPoweredOn: false,
+        currentRecoveryEpoch: 7,
+        incomingRecoveryEpoch: 7,
+        currentSessionGeneration: 41,
+        incomingSessionGeneration: 42
+      ),
+      .reject
+    )
+    XCTAssertEqual(
+      BleRecoveryActivationGatePolicy.evaluate(
+        awaitingRecoveryActivation: false,
+        pausedByBluetoothOff: false,
+        isBluetoothPoweredOn: true,
+        currentRecoveryEpoch: 0,
+        incomingRecoveryEpoch: 0,
+        currentSessionGeneration: 41,
+        incomingSessionGeneration: 41
+      ),
+      .notRequired,
+      "same-session reconcile remains valid outside a transport reset"
+    )
+    XCTAssertEqual(
+      BleRecoveryActivationGatePolicy.evaluate(
+        awaitingRecoveryActivation: true,
+        pausedByBluetoothOff: false,
+        isBluetoothPoweredOn: true,
+        currentRecoveryEpoch: 8,
+        incomingRecoveryEpoch: 7,
+        currentSessionGeneration: 41,
+        incomingSessionGeneration: 42
+      ),
+      .reject,
+      "the first reset cycle cannot consume the second reset cycle gate"
+    )
+  }
+
   func testBusinessConnectedSystemDisconnectReusesLastAcceptedExactOwner() {
     var task = BleReconnectTask(
       belongConfig: "ring_bcl_1",
@@ -1137,7 +1514,7 @@ class RunnerTests: XCTestCase {
     XCTAssertNil(results.first!)
   }
 
-  func testOtaWriteQueueKeepsPendingWhenBaseBackpressureThresholdExpires() {
+  func testOtaWriteQueueKeepsPendingBeforeFifteenSecondStallDeadline() {
     let peripheral = FakeOtaPeripheral(endpointId: "g2-left", canSend: false)
     let clock = FakeOtaClock()
     let scheduler = FakeOtaScheduler()
@@ -1156,15 +1533,16 @@ class RunnerTests: XCTestCase {
     }) { value in
       results.append(value)
     }
-    clock.advance(by: 4.1)
+    clock.advance(by: 14.9)
     scheduler.runNext()
 
     XCTAssertTrue(results.isEmpty)
     XCTAssertTrue(queue.hasPending)
-    XCTAssertTrue(logs.contains { $0.contains("stage=grace") })
+    XCTAssertFalse(logs.contains { $0.contains("stage=grace") })
+    XCTAssertFalse(logs.contains { $0.contains("stalled") })
   }
 
-  func testOtaWriteQueueSubmitsOnceWhenReadyArrivesDuringGrace() {
+  func testOtaWriteQueueSubmitsOnceWhenReadyArrivesBeforeFifteenSecondDeadline() {
     let peripheral = FakeOtaPeripheral(endpointId: "g2-left", canSend: false)
     let clock = FakeOtaClock()
     let scheduler = FakeOtaScheduler()
@@ -1184,12 +1562,11 @@ class RunnerTests: XCTestCase {
     }) { value in
       results.append(value)
     }
-    clock.advance(by: 4.1)
+    clock.advance(by: 14.9)
     scheduler.runNext()
-    clock.advance(by: 0.234)
     peripheral.canSendWriteWithoutResponse = true
     queue.onPeripheralReadyToSendWriteWithoutResponse()
-    // 被 ready 取消的 grace watchdog 即使仍留在 fake scheduler，也不能二次结算。
+    // 被 ready 取消的 watchdog 即使仍留在 fake scheduler，也不能二次结算。
     scheduler.runNext()
 
     XCTAssertEqual(submitCount, 1)
@@ -1198,16 +1575,17 @@ class RunnerTests: XCTestCase {
     XCTAssertFalse(queue.hasPending)
     XCTAssertTrue(logs.contains {
       $0.contains("resumed") &&
-        $0.contains("stage=grace") &&
+        $0.contains("wait=14.900s") &&
         $0.contains("source=callback")
     })
   }
 
-  func testOtaWriteQueueCompletesStalledBackpressureAfterGraceWithTypedFlutterError() {
+  func testOtaWriteQueueCompletesExactHeadAfterFifteenSecondStallWithIdentity() {
     let peripheral = FakeOtaPeripheral(endpointId: "g2-left", canSend: false)
     let clock = FakeOtaClock()
     let scheduler = FakeOtaScheduler()
     var results: [Any?] = []
+    var secondResults: [Any?] = []
     var logs: [String] = []
     let queue = OtaWriteQueue(
       peripheral: peripheral,
@@ -1216,15 +1594,29 @@ class RunnerTests: XCTestCase {
       scheduler: scheduler
     )
 
-    queue.enqueue(data: Data([0x04]), target: makeFakeOtaTarget { _ in
-      XCTFail("stalled write must not be submitted")
-      return true
-    }) { value in
+    queue.enqueue(
+      data: Data([0x04]),
+      target: makeFakeOtaTarget { _ in
+        XCTFail("stalled write must not be submitted")
+        return true
+      },
+      expectedSessionGeneration: 1001,
+      expectedAttemptGeneration: 2002
+    ) { value in
       results.append(value)
     }
-    clock.advance(by: 4.1)
-    scheduler.runNext()
-    clock.advance(by: 1.0)
+    queue.enqueue(
+      data: Data([0x05]),
+      target: makeFakeOtaTarget { _ in
+        XCTFail("tail write must wait for exact OTA recovery cleanup")
+        return true
+      },
+      expectedSessionGeneration: 1001,
+      expectedAttemptGeneration: 2003
+    ) { value in
+      secondResults.append(value)
+    }
+    clock.advance(by: 15.0)
     scheduler.runNext()
 
     let error = results.first as? FlutterError
@@ -1232,18 +1624,21 @@ class RunnerTests: XCTestCase {
     let details = error?.details as? [String: Any]
     XCTAssertEqual(details?["endpoint"] as? String, "g2-left")
     XCTAssertEqual(details?["reason"] as? String, "canSend=false")
-    XCTAssertEqual(details?["pending"] as? Int, 1)
-    XCTAssertGreaterThanOrEqual(details?["wait"] as? TimeInterval ?? 0, 5.0)
-    XCTAssertTrue(logs.contains {
-      $0.contains("stage=terminal") && $0.contains("episode=")
-    })
+    XCTAssertEqual(details?["session"] as? Int64, 1001)
+    XCTAssertEqual(details?["attempt"] as? Int64, 2002)
+    XCTAssertEqual(details?["pending"] as? Int, 2)
+    XCTAssertGreaterThanOrEqual(details?["wait"] as? TimeInterval ?? 0, 15.0)
+    XCTAssertTrue(secondResults.isEmpty)
+    XCTAssertTrue(queue.hasPending)
+    XCTAssertTrue(logs.contains { $0.contains("stalled") && $0.contains("episode=") })
   }
 
-  func testOtaWriteQueueCancellationDuringGraceRejectsLateReady() {
+  func testOtaWriteQueueStallRejectsLateReadyUntilExactRecoveryCleanup() {
     let peripheral = FakeOtaPeripheral(endpointId: "g2-left", canSend: false)
     let clock = FakeOtaClock()
     let scheduler = FakeOtaScheduler()
     var results: [Any?] = []
+    var secondResults: [Any?] = []
     var submitCount = 0
     let queue = OtaWriteQueue(
       peripheral: peripheral,
@@ -1257,16 +1652,63 @@ class RunnerTests: XCTestCase {
     }) { value in
       results.append(value)
     }
-    clock.advance(by: 4.1)
+    queue.enqueue(data: Data([0x06]), target: makeFakeOtaTarget { _ in
+      submitCount += 1
+      return true
+    }) { value in
+      secondResults.append(value)
+    }
+    clock.advance(by: 15.0)
     scheduler.runNext()
-    queue.cancelAll(reason: "reset")
+
     peripheral.canSendWriteWithoutResponse = true
     queue.onPeripheralReadyToSendWriteWithoutResponse()
     scheduler.runNext()
 
     XCTAssertEqual(submitCount, 0)
     XCTAssertEqual(results.count, 1)
-    XCTAssertEqual((results.first as? FlutterError)?.code, "ota_write_cancelled")
+    XCTAssertEqual((results.first as? FlutterError)?.code, "ota_write_stalled")
+    XCTAssertTrue(secondResults.isEmpty)
+    XCTAssertTrue(queue.hasPending)
+  }
+
+  func testOtaWriteQueueRecoveryCleanupStartsFreshEpisodeThatCanSend() {
+    let peripheral = FakeOtaPeripheral(endpointId: "g2-left", canSend: false)
+    let clock = FakeOtaClock()
+    let scheduler = FakeOtaScheduler()
+    var stalledResults: [Any?] = []
+    var recoveredResults: [Any?] = []
+    var recoveredSubmitCount = 0
+    let queue = OtaWriteQueue(
+      peripheral: peripheral,
+      clock: clock,
+      scheduler: scheduler
+    )
+
+    queue.enqueue(data: Data([0x05]), target: makeFakeOtaTarget { _ in
+      XCTFail("stalled write must not be submitted")
+      return true
+    }) { value in
+      stalledResults.append(value)
+    }
+    clock.advance(by: 15.0)
+    scheduler.runNext()
+    queue.cancelAll(reason: "ota recovery")
+
+    peripheral.canSendWriteWithoutResponse = true
+    queue.enqueue(data: Data([0x06]), target: makeFakeOtaTarget { _ in
+      recoveredSubmitCount += 1
+      return true
+    }) { value in
+      recoveredResults.append(value)
+    }
+    scheduler.runNextIgnoringCancellation()
+
+    XCTAssertEqual((stalledResults.first as? FlutterError)?.code, "ota_write_stalled")
+    XCTAssertEqual(recoveredSubmitCount, 1)
+    XCTAssertEqual(recoveredResults.count, 1)
+    XCTAssertNil(recoveredResults.first!)
+    XCTAssertFalse(queue.hasPending)
   }
 
   func testOtaWriteQueueStaleEpisodeTimerCannotDriveNewPendingWrite() {
@@ -1522,6 +1964,703 @@ class RunnerTests: XCTestCase {
     OtaWriteTarget(characteristicUUID: "OTA") { _, data in
       submit(data)
     }
+  }
+
+  func testG2OtaBeginIsIdempotentButRejectsTerminalScopeConflictAndEndpointOverlap() {
+    let registry = BleG2OtaTransactionRegistry(nativeInstanceId: "native-A")
+    let left = g2OtaScope(id: "tx-1", generation: 10, endpoints: ["left": (0, 0)])
+
+    let first = registry.begin(data: left)
+    XCTAssertEqual(first.status, .accepted)
+    XCTAssertEqual(first.instanceId, "native-A")
+    XCTAssertEqual(registry.begin(data: left).status, .accepted)
+
+    var conflictingSameId = left
+    conflictingSameId["generation"] = NSNumber(value: 11)
+    XCTAssertEqual(registry.begin(data: conflictingSameId).status, .invalidRequest)
+
+    let overlappingOtherId = g2OtaScope(id: "tx-2", generation: 12, endpoints: ["left": (0, 0), "right": (0, 0)])
+    let overlap = registry.begin(data: overlappingOtherId)
+    XCTAssertEqual(overlap.status, .invalidRequest)
+    XCTAssertEqual(overlap.reason, "endpointAlreadyOwned")
+
+    let finish = registry.commitPreparedFinish(data: g2OtaFinish(from: left, instanceId: "native-A", reason: "success"))
+    XCTAssertEqual(finish.status, .committed)
+    XCTAssertEqual(registry.begin(data: left).status, .alreadyCommitted)
+    XCTAssertEqual(registry.begin(data: conflictingSameId).status, .invalidRequest)
+  }
+
+  func testG2OtaEndpointOwnershipIgnoresUnrelatedRingUuid() {
+    let registry = BleG2OtaTransactionRegistry(nativeInstanceId: "native-A")
+    let glasses = g2OtaScope(id: "tx-owned", generation: 10, endpoints: ["left": (0, 0), "right": (0, 0)])
+    XCTAssertEqual(registry.begin(data: glasses).status, .accepted)
+
+    XCTAssertTrue(registry.isEndpointOwned("left"))
+    XCTAssertTrue(registry.isEndpointOwned("right"))
+    XCTAssertFalse(registry.isEndpointOwned("r1-unrelated"))
+    XCTAssertTrue(registry.shouldAllowLegacyCleanup(endpointId: "r1-unrelated"))
+
+    let ringAdmission = registry.shouldAllowAdmission(
+      endpointId: "r1-unrelated",
+      otaContext: nil,
+      purpose: .activation
+    )
+    XCTAssertTrue(ringAdmission.allowed)
+    XCTAssertEqual(ringAdmission.reason, "")
+  }
+
+  func testG2OtaRegistryRejectsBoolFractionalAndNegativeIdentities() {
+    let registry = BleG2OtaTransactionRegistry(nativeInstanceId: "native-A")
+    var boolGeneration = g2OtaScope(id: "tx-bool", generation: 1, endpoints: ["left": (0, 0)])
+    boolGeneration["generation"] = NSNumber(value: true)
+    XCTAssertEqual(registry.begin(data: boolGeneration).status, .invalidRequest)
+
+    var doubleWholeGeneration = g2OtaScope(id: "tx-double-whole", generation: 1, endpoints: ["left": (0, 0)])
+    doubleWholeGeneration["generation"] = NSNumber(value: 10.0)
+    XCTAssertEqual(registry.begin(data: doubleWholeGeneration).status, .invalidRequest)
+
+    var fractionalGeneration = g2OtaScope(id: "tx-fraction", generation: 1, endpoints: ["left": (0, 0)])
+    fractionalGeneration["generation"] = NSNumber(value: 1.5)
+    XCTAssertEqual(registry.begin(data: fractionalGeneration).status, .invalidRequest)
+
+    var overflowGeneration = g2OtaScope(id: "tx-overflow", generation: 1, endpoints: ["left": (0, 0)])
+    overflowGeneration["generation"] = NSNumber(value: UInt64(Int64.max) + 1)
+    XCTAssertEqual(registry.begin(data: overflowGeneration).status, .invalidRequest)
+
+    let negativeEndpoint = g2OtaScope(id: "tx-negative", generation: 1, endpoints: ["left": (-1, 1)])
+    XCTAssertEqual(registry.begin(data: negativeEndpoint).status, .invalidRequest)
+
+    var boolEndpoint = g2OtaScope(id: "tx-bool-endpoint", generation: 1, endpoints: ["left": (0, 0)])
+    if var endpoints = boolEndpoint["endpoints"] as? [[String: Any]] {
+      endpoints[0]["sessionGeneration"] = NSNumber(value: true)
+      boolEndpoint["endpoints"] = endpoints
+    }
+    XCTAssertEqual(registry.begin(data: boolEndpoint).status, .invalidRequest)
+
+    var doubleEndpoint = g2OtaScope(id: "tx-double-endpoint", generation: 1, endpoints: ["left": (0, 0)])
+    if var endpoints = doubleEndpoint["endpoints"] as? [[String: Any]] {
+      endpoints[0]["attemptGeneration"] = NSNumber(value: 10.0)
+      doubleEndpoint["endpoints"] = endpoints
+    }
+    XCTAssertEqual(registry.begin(data: doubleEndpoint).status, .invalidRequest)
+
+    var fractionalEndpoint = g2OtaScope(id: "tx-fraction-endpoint", generation: 1, endpoints: ["left": (0, 0)])
+    if var endpoints = fractionalEndpoint["endpoints"] as? [[String: Any]] {
+      endpoints[0]["sessionGeneration"] = NSNumber(value: 10.5)
+      endpoints[0]["attemptGeneration"] = NSNumber(value: 10)
+      fractionalEndpoint["endpoints"] = endpoints
+    }
+    XCTAssertEqual(registry.begin(data: fractionalEndpoint).status, .invalidRequest)
+
+    let halfPairEndpoint = g2OtaScope(id: "tx-half-pair", generation: 1, endpoints: ["left": (0, 1)])
+    XCTAssertEqual(registry.begin(data: halfPairEndpoint).status, .invalidRequest)
+
+    let valid = g2OtaScope(id: "tx-valid", generation: 2, endpoints: ["left": (0, 0)])
+    let begin = registry.begin(data: valid)
+    XCTAssertEqual(begin.status, .accepted)
+
+    let negativeUpdate = g2OtaUpdate(from: valid, instanceId: begin.instanceId, uuid: "left", action: "bind", session: -1, attempt: 1)
+    XCTAssertEqual(registry.update(data: negativeUpdate).status, .invalidRequest)
+
+    var boolAttempt = g2OtaUpdate(from: valid, instanceId: begin.instanceId, uuid: "left", action: "bind", session: 1, attempt: 1)
+    boolAttempt["attemptGeneration"] = NSNumber(value: true)
+    XCTAssertEqual(registry.update(data: boolAttempt).status, .invalidRequest)
+  }
+
+  func testG2OtaRecoverPreservesRegisteredPhysicalOwner() {
+    let registry = BleG2OtaTransactionRegistry(nativeInstanceId: "native-A")
+    let scope = g2OtaScope(id: "tx-recover", generation: 10, endpoints: ["left": (4, 5), "right": (0, 0)])
+    let begin = registry.begin(data: scope)
+    XCTAssertEqual(begin.status, .accepted)
+
+    let mismatchedRecover = registry.update(data: g2OtaUpdate(from: scope, instanceId: begin.instanceId, uuid: "left", action: "recover", session: 6, attempt: 7))
+    XCTAssertEqual(mismatchedRecover.status, .staleOwner)
+    XCTAssertEqual(mismatchedRecover.reason, "recoverPhysicalMismatch")
+
+    let exactRecover = registry.update(data: g2OtaUpdate(from: scope, instanceId: begin.instanceId, uuid: "left", action: "recover", session: 4, attempt: 5))
+    XCTAssertEqual(exactRecover.status, .accepted)
+
+    let waitingRecover = registry.update(data: g2OtaUpdate(from: scope, instanceId: begin.instanceId, uuid: "right", action: "recover", session: 0, attempt: 0))
+    XCTAssertEqual(waitingRecover.status, .accepted)
+    let context = BleG2OtaContext(data: [
+      "transactionId": "tx-recover",
+      "generation": NSNumber(value: 10),
+      "instanceId": begin.instanceId
+    ])
+    let writeGate = registry.shouldAllowAdmission(endpointId: "right", otaContext: context, purpose: .write)
+    XCTAssertFalse(writeGate.allowed)
+    XCTAssertEqual(writeGate.reason, "otaContextMissingPhysicalPair")
+
+    let firstBoundRecover = registry.update(data: g2OtaUpdate(from: scope, instanceId: begin.instanceId, uuid: "right", action: "recover", session: 8, attempt: 9))
+    XCTAssertEqual(firstBoundRecover.status, .invalidRequest)
+
+    let replacedRecover = registry.update(data: g2OtaUpdate(from: scope, instanceId: begin.instanceId, uuid: "right", action: "recover", session: 9, attempt: 10))
+    XCTAssertEqual(replacedRecover.status, .invalidRequest)
+  }
+
+  func testG2OtaParkRequiresActivePositiveExactPair() {
+    let registry = BleG2OtaTransactionRegistry(nativeInstanceId: "native-A")
+    let scope = g2OtaScope(id: "tx-park", generation: 10, endpoints: ["left": (0, 0)])
+    let begin = registry.begin(data: scope)
+
+    XCTAssertEqual(
+      registry.update(data: g2OtaUpdate(from: scope, instanceId: begin.instanceId, uuid: "left", action: "park", session: 0, attempt: 0)).status,
+      .invalidRequest
+    )
+    XCTAssertEqual(
+      registry.update(data: g2OtaUpdate(from: scope, instanceId: begin.instanceId, uuid: "left", action: "park", session: 1, attempt: 1)).status,
+      .invalidRequest
+    )
+
+    XCTAssertEqual(
+      registry.update(data: g2OtaUpdate(from: scope, instanceId: begin.instanceId, uuid: "left", action: "recover", session: 0, attempt: 0)).status,
+      .accepted
+    )
+    XCTAssertEqual(
+      registry.update(data: g2OtaUpdate(from: scope, instanceId: begin.instanceId, uuid: "left", action: "park", session: 1, attempt: 1)).status,
+      .invalidRequest
+    )
+    XCTAssertEqual(
+      registry.update(data: g2OtaUpdate(from: scope, instanceId: begin.instanceId, uuid: "left", action: "bind", session: 1, attempt: 1)).status,
+      .accepted
+    )
+    XCTAssertEqual(
+      registry.update(data: g2OtaUpdate(from: scope, instanceId: begin.instanceId, uuid: "left", action: "park", session: 1, attempt: 1)).status,
+      .accepted
+    )
+  }
+
+  func testG2OtaFinishRequiresInstanceAndReplaysWithoutReleasingGateBeforeCommit() {
+    let registry = BleG2OtaTransactionRegistry(nativeInstanceId: "native-A")
+    let scope = g2OtaScope(id: "tx-finish", generation: 10, endpoints: ["left": (1, 1), "right": (2, 2)])
+    let begin = registry.begin(data: scope)
+
+    let stale = registry.prepareFinish(data: g2OtaFinish(from: scope, instanceId: "old-native", reason: "success"))
+    XCTAssertEqual(stale.result.status, .staleOwner)
+
+    let prepared = registry.prepareFinish(data: g2OtaFinish(from: scope, instanceId: begin.instanceId, reason: "success"))
+    XCTAssertEqual(prepared.result.status, .committed)
+    XCTAssertEqual(Set(prepared.endpointIds), Set(["left", "right"]))
+    XCTAssertFalse(registry.shouldAllowAdmission(endpointId: "left", otaContext: nil, purpose: .activation).allowed)
+    let finishingContext = BleG2OtaContext(data: [
+      "transactionId": "tx-finish",
+      "generation": NSNumber(value: 10),
+      "instanceId": begin.instanceId
+    ])
+    XCTAssertEqual(
+      registry.shouldAllowAdmission(endpointId: "left", otaContext: finishingContext, purpose: .write).reason,
+      "otaContextEndpointRetiring"
+    )
+    XCTAssertEqual(
+      registry.shouldAllowAdmission(endpointId: "left", otaContext: finishingContext, purpose: .activation).reason,
+      "otaContextEndpointRetiring"
+    )
+    XCTAssertEqual(registry.prepareFinish(data: g2OtaFinish(from: scope, instanceId: begin.instanceId, reason: "success")).result.status, .committed)
+
+    let committed = registry.commitPreparedFinish(data: g2OtaFinish(from: scope, instanceId: begin.instanceId, reason: "success"))
+    XCTAssertEqual(committed.status, .committed)
+    XCTAssertTrue(registry.shouldAllowAdmission(endpointId: "left", otaContext: nil, purpose: .activation).allowed)
+
+    let replay = registry.commitPreparedFinish(data: g2OtaFinish(from: scope, instanceId: begin.instanceId, reason: "success"))
+    XCTAssertEqual(replay.status, .alreadyCommitted)
+    let staleReplay = registry.commitPreparedFinish(data: g2OtaFinish(from: scope, instanceId: "wrong-native", reason: "success"))
+    XCTAssertEqual(staleReplay.status, .staleOwner)
+    XCTAssertEqual(registry.query(data: ["transactionId": "tx-finish", "generation": NSNumber(value: 10), "instanceId": "wrong-native"]).status, .staleOwner)
+    XCTAssertEqual(registry.query(data: ["transactionId": "tx-finish", "generation": NSNumber(value: 10), "instanceId": begin.instanceId]).status, .alreadyCommitted)
+    let recreatedRegistry = BleG2OtaTransactionRegistry(nativeInstanceId: "native-B")
+    let recreatedQuery = recreatedRegistry.query(data: ["transactionId": "tx-finish", "generation": NSNumber(value: 10), "instanceId": begin.instanceId])
+    XCTAssertEqual(recreatedQuery.status, .invalidated)
+    XCTAssertEqual(recreatedQuery.reason, "nativeInstanceRecreated")
+
+    var conflict = scope
+    conflict["generation"] = NSNumber(value: 11)
+    XCTAssertEqual(registry.commitPreparedFinish(data: g2OtaFinish(from: conflict, instanceId: begin.instanceId, reason: "success")).status, .invalidRequest)
+
+    let unackedScope = g2OtaScope(id: "tx-unacked-cancel", generation: 12, endpoints: ["lost-ack": (1, 2)])
+    let unackedBegin = registry.begin(data: unackedScope)
+    XCTAssertEqual(unackedBegin.status, .accepted)
+    XCTAssertEqual(registry.prepareFinish(data: g2OtaFinish(from: unackedScope, instanceId: "", reason: "success")).result.status, .staleOwner)
+    XCTAssertEqual(registry.prepareFinish(data: g2OtaFinish(from: unackedScope, instanceId: "", reason: "failed")).result.status, .staleOwner)
+    let unackedCancel = registry.prepareFinish(data: g2OtaFinish(from: unackedScope, instanceId: "", reason: "cancelled"))
+    XCTAssertEqual(unackedCancel.result.status, .committed)
+    XCTAssertEqual(unackedCancel.result.instanceId, unackedBegin.instanceId)
+    XCTAssertEqual(unackedCancel.endpointIds, ["lost-ack"])
+    let unackedContext = BleG2OtaContext(data: [
+      "transactionId": "tx-unacked-cancel",
+      "generation": NSNumber(value: 12),
+      "instanceId": unackedBegin.instanceId
+    ])
+    XCTAssertEqual(
+      registry.shouldAllowAdmission(endpointId: "lost-ack", otaContext: unackedContext, purpose: .write).reason,
+      "otaContextEndpointRetiring"
+    )
+    XCTAssertEqual(registry.commitPreparedFinish(data: g2OtaFinish(from: unackedScope, instanceId: "", reason: "cancelled")).status, .committed)
+  }
+
+  func testG2OtaWriteAdmissionDiffersFromActivationAdmission() {
+    let registry = BleG2OtaTransactionRegistry(nativeInstanceId: "native-A")
+    let scope = g2OtaScope(id: "tx-admit", generation: 10, endpoints: ["left": (0, 0)])
+    let begin = registry.begin(data: scope)
+    let context = BleG2OtaContext(data: [
+      "transactionId": "tx-admit",
+      "generation": NSNumber(value: 10),
+      "instanceId": begin.instanceId
+    ])
+
+    XCTAssertTrue(registry.shouldAllowAdmission(endpointId: "left", otaContext: context, purpose: .activation).allowed)
+    XCTAssertFalse(registry.shouldAllowAdmission(endpointId: "left", otaContext: context, purpose: .write).allowed)
+
+    XCTAssertEqual(
+      registry.update(data: g2OtaUpdate(from: scope, instanceId: begin.instanceId, uuid: "left", action: "bind", session: 1, attempt: 1)).status,
+      .accepted
+    )
+    XCTAssertTrue(registry.shouldAllowAdmission(endpointId: "left", otaContext: context, purpose: .write).allowed)
+  }
+
+  func testG2OtaNativeBeginPolicyRequiresNativeKnownTargetsAndExactLivePairs() {
+    guard let scope = BleG2OtaTransactionScope(data: g2OtaScope(id: "tx-native-begin", generation: 10, endpoints: [
+      "left": (11, 12),
+      "right": (0, 0)
+    ])) else {
+      XCTFail("scope should parse")
+      return
+    }
+
+    let accepted: [String: BleG2OtaNativeEndpointState] = [
+      "left": BleG2OtaNativeEndpointState(
+        uuid: "left",
+        name: "Even left",
+        belongConfig: "Even-G2",
+        isNativeKnown: true,
+        isBusinessConnected: true,
+        isPeripheralConnected: true,
+        sessionGeneration: 11,
+        attemptGeneration: 12
+      ),
+      "right": BleG2OtaNativeEndpointState(
+        uuid: "right",
+        name: "Even right",
+        belongConfig: "Even-G2",
+        isNativeKnown: true,
+        isBusinessConnected: false,
+        isPeripheralConnected: false,
+        sessionGeneration: 0,
+        attemptGeneration: 0
+      )
+    ]
+    XCTAssertNil(BleG2OtaNativeBeginPolicy.rejectionReason(scope: scope, states: accepted))
+
+    var missingWaiting = accepted
+    missingWaiting["right"] = BleG2OtaNativeEndpointState(
+      uuid: "right",
+      name: "Even right",
+      belongConfig: "Even-G2",
+      isNativeKnown: false,
+      isBusinessConnected: false,
+      isPeripheralConnected: false,
+      sessionGeneration: 0,
+      attemptGeneration: 0
+    )
+    XCTAssertEqual(BleG2OtaNativeBeginPolicy.rejectionReason(scope: scope, states: missingWaiting), "nativeEndpointUnknown")
+
+    var stalePositivePair = accepted
+    stalePositivePair["left"] = BleG2OtaNativeEndpointState(
+      uuid: "left",
+      name: "Even left",
+      belongConfig: "Even-G2",
+      isNativeKnown: true,
+      isBusinessConnected: true,
+      isPeripheralConnected: true,
+      sessionGeneration: 11,
+      attemptGeneration: 13
+    )
+    XCTAssertEqual(BleG2OtaNativeBeginPolicy.rejectionReason(scope: scope, states: stalePositivePair), "nativePhysicalOwnerMismatch")
+  }
+
+  func testG2OtaNativeUpdateUsesConfigFrozenByBeginWhenWirePayloadOmitsConfig() {
+    let manager = BleManager.shared
+    let uuid = "OTA-BIND-\(UUID().uuidString)"
+    let scope = g2OtaScope(
+      id: "tx-native-bind-\(UUID().uuidString)",
+      generation: 10,
+      endpoints: [uuid: (0, 0)]
+    )
+    let begin = manager.g2OtaTransactions.begin(data: scope)
+    XCTAssertEqual(begin.status, .accepted)
+    defer {
+      _ = manager.g2OtaTransactions.clearActive(reason: .revoked)
+      manager.upgradeStateRegistry.consume(uuid)
+    }
+
+    // This is the production MethodChannel shape: config/SN/endpoints are
+    // frozen by begin and are intentionally not repeated on endpoint updates.
+    let update: [String: Any] = [
+      "transactionId": begin.transactionId,
+      "generation": NSNumber(value: begin.generation),
+      "instanceId": begin.instanceId,
+      "uuid": uuid,
+      "action": "bind",
+      "sessionGeneration": NSNumber(value: 41),
+      "attemptGeneration": NSNumber(value: 42)
+    ]
+
+    let result = manager.updateG2OtaEndpoint(update)
+    XCTAssertEqual(result.status, .staleOwner)
+    XCTAssertEqual(result.reason, "nativePhysicalOwnerMismatch")
+  }
+
+  func testG2OtaConfigPolicyRequiresProductionOtaPrivateService() {
+    XCTAssertTrue(BleG2OtaConfigPolicy.supportsG2Ota(privateServices: [
+      (type: 0, service: "0000180A-0000-1000-8000-00805F9B34FB"),
+      (type: 1, service: "00002760-08C2-11E1-9073-0E8AC72E1001")
+    ]))
+    XCTAssertFalse(BleG2OtaConfigPolicy.supportsG2Ota(privateServices: [
+      (type: 1, service: "00009999-08C2-11E1-9073-0E8AC72E1001")
+    ]))
+    XCTAssertFalse(BleG2OtaConfigPolicy.supportsG2Ota(privateServices: [
+      (type: 0, service: "00002760-08C2-11E1-9073-0E8AC72E1001")
+    ]))
+  }
+
+  func testG2OtaRecoveryGrantAllowsNativeNoDeviceRetryUntilTransactionInvalidates() {
+    let manager = BleManager.shared
+    let uuid = "OTA-NODEVICE-\(UUID().uuidString)"
+    let scope = g2OtaScope(id: "tx-native-retry-\(UUID().uuidString)", generation: 90, endpoints: [uuid: (0, 0)])
+    let begin = manager.g2OtaTransactions.begin(data: scope)
+    XCTAssertEqual(begin.status, .accepted)
+    manager.upgradeStateRegistry.enter(uuid)
+    defer {
+      _ = manager.g2OtaTransactions.clearActive(reason: .revoked)
+      manager.upgradeStateRegistry.consume(uuid)
+      manager.cancelReconnectTask(uuid: uuid, name: "Even \(uuid)")
+      manager.reconnectStore.remove(uuid: uuid, name: "Even \(uuid)")
+    }
+
+    let context = BleG2OtaContext(data: [
+      "transactionId": begin.transactionId,
+      "generation": NSNumber(value: begin.generation),
+      "instanceId": begin.instanceId
+    ])
+    var task = BleReconnectTask(
+      belongConfig: "g2_glasses",
+      uuid: uuid,
+      name: "Even \(uuid)",
+      source: .autoReconnect
+    )
+    task.g2OtaRecoveryContext = context
+    task.g2OtaRecoveryEndpointId = uuid
+
+    let admitted = manager.otaReconnectSchedulingAdmission(task: task, observedUuid: uuid)
+    XCTAssertTrue(admitted.allowed)
+    XCTAssertTrue(admitted.isOtaGranted)
+    let migratedPeripheralRetry = manager.otaReconnectSchedulingAdmission(task: task, observedUuid: UUID().uuidString)
+    XCTAssertTrue(migratedPeripheralRetry.allowed)
+    XCTAssertTrue(migratedPeripheralRetry.isOtaGranted)
+
+    manager.reconnectTasks[uuid.lowercased()] = task
+    let contexts = manager.g2OtaTransactions.endpointContexts(endpointIds: [uuid])
+    manager.clearG2OtaRecoveryGrants(contextsByEndpoint: contexts)
+    let clearedTask = manager.reconnectTasks[uuid.lowercased()]
+    XCTAssertNil(clearedTask?.g2OtaRecoveryContext)
+    XCTAssertNil(clearedTask?.g2OtaRecoveryEndpointId)
+
+    let committed = manager.g2OtaTransactions.commitPreparedFinish(data: g2OtaFinish(from: scope, instanceId: begin.instanceId, reason: "cancelled"))
+    XCTAssertEqual(committed.status, .committed)
+    manager.upgradeStateRegistry.consume(uuid)
+    let afterFinish = manager.otaReconnectSchedulingAdmission(task: clearedTask!, observedUuid: uuid)
+    XCTAssertTrue(afterFinish.allowed)
+    XCTAssertFalse(afterFinish.isOtaGranted)
+
+    var legacyTask = clearedTask!
+    legacyTask.g2OtaRecoveryContext = nil
+    legacyTask.g2OtaRecoveryEndpointId = nil
+    let legacyAfterFinish = manager.otaReconnectSchedulingAdmission(task: legacyTask, observedUuid: uuid)
+    XCTAssertTrue(legacyAfterFinish.allowed)
+    XCTAssertFalse(legacyAfterFinish.isOtaGranted)
+  }
+
+  func testG2OtaRetirementPolicyKeepsGateClosedAndConsumesLateCallbacks() {
+    let registry = BleG2OtaTransactionRegistry(nativeInstanceId: "native-A")
+    let scope = g2OtaScope(id: "tx-retire", generation: 10, endpoints: ["left": (21, 22)])
+    let begin = registry.begin(data: scope)
+    XCTAssertEqual(begin.status, .accepted)
+    XCTAssertEqual(registry.update(data: g2OtaUpdate(from: scope, instanceId: begin.instanceId, uuid: "left", action: "bind", session: 21, attempt: 22)).status, .accepted)
+
+    let prepared = registry.prepareFinish(data: g2OtaFinish(from: scope, instanceId: begin.instanceId, reason: "success"))
+    XCTAssertEqual(prepared.result.status, .committed)
+    XCTAssertFalse(registry.shouldAllowAdmission(endpointId: "left", otaContext: nil, purpose: .activation).allowed)
+    let snapshot = registry.endpointSnapshots(endpointIds: ["left"])["left"]
+    let finishDecision = BleG2OtaRetirementPolicy.decide(
+      snapshot: snapshot,
+      state: BleG2OtaRetirementEndpointState(
+        uuid: "left",
+        hasConnectedCache: true,
+        isPeripheralConnected: true,
+        sessionGeneration: 21,
+        attemptGeneration: 22,
+        isUpgrading: true
+      )
+    )
+    XCTAssertEqual(finishDecision, BleG2OtaRetirementDecision(
+      shouldClearLocalState: true,
+      shouldIsolateCache: true,
+      shouldInstallCancellationBarrier: true,
+      shouldCancelPeripheral: true
+    ))
+
+    let gattReleasedDecision = BleG2OtaRetirementPolicy.decide(
+      snapshot: snapshot,
+      state: BleG2OtaRetirementEndpointState(
+        uuid: "left",
+        hasConnectedCache: false,
+        isPeripheralConnected: false,
+        sessionGeneration: 0,
+        attemptGeneration: 0,
+        isUpgrading: false
+      )
+    )
+    XCTAssertEqual(gattReleasedDecision, BleG2OtaRetirementDecision(
+      shouldClearLocalState: true,
+      shouldIsolateCache: false,
+      shouldInstallCancellationBarrier: false,
+      shouldCancelPeripheral: false
+    ))
+
+    let barrier = BlePeripheralCancellationBarrierGate()
+    XCTAssertEqual(barrier.begin(endpointId: "left")?.isNew, true)
+    XCTAssertTrue(barrier.isBlocking(endpointId: "left"))
+    XCTAssertEqual(barrier.consumeCallback(endpointId: "left"), .activeBarrier(1))
+    XCTAssertFalse(barrier.isBlocking(endpointId: "left"))
+
+    let committed = registry.commitPreparedFinish(data: g2OtaFinish(from: scope, instanceId: begin.instanceId, reason: "success"))
+    XCTAssertEqual(committed.status, .committed)
+    XCTAssertTrue(registry.shouldAllowAdmission(endpointId: "left", otaContext: nil, purpose: .activation).allowed)
+
+    let lateDecision = BleG2OtaRetirementPolicy.decide(
+      snapshot: snapshot,
+      state: BleG2OtaRetirementEndpointState(
+        uuid: "left",
+        hasConnectedCache: true,
+        isPeripheralConnected: true,
+        sessionGeneration: 21,
+        attemptGeneration: 23,
+        isUpgrading: false
+      )
+    )
+    XCTAssertEqual(lateDecision, BleG2OtaRetirementDecision(
+      shouldClearLocalState: false,
+      shouldIsolateCache: false,
+      shouldInstallCancellationBarrier: false,
+      shouldCancelPeripheral: false
+    ))
+
+    let leftoverDecision = BleG2OtaRetirementPolicy.decide(
+      snapshot: snapshot,
+      state: BleG2OtaRetirementEndpointState(
+        uuid: "left",
+        hasConnectedCache: true,
+        isPeripheralConnected: true,
+        sessionGeneration: 21,
+        attemptGeneration: 23,
+        isUpgrading: true
+      )
+    )
+    XCTAssertEqual(leftoverDecision, BleG2OtaRetirementDecision(
+      shouldClearLocalState: true,
+      shouldIsolateCache: true,
+      shouldInstallCancellationBarrier: true,
+      shouldCancelPeripheral: true
+    ))
+
+    let parkedScope = g2OtaScope(id: "tx-park-retire", generation: 11, endpoints: ["right": (31, 32)])
+    let parkedBegin = registry.begin(data: parkedScope)
+    XCTAssertEqual(parkedBegin.status, .accepted)
+    XCTAssertEqual(registry.update(data: g2OtaUpdate(from: parkedScope, instanceId: parkedBegin.instanceId, uuid: "right", action: "bind", session: 31, attempt: 32)).status, .accepted)
+    XCTAssertEqual(registry.update(data: g2OtaUpdate(from: parkedScope, instanceId: parkedBegin.instanceId, uuid: "right", action: "park", session: 31, attempt: 32)).status, .accepted)
+    let parkedContext = BleG2OtaContext(data: [
+      "transactionId": "tx-park-retire",
+      "generation": NSNumber(value: 11),
+      "instanceId": parkedBegin.instanceId
+    ])
+    XCTAssertFalse(registry.shouldAllowAdmission(endpointId: "right", otaContext: parkedContext, purpose: .write).allowed)
+    let parkedSnapshot = registry.endpointSnapshots(endpointIds: ["right"])["right"]
+    XCTAssertEqual(parkedSnapshot?.phase, .parked)
+    let parkedDecision = BleG2OtaRetirementPolicy.decide(
+      snapshot: parkedSnapshot,
+      state: BleG2OtaRetirementEndpointState(
+        uuid: "right",
+        hasConnectedCache: true,
+        isPeripheralConnected: true,
+        sessionGeneration: 31,
+        attemptGeneration: 32,
+        isUpgrading: true
+      )
+    )
+    XCTAssertEqual(parkedDecision, BleG2OtaRetirementDecision(
+      shouldClearLocalState: true,
+      shouldIsolateCache: true,
+      shouldInstallCancellationBarrier: true,
+      shouldCancelPeripheral: true
+    ))
+  }
+
+  func testG2OtaFinishOrchestratorRejectsReentrantWorkAndReplaysWithoutSideEffects() {
+    let registry = BleG2OtaTransactionRegistry(nativeInstanceId: "native-A")
+    let scope = g2OtaScope(id: "tx-orchestrated-finish", generation: 20, endpoints: [
+      "left": (101, 102),
+      "right": (201, 202)
+    ])
+    let begin = registry.begin(data: scope)
+    XCTAssertEqual(begin.status, .accepted)
+    XCTAssertEqual(registry.update(data: g2OtaUpdate(from: scope, instanceId: begin.instanceId, uuid: "left", action: "bind", session: 101, attempt: 102)).status, .accepted)
+    XCTAssertEqual(registry.update(data: g2OtaUpdate(from: scope, instanceId: begin.instanceId, uuid: "right", action: "bind", session: 201, attempt: 202)).status, .accepted)
+    let context = BleG2OtaContext(data: [
+      "transactionId": begin.transactionId,
+      "generation": NSNumber(value: begin.generation),
+      "instanceId": begin.instanceId
+    ])
+    var retireCalls = 0
+    var wakeCalls = 0
+    var retiredEndpointCounts: [Int] = []
+
+    let result = BleG2OtaFinishOrchestrator.finish(
+      data: g2OtaFinish(from: scope, instanceId: begin.instanceId, reason: "success"),
+      registry: registry,
+      retire: { endpointIds, snapshots, contextsByEndpoint, _ in
+        retireCalls += 1
+        retiredEndpointCounts.append(endpointIds.count)
+        XCTAssertEqual(Set(endpointIds), Set(["left", "right"]))
+        XCTAssertEqual(Set(snapshots.keys), Set(["left", "right"]))
+        XCTAssertEqual(Set(contextsByEndpoint.keys), Set(["left", "right"]))
+        XCTAssertEqual(
+          registry.shouldAllowAdmission(endpointId: "left", otaContext: context, purpose: .write).reason,
+          "otaContextEndpointRetiring"
+        )
+        XCTAssertEqual(
+          registry.shouldAllowAdmission(endpointId: "right", otaContext: context, purpose: .activation).reason,
+          "otaContextEndpointRetiring"
+        )
+        // Recover is rejected while finish has atomically moved the group into
+        // retiring.  The exact failure status may reflect either the retiring
+        // phase or the now-invalid recovery ownership, but it must never accept
+        // a new transport transition between prepare and commit.
+        XCTAssertNotEqual(
+          registry.update(data: g2OtaUpdate(from: scope, instanceId: begin.instanceId, uuid: "left", action: "recover", session: 101, attempt: 102)).status,
+          .accepted
+        )
+        XCTAssertEqual(
+          registry.prepareFinish(data: g2OtaFinish(from: scope, instanceId: begin.instanceId, reason: "success")).result.status,
+          .committed
+        )
+      },
+      wake: { endpointIds in
+        wakeCalls += 1
+        XCTAssertEqual(Set(endpointIds), Set(["left", "right"]))
+      }
+    )
+    XCTAssertEqual(result.status, .committed)
+    XCTAssertEqual(retireCalls, 1)
+    XCTAssertEqual(wakeCalls, 1)
+    XCTAssertEqual(retiredEndpointCounts, [2])
+
+    let replay = BleG2OtaFinishOrchestrator.finish(
+      data: g2OtaFinish(from: scope, instanceId: begin.instanceId, reason: "success"),
+      registry: registry,
+      retire: { _, _, _, _ in retireCalls += 1 },
+      wake: { _ in wakeCalls += 1 }
+    )
+    XCTAssertEqual(replay.status, .alreadyCommitted)
+    XCTAssertEqual(retireCalls, 1)
+    XCTAssertEqual(wakeCalls, 1)
+  }
+
+  func testG2OtaFinishOrchestratorWakesOnlyReconnectableReasons() {
+    let reasons = ["success", "failed", "cancelled", "revoked"]
+    var wakeCountsByReason: [String: Int] = [:]
+
+    for (index, reason) in reasons.enumerated() {
+      let registry = BleG2OtaTransactionRegistry(nativeInstanceId: "native-A")
+      let scope = g2OtaScope(id: "tx-finish-reason-\(reason)", generation: Int64(30 + index), endpoints: [
+        "left": (Int64(301 + index), Int64(401 + index))
+      ])
+      let begin = registry.begin(data: scope)
+      XCTAssertEqual(begin.status, .accepted)
+      XCTAssertEqual(registry.update(data: g2OtaUpdate(from: scope, instanceId: begin.instanceId, uuid: "left", action: "bind", session: Int64(301 + index), attempt: Int64(401 + index))).status, .accepted)
+
+      var retireCalls = 0
+      var wakeCalls = 0
+      let result = BleG2OtaFinishOrchestrator.finish(
+        data: g2OtaFinish(from: scope, instanceId: begin.instanceId, reason: reason),
+        registry: registry,
+        retire: { endpointIds, snapshots, contextsByEndpoint, _ in
+          retireCalls += 1
+          XCTAssertEqual(endpointIds, ["left"])
+          XCTAssertEqual(Set(snapshots.keys), Set(["left"]))
+          XCTAssertEqual(Set(contextsByEndpoint.keys), Set(["left"]))
+        },
+        wake: { endpointIds in
+          wakeCalls += 1
+          XCTAssertEqual(endpointIds, ["left"])
+        }
+      )
+      XCTAssertEqual(result.status, .committed)
+      XCTAssertEqual(retireCalls, 1)
+      wakeCountsByReason[reason] = wakeCalls
+    }
+
+    XCTAssertEqual(wakeCountsByReason["success"], 1)
+    XCTAssertEqual(wakeCountsByReason["failed"], 1)
+    XCTAssertEqual(wakeCountsByReason["cancelled"], 1)
+    XCTAssertEqual(wakeCountsByReason["revoked"], 0)
+  }
+
+  private func g2OtaScope(
+    id: String,
+    generation: Int64,
+    endpoints: [String: (Int64, Int64)]
+  ) -> [String: Any] {
+    [
+      "transactionId": id,
+      "generation": NSNumber(value: generation),
+      "config": "Even-G2",
+      "sn": "S200LABK140060",
+      "endpoints": endpoints.map { uuid, pair in
+        [
+          "uuid": uuid,
+          "name": "Even \(uuid)",
+          "sessionGeneration": NSNumber(value: pair.0),
+          "attemptGeneration": NSNumber(value: pair.1)
+        ] as [String: Any]
+      }
+    ]
+  }
+
+  private func g2OtaUpdate(
+    from scope: [String: Any],
+    instanceId: String,
+    uuid: String,
+    action: String,
+    session: Int64,
+    attempt: Int64
+  ) -> [String: Any] {
+    var data = scope
+    data["instanceId"] = instanceId
+    data["uuid"] = uuid
+    data["action"] = action
+    data["sessionGeneration"] = NSNumber(value: session)
+    data["attemptGeneration"] = NSNumber(value: attempt)
+    return data
+  }
+
+  private func g2OtaFinish(
+    from scope: [String: Any],
+    instanceId: String,
+    reason: String
+  ) -> [String: Any] {
+    var data = scope
+    data["instanceId"] = instanceId
+    data["reason"] = reason
+    return data
   }
 
 }

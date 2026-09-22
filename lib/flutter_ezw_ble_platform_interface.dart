@@ -3,6 +3,8 @@ import 'dart:typed_data';
 import 'package:flutter_ezw_ble/core/models/ble_config.dart';
 import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
 import 'package:flutter_ezw_ble/core/models/ble_device.dart';
+import 'package:flutter_ezw_ble/core/models/ble_g2_ota_transaction.dart';
+import 'package:flutter_ezw_ble/core/models/ble_ota_recovery_disconnect_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_business_connection_attempt.dart';
 import 'package:flutter_ezw_ble/core/models/ble_scan_start_result.dart';
@@ -45,6 +47,13 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   ///
   Future<int> bleState() {
     throw UnimplementedError('bleState() has not been implemented.');
+  }
+
+  /// 读取当前进程 transport reset 周期，不产生连接或查询 peripheral 副作用。
+  ///
+  /// iOS final recovery activation 必须回传此值；Android 当前返回 0。
+  Future<int> bleRecoveryEpoch() {
+    throw UnimplementedError('bleRecoveryEpoch() has not been implemented.');
   }
 
   /// 设置蓝牙配置
@@ -159,6 +168,79 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     );
   }
 
+  /// OTA 写阻塞恢复专用物理断开。
+  ///
+  /// 返回值只描述 native 是否接受 exact teardown：
+  /// `accepted` 会触发真实 CoreBluetooth/GATT 断连并保留 autoReconnect owner；
+  /// `alreadyDisconnected` 表示本 attempt 已无活跃物理链路；`staleIdentity`
+  /// 与 `unavailable` 均由上层直接终止，不强行重试。
+  /// G2 事务持有期间必须同时携带 otaContext；旧 physical-only 调用不能
+  /// 取消新事务写队列。此入口只产生真实断连，恢复仍沿原有有界 supervisor。
+  Future<BleOtaRecoveryDisconnectResult> disconnectForOtaRecovery(
+    String uuid, {
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+    BleG2OtaContext? otaContext,
+  }) {
+    throw UnimplementedError(
+      'disconnectForOtaRecovery(uuid: $uuid) has not been implemented.',
+    );
+  }
+
+  /// Register the full G2 OTA endpoint set in native before the first OTA
+  /// command. Native returns an instance token that must be supplied to all
+  /// following transaction calls.
+  Future<BleG2OtaTransactionResult> beginG2OtaTransaction({
+    required String transactionId,
+    required int generation,
+    required String config,
+    required String sn,
+    required List<BleG2OtaEndpointIdentity> endpoints,
+  }) {
+    throw UnimplementedError(
+      'beginG2OtaTransaction(transactionId: $transactionId) has not been implemented.',
+    );
+  }
+
+  /// Bind, recover, or park one endpoint under the native-owned transaction.
+  Future<BleG2OtaTransactionResult> updateG2OtaEndpoint({
+    required BleG2OtaContext context,
+    required String uuid,
+    required BleG2OtaEndpointAction action,
+    int sessionGeneration = 0,
+    int attemptGeneration = 0,
+  }) {
+    throw UnimplementedError(
+      'updateG2OtaEndpoint(transactionId: ${context.transactionId}, uuid: $uuid) has not been implemented.',
+    );
+  }
+
+  /// Atomically retire the whole native G2 OTA transaction group.
+  Future<BleG2OtaTransactionResult> finishG2OtaTransaction({
+    required String transactionId,
+    required int generation,
+    required String reason,
+    required String config,
+    required String sn,
+    required List<BleG2OtaEndpointIdentity> endpoints,
+    String instanceId = '',
+  }) {
+    throw UnimplementedError(
+      'finishG2OtaTransaction(transactionId: $transactionId) has not been implemented.',
+    );
+  }
+
+  /// Query the native terminal ledger without mutating connection state.
+  Future<BleG2OtaTransactionResult> queryG2OtaTransaction({
+    required String transactionId,
+    required int generation,
+    String instanceId = '',
+  }) {
+    throw UnimplementedError(
+      'queryG2OtaTransaction(transactionId: $transactionId) has not been implemented.',
+    );
+  }
+
   /// 设备预连接：告知原生设备即将连接，允许在连接成功前做一些准备工作，避免超时退出
   ///
   /// - param uuid 设备唯一标识
@@ -229,10 +311,13 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   Future<List<BleReconnectActivationResult>> activateAutoReconnectTargets(
     List<BleDevice> devices, {
     BleConnectSource source = BleConnectSource.autoReconnect,
+    BleReconnectActivationMode mode = BleReconnectActivationMode.initial,
     int sessionGeneration = 0,
+    int recoveryEpoch = 0,
+    BleG2OtaContext? otaContext,
   }) {
     throw UnimplementedError(
-      'activateAutoReconnectTargets(devices: $devices, source: $source, sessionGeneration: $sessionGeneration) has not been implemented.',
+      'activateAutoReconnectTargets(devices: $devices, source: $source, mode: $mode, sessionGeneration: $sessionGeneration, recoveryEpoch: $recoveryEpoch) has not been implemented.',
     );
   }
 
@@ -259,6 +344,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// - param allowDuringUpgrade 业务协议已确认该控制指令可在升级态发送
   /// - param expectedSessionGeneration OTA 调用方冻结的业务 session；0 表示兼容旧调用
   /// - param expectedAttemptGeneration OTA 调用方冻结的物理 attempt；0 表示兼容旧调用
+  /// - param otaContext G2 OTA 原生事务凭据；非空时 native 必须同时校验事务和物理身份
   ///
   Future<void> sendCmd(
     String uuid,
@@ -267,6 +353,8 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     bool allowDuringUpgrade = false,
     int expectedSessionGeneration = 0,
     int expectedAttemptGeneration = 0,
+    BleG2OtaContext? otaContext,
+    BleBusinessConnectionAttempt? expectedAttempt,
   }) {
     throw UnimplementedError('sendCmd() has not been implemented.');
   }
@@ -278,6 +366,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// - param psType 指令类型
   /// - param expectedSessionGeneration OTA 调用方冻结的业务 session；0 表示兼容旧调用
   /// - param expectedAttemptGeneration OTA 调用方冻结的物理 attempt；0 表示兼容旧调用
+  /// - param otaContext G2 OTA 原生事务凭据；非空时 native 必须同时校验事务和物理身份
   ///
   Future<void> sendCmdNoWait(
     String uuid,
@@ -285,6 +374,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     int psType = 0,
     int expectedSessionGeneration = 0,
     int expectedAttemptGeneration = 0,
+    BleG2OtaContext? otaContext,
   }) {
     throw UnimplementedError('sendCmdNoWait() has not been implemented.');
   }
@@ -301,6 +391,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     int psType = 1,
     int expectedSessionGeneration = 0,
     int expectedAttemptGeneration = 0,
+    BleG2OtaContext? otaContext,
   }) {
     throw UnimplementedError('sendOtaPacketBatch() has not been implemented.');
   }
@@ -362,10 +453,52 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
 
   /// 重置蓝牙。
   ///
-  /// 这是中性 runtime teardown：释放扫描、连接和发送队列，但保留持久自动回连 owner，
-  /// 等待上层下次普通冷启动恢复流程重新 activate。
-  Future<void> resetBle() {
-    throw UnimplementedError('resetBle() has not been implemented.');
+  /// 冷启动使用 [preserveStateRestoration] 保留 iOS 已交还、但尚未被当前设备
+  /// activation 认领的 peripheral；登出/移除/用户真取消保持默认 hard reset。
+  Future<void> resetBle({bool preserveStateRestoration = false}) {
+    throw UnimplementedError(
+      'resetBle(preserveStateRestoration: $preserveStateRestoration) has not been implemented.',
+    );
+  }
+
+  /// 是否存在等待当前账号认领的 iOS State Restoration peripheral。
+  ///
+  /// 该查询只读取 native escrow，不会认领 peripheral、启动 GATT 或发布连接状态；
+  /// Android 固定返回 false。
+  Future<bool> hasPendingStateRestoration() {
+    throw UnimplementedError(
+      'hasPendingStateRestoration() has not been implemented.',
+    );
+  }
+
+  /// 当前进程是否由 iOS CoreBluetooth central restoration 启动。
+  ///
+  /// 该事实来自 `launchOptions.bluetoothCentrals`，与 `willRestoreState` escrow 是否
+  /// 仍有 peripheral 独立；不认领设备、不启动 GATT。Android 固定返回 false。
+  Future<bool> wasLaunchedForBluetoothStateRestoration() {
+    throw UnimplementedError(
+      'wasLaunchedForBluetoothStateRestoration() has not been implemented.',
+    );
+  }
+
+  /// 本进程是否发生过 iOS `willRestoreState` 回调。
+  ///
+  /// escrow 可能在 Dart 查询前已被 claim/finalize 消费清空，`hasPendingStateRestoration`
+  /// 因此不足以证明「经历过 SR」；该事实由原生一次性锁存、只读暴露，不认领设备、
+  /// 不启动 GATT。Android 固定返回 false。
+  Future<bool> didExperienceStateRestorationThisProcess() {
+    throw UnimplementedError(
+      'didExperienceStateRestorationThisProcess() has not been implemented.',
+    );
+  }
+
+  /// 结束冷启动 State Restoration 认领窗口。
+  ///
+  /// iOS 会取消未被当前业务设备认领的历史 peripheral；Android 为 no-op。
+  Future<void> finalizeStateRestorationClaims() {
+    throw UnimplementedError(
+      'finalizeStateRestorationClaims() has not been implemented.',
+    );
   }
 
   /// 清除连接缓存

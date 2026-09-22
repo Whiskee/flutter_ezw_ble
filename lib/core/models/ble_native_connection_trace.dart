@@ -13,6 +13,7 @@ class BleNativeConnectionTrace {
     required this.attemptId,
     required this.steps,
     this.capturedElapsedMs,
+    this.rssiStatus,
     this.lastRssiDbm,
     this.rssiAgeMs,
     this.phy,
@@ -27,6 +28,9 @@ class BleNativeConnectionTrace {
 
   /// Native monotonic elapsed time when this snapshot was captured.
   final int? capturedElapsedMs;
+
+  /// Sampling evidence; absence on older native versions means not observable.
+  final String? rssiStatus;
 
   /// Latest RSSI sample in dBm. Missing when the OS never delivered a sample.
   final int? lastRssiDbm;
@@ -54,6 +58,9 @@ class BleNativeConnectionTraceStep {
     required this.stage,
     required this.result,
     required this.elapsedMs,
+    this.occurredAtMs,
+    this.timingStatus,
+    this.physicalConnectionEvent,
     this.serviceType,
     this.causeDomain,
     this.causeCode,
@@ -78,6 +85,15 @@ class BleNativeConnectionTraceStep {
 
   /// Elapsed milliseconds since native created the physical attempt trace.
   final int elapsedMs;
+
+  /// Source occurrence epoch derived from the attempt monotonic/wall anchor.
+  final int? occurredAtMs;
+
+  /// valid or clock_changed; absent source metadata degrades to partial upstream.
+  final String? timingStatus;
+
+  /// Only real platform callbacks set connected/disconnected, never cleanup.
+  final String? physicalConnectionEvent;
 
   /// Optional private service type for service/characteristic/CCCD details.
   final String? serviceType;
