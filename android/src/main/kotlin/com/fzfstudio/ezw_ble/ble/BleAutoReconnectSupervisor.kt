@@ -663,7 +663,7 @@ internal class BleAutoReconnectSupervisor(
         attemptGeneration: Long,
     ): BleAndroidSecurityRecoveryAction {
         val task = reconnectTasks[reconnectKey(uuid)]
-        if (source != BleConnectSource.AUTO_RECONNECT || task == null) {
+        if (!source.isAutomaticReconnect || task == null) {
             return BleAndroidSecurityRecoveryAction.MANUAL_FAILURE
         }
         val (action, nextCount) = BleAndroidSecurityRecoveryPolicy.record(

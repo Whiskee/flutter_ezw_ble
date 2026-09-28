@@ -62,11 +62,18 @@ data class BleCmd(
         "otaTransactionId" to otaTransactionId,
         "otaGeneration" to otaGeneration,
         "otaInstanceId" to otaInstanceId,
-
-    ) + (receiveIdentity?.let { mapOf(
-        "sessionGeneration" to it.sessionGeneration,
-        "attemptGeneration" to it.attemptGeneration,
-    ) } ?: emptyMap())
+        // The legacy/OTA pair above describes command intent. A receive
+        // identity is separately signed by the exact native GATT callback and
+        // must remain independently nullable. Flattening these fields lets a
+        // rejected identity inherit a positive legacy pair and fail open.
+        "receiveIdentity" to receiveIdentity?.let {
+            mapOf(
+                "uuid" to it.uuid,
+                "sessionGeneration" to it.sessionGeneration,
+                "attemptGeneration" to it.attemptGeneration,
+            )
+        },
+    )
 
     /**
      * 比较两个指令结果是否等价。

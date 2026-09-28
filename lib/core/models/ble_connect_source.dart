@@ -4,7 +4,23 @@
 enum BleConnectSource {
   unknown,
   autoReconnect,
+  androidCdm,
+  androidBlePendingIntent,
   manualReconnect,
   stateRestoration,
   foreground,
+}
+
+extension BleConnectSourceSemantics on BleConnectSource {
+  bool get isAutomaticReconnect => switch (this) {
+        BleConnectSource.autoReconnect ||
+        BleConnectSource.androidCdm ||
+        BleConnectSource.androidBlePendingIntent ||
+        BleConnectSource.stateRestoration =>
+          true,
+        BleConnectSource.unknown ||
+        BleConnectSource.manualReconnect ||
+        BleConnectSource.foreground =>
+          false,
+      };
 }

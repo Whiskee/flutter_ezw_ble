@@ -70,6 +70,31 @@ class BleReceiptCallbackTest {
             assertEquals("AQID", events.single()["data"])
             assertEquals(7L, events.single()["sessionGeneration"])
             assertEquals(11L, events.single()["attemptGeneration"])
+            assertEquals(
+                mapOf(
+                    "uuid" to uuid,
+                    "sessionGeneration" to 7L,
+                    "attemptGeneration" to 11L,
+                ),
+                events.single()["receiveIdentity"],
+            )
         }
+    }
+
+    @Test
+    fun `legacy positive pair cannot replace rejected receive identity`() {
+        val event = BleCmd(
+            uuid = "AA:BB:CC:DD:EE:FF",
+            psType = 0,
+            data = byteArrayOf(1),
+            isSuccess = true,
+            sessionGeneration = 7L,
+            attemptGeneration = 11L,
+            receiveIdentity = null,
+        )
+
+        assertEquals(null, event.toFlutterMap()["receiveIdentity"])
+        assertEquals(7L, event.toFlutterMap()["sessionGeneration"])
+        assertEquals(11L, event.toFlutterMap()["attemptGeneration"])
     }
 }

@@ -40,6 +40,8 @@ Map<String, dynamic> _$BleConnectModelToJson(BleConnectModel instance) =>
 const _$BleConnectSourceEnumMap = {
   BleConnectSource.unknown: 'unknown',
   BleConnectSource.autoReconnect: 'autoReconnect',
+  BleConnectSource.androidCdm: 'androidCdm',
+  BleConnectSource.androidBlePendingIntent: 'androidBlePendingIntent',
   BleConnectSource.manualReconnect: 'manualReconnect',
   BleConnectSource.stateRestoration: 'stateRestoration',
   BleConnectSource.foreground: 'foreground',
