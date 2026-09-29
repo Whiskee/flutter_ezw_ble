@@ -495,7 +495,7 @@ extension BleManager {
             return
         }
         let key = reconnectKey(uuid: admission.endpointId)
-        let autoReconnect = admission.source == .autoReconnect ||
+        let autoReconnect = admission.source.isAutomaticReconnect ||
             reconnectTasks[key] != nil
         drivePeripheralConnection(
             peripheral,

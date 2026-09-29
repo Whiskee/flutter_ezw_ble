@@ -103,7 +103,7 @@ internal object BleAndroidSecurityRecoveryPolicy {
         currentCount: Int,
         lastCountedAttemptGeneration: Long,
     ): Pair<BleAndroidSecurityRecoveryAction, Int> {
-        if (source != BleConnectSource.AUTO_RECONNECT) {
+        if (!source.isAutomaticReconnect) {
             return BleAndroidSecurityRecoveryAction.MANUAL_FAILURE to currentCount
         }
         if (attemptGeneration <= 0L || attemptGeneration == lastCountedAttemptGeneration) {

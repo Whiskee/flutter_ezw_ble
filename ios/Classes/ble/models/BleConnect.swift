@@ -87,9 +87,20 @@ struct BleConnectModel: Codable {
 enum BleConnectSource: String, Codable {
     case unknown
     case autoReconnect
+    case androidCdm
+    case androidBlePendingIntent
     case manualReconnect
     case stateRestoration
     case foreground
+
+    var isAutomaticReconnect: Bool {
+        switch self {
+        case .autoReconnect, .androidCdm, .androidBlePendingIntent, .stateRestoration:
+            return true
+        case .unknown, .manualReconnect, .foreground:
+            return false
+        }
+    }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()

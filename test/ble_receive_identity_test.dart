@@ -7,7 +7,7 @@ import 'package:flutter/services.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
-  test('receive map retains native pair through ordinary serialization', () {
+  test('receive map trusts only the separately signed native identity', () {
     final cmd = BleCmd.receiveMap({
       'uuid': 'ring',
       'psType': 0,
@@ -15,12 +15,27 @@ void main() {
       'isSuccess': true,
       'sessionGeneration': 7,
       'attemptGeneration': 11,
+      'receiveIdentity': {
+        'uuid': 'ring',
+        'sessionGeneration': 17,
+        'attemptGeneration': 21,
+      },
     });
     expect(cmd.toJson()['receiveIdentity'], {
+      'uuid': 'ring',
+      'sessionGeneration': 17,
+      'attemptGeneration': 21,
+    });
+    expect(cmd.sessionGeneration, 7);
+    expect(cmd.attemptGeneration, 11);
+  });
+  test('legacy positive pair cannot manufacture receive identity', () {
+    final cmd = BleCmd.receiveMap({
       'uuid': 'ring',
       'sessionGeneration': 7,
       'attemptGeneration': 11,
     });
+    expect(cmd.receiveIdentity, isNull);
   });
   test('unknown malformed and aliased receipt metadata stays precise', () {
     for (final pair in [
@@ -38,8 +53,11 @@ void main() {
       'b': 2,
       'c': 'AQID',
       'd': true,
-      'sessionGeneration': 7,
-      'attemptGeneration': 11
+      'receiveIdentity': {
+        'uuid': 'ring',
+        'sessionGeneration': 7,
+        'attemptGeneration': 11,
+      },
     });
     expect(
         BleCmd.fromJson(original.toJson()).receiveIdentity,

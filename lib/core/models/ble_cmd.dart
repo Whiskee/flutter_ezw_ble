@@ -65,6 +65,7 @@ class BleCmd {
     final otaTransactionId = data["otaTransactionId"];
     final otaGeneration = data["otaGeneration"];
     final otaInstanceId = data["otaInstanceId"];
+    final receiveIdentity = data["receiveIdentity"];
     return BleCmd(
       uuid is String ? uuid : uuid?.toString() ?? "",
       psType is num ? psType.toInt() : 0,
@@ -77,7 +78,9 @@ class BleCmd {
       otaTransactionId: otaTransactionId is String ? otaTransactionId : '',
       otaGeneration: otaGeneration is num ? otaGeneration.toInt() : 0,
       otaInstanceId: otaInstanceId is String ? otaInstanceId : '',
-      receiveIdentity: BleReceiveIdentity.fromJson({...data, 'uuid': uuid}),
+      // Native receive admission is an independently nullable proof. Never
+      // infer it from the legacy/OTA command pair on the outer event map.
+      receiveIdentity: BleReceiveIdentity.fromJson(receiveIdentity),
     );
   }
 }
