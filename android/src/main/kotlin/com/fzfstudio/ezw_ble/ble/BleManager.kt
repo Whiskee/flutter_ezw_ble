@@ -3935,7 +3935,7 @@ class BleManager private constructor() {
                 // 5. EventChannel 输出保持在 manager，避免 pipeline 关心 Flutter JSON 结构。
                 sendMatchDevices(sn, devices)
             },
-            onScanFailed = { errorCode ->
+            reportScanFailure = { errorCode ->
                 // 6. Android 异步失败按创建 callback 时冻结的 generation 精确收口。
                 handleScanFailed(generation, errorCode)
             },
