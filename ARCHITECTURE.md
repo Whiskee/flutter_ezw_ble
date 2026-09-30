@@ -336,7 +336,7 @@ class BleDevice {
 class BleMatchDevice {
   final String sn;
   final List<BleDevice> devices;     // 一台设备的所有 BLE 端点
-  String remark;                     // App 侧的备注（不参与 JSON 序列化）
+  String remark;                     // App 侧的备注（通过固定 remark 键手动序列化，缺失时为空）
   String get belongConfig => devices.first.belongConfig;
   // ... 一组聚合 getter：isConnecting / isConnected / isAllDisconnected / isBound 等
   bool isSameDevice(BleMatchDevice other);
