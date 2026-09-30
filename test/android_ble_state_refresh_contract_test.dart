@@ -49,7 +49,8 @@ void main() {
       'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleScanPipeline.kt',
     ).readAsStringSync();
 
-    expect(pipelineSource, contains('onScanFailed(errorCode)'));
+    expect(pipelineSource, contains('reportScanFailure(errorCode)'));
+    expect(managerSource, contains('reportScanFailure = { errorCode ->'));
     expect(managerSource, contains('activeScanGeneration != generation'));
     expect(managerSource, contains('BleEC.SCAN_STATE.event?.success('));
     expect(managerSource, contains('"reason" to "asyncFailure"'));
