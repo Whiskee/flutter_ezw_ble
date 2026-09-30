@@ -1542,6 +1542,28 @@ class RunnerTests: XCTestCase {
     XCTAssertFalse(logs.contains { $0.contains("stalled") })
   }
 
+  /// ready 回调到达时必须同时记录标志取值：回调到了但标志仍为 false，与回调根本
+  /// 不到，是两种不同的故障形态，现场只能靠这一行区分。
+  func testOtaWriteQueueReadyLogReportsSendReadinessFlag() {
+    let peripheral = FakeOtaPeripheral(endpointId: "g2-left", canSend: false)
+    var logs: [String] = []
+    let queue = OtaWriteQueue(
+      peripheral: peripheral,
+      logger: { logs.append($0) },
+      clock: FakeOtaClock(),
+      scheduler: FakeOtaScheduler()
+    )
+
+    queue.onPeripheralReadyToSendWriteWithoutResponse()
+    peripheral.canSendWriteWithoutResponse = true
+    queue.onPeripheralReadyToSendWriteWithoutResponse()
+
+    let readyLogs = logs.filter { $0.contains("[ezw_ble][ota] ready") }
+    XCTAssertEqual(readyLogs.count, 2)
+    XCTAssertTrue(readyLogs[0].contains("canSend=false"))
+    XCTAssertTrue(readyLogs[1].contains("canSend=true"))
+  }
+
   func testOtaWriteQueueSubmitsOnceWhenReadyArrivesBeforeFifteenSecondDeadline() {
     let peripheral = FakeOtaPeripheral(endpointId: "g2-left", canSend: false)
     let clock = FakeOtaClock()

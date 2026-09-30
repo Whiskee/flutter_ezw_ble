@@ -1652,8 +1652,11 @@ extension BleManager {
             return
         }
         //  根据不同uuid类型获取不同的服务特征
+        //  - 写前采样发送就绪标志只用于诊断日志：本入口历来不读取该标志就直接写出，
+        //    这里不得把采样值用于任何放行判断，否则普通通道会继承 OTA 队列的阻塞问题。
+        let canSendBefore = device.peripheral.canSendWriteWithoutResponse
         device.peripheral.writeValue(data, for: writeChars, type: .withoutResponse)
-        loggerD(msg: "sendCmd: \(uuid), type=\(psType), writeChars=\(writeChars.uuid.uuidString), data length =\(data.count)")
+        loggerD(msg: "sendCmd: \(uuid), type=\(psType), writeChars=\(writeChars.uuid.uuidString), data length =\(data.count), \(wwrDiagnostics(device.peripheral, before: canSendBefore))")
     }
 
     /**
@@ -1734,12 +1737,20 @@ extension BleManager {
         let supportsNoResponse = writeChars.properties.contains(.writeWithoutResponse)
         if isOtaChannel && supportsNoResponse {
             //  - 4.1、获取或惰性创建 OTA 写队列, 注入 loggerD 用于埋点
-            let queue = otaWriteQueues[uuid] ?? OtaWriteQueue(
-                peripheral: device.peripheral,
-                logger: { [weak self] msg in
-                    self?.loggerD(msg: msg)
-                }
-            )
+            //  -- 队列弱引用创建时的 peripheral; 创建时记录对象地址, 与普通写入日志里的
+            //     地址对照, 可判断重连后队列读取的是否仍是实际写入的那个实例.
+            let queue: OtaWriteQueue
+            if let existing = otaWriteQueues[uuid] {
+                queue = existing
+            } else {
+                queue = OtaWriteQueue(
+                    peripheral: device.peripheral,
+                    logger: { [weak self] msg in
+                        self?.loggerD(msg: msg)
+                    }
+                )
+                loggerD(msg: "[ezw_ble][ota] queue created uuid=\(uuid) peripheral=\(Unmanaged.passUnretained(device.peripheral).toOpaque())")
+            }
             otaWriteQueues[uuid] = queue
             //  - 4.2、入队后只有真正调用 peripheral.writeValue 才回调成功。
             //  -- 这里构造提交目标而不让队列直接依赖 CBCharacteristic，便于 XCTest 覆盖背压时序。
@@ -1783,8 +1794,10 @@ extension BleManager {
             ))
         } else {
             //  - 4.4、保持现有非 OTA 行为: WriteWithoutResponse 立即返回, 不做背压
+            //  -- 写前采样只用于诊断日志, 不参与放行判断(原因同 sendCmd).
+            let canSendBefore = device.peripheral.canSendWriteWithoutResponse
             device.peripheral.writeValue(data, for: writeChars, type: .withoutResponse)
-            loggerD(msg: "sendCmdNoWait: \(uuid), type=\(psType), writeChars=\(writeChars.uuid.uuidString), data length=\(data.count)")
+            loggerD(msg: "sendCmdNoWait: \(uuid), type=\(psType), writeChars=\(writeChars.uuid.uuidString), data length=\(data.count), \(wwrDiagnostics(device.peripheral, before: canSendBefore))")
             result(nil)
         }
     }
@@ -1792,6 +1805,22 @@ extension BleManager {
     /// OTA 错误 details 需要带上当前 native pending 深度，帮助区分“尚未提交”和“已提交后设备无 ack”。
     private func queueDepthForOta(uuid: String) -> Int {
         return otaWriteQueues[uuid]?.queueDepth ?? 0
+    }
+
+    /**
+     *  WriteWithoutResponse 发送就绪诊断片段
+     *
+     *  - 背景: 部分 iOS 26.x 手机上 `canSendWriteWithoutResponse` 长期为 false 且 ready 回调
+     *    不到, 但写入仍能送达. 只看 OTA 队列日志无法区分"标志失效"与"链路真的拥塞".
+     *  - canSendBefore 由调用方在 writeValue 之前采样, canSendAfter 在写出之后读取,
+     *    两者对照可以直接看到该标志是否逐写翻转、上一次 ready 是否已经到达.
+     *  - peripheral 输出对象地址, 用于判断重连前后 CoreBluetooth 是否复用同一个实例.
+     *  - 全部是只读采样, 不改变任何写入或流控行为.
+     */
+    private func wwrDiagnostics(_ peripheral: CBPeripheral, before canSendBefore: Bool) -> String {
+        let canSendAfter = peripheral.canSendWriteWithoutResponse
+        let address = Unmanaged.passUnretained(peripheral).toOpaque()
+        return "canSendBefore=\(canSendBefore), canSendAfter=\(canSendAfter), peripheral=\(address)"
     }
 
     /// OTA 恢复重传可携带业务层冻结的 exact session/attempt。未传 expected pair 时保持旧
@@ -4058,10 +4087,14 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
     /**
      *  WriteWithoutResponse 背压解除回调
      *  - CoreBluetooth 通知该外设可继续接收无应答写入, 把信号转发到对应的 OTA 写队列继续 pump.
+     *  - 没有 OTA 队列时回调无人消费, 但仍要记录一行: 普通通道每次写入后系统都应回调一次,
+     *    现场需要据此判断 ready 是"从未到达"还是"到达时没有队列". 有队列时由队列自己记录,
+     *    这里不重复输出, 避免 OTA 传输期间日志翻倍.
      */
     func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
         let uuid = peripheral.identifier.uuidString
         guard let queue = otaWriteQueues[uuid] else {
+            loggerD(msg: "[ezw_ble][wwr] ready uuid=\(uuid) canSend=\(peripheral.canSendWriteWithoutResponse) queue=none peripheral=\(Unmanaged.passUnretained(peripheral).toOpaque())")
             return
         }
         queue.onPeripheralReadyToSendWriteWithoutResponse()

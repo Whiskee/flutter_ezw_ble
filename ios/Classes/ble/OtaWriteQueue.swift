@@ -191,7 +191,10 @@ extension OtaWriteQueue {
      *  - OS 通知背压解除, 立即继续抽干队列.
      */
     func onPeripheralReadyToSendWriteWithoutResponse() {
-        logger?("[ezw_ble][ota] ready endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) pending=\(pending.count)")
+        // 同时记录回调到达时的标志取值：回调到了但标志仍为 false，与回调根本不到，
+        // 是两种不同的故障形态，只有在这里采样才能区分。外设已释放时无值可读。
+        let canSend = peripheral.map { String($0.canSendWriteWithoutResponse) } ?? "released"
+        logger?("[ezw_ble][ota] ready endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) canSend=\(canSend) pending=\(pending.count)")
         // ready 回调本身不重置计时；只有 canSend 已真实恢复时 pump 才结束当前 episode，
         // 否则一次虚假/过早回调会把 15 秒 fail-closed 窗口无限向后延长。
         pump(resumeSource: "callback")

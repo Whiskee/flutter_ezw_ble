@@ -226,13 +226,41 @@ Android `sendCmdNoWait(psType == 1)` 同样必须保留 `BluetoothGatt.writeChar
 [ezw_ble][ota] enqueued endpoint=<uuid> bytes=<len> pending=<n>
 [ezw_ble][ota] submitted endpoint=<uuid> char=<charUuid> bytes=<len> pending=<n>
 [ezw_ble][ota] backpressure endpoint=<uuid> episode=<n> reason=<reason> wait=<duration> pending=<n>
-[ezw_ble][ota] ready endpoint=<uuid> episode=<n> pending=<n>
+[ezw_ble][ota] ready endpoint=<uuid> episode=<n> canSend=<bool|released> pending=<n>
 [ezw_ble][ota] resumed endpoint=<uuid> episode=<n> reason=<reason> source=<callback|poll> wait=<duration> pending=<n>
 [ezw_ble][ota] stalled endpoint=<uuid> episode=<n> reason=<reason> wait=<duration> pending=<n> session=<n> attempt=<n>
 [ezw_ble][ota] cancelled endpoint=<uuid> episode=<n> reason=<reason> pending=<n>
 ```
 
 日志经现有 `logger` EventChannel 上报到 Dart 端 `blePrintEC`(参考 §6 命名约定)。
+
+#### 4.5.1 发送就绪诊断
+
+部分 iOS 26.x 手机上 `canSendWriteWithoutResponse` 长期为 false 且 ready 回调不到,但写入
+仍能送达。仅凭 OTA 队列日志无法区分"标志失效"与"链路真的拥塞",因此补充以下只读采样:
+
+```
+[ezw_ble][ota] queue created uuid=<uuid> peripheral=<对象地址>
+[ezw_ble][wwr] ready uuid=<uuid> canSend=<bool> queue=none peripheral=<对象地址>
+sendCmd: <uuid>, type=<psType>, writeChars=<charUuid>, data length =<len>, canSendBefore=<bool>, canSendAfter=<bool>, peripheral=<对象地址>
+sendCmdNoWait: <uuid>, type=<psType>, writeChars=<charUuid>, data length=<len>, canSendBefore=<bool>, canSendAfter=<bool>, peripheral=<对象地址>
+```
+
+- `[ezw_ble][wwr] ready` 只在该外设没有 OTA 队列时输出;有队列时由 `[ezw_ble][ota] ready`
+  记录,同一次回调不会输出两行。
+- `canSendBefore` 在 `writeValue` 之前采样,`canSendAfter` 在之后读取。
+- `peripheral` 是 `CBPeripheral` 对象地址,用于判断重连前后是否为同一实例。
+- 以上采样只用于日志。普通通道(`sendCmd`、非 OTA 的 `sendCmdNoWait`)仍然不读取该标志
+  就直接写出,不得把采样值用于任何放行判断。
+
+判读:
+
+| 现象 | 含义 |
+| --- | --- |
+| `canSendBefore=false` 的写入随后收到设备协议回复 | 标志失效,链路实际可写 |
+| 写入之后长时间没有任何 `ready` 行 | 系统没有回送 ready |
+| `ready` 行里 `canSend=false` | 回调到达但标志未恢复 |
+| 重连前后 `peripheral` 地址相同 | CoreBluetooth 复用了同一对象 |
 
 ---
 
