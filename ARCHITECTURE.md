@@ -549,7 +549,7 @@ CoreBluetooth Code 14 表示系统和 peripheral 的配对信息已不一致。�
 5. 每条 read characteristic 都重新打开 notify/CCCD；
 6. 全部成功后才上报 `connectFinish`；G2 等待业务鉴权后用该事件的 exact attempt 两阶段提交进入 `connected`，G1/R1 继续调用兼容 `deviceConnected`。
 
-Android/iOS G2 的 Security Gate 只统计真实 5403 保护写安全失败，以及 Android Bond-first 或防御性 fallback `createBond()` 的明确拒绝/失败。每个 endpoint / recovery episode 最多 5 次实际安全建立尝试，初次失败计为第 1 次；第 5 次发布 `securityRecoveryExhausted` 并停止该 endpoint 自动 owner，不得再产生第 6 次自动连接；该状态不是 `isError` / `isDisconnected`，由 even_connect 静默消费。蓝牙关闭、扫描未命中、普通连接超时以及缺失/不支持 5403 本身不消耗预算（iOS 保护写在途时的连接超时与写回调原子消费同一 exact attempt，计为一次）；iOS 生命周期恢复只复验仍有效的 exact owner。iOS 自动第 1～4 次失败（含 `stateRestoration`）先落盘计数，再经 cancellation barrier 拆掉本 attempt，由同一 owner 按 `disconnectFromSys` 重调度并建立新的 exact attempt 与 CoreBluetooth pending connect（`retryPendingConnect`）；inactive 只复用进程内 `CBPeripheral`，不扫描、不同步 retrieve。不得复用下文 R1 Code 14 的新鲜广播恢复：G2 右腿是 iOS ANCS 客户端，链路由系统持有、App cancel 后仍不断开也不广播，而新鲜广播扫描只在 active 时运行。用户手动点击会清除该 endpoint 的自动耗尽/计数标记，不执行五次静默恢复，首次真实安全失败仍沿用 `boundFail`。
+Android/iOS G2 的 Security Gate 只统计真实 5403 保护写安全失败，以及 Android Bond-first 或防御性 fallback `createBond()` 的明确拒绝/失败。每个 endpoint / recovery episode 最多 5 次实际安全建立尝试，初次失败计为第 1 次；第 5 次发布 `securityRecoveryExhausted` 并停止该 endpoint 自动 owner，不得再产生第 6 次自动连接；该状态不是 `isError` / `isDisconnected`，由 even_connect 静默消费。蓝牙关闭、扫描未命中、普通连接超时、缺失/不支持 5403 本身，以及 Android 5403 写返回 `GATT_INVALID_HANDLE`（本端 attribute cache 过期，见 11.5）都不消耗预算（iOS 保护写在途时的连接超时与写回调原子消费同一 exact attempt，计为一次）；iOS 生命周期恢复只复验仍有效的 exact owner。iOS 自动第 1～4 次失败（含 `stateRestoration`）先落盘计数，再经 cancellation barrier 拆掉本 attempt，由同一 owner 按 `disconnectFromSys` 重调度并建立新的 exact attempt 与 CoreBluetooth pending connect（`retryPendingConnect`）；inactive 只复用进程内 `CBPeripheral`，不扫描、不同步 retrieve。不得复用下文 R1 Code 14 的新鲜广播恢复：G2 右腿是 iOS ANCS 客户端，链路由系统持有、App cancel 后仍不断开也不广播，而新鲜广播扫描只在 active 时运行。用户手动点击会清除该 endpoint 的自动耗尽/计数标记，不执行五次静默恢复，首次真实安全失败仍沿用 `boundFail`。
 
 Android 自动/手动回连统一使用 `connectGatt(autoConnect = true)`；`autoReconnectUseNativePassive` 不再决定是否退回 active/scan-first。pending 阶段的 exact-GATT deadline 只回收未收到物理 callback 的 zombie handle；Gate queued 与业务 pipeline 阶段不会被它关闭。
 
@@ -793,6 +793,8 @@ Android `onConnectionStateChange(... STATE_DISCONNECTED)` 的 `status` 必须按
 不要把连接回调里的 HCI 断开原因和 `BOUND_FAIL` 直接绑定。`BOUND_FAIL` 只应描述绑定流程失败，不应描述普通链路超时。连接回调中的 `status=8` 也不得触发授权恢复、GATT cache refresh 或 `needsScanBeforeConnect`；它仍按既有阶段语义处理：业务已 connected 后走 `DISCONNECT_FROM_SYS`，connecting 阶段走 `TIMEOUT`。
 
 GATT 操作回调保留相反边界：descriptor / characteristic write 的 `status=8` 是 `GATT_INSUFFICIENT_AUTHORIZATION`，必须先调用 Android 授权恢复入口刷新本端 GATT cache/bond 视图。descriptor write 仍以 `CHARS_FAIL` 终止本次 GATT readiness；characteristic write 发生在业务 connected 后，恢复后以 `DISCONNECT_FROM_SYS` 终止 session，且不得继续 `poll` / `writeNext` 消费发送队列。
+
+readiness 阶段的 5403 写或 CCCD 写返回 `status=1`（`GATT_INVALID_HANDLE`，即 ATT Invalid Handle）时，句柄来自过期的本端 attribute cache：已 Bond 设备的服务发现直接读取系统 GATT cache，对端固件改表后，若 Service Changed 晚于首个 GATT 请求到达，系统不会重新发现，此后每次回连都会复用同一份失效句柄。必须先调用 stale cache 恢复入口 `refresh()` 本端 GATT cache，再按原 `CHARS_FAIL` 终止，让下一次 attempt 走空中服务发现。它不是安全证据：不调用授权恢复、不消耗 Security Gate 预算、不设置 `needsScanBeforeConnect`、不改 Bond；连接回调的 HCI status 同样不得进入该入口。
 
 ### 11.6 iOS 连接主流程
 

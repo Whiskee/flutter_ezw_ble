@@ -40,7 +40,7 @@
 - `initConfigs` 必须使用 `customToJson` 序列化嵌套模型，不要改成浅层 JSON。
 - 不要手工编辑 `*.g.dart`。修改源模型后运行 build_runner。
 - `receiveData` 的二进制 payload 跨 Method/EventChannel 时保持 Base64 约定。
-- Android `onConnectionStateChange` 的 status 使用 HCI/controller 断连语义；characteristic/descriptor 回调才使用 ATT/GATT 操作语义。数值 `8` 在前者是连接超时，严禁触发授权恢复/cache refresh/`needsScanBeforeConnect`；在后者是授权不足，必须走授权恢复后再按回调阶段终止。
+- Android `onConnectionStateChange` 的 status 使用 HCI/controller 断连语义；characteristic/descriptor 回调才使用 ATT/GATT 操作语义。数值 `8` 在前者是连接超时，严禁触发授权恢复/cache refresh/`needsScanBeforeConnect`；在后者是授权不足，必须走授权恢复后再按回调阶段终止。数值 `1` 在后者是 `GATT_INVALID_HANDLE`：readiness 阶段的 5403/CCCD 写返回它说明本端 attribute cache 过期，必须先刷新 cache 再按 `CHARS_FAIL` 终止，不得计入安全预算、走授权恢复或改 Bond。
 - 原生连接 Trace 默认关闭，只能由 `setConnectionTraceEnabled(bool)` 显式打开；关闭仅清进程内 Trace/RSSI 诊断缓存，不能断开设备、取消/调度 autoReconnect 或补造当前链路。`nativeTrace.attemptId` 是诊断 UUID，不能替代 `sessionGeneration/attemptGeneration` owner 校验；step 快照最多 32 条，溢出必须用连续 `stepSeq` + `trace/gap.droppedCount` 表达缺口。
 - Trace 发生时间必须在原生生产处用同一 wall/monotonic 锚点冻结；快照/重放不得改写，墙钟跳变仅标记 `clock_changed`。`physicalConnectionEvent` 只能由 exact owner 的真实物理回调写入，reset/取消/状态投影不得伪造；RSSI 只复用既有读请求。
 - iOS OTA 中 `psType == 1` 的 `sendCmdNoWait` 必须与 `OtaWriteQueue`、`canSendWriteWithoutResponse` 和 `docs/IOS_OTA_NOWAIT_SPEC.md` 对齐。
