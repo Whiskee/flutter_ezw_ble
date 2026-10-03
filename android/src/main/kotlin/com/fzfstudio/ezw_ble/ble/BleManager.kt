@@ -4055,6 +4055,10 @@ class BleManager private constructor() {
                 // 6. 只有 ATT/GATT 操作回调里的授权不足才能恢复 cache/bond；连接断连 status 不走这里。
                 recoverInsufficientAuthorization(gatt, device)
             },
+            recoverStaleAttributeCache = { gatt, device ->
+                // 6.1 ATT 句柄失效说明本端 GATT cache 过期；只刷新 cache，不动 Bond、不计安全预算。
+                recoverStaleAttributeCache(gatt, device)
+            },
             securityGateAttempts = securityGateAttempts,
             securityGateOwner = { gatt -> securityGateOwner(admission, gatt) },
             onSecurityGateFailure = { gatt, device, causeDomain, causeCode ->
@@ -5484,6 +5488,22 @@ class BleManager private constructor() {
         sendLog(
             BleLoggerTag.d,
             "${device.uuid}, authorization recovery: refresh=$refreshed, bond=${bondState.toBondStateName()}, keepBond=true",
+        )
+    }
+
+    /**
+     * 恢复 ATT/GATT 操作返回 GATT_INVALID_HANDLE 后的本端 attribute cache。
+     *
+     * 已 Bond 设备的 discoverServices 直接读取系统 GATT cache；对端固件改表后，若 Service Changed
+     * 晚于首个 GATT 请求到达，系统不会重新发现，此后每次回连都复用同一份失效句柄。这里只刷新
+     * cache，让下一次 attempt 走空中服务发现：保留系统 Bond，不设置 needsScanBeforeConnect（链路
+     * 与地址都正常），也不进入安全恢复预算。
+     */
+    private fun recoverStaleAttributeCache(gatt: BluetoothGatt, device: BleDevice) {
+        val refreshed = refreshDeviceCache(gatt)
+        sendLog(
+            BleLoggerTag.d,
+            "${device.uuid}, stale attribute cache recovery: refresh=$refreshed, keepBond=true",
         )
     }
 

@@ -7,6 +7,8 @@ object BluetoothGattStatus {
     const val HCI_LMP_RESPONSE_TIMEOUT = 34
     const val HCI_CONNECTION_FAILED_TO_BE_ESTABLISHED = 62
     const val GATT_INSUFFICIENT_AUTHORIZATION = 8
+    /** 仅限 characteristic/descriptor 操作回调：对端回 ATT Invalid Handle，说明本端 attribute cache 已过期。 */
+    const val GATT_INVALID_HANDLE = 1
 
     private val gattOperationStatusMessages: Map<Int, String> = mapOf(
         0 to "GATT_SUCCESS",

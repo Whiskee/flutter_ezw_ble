@@ -313,6 +313,16 @@ Native reconnect is successful only after the optional Security Gate and every c
 
 If any service, characteristic, or notify setup fails, native emits the existing failure state and schedules the next reconnect attempt.
 
+On Android, a 5403 write or CCCD write in this pipeline that returns ATT/GATT
+status 1 (`GATT_INVALID_HANDLE`) means the handle came from a stale local
+attribute cache: bonded devices are discovered from the system GATT cache, and a
+Service Changed indication that arrives after the first GATT request does not
+trigger rediscovery, so every later reconnect would reuse the same dead handle.
+Refresh the local GATT cache before the existing `charsFail` terminal so the
+next attempt rediscovers services over the air. This is not security evidence:
+it does not call authorization recovery, consume the Security Gate budget, set
+scan-before-connect, or touch the bond.
+
 For iOS, the finish gate must require:
 
 ```swift
@@ -339,8 +349,9 @@ Automatic recovery is scoped by endpoint, recovery episode, positive
   fires while the exact 5403 write is still in flight — the timeout and the
   write callback consume the same exact attempt atomically, whichever comes
   first. Bluetooth off, App inactive/background, scan misses, ordinary connection
-  timeout before the write, and missing or unsupported 5403 do not consume the
-  budget.
+  timeout before the write, missing or unsupported 5403, and an Android 5403
+  write rejected with `GATT_INVALID_HANDLE` (stale attribute cache, see GATT
+  Reconnect Readiness) do not consume the budget.
 - The first failed 5403 write is attempt 1. On iOS, automatic attempts 1
   through 4 (including `stateRestoration` owners) persist the count, cancel the
   old attempt through the cancellation barrier, and — after the exact
