@@ -66,8 +66,9 @@ class BleMatchDevice {
   factory BleMatchDevice.fromJson(Map<String, dynamic> json) =>
       _$BleMatchDeviceFromJson(json)..remark = json['remark'] as String? ?? "";
 
+  // 缓存读取固定使用 remark 键；不能把备注内容本身当成键，否则重启会丢失名称。
   Map<String, dynamic> toJson() =>
-      _$BleMatchDeviceToJson(this)..[remark] = remark;
+      _$BleMatchDeviceToJson(this)..['remark'] = remark;
 
   BleMatchDevice copy() =>
       BleMatchDevice(sn, devices: devices.map((match) => match.copy()).toList())

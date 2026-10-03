@@ -243,6 +243,7 @@ class MockFlutterEzwBlePlatform
     int psType = 1,
     int expectedSessionGeneration = 0,
     int expectedAttemptGeneration = 0,
+    BleG2OtaContext? otaContext,
   }) {
     throw UnimplementedError();
   }
