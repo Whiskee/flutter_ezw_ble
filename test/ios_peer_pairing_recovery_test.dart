@@ -207,10 +207,10 @@ void main() {
     final reconnect = File('ios/Classes/ble/BleAutoReconnectCoordinator.swift')
         .readAsStringSync();
     final activationStart = reconnect.indexOf(
-      'private func activateArmedReconnectTask',
+      'func activateArmedReconnectTask',
     );
     final activationEnd = reconnect.indexOf(
-      '/// 扫描仅为已声明的 name-only owner',
+      'func cancelReconnectTask(',
       activationStart,
     );
     final activation = reconnect.substring(activationStart, activationEnd);

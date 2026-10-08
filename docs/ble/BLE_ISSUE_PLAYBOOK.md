@@ -71,6 +71,13 @@ Reachable cause and containment:
 - Native poweredOn does not create a new resolver or consume the reset barrier.
   The existing Dart BLE-available combined recovery batch remains the recovery
   entry. Existing SR launch lookup and the main-owned central queue are unchanged.
+- Review follow-up: a deferred name-only resolver must not consume the entire
+  advertisement while retaining its owner. It now leaves valid broadcasts to
+  ordinary MAC/SN parsing and scan delivery, while keeping the epoch/session
+  barrier. Ready identity resolution precedes ordinary scan-cache deduplication
+  so a later accepted S2 can resolve a peripheral already displayed in that
+  scan window. mfr0 packets remain private to an authorized exact resolver or
+  are rejected by the normal parser; no implicit thaw/retry is added.
 
 Introduction history (AuthorDate / CommitDate both UTC+8 unless distinguished):
 

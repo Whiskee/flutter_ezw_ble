@@ -506,6 +506,17 @@ installs its UUID task, both the system-connected/escrow and stable-UUID paths
 retire the corresponding exact pending identity. A successful activation with
 no system identity leaves a ready pending owner for the existing auxiliary scan.
 
+An implicit resolver that cannot consume the pending barrier returns the
+advertisement to the existing scan pipeline without mutating that owner. Its
+peer-pairing guard and normal MAC/SN validation still apply; empty manufacturer
+data does not become a normal scan result. Valid ordinary advertisements retain
+the usual one-result-per-UUID-per-scan-window behavior. Identity resolution runs
+before ordinary display deduplication: a valid higher-session activation can
+make the owner ready after its peripheral was already displayed in the same
+window. The next advertisement then resolves it once through the existing
+arm/Gate path. Neither a new scan window nor an ordinary scan event thaws S1.
+Config revocation and cancellation keep their existing pending removal rules.
+
 The central manager uses the main queue (`queue: nil`), so synchronous
 ordinary `retrieveConnectedPeripherals` and `retrievePeripherals` wrappers use
 the same native executor and require both an active host app and a currently
@@ -547,6 +558,16 @@ query spy verifies closure execution across lifecycle/transport states; the
 production pending policy verifies S1/S2 and consecutive-reset epochs. These
 tests do not cover real CBPeripheral admission, daemon liveness, or hardware
 reconnection, which require the iPhone release acceptance run.
+
+`fvm flutter test test/ios_pending_identity_scan_native_test.dart` compiles the
+complete production Swift scan pipeline/resolver, identity model, recovery gate
+and scan models against external CoreBluetooth/manager/GATT test spies. It
+checks frozen-owner preservation, valid MAC/SN delivery and deduplication across
+scan windows, mfr0 filtering, and accepted S2 resolution through an existing
+scan cache. Cancellation/config teardown and the final activation assignment
+are fixture boundaries; the actual resolver and recovery policy are executed.
+This test does not execute the real daemon, full Manager teardown, Gate/GATT, or
+the Dart BLE-available recovery batch.
 
 iOS lookup order:
 

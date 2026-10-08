@@ -559,6 +559,8 @@ iOS 的 `CBCentralManager(queue: nil)`、Flutter MethodChannel 与生命周期�
 
 name-only owner 尚无 UUID task，也必须在 unknown/resetting/off 周期冻结 recovery epoch 与 `awaitingRecoveryActivation`。扫描或生命周期身份补偿不能拿旧 session 创建新 UUID task；只有 available 后 Dart 汇总的新 activation 携带当前 epoch 与更高正 session 才能解除。成功安装 UUID owner 后精确退役对应 pending identity；取消/配置撤销仍沿用现有清理入口。poweredOn 不新增原生自动消费路径。
 
+`BleScanPipeline` 中的 name-only resolver 未获恢复许可时保留 exact pending 并返回未消费，广播继续经过既有 peer-pairing 守卫与普通 MAC/SN 校验；冻结期间不会向 owner 分配 UUID/attempt，也不会把空 manufacturer 数据变成普通扫描结果。普通结果仍每个扫描窗口按 UUID 去重，但 ready owner 的身份解析先于展示去重，以便同一窗口内合法新 session 能解析已经展示过的外设。取消/配置撤销仍先移除 pending，不因后续扫描重新创建 owner。
+
 既有 `retrievePeripheralForStateRestorationLaunch` 是独立的后台 SR 启动一次 identifier 补查，带 background、poweredOn、当前目标及未 terminating 条件，本次未修改。普通查询门禁不能证明 ready 时的 daemon 同步 XPC 永不阻塞，也没有整体迁移 central 队列。
 
 完整方案见 `docs/AUTO_RECONNECT_SPEC.md`。
