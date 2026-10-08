@@ -32,6 +32,88 @@ Owner:
 - `flutter_ezw_ble` iOS native owns lifecycle containment and exact deferred-owner recovery.
 - even_connect/App keep their existing activation, retry, protocol, and business-connected semantics.
 
+## iPhone 16 scene-update watchdog with the active-only gate present
+
+Related bug: [7130658563](https://project.feishu.cn/venealities200/softwarebug/detail/7130658563).
+
+Evidence (2026-10-08, UTC+8):
+
+- Even 2.4.0 (1075), TestFlight, iPhone 16 / iOS 18.2 produced two
+  `FRONTBOARD / 0x8BADF00D / scene-update` reports at 11:11:04 and 11:12:19.
+  The watchdog limit was 10 seconds and app CPU time was negligible.
+- Both main-thread stacks stop in synchronous XPC through
+  `retrieveConnectedPeripheralsWhenAppActive` -> `findPeripheralFromConnected`
+  -> `activateAutoReconnectTargets`. This is the ordinary connected wrapper,
+  not the separate SR background identifier lookup.
+- App logs end after cold-start activation submission with the last native BLE
+  state recorded as unknown. The earlier reset and lifecycle gate closure are
+  present. Exact installed build 1075 source SHA remains unverified; reference
+  `28e0ef8155a1655a3865045b8ad244ce894562b2` matches the stack signatures, and
+  current App pin `f84caf808f2442fbc29b22b0452aea842df167af` has identical iOS
+  source. These are source references, not proof of build provenance.
+
+Reachable cause and containment:
+
+- Activation queries system-connected identity before it arms the UUID owner
+  and reaches `beginReconnectAttempt`'s poweredOn check. Stable UUIDs still need
+  that query because a stale UUID or escrow can coexist with a new system-owned
+  ANCS peripheral. The lifecycle gate alone does not exclude unknown/resetting.
+- Both ordinary wrappers now execute their query closure only at active +
+  poweredOn. A denied lookup retains exact pending/deferred ownership and does
+  not manufacture a device miss. The existing stable task pause/epoch path
+  remains responsible for transport recovery.
+- Name-only identities also freeze their epoch/reset barrier. Otherwise,
+  poweredOn can race the Dart epoch await: didBecomeActive or a late scan can
+  resolve the old identity and arm a brand-new UUID task with the old session.
+  Implicit resolution is now blocked until a valid final Dart activation with
+  current epoch and higher positive session. Cancels/config revocations remove
+  the owner, and successful UUID installation retires its exact pending entry.
+- Native poweredOn does not create a new resolver or consume the reset barrier.
+  The existing Dart BLE-available combined recovery batch remains the recovery
+  entry. Existing SR launch lookup and the main-owned central queue are unchanged.
+
+Introduction history (AuthorDate / CommitDate both UTC+8 unless distinguished):
+
+- `dd14d163a845507844b45e0550ee1d7679390abd`, 陈伟琦, 2026-07-23 15:12:01:
+  activation introduced the name-only system-connected pre-query.
+- `1878b1bad70fe2ac67a68040725af8adbf313a77`, 陈伟琦, 2026-08-13 16:55:49:
+  added active-only wrappers for the earlier process-exit case.
+- `b5b7944e0076aba516dcc87359a739f282e91db9`, 陈伟琦, AuthorDate
+  2026-09-01 11:55:04 / CommitDate 22:39:24: activation also queries stable UUID
+  owners and prefers current system-connected identity over escrow.
+- `a6466a6ff09acb4fc8b50449b415012904c90cf6`, 陈伟琦, 2026-09-11 18:28:34:
+  explicit epoch barrier for UUID tasks; name-only pending identities were not
+  covered. These authors describe changes, not individual responsibility for
+  this watchdog. Formal 2.3.1 already contains the same activation implementation;
+  no new 2.4.0 opening of this ordinary iOS query was found.
+
+Validation and remaining boundary:
+
+- Native query-spy regression fails with the extracted previous active-only
+  behavior at active unknown/resetting/off and passes with the combined gate.
+  The same production executor is called by both ordinary wrappers.
+- Production pending-policy tests cover old S1 refusal, exact epoch/higher S2
+  acceptance, stale-session refusal and consecutive reset. They do not model
+  CBPeripheral, daemon XPC or the complete GATT/authorization flow.
+- The 14 targeted tests, 191 plugin tests and static analysis passed. Production
+  Swift typechecking and the integrated iphoneos arm64 Release build passed.
+  The signed patch was overlaid on the affected iPhone 16 without clearing data.
+  At 12:38:52 the native unknown startup path acknowledged all three cached
+  endpoints as `nativeOwnerDeferred` in about 8 ms. The same process remained
+  alive for about 84 seconds with no new Runner/Jetsam report in that window.
+  Backend business 401 then reset the owners and routed to login; poweredOn,
+  GATT/AUTH and full device recovery were not verified by this startup check.
+- Run `fvm flutter test test/ios_synchronous_lookup_native_test.dart` on macOS
+  plus the lifecycle and epoch contract tests. Compile/typecheck production Swift
+  against the iOS SDK and validate the integrated Release build on the affected
+  iPhone, including active before poweredOn, reset during epoch await, inactive
+  transition, cancellation/config removal and name-only identity recovery.
+- Log which unavailable path actually ran, exact session/epoch, query admission,
+  pending acknowledgement and resulting business connected state. Retain failed
+  samples and verify the original process remains alive. Active + poweredOn does
+  not prove all daemon synchronous XPC waits are bounded; repeated clean runs do
+  not establish universal watchdog absence.
+
 ## Android passive autoReconnect closes the live GATT after business connected
 
 Symptoms:

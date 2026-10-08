@@ -443,6 +443,24 @@ extension BleManager {
         guard candidates.count <= 1 else {
             return false
         }
+        // Name-only owners have no task, but a reset still invalidates their
+        // session. Check before query/claim/arm can turn that owner into a UUID.
+        if let pending = pendingReconnectIdentities.values.first(where: {
+            $0.matches(
+                belongConfig: target.belongConfig,
+                advertisedName: target.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }) {
+            guard pending.recoveryGate.activationDecision(
+                      isBluetoothPoweredOn: centralManager.state == .poweredOn,
+                      currentRecoveryEpoch: currentTransportRecoveryEpoch,
+                      incomingRecoveryEpoch: recoveryEpoch,
+                      currentSessionGeneration: pending.sessionGeneration,
+                      incomingSessionGeneration: sessionGeneration
+                  ) != .reject else {
+                return false
+            }
+        }
         guard let current = candidates.first else {
             return true
         }
@@ -655,7 +673,7 @@ extension BleManager {
                 )
             }
             // 1.3、SR 可能早于 Dart 当前设备加载，先让当前账号 target 精确认领 escrow。
-            // App active 时仍需对稳定 UUID 查询系统已连接对象：restoration escrow 中的
+            // App active 且 central poweredOn 时仍需对稳定 UUID 查询系统已连接对象：restoration escrow 中的
             // peripheral 可能长期停在 connecting，而 iOS 已用另一个实例持有真实连接。
             let claimedRestoration = restorationCoordinator.claimPendingPeripheral(
                 uuid: trimmedUuid,
@@ -663,7 +681,7 @@ extension BleManager {
                 nameFilters: config.scan.nameFilters
             )
             let systemConnectedPeripheral: CBPeripheral? = {
-                guard allowsSynchronousCoreBluetoothLookup else {
+                guard canPerformSynchronousCoreBluetoothLookup else {
                     return nil
                 }
                 return findPeripheralFromConnected(
@@ -723,6 +741,15 @@ extension BleManager {
                     )
                 }
                 task = activatedTask
+                // This explicit activation has passed both task and name-only
+                // reset barriers. Retire only its exact pending identity after
+                // the stable owner is accepted; failed arm/consume retains it.
+                pendingReconnectIdentities = pendingReconnectIdentities.filter {
+                    !$0.value.matches(
+                        belongConfig: target.belongConfig,
+                        advertisedName: trimmedName
+                    )
+                }
                 if source == .manualReconnect {
                     task.securityGateFailureCount = 0
                     task.pairingRecoveryState = .normal
@@ -830,6 +857,40 @@ extension BleManager {
                     source: source,
                     sessionGeneration: sessionGeneration
                 ).key
+                let isBluetoothPoweredOn = centralManager.state == .poweredOn
+                let identityRecoveryEpoch = isBluetoothPoweredOn
+                    ? currentTransportRecoveryEpoch
+                    : beginTransportRecoveryCycleIfNeeded()
+                let previousPending = pendingReconnectIdentities[pendingKey]
+                let identityRecoveryGate: BlePendingIdentityRecoveryGate
+                if let previousPending {
+                    guard let accepted = previousPending.recoveryGate.acceptingActivation(
+                        isBluetoothPoweredOn: isBluetoothPoweredOn,
+                        currentRecoveryEpoch: identityRecoveryEpoch,
+                        incomingRecoveryEpoch: recoveryEpoch,
+                        currentSessionGeneration: previousPending.sessionGeneration,
+                        incomingSessionGeneration: sessionGeneration
+                    ) else {
+                        return BleReconnectActivationResult(
+                            target: target,
+                            state: .rejected,
+                            reason: "staleRecoveryActivation",
+                            source: source,
+                            mode: mode,
+                            ownerDisposition: .rejected,
+                            sessionGeneration: sessionGeneration
+                        )
+                    }
+                    identityRecoveryGate = accepted
+                } else {
+                    // An unknown/resetting cold start owns an identity without
+                    // performing a query or an attempt. Only the future final
+                    // Dart activation may authorize it after transport returns.
+                    identityRecoveryGate = BlePendingIdentityRecoveryGate(
+                        recoveryEpoch: identityRecoveryEpoch,
+                        awaitingRecoveryActivation: !isBluetoothPoweredOn
+                    )
+                }
                 let pending = BlePendingReconnectIdentity(
                     belongConfig: target.belongConfig,
                     name: trimmedName,
@@ -841,12 +902,15 @@ extension BleManager {
                     ),
                     sessionGeneration: sessionGeneration > 0
                         ? sessionGeneration
-                        : pendingReconnectIdentities[pendingKey]?.sessionGeneration ?? 0
+                        : pendingReconnectIdentities[pendingKey]?.sessionGeneration ?? 0,
+                    recoveryGate: identityRecoveryGate
                 )
                 pendingReconnectIdentities[pending.key] = pending
-                let pendingReason = allowsSynchronousCoreBluetoothLookup
-                    ? "awaitingPeripheralIdentity"
-                    : "appInactiveDeferred"
+                let pendingReason = !allowsSynchronousCoreBluetoothLookup
+                    ? "appInactiveDeferred"
+                    : centralManager.state != .poweredOn
+                        ? "bluetoothUnavailableDeferred"
+                        : "awaitingPeripheralIdentity"
                 loggerD(msg: "autoReconnect identityPending: config=\(target.belongConfig), name=\(trimmedName), macSuffix=\(target.expectedMacSuffix), reason=\(pendingReason)")
                 return BleReconnectActivationResult(
                     target: target,
@@ -893,6 +957,14 @@ extension BleManager {
                 )
             }
             task = activatedTask
+            // UUID supplied by a newer Dart activation also replaces the exact
+            // name-only owner, even if retrieve/escrow did not find a peripheral.
+            pendingReconnectIdentities = pendingReconnectIdentities.filter {
+                !$0.value.matches(
+                    belongConfig: target.belongConfig,
+                    advertisedName: trimmedName
+                )
+            }
             let manualTakesOverExistingFreshWait =
                 source == .manualReconnect &&
                 (task.pairingRecoveryState == .awaitingFreshAdvertisement ||
@@ -1574,6 +1646,18 @@ extension BleManager {
             return false
         }
         let pending = entry.value
+        guard bleConfigs.contains(where: {
+                  $0.name == pending.belongConfig && $0.autoReconnect
+              }),
+              centralManager.state == .poweredOn,
+              pending.recoveryGate.canResolveIdentity(
+                  currentRecoveryEpoch: currentTransportRecoveryEpoch
+              ) else {
+            // Consume the scan hint but retain the exact owner. The higher
+            // final Dart activation, not this implicit callback, releases reset.
+            loggerD(msg: "autoReconnect identity resolve deferred: config=\(belongConfig), name=\(advertisedName), session=\(pending.sessionGeneration), recoveryEpoch=\(pending.recoveryGate.recoveryEpoch)")
+            return true
+        }
         pendingReconnectIdentities.removeValue(forKey: entry.key)
         let uuid = peripheral.identifier.uuidString
         let target = BleReconnectTarget(
@@ -1679,6 +1763,17 @@ extension BleManager {
     func pauseReconnectTasksForBluetoothOff() {
         let recoveryEpoch = beginTransportRecoveryCycleIfNeeded()
         pausePeerPairingRecoveryForBluetoothOff()
+        // No UUID/attempt exists yet, but these exact identities must not be
+        // converted by a late scan or didBecomeActive using the reset session.
+        for key in pendingReconnectIdentities.keys {
+            guard var pending = pendingReconnectIdentities[key] else { continue }
+            pending.recoveryGate = BlePendingIdentityRecoveryGate(
+                recoveryEpoch: recoveryEpoch,
+                awaitingRecoveryActivation: true
+            )
+            pending.source = BleReconnectSourcePolicy.afterTransportReset()
+            pendingReconnectIdentities[key] = pending
+        }
         for key in reconnectTasks.keys {
             guard var task = reconnectTasks[key] else {
                 continue
@@ -1821,13 +1916,16 @@ extension BleManager {
     /// didBecomeActive 后补偿 name-only system-connected identity。每个快照在查询前后都
     /// 复验当前 owner，避免取消、替换 generation 或配置撤销后被旧补偿复活。
     private func resolveAppInactivePendingIdentities() {
-        guard allowsSynchronousCoreBluetoothLookup else { return }
+        guard canPerformSynchronousCoreBluetoothLookup else { return }
         let deferredPending = Array(pendingReconnectIdentities.values)
         for pending in deferredPending {
             guard let currentPending = pendingReconnectIdentities[pending.key],
                   currentPending.sessionGeneration == pending.sessionGeneration,
                   currentPending.belongConfig == pending.belongConfig,
                   currentPending.name == pending.name,
+                  currentPending.recoveryGate.canResolveIdentity(
+                      currentRecoveryEpoch: currentTransportRecoveryEpoch
+                  ),
                   let config = bleConfigs.first(where: {
                       $0.name == pending.belongConfig && $0.autoReconnect
                   }),
@@ -1841,7 +1939,10 @@ extension BleManager {
                   revalidated.sessionGeneration == pending.sessionGeneration,
                   revalidated.source == pending.source,
                   revalidated.expectedMacSuffix == pending.expectedMacSuffix,
-                  allowsSynchronousCoreBluetoothLookup else {
+                  revalidated.recoveryGate.canResolveIdentity(
+                      currentRecoveryEpoch: currentTransportRecoveryEpoch
+                  ),
+                  canPerformSynchronousCoreBluetoothLookup else {
                 continue
             }
             loggerD(msg: "appLifecycle: resolve deferred identity config=\(pending.belongConfig), name=\(pending.name), uuid=\(peripheral.identifier.uuidString), sessionGeneration=\(pending.sessionGeneration)")
@@ -2225,7 +2326,7 @@ extension BleManager {
             })?.1
         }()
         guard let peripheral = cachedPeripheral else {
-            guard allowsSynchronousCoreBluetoothLookup else {
+            guard canPerformSynchronousCoreBluetoothLookup else {
                 deferReconnectTaskForAppInactivity(
                     task,
                     context: "beginDirectReconnectAttempt no in-memory peripheral"

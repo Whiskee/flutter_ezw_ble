@@ -142,40 +142,6 @@ struct BleReconnectTask {
     var g2OtaRecoveryEndpointId: String?
 }
 
-/// Transport reset 后显式 activation 的纯准入策略。
-///
-/// 把 poweredOn 早到/晚到、旧 batch 和同代重复请求从 CoreBluetooth 资源操作中拆出，
-/// XCTest 可直接验证门禁；真实 owner 的原子读写仍由 BleManager 主队列完成。
-enum BleRecoveryActivationGateDecision: Equatable {
-    case notRequired
-    case consume
-    case reject
-}
-
-enum BleRecoveryActivationGatePolicy {
-    static func evaluate(
-        awaitingRecoveryActivation: Bool,
-        pausedByBluetoothOff: Bool,
-        isBluetoothPoweredOn: Bool,
-        currentRecoveryEpoch: Int64,
-        incomingRecoveryEpoch: Int64,
-        currentSessionGeneration: Int64,
-        incomingSessionGeneration: Int64
-    ) -> BleRecoveryActivationGateDecision {
-        guard awaitingRecoveryActivation || pausedByBluetoothOff else {
-            return .notRequired
-        }
-        guard isBluetoothPoweredOn,
-              currentRecoveryEpoch > 0,
-              incomingRecoveryEpoch == currentRecoveryEpoch,
-              incomingSessionGeneration > 0,
-              incomingSessionGeneration > currentSessionGeneration else {
-            return .reject
-        }
-        return .consume
-    }
-}
-
 /// 发送系统终态时使用的连接来源与代次，二者必须作为同一快照一起继承。
 struct BleTerminalConnectionMetadata: Equatable {
     let source: BleConnectSource
@@ -609,22 +575,29 @@ struct BlePendingReconnectIdentity {
     let belongConfig: String
     let name: String
     let expectedMacSuffix: String
-    let source: BleConnectSource
+    var source: BleConnectSource
     /// Dart session generation for name-only owners; legacy callers fall back to 0.
     let sessionGeneration: Int64
+    /// A pending identity must preserve the same transport barrier as a UUID task.
+    var recoveryGate: BlePendingIdentityRecoveryGate
 
     init(
         belongConfig: String,
         name: String,
         expectedMacSuffix: String,
         source: BleConnectSource,
-        sessionGeneration: Int64 = 0
+        sessionGeneration: Int64 = 0,
+        recoveryGate: BlePendingIdentityRecoveryGate = BlePendingIdentityRecoveryGate(
+            recoveryEpoch: 0,
+            awaitingRecoveryActivation: false
+        )
     ) {
         self.belongConfig = belongConfig
         self.name = name
         self.expectedMacSuffix = expectedMacSuffix
         self.source = source
         self.sessionGeneration = sessionGeneration
+        self.recoveryGate = recoveryGate
     }
 
     /// 配置名与完整广播名共同组成唯一 owner，避免仅凭 R1 前缀误连附近设备。

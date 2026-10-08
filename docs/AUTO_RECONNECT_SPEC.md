@@ -494,12 +494,28 @@ passes it unchanged with activation; another reset between the query and
 activation makes that request stale. Arm-only calls, connection events, old
 timers, and lifecycle compensation preserve the barrier.
 
+Name-only `identityPending` owners carry the same process-local epoch and an
+`awaitingRecoveryActivation` flag even though no UUID task exists yet. An
+unknown/resetting/off activation retains that exact identity and allocates no
+attempt. Non-poweredOn callbacks freeze all existing pending identities as well
+as UUID tasks. A late scan or foreground probe cannot convert the old session
+into a UUID task after power returns; only an explicit activation with the
+current epoch and a higher positive session can release it. A rejected request
+does not query, claim escrow, or mutate that owner. Once a valid activation
+installs its UUID task, both the system-connected/escrow and stable-UUID paths
+retire the corresponding exact pending identity. A successful activation with
+no system identity leaves a ready pending owner for the existing auxiliary scan.
+
 The central manager uses the main queue (`queue: nil`), so synchronous
-`retrieveConnectedPeripherals` and `retrievePeripherals` calls are allowed only
-while the host app is active. `willResignActive`, `didEnterBackground`, and
-`willTerminate` close this gate immediately; only `didBecomeActive` reopens it.
-This prevents a MethodChannel activation during the process-exit grace window
-from blocking the main thread in CoreBluetooth synchronous XPC.
+ordinary `retrieveConnectedPeripherals` and `retrievePeripherals` wrappers use
+the same native executor and require both an active host app and a currently
+`poweredOn` central. `willResignActive`, `didEnterBackground`, and `willTerminate`
+close the lifecycle gate immediately; `didBecomeActive` restores only the
+lifecycle permission. Cold-start identity pre-query runs before the attempt's
+power check, so it must use this combined gate as well. A denied query is deferred,
+not evidence that the peripheral is missing. This contains inactive exit and
+active unknown/resetting query paths; it does not prove daemon XPC cannot stall
+even when both conditions are met.
 
 While inactive, only a peripheral already held in the process may still use the
 existing Gate/pending-connect path. A name-only owner stays `identityPending`
@@ -510,6 +526,27 @@ current config, owner key, and session generation before one compensation pass:
 name-only system-connected hits reuse `resolvePendingReconnectIdentity`, and
 UUID owners reuse the normal activation/Gate path. Cancelled, replaced, or
 revoked owners fail closed.
+
+When didBecomeActive arrives before poweredOn, it performs no synchronous
+identity query. The existing Dart BLE-available recovery batch reads the current
+epoch and activates all eligible targets with a higher session; this restores
+both UUID and name-only owners. Native poweredOn continues to mark the UUID
+barrier only, and does not implicitly consume pending identity recovery.
+
+The existing `retrievePeripheralForStateRestorationLaunch` remains a separate
+one-time identifier lookup for an exact target during a Bluetooth SR background
+launch, gated by poweredOn/background/launch identity/not terminating. Its
+behavior is unchanged by this ordinary-wrapper fix; the central queue is not
+migrated and no single retrieve is dispatched to a global queue.
+
+Executable regression: `swiftc ios/Classes/ble/BleSynchronousCoreBluetoothLookup.swift
+ios/Classes/ble/BleRecoveryActivationGate.swift test/native/synchronous_lookup_test.swift
+-o /tmp/ble-lookup-tests` then `/tmp/ble-lookup-tests`, or
+`fvm flutter test test/ios_synchronous_lookup_native_test.dart` on macOS. The
+query spy verifies closure execution across lifecycle/transport states; the
+production pending policy verifies S1/S2 and consecutive-reset epochs. These
+tests do not cover real CBPeripheral admission, daemon liveness, or hardware
+reconnection, which require the iPhone release acceptance run.
 
 iOS lookup order:
 
@@ -642,9 +679,15 @@ hard cancel reachability without linear memory growth.
 - A late OTA exit after transport loss never changes the endpoint back to
   `connected` on either platform.
 - iOS ANCS/system-connected devices do not fall into scan timeout.
-- iOS inactive/background/terminating paths do not call either synchronous
-  retrieve API, manufacture `noDeviceFound`, or advance reconnect attempts;
-  active compensation only resumes the exact current owner/generation.
+- iOS ordinary synchronous retrieve wrappers never execute their query closure
+  while inactive/background/terminating or not poweredOn, manufacture
+  `noDeviceFound` from that denial, or advance reconnect attempts; active
+  compensation checks exact current owner/config/session/epoch. The separate
+  pre-existing SR background launch identifier lookup retains its own exception.
+- Name-only implicit identity callbacks cannot consume a reset barrier, including
+  the window where another UUID begin advanced the process epoch before the
+  delegate froze the identity. Current epoch/higher session final activation can
+  recover it; cancelled, revoked and lower-session owners cannot reappear.
 - Android out-of-range devices recover through the mandatory passive reconnect path.
 - Android business-connected system disconnect rebuilds `passiveGatt`; an old
   GATT/session cannot terminate a newer attempt.
