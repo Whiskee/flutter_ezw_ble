@@ -99,11 +99,18 @@ class BleManager: NSObject {
     private lazy var otaWriteQueues: [String: OtaWriteQueue] = [:]
     //  - 原生自动回连任务，只有业务 connected 后才会加入
     lazy var reconnectTasks: [String: BleReconnectTask] = [:]
-    //  - CBCentralManager 使用主队列；同步 retrieve 只允许在 App active 窗口执行，
-    //    避免退出宽限期主线程卡在 CoreBluetooth XPC 同步查询并触发 0x8BADF00D。
+    //  - 生命周期事实只由通知更新；同步 retrieve 还必须检查实时 poweredOn。
+    //    冷启动 active 时 central 仍可能 unknown，不能提前进入同步 XPC。
     var allowsSynchronousCoreBluetoothLookup = false
-    //  - willTerminate 后的退出宽限期是同步 retrieve 唯一真正危险的窗口；SR 后台拉起
-    //    本身不是退出，这里单独记录以便区分。
+    /// A lifecycle notification alone does not make the central ready: cold-start
+    /// activation can arrive while it is unknown/resetting, before begin's guard.
+    var canPerformSynchronousCoreBluetoothLookup: Bool {
+        BleSynchronousCoreBluetoothLookup.isAllowed(
+            isAppActive: allowsSynchronousCoreBluetoothLookup,
+            isBluetoothPoweredOn: centralManager.state == .poweredOn
+        )
+    }
+    //  - 单独记录 willTerminate，以区别有明确 owner 的 SR 后台拉起特例。
     var hasReceivedWillTerminate = false
     //  - SR 后台拉起窗口内，每个 endpoint 只允许一次 identifier 补查（每进程一次），
     //    用于补建 iOS 未随 willRestoreState 交还的当前目标腿的 pending connect。
@@ -2160,38 +2167,45 @@ extension BleManager {
     }
 
     /**
-     * Active-only wrapper for CoreBluetooth's synchronous connected-peripheral query.
+     * Active + poweredOn wrapper for CoreBluetooth's synchronous connected query.
      *
      * `CBCentralManager(queue: nil)` and MethodChannel callbacks both use the main queue.
      * During process exit this API can block in synchronous XPC longer than FrontBoard's
-     * five-second grace window, so inactive callers must defer instead of querying.
+     * grace window. Cold-start active callers can also arrive while the central is
+     * unknown/resetting, so both lifecycle and transport must permit this query.
      */
     func retrieveConnectedPeripheralsWhenAppActive(
         withServices serviceUUIDs: [CBUUID],
         context: String
     ) -> [CBPeripheral] {
-        guard allowsSynchronousCoreBluetoothLookup else {
-            loggerD(msg: "appLifecycle: defer retrieveConnectedPeripherals context=\(context)")
-            return []
-        }
-        return centralManager.retrieveConnectedPeripherals(withServices: serviceUUIDs)
+        BleSynchronousCoreBluetoothLookup.retrieve(
+            isAppActive: allowsSynchronousCoreBluetoothLookup,
+            isBluetoothPoweredOn: centralManager.state == .poweredOn,
+            query: { centralManager.retrieveConnectedPeripherals(withServices: serviceUUIDs) },
+            onDeferred: {
+                loggerD(msg: "appLifecycle: defer retrieveConnectedPeripherals context=\(context), central=\(centralManager.state.label)")
+            }
+        )
     }
 
     /**
-     * Active-only wrapper for CoreBluetooth's synchronous identifier lookup.
+     * Active + poweredOn wrapper for CoreBluetooth's synchronous identifier lookup.
      *
-     * Callers retain their existing in-memory peripheral while inactive; an empty
+     * Callers retain their exact owner while unavailable; an empty
      * result here means "deferred", not "device missing", and must not create a terminal state.
      */
     func retrievePeripheralsWhenAppActive(
         withIdentifiers identifiers: [UUID],
         context: String
     ) -> [CBPeripheral] {
-        guard allowsSynchronousCoreBluetoothLookup else {
-            loggerD(msg: "appLifecycle: defer retrievePeripherals context=\(context)")
-            return []
-        }
-        return centralManager.retrievePeripherals(withIdentifiers: identifiers)
+        BleSynchronousCoreBluetoothLookup.retrieve(
+            isAppActive: allowsSynchronousCoreBluetoothLookup,
+            isBluetoothPoweredOn: centralManager.state == .poweredOn,
+            query: { centralManager.retrievePeripherals(withIdentifiers: identifiers) },
+            onDeferred: {
+                loggerD(msg: "appLifecycle: defer retrievePeripherals context=\(context), central=\(centralManager.state.label)")
+            }
+        )
     }
 
     /**
