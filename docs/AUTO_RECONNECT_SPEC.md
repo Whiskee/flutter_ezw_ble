@@ -146,6 +146,30 @@ Dart may seed the already-bound targets and activate them immediately; this is
 still recovery of a previously authorized owner, not retry of an unknown
 first-connect failure.
 
+### iOS target persistence
+
+`BleReconnectStore.saveTargets` skips `UserDefaults.set` only when the raw stored
+list already contains the same complete four-field records (`belongConfig`,
+`uuid`, `name`, `expectedMacSuffix`) with unique UUIDs and no duplicate nonempty names. UUID
+uniqueness is case-insensitive; names follow the exact lookup comparison. Normal
+upsert moves a matching item to the end of its proposed list, but that incidental
+rotation does not carry activation priority: the incoming activation batch and
+physical callback/Gate queues determine execution order. Equivalent unambiguous
+upserts therefore keep the stored order, including when batches arrive in a
+different order. This is not permission to reorder or merge ambiguous caches:
+`target()` uses first-match UUID/name lookup, so duplicate identities must still
+pass through the original write/cleanup path.
+
+Comparison reads the actual raw defaults rather than decoded `targets()` results
+or a process cache. Missing/extra fields, invalid container/field types, dropped
+legacy entries and any changed field value or casing still write the canonical
+format. Only the final target storage side effect is skipped; canonical identity
+resolution, replaced-identity safety cleanup and new runtime owner/session
+installation run normally. The separate security recovery record writes,
+including the fifth-failure exhaustion latch, and explicit reset key removal are
+unchanged. Optimized native behavior evidence and limits are in
+[target storage verification](reconnect_target_storage_verification.md).
+
 The task is a long-lived reconnect intent. Native must keep it alive until an
 explicit owner cancels it, because timeout/noDeviceFound/service failures only
 describe one failed attempt, not the end of the reconnect contract.

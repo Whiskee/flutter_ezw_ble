@@ -407,6 +407,10 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       });
 
   @override
+  Future<void> setDebugLoggingEnabled(bool enabled) =>
+      methodChannel.invokeMethod("setDebugLoggingEnabled", enabled);
+
+  @override
   Future<void> setConnectionTraceEnabled(bool enabled) =>
       methodChannel.invokeMethod("setConnectionTraceEnabled", enabled);
 

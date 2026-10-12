@@ -42,10 +42,12 @@
 - `receiveData` 的二进制 payload 跨 Method/EventChannel 时保持 Base64 约定。
 - Android `onConnectionStateChange` 的 status 使用 HCI/controller 断连语义；characteristic/descriptor 回调才使用 ATT/GATT 操作语义。数值 `8` 在前者是连接超时，严禁触发授权恢复/cache refresh/`needsScanBeforeConnect`；在后者是授权不足，必须走授权恢复后再按回调阶段终止。
 - 原生连接 Trace 默认关闭，只能由 `setConnectionTraceEnabled(bool)` 显式打开；关闭仅清进程内 Trace/RSSI 诊断缓存，不能断开设备、取消/调度 autoReconnect 或补造当前链路。`nativeTrace.attemptId` 是诊断 UUID，不能替代 `sessionGeneration/attemptGeneration` owner 校验；step 快照最多 32 条，溢出必须用连续 `stepSeq` + `trace/gap.droppedCount` 表达缺口。
+- iOS Debug 日志默认关闭，宿主通过 `setDebugLoggingEnabled(bool)` 同步自己的 Debug 状态；门控必须早于插值、诊断 hex/summary、去重 key 消费及 EventChannel 缓冲。setter 只更新独立静态 policy，不得构造 `BleManager`/central、改 owner/重试/业务事件/Trace 或清错误日志；OTA 硬背压、外设释放和服务发现错误保留 Error。Android 当前只兼容 no-op。完整机制见 `ARCHITECTURE.md` §6。
 - Trace 发生时间必须在原生生产处用同一 wall/monotonic 锚点冻结；快照/重放不得改写，墙钟跳变仅标记 `clock_changed`。`physicalConnectionEvent` 只能由 exact owner 的真实物理回调写入，reset/取消/状态投影不得伪造；RSSI 只复用既有读请求。
 - iOS OTA 中 `psType == 1` 的 `sendCmdNoWait` 必须与 `OtaWriteQueue`、`canSendWriteWithoutResponse` 和 `docs/IOS_OTA_NOWAIT_SPEC.md` 对齐。
 - G2 OTA 的 `beginG2OtaTransaction` / `updateG2OtaEndpoint` / `finishG2OtaTransaction` / `queryG2OtaTransaction` 是 native 所有权边界；所有 OTA `sendCmd` / `sendCmdNoWait` / recovery activation / park / finish 都必须携带 transaction context，并继续用 `expectedSessionGeneration + expectedAttemptGeneration` 校验实际写入和断开。begin 冻结 transaction/config/SN/endpoint 集合，session/attempt 只属于可变 physical lease；恢复重绑后 finish 不得因调用方仍持有 begin 的旧 pair 拒绝同一事务，实际 teardown 必须使用 registry 当前 exact pair。调用方传正数时，native 必须在实际写入、清理或 reboot teardown 前按当前 transaction 和物理 owner fail-closed。旧 UUID-only/physical-only 接口不得清理新 G2 transaction；首腿完成进入 `parked`，最终 `finish` 整组退役，只有 `committed` / `alreadyCommitted` 证明退役成功。`receiveData` 的 OTA response 必须尽量携带同一 pair 和 transaction；Android 以 callback 冻结 admission + GATT handle 过滤为准，iOS 只能基于当前 connected peripheral、reconnect owner metadata 与 transaction stamp，CoreBluetooth 不提供每条 notification 的底层连接句柄，因此不能宣称具备 Android 同级 GATT handle identity。
 - 改 auto reconnect 时，同步更新 `docs/AUTO_RECONNECT_SPEC.md`、`ARCHITECTURE.md` 和相关测试/排障记录。
+- iOS 回连目标去重只在 `saveTargets` 存储边界执行，完整约束见 `docs/AUTO_RECONNECT_SPEC.md` 的目标持久化段：只跳过完整原始四字段相等且 UUID/名称无歧义的写入并保留原排列；不得短路 canonical/安全清理、新 session owner 安装或独立的第五次安全失败落盘，旧格式、坏缓存及字段大小写变化仍须走写入。
 - BLE 行为变化通常需要同时审视 Dart 和原生两端，不要假设 Android 与 iOS 可以共享实现细节。
 
 ## 常用命令

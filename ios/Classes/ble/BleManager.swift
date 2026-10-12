@@ -794,13 +794,15 @@ extension BleManager {
         let generation = scanGenerationSeed
         // 生成本次扫描所使用的配置快照。搜索无结果时，首先要确认 native 真的拿到了
         // Dart 缓存配置；但同一配置重复开始扫描时只打印一次，避免日志噪声盖过扫描决策日志。
-        let configSummary = bleConfigs.map { config in
-            "\(config.name){filters=\(config.scan.nameFilters),matchCount=\(config.scan.matchCount)}"
-        }.joined(separator: ";")
-        let configSignature = "\(pureModel)|\(configSummary)"
-        if lastLoggedScanConfigSignature != configSignature {
-            lastLoggedScanConfigSignature = configSignature
-            loggerD(msg: "startScan/config: pure=\(pureModel), state=\(centralManager.state.label), configs=[\(configSummary)]")
+        if BleDebugLogPolicy.isEnabled {
+            let configSummary = bleConfigs.map { config in
+                "\(config.name){filters=\(config.scan.nameFilters),matchCount=\(config.scan.matchCount)}"
+            }.joined(separator: ";")
+            let configSignature = "\(pureModel)|\(configSummary)"
+            if lastLoggedScanConfigSignature != configSignature {
+                lastLoggedScanConfigSignature = configSignature
+                loggerD(msg: "startScan/config: pure=\(pureModel), state=\(centralManager.state.label), configs=[\(configSummary)]")
+            }
         }
         loggerD(msg: "startScan: generation=\(generation)")
         return scanStartResult(
@@ -1738,6 +1740,9 @@ extension BleManager {
                 peripheral: device.peripheral,
                 logger: { [weak self] msg in
                     self?.loggerD(msg: msg)
+                },
+                errorLogger: { [weak self] msg in
+                    self?.loggerE(msg: msg)
                 }
             )
             otaWriteQueues[uuid] = queue
@@ -2677,8 +2682,11 @@ extension BleManager {
             if let nsError {
                 recordBondSecurityFailureIfNeeded(peripheral: peripheral, error: nsError)
             }
+            // Preserve failure evidence even when Debug/Trace is off, before
+            // teardown removes the exact admission used by this callback.
+            let admission = currentConnectionAdmission(uuid: peripheral.identifier.uuidString)
+            loggerE(msg: "didDiscoverServices: \(peripheral.identifier.uuidString), search service fail = \(String(describing: error)), sessionGeneration=\(admission?.sessionGeneration ?? 0), attemptGeneration=\(admission?.generation ?? 0)")
             handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .serviceFail, tag: tag)
-            loggerD(msg: "didDiscoverServices: \(peripheral.identifier.uuidString), search service fail = \(String(describing: error))")
             return
         }
         //  - 1.2、没有查询到配置
@@ -3738,8 +3746,11 @@ extension BleManager {
     /**
      * Logger d
      */
-    func loggerD(msg: String) {
-        BleEC.logger.emit("[d]-BleManage::\(msg)")
+    func loggerD(msg: @autoclosure () -> String) {
+        // Notify/write can run per packet: return before interpolation and
+        // EventChannel buffering, including before Dart subscribes at startup.
+        guard BleDebugLogPolicy.isEnabled else { return }
+        BleEC.logger.emit("[d]-BleManage::\(msg())")
     }
     
     /**

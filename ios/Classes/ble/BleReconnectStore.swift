@@ -1080,7 +1080,36 @@ final class BleReconnectStore {
      *  所有写入统一走这里，保证磁盘格式只暴露 BleReconnectTarget.raw。
      */
     private func saveTargets(_ targets: [BleReconnectTarget]) {
-        defaults.set(targets.map(\.raw), forKey: targetsKey)
+        let next = targets.map(\.raw)
+        // arm 已在调用 store 前安装当前 session；这里只省去等价存储副作用，不能
+        // 把 upsert/安全状态清理或新的内存 owner 当成重复操作提前返回。
+        if hasUnchangedUnambiguousTargets(next) { return }
+        defaults.set(next, forKey: targetsKey)
+    }
+
+    /// 正常 upsert 会把命中项移到末尾，但持久化表不承载 activation 顺序。保留
+    /// 原排列可避免双腿轮流 arm 时反复写入；含歧义身份的旧缓存不能按集合去重，
+    /// 因为 target() 的 first 匹配仍有优先级。直接核对原始字典也保证 compactMap
+    /// 丢弃的坏条目、旧格式缺字段或多余键仍经过原写入路径收敛。
+    private func hasUnchangedUnambiguousTargets(_ next: [[String: String]]) -> Bool {
+        guard var remaining = defaults.array(forKey: targetsKey) as? [[String: String]],
+              remaining.count == next.count else { return false }
+        var uuids = Set<String>()
+        var names = Set<String>()
+        for raw in remaining {
+            guard let target = BleReconnectTarget(raw: raw), target.raw == raw,
+                  UUID(uuidString: target.uuid) != nil,
+                  !target.belongConfig.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  uuids.insert(target.uuid.lowercased()).inserted else { return false }
+            if !target.name.isEmpty, !names.insert(target.name).inserted { return false }
+        }
+        // 四字段使用原值精确比较；UUID/名称/配置/MAC 的大小写变化仍必须写回，
+        // 不能用 owner 匹配时的大小写容忍吞掉持久化规范化。列表很小，无需编码/缓存。
+        for raw in next {
+            guard let index = remaining.firstIndex(of: raw) else { return false }
+            remaining.remove(at: index)
+        }
+        return remaining.isEmpty
     }
 
     private func saveSecurityRecoveryRecords(_ records: [BleSecurityRecoveryRecord]) {
