@@ -401,6 +401,16 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     throw UnimplementedError('quiteUpgradeState() has not been implemented.');
   }
 
+  /// Control iOS native Debug logging before formatting and channel emission.
+  ///
+  /// Defaults to false in each native process. Error logs and connection Trace
+  /// are independent. Android accepts this API without changing its logging.
+  Future<void> setDebugLoggingEnabled(bool enabled) {
+    throw UnimplementedError(
+      'setDebugLoggingEnabled(enabled: $enabled) has not been implemented.',
+    );
+  }
+
   /// Enable or disable native connection trace snapshots.
   ///
   /// The default native value is false. Disabling must only clear trace/RSSI

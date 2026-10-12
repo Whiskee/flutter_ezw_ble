@@ -124,6 +124,9 @@ final class OtaWriteQueue {
     private let scheduler: OtaWriteScheduler
     //  - 日志回调(由 BleManager 注入, 复用其 loggerD)
     private let logger: ((String) -> Void)?
+    // Terminal failures remain observable with Debug off; this callback must
+    // not be used for ordinary cancellation or successful packet submission.
+    private let errorLogger: ((String) -> Void)?
 
     //  =========== Get/Set
     /// 当前队列深度(包含尚未写入 BLE 栈的项)
@@ -139,11 +142,13 @@ final class OtaWriteQueue {
     init(
         peripheral: OtaWritePeripheral,
         logger: ((String) -> Void)? = nil,
+        errorLogger: ((String) -> Void)? = nil,
         clock: OtaWriteClock = SystemOtaWriteClock(),
         scheduler: OtaWriteScheduler = MainQueueOtaWriteScheduler()
     ) {
         self.peripheral = peripheral
         self.logger = logger
+        self.errorLogger = errorLogger
         self.clock = clock
         self.scheduler = scheduler
     }
@@ -182,7 +187,7 @@ extension OtaWriteQueue {
             expectedAttemptGeneration: expectedAttemptGeneration,
             result: result
         ))
-        logger?("[ezw_ble][ota] enqueued endpoint=\(peripheral?.otaEndpointId ?? "released") bytes=\(data.count) pending=\(pending.count)")
+        debugLog("[ezw_ble][ota] enqueued endpoint=\(peripheral?.otaEndpointId ?? "released") bytes=\(data.count) pending=\(pending.count)")
         pump()
     }
 
@@ -191,7 +196,7 @@ extension OtaWriteQueue {
      *  - OS 通知背压解除, 立即继续抽干队列.
      */
     func onPeripheralReadyToSendWriteWithoutResponse() {
-        logger?("[ezw_ble][ota] ready endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) pending=\(pending.count)")
+        debugLog("[ezw_ble][ota] ready endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) pending=\(pending.count)")
         // ready 回调本身不重置计时；只有 canSend 已真实恢复时 pump 才结束当前 episode，
         // 否则一次虚假/过早回调会把 15 秒 fail-closed 窗口无限向后延长。
         pump(resumeSource: "callback")
@@ -209,7 +214,7 @@ extension OtaWriteQueue {
             clearBackpressureWait()
             return
         }
-        logger?("[ezw_ble][ota] cancelled endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) reason=\(reason) pending=\(pending.count)")
+        debugLog("[ezw_ble][ota] cancelled endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) reason=\(reason) pending=\(pending.count)")
         let snapshot = pending
         pending.removeAll()
         sinceLastDrainSync = 0
@@ -298,7 +303,7 @@ extension OtaWriteQueue {
                 continue
             }
             sinceLastDrainSync += 1
-            logger?("[ezw_ble][ota] submitted endpoint=\(peripheral.otaEndpointId) char=\(head.target.characteristicUUID) bytes=\(head.data.count) pending=\(pending.count)")
+            debugLog("[ezw_ble][ota] submitted endpoint=\(peripheral.otaEndpointId) char=\(head.target.characteristicUUID) bytes=\(head.data.count) pending=\(pending.count)")
             //  - 2.3、CoreBluetooth 已接受本次 writeValue 调用后才向 Dart 回包;
             //  -- WriteWithoutResponse 无设备 ack, 这里的成功只代表已提交给 CoreBluetooth。
             head.result(nil)
@@ -320,11 +325,18 @@ extension OtaWriteQueue {
 
 private extension OtaWriteQueue {
 
+    /// Gate at the producer, before the String callback reaches BleManager.
+    /// This keeps each packet's interpolation lazy without changing queue flow.
+    func debugLog(_ message: @autoclosure () -> String) {
+        guard BleDebugLogPolicy.isEnabled, let logger else { return }
+        logger(message())
+    }
+
     func completePendingAsUnavailable(reason: String) {
         guard !pending.isEmpty else {
             return
         }
-        logger?("[ezw_ble][ota] cancelled endpoint=released reason=\(reason) pending=\(pending.count)")
+        errorLogger?("[ezw_ble][ota] cancelled endpoint=released reason=\(reason) pending=\(pending.count)")
         let snapshot = pending
         pending.removeAll()
         sinceLastDrainSync = 0
@@ -352,14 +364,14 @@ private extension OtaWriteQueue {
             backpressureEpisode &+= 1
             backpressureStartedAt = clock.now
             backpressureReason = reason
-            logger?("[ezw_ble][ota] backpressure endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) reason=\(reason) wait=0.0s pending=\(pending.count)")
+            debugLog("[ezw_ble][ota] backpressure endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) reason=\(reason) wait=0.0s pending=\(pending.count)")
         }
     }
 
     func markSoftThrottleWait() {
         clearBackpressureWait()
         backpressureEpisode &+= 1
-        logger?("[ezw_ble][ota] throttle endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) pending=\(pending.count)")
+        debugLog("[ezw_ble][ota] throttle endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) pending=\(pending.count)")
     }
 
     func clearBackpressureWait() {
@@ -404,7 +416,7 @@ private extension OtaWriteQueue {
         }
         let stalled = pending.removeFirst()
         let pendingCount = pending.count + 1
-        logger?("[ezw_ble][ota] stalled endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) reason=\(reason) wait=\(String(format: "%.3f", waitSeconds))s pending=\(pendingCount) session=\(stalled.expectedSessionGeneration) attempt=\(stalled.expectedAttemptGeneration)")
+        errorLogger?("[ezw_ble][ota] stalled endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) reason=\(reason) wait=\(String(format: "%.3f", waitSeconds))s pending=\(pendingCount) session=\(stalled.expectedSessionGeneration) attempt=\(stalled.expectedAttemptGeneration)")
         sinceLastDrainSync = 0
         stalledAwaitingRecovery = true
         clearBackpressureWait()
@@ -424,7 +436,7 @@ private extension OtaWriteQueue {
             return
         }
         let waitSeconds = clock.now.timeIntervalSince(startedAt)
-        logger?("[ezw_ble][ota] resumed endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) reason=\(backpressureReason ?? "unknown") source=\(source) wait=\(String(format: "%.3f", waitSeconds))s pending=\(pending.count)")
+        debugLog("[ezw_ble][ota] resumed endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) reason=\(backpressureReason ?? "unknown") source=\(source) wait=\(String(format: "%.3f", waitSeconds))s pending=\(pending.count)")
     }
 }
 

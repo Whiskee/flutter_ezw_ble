@@ -160,14 +160,17 @@ extension BleManager {
      * iOS 扫描设置了 AllowDuplicates，目标设备可能每秒回调很多次。诊断日志必须按 key 去重，
      * 否则用户只会看到刷屏，反而难以判断第一处过滤断点。
      */
-    private func logScanDropOnce(key: String, message: String) {
+    private func logScanDropOnce(key: @autoclosure () -> String, message: @autoclosure () -> String) {
+        // Disabled logging must neither format repeated advertisements nor
+        // consume dedupe keys needed if Debug is enabled during this scan.
+        guard BleDebugLogPolicy.isEnabled else { return }
         // 1. 相同扫描断点只打印第一次，保留“发生过”的证据即可。
-        guard BleScanDebugLog.shouldLog(key: key) else {
+        guard BleScanDebugLog.shouldLog(key: key()) else {
             return
         }
 
         // 2. 所有扫描诊断都使用 scan/debug 前缀，便于终端 grep。
-        loggerD(msg: message)
+        loggerD(msg: message())
     }
 
     /**
@@ -421,7 +424,7 @@ extension BleManager {
         parsedSn: String
     ) {
         // 1. 只对指定排障设备输出，避免每条广播都打印大块 hex。
-        guard name == "EVEN R1_1AF5A7" else {
+        guard BleDebugLogPolicy.isEnabled, name == "EVEN R1_1AF5A7" else {
             return
         }
         let slice = extractSnRuleSlice(data: manufactureData, snRule: snRule)

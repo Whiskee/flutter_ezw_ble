@@ -261,6 +261,11 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
+  Future<void> setDebugLoggingEnabled(bool enabled) {
+    throw UnimplementedError();
+  }
+
+  @override
   Future<void> setConnectionTraceEnabled(bool enabled) {
     throw UnimplementedError();
   }

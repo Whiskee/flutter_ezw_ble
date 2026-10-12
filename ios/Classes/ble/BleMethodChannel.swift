@@ -71,6 +71,8 @@ enum BleMC: String {
     case quiteUpgradeState
     /// Enable/disable process-local native connection Trace.
     case setConnectionTraceEnabled
+    /// Change Debug formatting/emission only; never construct BleManager here.
+    case setDebugLoggingEnabled
     /// Open system Bluetooth settings.
     case openBleSettings
     /// Open this app's settings page.
@@ -116,7 +118,7 @@ enum BleMC: String {
                     jsonData.decodeTo()
                 }
                 .filter { $0 != nil }
-            BleEC.logger.emit("[d]-BleChannel::initConfigs received=\(jsonArray.count), decoded=\(configs.count)")
+            BleDebugLogPolicy.emit("[d]-BleChannel::initConfigs received=\(jsonArray.count), decoded=\(configs.count)")
             // 配置本身必须先同步写入 native，再返回 Dart；否则 Dart await 后立刻
             // startScan/connect 时，iOS 仍可能处于空配置。BleManager.initConfigs 内部
             // 已经把 reconnect 重放 defer 到下一轮主队列，所以这里不会阻塞首帧。
@@ -148,7 +150,7 @@ enum BleMC: String {
             // so Swift Codable never sees NSNull for Bool fields.
             jsonData["afterUpgrade"] = jsonData["afterUpgrade"] as? Bool ?? false
             jsonData["directConnect"] = jsonData["directConnect"] as? Bool ?? false
-            BleEC.logger.emit("[d]-BleChannel::connectDevice args uuid=\(jsonData["uuid"] as? String ?? ""), name=\(jsonData["name"] as? String ?? ""), sn=\(jsonData["sn"] as? String ?? ""), config=\(jsonData["belongConfig"] as? String ?? ""), afterUpgrade=\(jsonData["afterUpgrade"] as? Bool ?? false), directConnect=\(jsonData["directConnect"] as? Bool ?? false)")
+            BleDebugLogPolicy.emit("[d]-BleChannel::connectDevice args uuid=\(jsonData["uuid"] as? String ?? ""), name=\(jsonData["name"] as? String ?? ""), sn=\(jsonData["sn"] as? String ?? ""), config=\(jsonData["belongConfig"] as? String ?? ""), afterUpgrade=\(jsonData["afterUpgrade"] as? Bool ?? false), directConnect=\(jsonData["directConnect"] as? Bool ?? false)")
             if let easyConnect: BleEasyConnect = jsonData.decodeTo() {
                 BleManager.shared.connect(easyConnect: easyConnect)
             } else {
@@ -372,6 +374,11 @@ enum BleMC: String {
             break
         case .setConnectionTraceEnabled:
             BleManager.shared.setConnectionTraceEnabled(arguments as? Bool == true)
+            break
+        case .setDebugLoggingEnabled:
+            // This policy exists before any central/manager. Logging settings
+            // cannot become a new BLE startup or State Restoration entry point.
+            BleDebugLogPolicy.setEnabled(arguments as? Bool == true)
             break
         case .cleanConnectCache:
             BleManager.shared.cleanConnectCache()

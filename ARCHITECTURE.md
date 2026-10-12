@@ -193,6 +193,7 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `quiteUpgradeState` | `Future<void> quiteUpgradeState(String uuid, {int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0})` | 退出 OTA 状态；携带正 expected pair 时，只有当前物理 owner 匹配才消费 OTA marker 和 pending 写，避免旧 attempt 清掉新 attempt。链路仍有效时才恢复 `connected`，断连后到达的旧 OTA 回调不能复活连接态。 |
 | `disconnectForOtaReboot` | `Future<void> disconnectForOtaReboot(String uuid, String name, {int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0})` | OTA 安装成功后的固件 reboot teardown。携带正 expected pair 时，native 必须精确匹配当前 owner 后才 detach 旧物理 GATT/CBPeripheral、发 `disconnectFromSys` 并标记一次性 suppression；旧 pair 不能关闭或屏蔽新 attempt。0/0 仅保留旧调用兼容。 |
 | `setConnectionTraceEnabled` | `Future<void> setConnectionTraceEnabled(bool enabled)` | 打开/关闭原生连接 Trace。默认关闭；关闭只清进程内 Trace/RSSI 诊断缓存，不断开设备、不取消 autoReconnect、不补造当前链路。开启后仅从下一次真实物理 attempt 开始记录。 |
+| `setDebugLoggingEnabled` | `Future<void> setDebugLoggingEnabled(bool enabled)` | iOS 进程内 Debug 日志默认关闭；只控制文本构造与 logger EventChannel 发出。Error、业务事件、Trace 和连接所有权独立。Android 接受并返回成功，当前 no-op。可通过 `EzwBle.to.setDebugLoggingEnabled(enabled)` 或 `bleMC` 调用。 |
 | `openBleSettings` | `Future<void> openBleSettings()` | 跳系统蓝牙开关页。 |
 | `openAppSettings` | `Future<void> openAppSettings()` | 跳本 App 权限设置页。 |
 | `resetBle` | `Future<void> resetBle()` | 让原生层重置内部 BLE 栈状态（清队列、断所有连接、清缓存）。 |
@@ -229,6 +230,26 @@ enum BleEventChannel {
 | `connectStatus` | JSON 字符串 | `BleConnectModel.fromJson` | 连接流程的每一步推进（见 §8）；携带 `source`、兼容键 `generation`、`sessionGeneration` 与 `attemptGeneration`。`generation` 始终序列化为 Dart session generation；旧 payload 分别回退为 `unknown` / `0`。 |
 | `receiveData` | Map：`{uuid, psType, data:Base64, isSuccess, sessionGeneration, attemptGeneration, otaTransactionId, otaGeneration, otaInstanceId}` | `BleCmd.receiveMap` | 来自原生的特征值数据。**注意 `data` 字段是 Base64**，业务侧拿到的 `BleCmd.data` 已经是 `Uint8List`，背后由 `flutter_ezw_utils.encodeBase64()` 解码。`sessionGeneration/attemptGeneration` 由 Android 原 callback 冻结 exact GATT owner 后发布，旧事件或 unknown 为 0；非 OTA 同样保留 known identity。G2 OTA 事务持有期间还会附带 transaction 字段；Dart 必须同时校验 transaction 与 physical pair 后才消费 ACK/Notify。 |
 | `logger` | String，含 `[d]-` / `[e]-` 前缀 | `String` | 仅 iOS 主动 push；业务侧自行根据前缀分级。 |
+
+`setDebugLoggingEnabled(bool)` 使用独立的 `BleDebugLogPolicy`，native 每进程默认
+`false`。MethodChannel setter 不访问 `BleManager.shared`，因此宿主可以在 BLE 配置
+之前应用 Debug 设置，不能由日志开关提前创建 central 或改变 State Restoration 启动时序。
+策略由现有主队列执行，与 `CBCentralManager(queue: nil)`、MethodChannel、OTA scheduler
+处于同一串行域。宿主应在初始 logger 配置完成及 Debug 设置变化时同步这个值。
+
+iOS `loggerD(msg:)` 使用 `@autoclosure`，关闭时在构造 String 和 `BleEC.logger.emit`
+之前返回。启动/dispatcher 的直接 Debug 发出也走相同门控；扫描的 key、hex、配置
+summary 只在开启后构造，关闭期间不消费扫描诊断去重键。OTA 队列在 String 回调
+之前再次门控，避免逐包插值发生在 Manager 入口之前。开关可运行中切换，不积累或
+补发关闭期间的 Debug 消息，开启后沿用既有 `[d]-` 前缀。
+
+Error 日志保持可用；真实服务发现错误在 teardown 前保留 exact admission 诊断。
+OTA `ota_write_stalled` 和外设释放失败使用独立 Error 回调，普通主动取消仍为 Debug。
+连接状态 JSON、完整通知 payload、扫描业务缓存、Trace、原生恢复事件账本及任何
+owner/重试/终态行为不由这个日志开关控制。Android 此次仅增加兼容 no-op，不更改
+原有 Android 日志行为。验证见 `test/ios_debug_logging_test.dart` 与
+`test/native/debug_logging_test.swift`：优化模式编译实际 policy、生产 logger/扫描
+helper 与完整 OTA 队列，验证关闭时零插值/零发出及业务写入和错误终态不变。
 
 iOS 的非 `poweredOn` 状态继续沿用既有连接 teardown；但只有公开状态
 `CBManagerState.poweredOff` 才能在断连 Trace 上标记 `bluetooth_adapter/4`。
@@ -492,6 +513,12 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 - **鉴权宽限（重点）**：G1/R1 继续通过 `devicePreConnected(uuid)` / `deviceConnected(uuid)` 进入有界宽限并提交业务 connected。G2 必须从 `connectFinish` 冻结 `uuid/sessionGeneration/attemptGeneration`，通过 `prepareBusinessConnection(attempt)` / `commitBusinessConnection(attempt)` 完成两阶段提交；旧 attempt 只能 exact abort，不能删除新 lease。无论哪条路径，宽限二次到期仍未 connected 都强制上报 `timeout`，避免永久卡在 `connectFinish`。
 
 ### 8.6 原生自动回连（`autoReconnect`）
+
+iOS 目标持久化的完整约束见 `docs/AUTO_RECONNECT_SPEC.md`「iOS target persistence」。
+`saveTargets` 只省去完整且无歧义的相等原始四字段列表写入，并保留原排列；正常
+upsert 的末尾轮转不是 activation/Gate 优先级。旧格式、坏条目、重复身份和字段值
+或大小写变化仍走原写入路径。canonical 解析、安全状态清理和内存 owner/session
+安装在此前照常执行；独立安全预算落盘和 reset key 移除不参与此去重。
 
 `BleConfig.autoReconnect = true` 后，Android/iOS 原生层会在设备已经达到业务 `connected` 后注册一个长期回连意图。这个意图只处理系统异常断连和连接流程失败，不处理用户主动断连。
 

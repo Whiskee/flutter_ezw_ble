@@ -45,4 +45,9 @@ class EzwBle {
 
   /// 构造函数
   EzwBle._init();
+
+  /// Apply the host's Debug setting without changing BLE or Trace ownership.
+  /// iOS defaults to off before this call; Android currently accepts a no-op.
+  Future<void> setDebugLoggingEnabled(bool enabled) =>
+      bleMC.setDebugLoggingEnabled(enabled);
 }
