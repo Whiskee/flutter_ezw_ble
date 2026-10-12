@@ -48,12 +48,11 @@ extension BleManager {
             return
         }
 
-        // 3. 同一个 peripheral 在当前扫描窗口只处理一次，避免重复上报 scanResult。
-        guard !scanResultTemp.contains(where: { info in
+        // 3. 普通展示仍按扫描窗口去重，但身份解析不能被展示缓存挡住。
+        // frozen owner 的有效广播可能先进入该缓存，之后合法 S2 仍需解析同一 UUID。
+        let isCachedInCurrentScanWindow = scanResultTemp.contains(where: { info in
             info.0.uuid == peripheral.identifier.uuidString
-        }) else {
-            return
-        }
+        })
 
         // 4. 按配置 nameFilters 匹配目标设备，插件本体不硬编码任何设备型号。
         guard let bleConfig = bleConfigs.first(where: { config in
@@ -81,6 +80,7 @@ extension BleManager {
 
         // 6. 纯净模式只展示原始设备，不执行 MAC/SN 规则，便于排查广播内容。
         guard !scanPureModel else {
+            guard !isCachedInCurrentScanWindow else { return }
             emitPureScanResult(
                 peripheral: peripheral,
                 advertisedName: advertisedName,
@@ -91,7 +91,8 @@ extension BleManager {
         }
 
         // 7. name-only 自动回连 owner 先于 MAC/SN 规则解析。只有 config + 完整名称
-        // 精确命中的已声明 owner 才能消费该广播；普通 mfrSize=0 设备仍在下方丢弃。
+        // 精确命中且已获恢复许可的 owner 才能消费该广播；冻结只阻止旧 owner 解析，
+        // 正常广播继续经过下方 MAC/SN 规则，普通 mfrSize=0 设备仍被丢弃。
         if resolvePendingReconnectIdentity(
             peripheral: peripheral,
             advertisedName: advertisedName,
@@ -100,6 +101,10 @@ extension BleManager {
         ) {
             return
         }
+
+        // ready owner 解析优先于展示去重；重复普通广播仍只发布一次，旧 S1
+        // 在 resolver 内保持冻结，不会因为展示缓存或新扫描窗口获得连接许可。
+        guard !isCachedInCurrentScanWindow else { return }
 
         // Code 14 恢复必须等待失败之后的新目标广告；该分支只消费精确 owner，不把结果
         // 暴露为普通扫描设备，也不依赖制造商数据，避免配对失配期间漏掉同一已绑定戒指。
@@ -152,6 +157,68 @@ extension BleManager {
             mac: deviceMac,
             rssi: rssi.intValue
         )
+    }
+
+    /// 扫描仅为已声明的 name-only owner 补齐 UUID，不把普通空 manufacturer 广播暴露给 Dart。
+    @discardableResult
+    func resolvePendingReconnectIdentity(
+        peripheral: CBPeripheral,
+        advertisedName: String,
+        belongConfig: String,
+        rssi: Int
+    ) -> Bool {
+        guard let entry = pendingReconnectIdentities.first(where: {
+            $0.value.matches(belongConfig: belongConfig, advertisedName: advertisedName)
+        }) else {
+            return false
+        }
+        let pending = entry.value
+        guard bleConfigs.contains(where: {
+                  $0.name == pending.belongConfig && $0.autoReconnect
+              }),
+              centralManager.state == .poweredOn,
+              pending.recoveryGate.canResolveIdentity(
+                  currentRecoveryEpoch: currentTransportRecoveryEpoch
+              ) else {
+            // Retain the exact owner without consuming ordinary scan delivery.
+            // The MAC/SN pipeline still validates this advertisement; only the
+            // higher final Dart activation, not this callback, releases reset.
+            loggerD(msg: "autoReconnect identity resolve deferred: config=\(belongConfig), name=\(advertisedName), session=\(pending.sessionGeneration), recoveryEpoch=\(pending.recoveryGate.recoveryEpoch)")
+            return false
+        }
+        pendingReconnectIdentities.removeValue(forKey: entry.key)
+        let uuid = peripheral.identifier.uuidString
+        let target = BleReconnectTarget(
+            belongConfig: pending.belongConfig,
+            uuid: uuid,
+            name: advertisedName,
+            expectedMacSuffix: pending.expectedMacSuffix
+        )
+        guard let task = armReconnectTarget(
+            target,
+            source: pending.source,
+            sessionGeneration: pending.sessionGeneration
+        ) else {
+            loggerE(msg: "autoReconnect identity resolve rejected: config=\(belongConfig), name=\(advertisedName), uuid=\(uuid)")
+            return true
+        }
+        // beginDirectReconnectAttempt 只消费 retrieve/scan cache；先写入内部 cache，
+        // 但不走 emitMatchedScanResult，因此 mfrSize=0 不会成为普通扫描结果。
+        scanResultTemp.removeAll { $0.0.uuid.caseInsensitiveCompare(uuid) == .orderedSame }
+        scanResultTemp.append((
+            BleDevice(
+                belongConfig: belongConfig,
+                name: advertisedName,
+                uuid: uuid,
+                sn: advertisedName,
+                mac: "",
+                rssi: rssi
+            ),
+            peripheral
+        ))
+        loggerD(msg: "autoReconnect identity resolved: config=\(belongConfig), name=\(advertisedName), uuid=\(uuid), source=\(pending.source.rawValue)")
+        activateArmedReconnectTask(task, source: pending.source)
+        return true
     }
 
     /**

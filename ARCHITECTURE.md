@@ -551,13 +551,19 @@ CoreBluetooth Code 14 表示系统和 peripheral 的配对信息已不一致。�
 5. 每条 read characteristic 都重新打开 notify/CCCD；
 6. 全部成功后才上报 `connectFinish`；G2 等待业务鉴权后用该事件的 exact attempt 两阶段提交进入 `connected`，G1/R1 继续调用兼容 `deviceConnected`。
 
-Android/iOS G2 的 Security Gate 只统计真实 5403 保护写安全失败，以及 Android Bond-first 或防御性 fallback `createBond()` 的明确拒绝/失败。每个 endpoint / recovery episode 最多 5 次实际安全建立尝试，初次失败计为第 1 次；第 5 次发布 `securityRecoveryExhausted` 并停止该 endpoint 自动 owner，不得再产生第 6 次自动连接；该状态不是 `isError` / `isDisconnected`，由 even_connect 静默消费。蓝牙关闭、扫描未命中、普通连接超时以及缺失/不支持 5403 本身不消耗预算（iOS 保护写在途时的连接超时与写回调原子消费同一 exact attempt，计为一次）；iOS 生命周期恢复只复验仍有效的 exact owner。iOS 自动第 1～4 次失败（含 `stateRestoration`）先落盘计数，再经 cancellation barrier 拆掉本 attempt，由同一 owner 按 `disconnectFromSys` 重调度并建立新的 exact attempt 与 CoreBluetooth pending connect（`retryPendingConnect`）；inactive 只复用进程内 `CBPeripheral`，不扫描、不同步 retrieve。不得复用下文 R1 Code 14 的新鲜广播恢复：G2 右腿是 iOS ANCS 客户端，链路由系统持有、App cancel 后仍不断开也不广播，而新鲜广播扫描只在 active 时运行。用户手动点击会清除该 endpoint 的自动耗尽/计数标记，不执行五次静默恢复，首次真实安全失败仍沿用 `boundFail`。
+Android/iOS G2 的 Security Gate 只统计真实 5403 保护写安全失败，以及 Android Bond-first 或防御性 fallback `createBond()` 的明确拒绝/失败。每个 endpoint / recovery episode 最多 5 次实际安全建立尝试，初次失败计为第 1 次；第 5 次发布 `securityRecoveryExhausted` 并停止该 endpoint 自动 owner，不得再产生第 6 次自动连接；该状态不是 `isError` / `isDisconnected`，由 even_connect 静默消费。蓝牙关闭、扫描未命中、普通连接超时、缺失/不支持 5403 本身，以及 Android 5403 写返回 `GATT_INVALID_HANDLE`（本端 attribute cache 过期，见 11.5）都不消耗预算（iOS 保护写在途时的连接超时与写回调原子消费同一 exact attempt，计为一次）；iOS 生命周期恢复只复验仍有效的 exact owner。iOS 自动第 1～4 次失败（含 `stateRestoration`）先落盘计数，再经 cancellation barrier 拆掉本 attempt，由同一 owner 按 `disconnectFromSys` 重调度并建立新的 exact attempt 与 CoreBluetooth pending connect（`retryPendingConnect`）；inactive 只复用进程内 `CBPeripheral`，不扫描、不同步 retrieve。不得复用下文 R1 Code 14 的新鲜广播恢复：G2 右腿是 iOS ANCS 客户端，链路由系统持有、App cancel 后仍不断开也不广播，而新鲜广播扫描只在 active 时运行。用户手动点击会清除该 endpoint 的自动耗尽/计数标记，不执行五次静默恢复，首次真实安全失败仍沿用 `boundFail`。
 
 Android 自动/手动回连统一使用 `connectGatt(autoConnect = true)`；`autoReconnectUseNativePassive` 不再决定是否退回 active/scan-first。pending 阶段的 exact-GATT deadline 只回收未收到物理 callback 的 zombie handle；Gate queued 与业务 pipeline 阶段不会被它关闭。
 
 iOS 回连优先走 `retrieveConnectedPeripherals` / `retrievePeripherals` / 进程内 cache / 同时扫描已写入的 cache，自动回连任务来源的 `centralManager.connect` 携带系统 auto reconnect option。卸载重装后业务缓存 UUID 可能已经失效，而 ANCS 系统连接又会让端点停止广播；因此直连路径先按配置私有服务 + ANCS 查询系统连接，只允许旧 UUID 或完整非空端点名精确接管，再在 admission 前迁移 native identity。找不到 peripheral 时不在插件内启动 scan-by-name，只保留任务等待上层并行扫描补缓存。已知 peripheral 的 pending connect 不能被短扫描 timeout 取消，因为它是普通自动回连的系统等待点。若相同稳定 name 对应的 CoreBluetooth UUID 从 A 漂移到 B，任务、持久化 owner 和 Gate identity 原子迁移；每个 canonical target 仅保留“最早 UI owner + 最近旧身份”两个 alias，保证 hard cancel 可达且长期内存有界。
 
-iOS 的 `CBCentralManager(queue: nil)`、Flutter MethodChannel 与生命周期通知都运行在主队列。`retrieveConnectedPeripherals` / `retrievePeripherals` 是同步 CoreBluetooth/XPC 查询，只允许在 App active 窗口执行：`willResignActive`、`didEnterBackground`、`willTerminate` 立即关闭门禁，`didBecomeActive` 才重新打开。inactive 时只有进程已持有的内存 peripheral 可继续进入既有 Gate；缺少 peripheral 的 name-only owner 保持 `identityPending`，UUID owner 保持 `deferredByAppInactivity`，不得发布 `noDeviceFound` 或增加 retry。回到 active 后只对仍存在、配置仍授权且 session generation 未被替换的 owner 补偿一次系统查询；name-only 命中复用 `resolvePendingReconnectIdentity`，UUID owner 复用原 activation/Gate。
+iOS 的 `CBCentralManager(queue: nil)`、Flutter MethodChannel 与生命周期通知都运行在主队列。两个普通 `retrieveConnectedPeripherals` / `retrievePeripherals` wrapper 使用同一个原生查询执行器，同时检查 App active 与实时 `poweredOn`；冷启动 activation 的身份预查询发生在 begin attempt 之前，不能依赖后者的蓝牙检查。`willResignActive`、`didEnterBackground`、`willTerminate` 立即关闭生命周期许可，`didBecomeActive` 只恢复生命周期事实。不可用时 name-only owner 保持 `identityPending`；UUID owner 由原有 transport pause / inactive defer 保存，均不得把拒绝查询解释为 `noDeviceFound` 或增加 retry。active 补偿必须重新检查 poweredOn、config、exact owner/session 和 transport epoch；name-only 命中复用 `resolvePendingReconnectIdentity`，UUID owner 复用原 activation/Gate。
+
+name-only owner 尚无 UUID task，也必须在 unknown/resetting/off 周期冻结 recovery epoch 与 `awaitingRecoveryActivation`。扫描或生命周期身份补偿不能拿旧 session 创建新 UUID task；只有 available 后 Dart 汇总的新 activation 携带当前 epoch 与更高正 session 才能解除。成功安装 UUID owner 后精确退役对应 pending identity；取消/配置撤销仍沿用现有清理入口。poweredOn 不新增原生自动消费路径。
+
+`BleScanPipeline` 中的 name-only resolver 未获恢复许可时保留 exact pending 并返回未消费，广播继续经过既有 peer-pairing 守卫与普通 MAC/SN 校验；冻结期间不会向 owner 分配 UUID/attempt，也不会把空 manufacturer 数据变成普通扫描结果。普通结果仍每个扫描窗口按 UUID 去重，但 ready owner 的身份解析先于展示去重，以便同一窗口内合法新 session 能解析已经展示过的外设。取消/配置撤销仍先移除 pending，不因后续扫描重新创建 owner。
+
+既有 `retrievePeripheralForStateRestorationLaunch` 是独立的后台 SR 启动一次 identifier 补查，带 background、poweredOn、当前目标及未 terminating 条件，本次未修改。普通查询门禁不能证明 ready 时的 daemon 同步 XPC 永不阻塞，也没有整体迁移 central 队列。
 
 完整方案见 `docs/AUTO_RECONNECT_SPEC.md`。
 
@@ -796,6 +802,8 @@ Android `onConnectionStateChange(... STATE_DISCONNECTED)` 的 `status` 必须按
 
 GATT 操作回调保留相反边界：descriptor / characteristic write 的 `status=8` 是 `GATT_INSUFFICIENT_AUTHORIZATION`，必须先调用 Android 授权恢复入口刷新本端 GATT cache/bond 视图。descriptor write 仍以 `CHARS_FAIL` 终止本次 GATT readiness；characteristic write 发生在业务 connected 后，恢复后以 `DISCONNECT_FROM_SYS` 终止 session，且不得继续 `poll` / `writeNext` 消费发送队列。
 
+readiness 阶段的 5403 写或 CCCD 写返回 `status=1`（`GATT_INVALID_HANDLE`，即 ATT Invalid Handle）时，句柄来自过期的本端 attribute cache：已 Bond 设备的服务发现直接读取系统 GATT cache，对端固件改表后，若 Service Changed 晚于首个 GATT 请求到达，系统不会重新发现，此后每次回连都会复用同一份失效句柄。必须先调用 stale cache 恢复入口 `refresh()` 本端 GATT cache，再按原 `CHARS_FAIL` 终止，让下一次 attempt 走空中服务发现。它不是安全证据：不调用授权恢复、不消耗 Security Gate 预算、不设置 `needsScanBeforeConnect`、不改 Bond；连接回调的 HCI status 同样不得进入该入口。
+
 ### 11.6 iOS 连接主流程
 
 ```
@@ -857,7 +865,7 @@ iOS 的关键差异：系统级 ANCS 连接会让外设停止广播，`scanForPe
 15. UI 1 分钟超时不取消 native task；用户点击取消必须清 task、持久化 owner、pending GATT/peripheral 与迟到 timer/callback 的复活入口。
 16. Android exact commit（或 G1/R1 `deviceConnected`）释放 Gate 后的 live GATT 系统断连仍上报 `disconnectFromSys` 并重建 passive GATT；旧 `(sessionId, GATT)` 不得干扰新 attempt。
 17. iOS cancellation watchdog 长期漏回调时每 endpoint 只占一个 debt counter；业务 connected 后的真实断连不能被旧 debt 吞掉。
-18. iOS inactive/background/terminating 时不得调用同步 retrieve API；deferred owner 不产生 `noDeviceFound`，只有 `didBecomeActive` 且 exact generation/config 仍有效时才能补偿恢复。
+18. iOS 两个普通同步 retrieve wrapper 只在 active + poweredOn 执行；deferred owner 不产生 `noDeviceFound`。补偿必须复验 exact generation/config/transport epoch，name-only reset barrier 只由显式 final recovery activation 消费；既有 SR 启动一次 identifier 补查保持独立约束。
 19. iOS exact commit 释放 Gate 后的 CoreBluetooth 系统断连仍带最后成功的 session/attempt pair；当前 admission 优先于历史 task，旧 attempt 不得终止新 owner。
 
 ---

@@ -65,14 +65,8 @@ void main() {
     expect(retrieve, contains('stateRestorationLaunchRetrieveAttempts.insert(reconnectKey(uuid: endpointId))'));
     expect(retrieve, contains('centralManager.retrievePeripherals(withIdentifiers: [identifier]).first'));
     expect(retrieve, contains('type: "ios_sr_launch_retrieve"'));
-    // 活跃窗口的普通 retrieve 门禁保持不变。
-    expect(
-      manager,
-      contains('''        guard allowsSynchronousCoreBluetoothLookup else {
-            loggerD(msg: "appLifecycle: defer retrievePeripherals context=\\(context)")
-            return []
-        }'''),
-    );
+    // 普通 retrieve 仍受统一 active + poweredOn 执行器约束。
+    expect(manager, contains('BleSynchronousCoreBluetoothLookup.retrieve('));
   });
 
   test('willTerminate latches the flag and inactive defer honors the launch retrieve', () {

@@ -17,6 +17,9 @@ void main() {
   final reconnectStore = File(
     'ios/Classes/ble/BleReconnectStore.swift',
   ).readAsStringSync();
+  final recoveryGate = File(
+    'ios/Classes/ble/BleRecoveryActivationGate.swift',
+  ).readAsStringSync();
   final manager = File('ios/Classes/ble/BleManager.swift').readAsStringSync();
   final methodChannel =
       File('ios/Classes/ble/BleMethodChannel.swift').readAsStringSync();
@@ -67,15 +70,15 @@ void main() {
     );
 
     expect(
-      reconnectStore,
+      recoveryGate,
       contains('incomingSessionGeneration > 0'),
     );
     expect(
-      reconnectStore,
+      recoveryGate,
       contains('incomingSessionGeneration > currentSessionGeneration'),
     );
     expect(
-      reconnectStore,
+      recoveryGate,
       contains('incomingRecoveryEpoch == currentRecoveryEpoch'),
     );
     expect(consume, contains('BleRecoveryActivationGatePolicy.evaluate('));

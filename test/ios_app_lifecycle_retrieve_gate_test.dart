@@ -3,7 +3,7 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  test('iOS synchronous CoreBluetooth retrieval is active-only', () {
+  test('iOS retrieval uses the native active + poweredOn executor', () {
     final manager = File('ios/Classes/ble/BleManager.swift').readAsStringSync();
     final connect = File(
       'ios/Classes/ble/BleConnectCoordinator.swift',
@@ -26,10 +26,8 @@ void main() {
       contains('func retrieveConnectedPeripheralsWhenAppActive('),
     );
     expect(manager, contains('func retrievePeripheralsWhenAppActive('));
-    expect(
-      manager,
-      contains('guard allowsSynchronousCoreBluetoothLookup else'),
-    );
+    expect(manager.split('BleSynchronousCoreBluetoothLookup.retrieve('), hasLength(3));
+    expect(manager, contains('isBluetoothPoweredOn: centralManager.state == .poweredOn'));
 
     expect(
       connect,
@@ -68,7 +66,7 @@ void main() {
       reconnect.indexOf('func registerPeerPairingFailure'),
     );
     final inactiveGuard = directAttempt.indexOf(
-      'guard allowsSynchronousCoreBluetoothLookup else',
+      'guard canPerformSynchronousCoreBluetoothLookup else',
     );
     final noDeviceFailure = directAttempt.indexOf('state: .noDeviceFound');
     expect(inactiveGuard, isNonNegative);

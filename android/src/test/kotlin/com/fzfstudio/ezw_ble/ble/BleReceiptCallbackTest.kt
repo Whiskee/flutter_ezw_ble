@@ -44,6 +44,7 @@ class BleReceiptCallbackTest {
             recordTracePhyPolicy = { _, _, _, _ -> }, onPhysicalConnected = { _, _ -> },
             onSessionTerminal = { _, _, _ -> }, isBluetoothEnabled = { true },
             recoverInsufficientAuthorization = { _, _ -> }, consumeDisconnectingState = { null },
+            recoverStaleAttributeCache = { _, _ -> error("Notify must not refresh the attribute cache") },
             // This fixture receives ordinary R1 data on an already-ready GATT;
             // security admission must never be advanced by a notification.
             securityGateAttempts = BleAndroidSecurityGateAttemptRegistry(),

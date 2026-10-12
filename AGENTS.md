@@ -25,7 +25,7 @@
 - `ios/Classes/**` 是 iOS CoreBluetooth 实现，包含 `BleManager`、`BleChannel` 和 `OtaWriteQueue`。
 - 原生自动回连只在业务调用 `deviceConnected(uuid)` 后启用；`connectFinish` 只表示 GATT ready，不表示业务 connected。
 - `timeout`、`noDeviceFound`、`serviceFail`、`charsFail` 是单次尝试失败，不是长期回连停止条件；只有用户/业务主动断连、移除、reset、清缓存、配置关闭或插件释放才能取消 reconnect intent。
-- iOS `CBCentralManager(queue: nil)` 的 `retrieveConnectedPeripherals` / `retrievePeripherals` 只允许经 active 生命周期门禁调用；inactive/background/terminating 时只能复用进程内 peripheral，缺失时保留 exact deferred owner，不得制造 `noDeviceFound` 或增加 retry。`didBecomeActive` 补偿必须复验 config、owner 和 session generation。
+- iOS 两个普通同步 retrieve wrapper 必须同时满足 App active 与实时 `poweredOn`；不可用时保留 exact deferred/identityPending owner，不得把门禁拒绝当作 `noDeviceFound` 或增加 retry。name-only owner 也必须冻结 transport epoch，旧扫描/生命周期补偿不能消费 reset barrier；恢复只认 Dart 当前 epoch + 更高正 session activation。冻结只禁止旧 owner resolve/arm，不得吞掉经过 MAC/SN 校验的普通扫描结果；展示缓存去重不得阻止合法新 session 解析身份。既有 SR 后台启动一次 identifier 补查仍按 `docs/AUTO_RECONNECT_SPEC.md` 的独立例外执行，禁止把单个调用扔到 global queue。
 - Android 蓝牙重开与 iOS `resetting → poweredOn` 都必须等待 Dart 汇总后的更高正 recovery session：native powered-on 只设置 `awaitingRecoveryActivation`，不得使用 reset 前 session 抢跑 GATT/pending connect；iOS activation 还必须匹配 available 后只读取得的当前 transport recovery epoch，连续 reset 的旧 epoch 必须 fail-closed。arm、旧 timer、connection event 与生命周期补偿均不得消费门禁。
 - iOS 业务 `connected` 释放 Gate 前必须把已接受的 `sessionGeneration + attemptGeneration` 成对保存在 reconnect owner；随后的 CoreBluetooth `didDisconnect` / 蓝牙关闭终态必须回传该 exact pair。禁止只恢复 session 而把 attempt 降为 0，显式取消、替换、移除 owner 必须同时使该快照不可达。
 - Android/iOS G2 `securityGate`（5403）必须在普通业务 Notify 订阅和 `connectFinish` 前完成一次有响应保护写。Android G2 必须配置 `initiateBinding=true`：exact admission 先通过 `createBond()` 唯一拉起系统配对，Bond 完成后再发现服务并写 5403 验证当前链路密钥，避免主动 Bond 与受保护写分别触发配对弹窗；已 Bond 设备不得重复 `createBond()`，5403 缺失/不支持时按旧固件路径继续普通 readiness。真实 Gate/Bond 安全失败按每 endpoint 每 episode 最多 5 次恢复，第 5 次发布静默 `securityRecoveryExhausted`；手动第一次安全失败仍走 `boundFail`。
@@ -40,7 +40,7 @@
 - `initConfigs` 必须使用 `customToJson` 序列化嵌套模型，不要改成浅层 JSON。
 - 不要手工编辑 `*.g.dart`。修改源模型后运行 build_runner。
 - `receiveData` 的二进制 payload 跨 Method/EventChannel 时保持 Base64 约定。
-- Android `onConnectionStateChange` 的 status 使用 HCI/controller 断连语义；characteristic/descriptor 回调才使用 ATT/GATT 操作语义。数值 `8` 在前者是连接超时，严禁触发授权恢复/cache refresh/`needsScanBeforeConnect`；在后者是授权不足，必须走授权恢复后再按回调阶段终止。
+- Android `onConnectionStateChange` 的 status 使用 HCI/controller 断连语义；characteristic/descriptor 回调才使用 ATT/GATT 操作语义。数值 `8` 在前者是连接超时，严禁触发授权恢复/cache refresh/`needsScanBeforeConnect`；在后者是授权不足，必须走授权恢复后再按回调阶段终止。数值 `1` 在后者是 `GATT_INVALID_HANDLE`：readiness 阶段的 5403/CCCD 写返回它说明本端 attribute cache 过期，必须先刷新 cache 再按 `CHARS_FAIL` 终止，不得计入安全预算、走授权恢复或改 Bond。
 - 原生连接 Trace 默认关闭，只能由 `setConnectionTraceEnabled(bool)` 显式打开；关闭仅清进程内 Trace/RSSI 诊断缓存，不能断开设备、取消/调度 autoReconnect 或补造当前链路。`nativeTrace.attemptId` 是诊断 UUID，不能替代 `sessionGeneration/attemptGeneration` owner 校验；step 快照最多 32 条，溢出必须用连续 `stepSeq` + `trace/gap.droppedCount` 表达缺口。
 - Trace 发生时间必须在原生生产处用同一 wall/monotonic 锚点冻结；快照/重放不得改写，墙钟跳变仅标记 `clock_changed`。`physicalConnectionEvent` 只能由 exact owner 的真实物理回调写入，reset/取消/状态投影不得伪造；RSSI 只复用既有读请求。
 - iOS OTA 中 `psType == 1` 的 `sendCmdNoWait` 必须与 `OtaWriteQueue`、`canSendWriteWithoutResponse` 和 `docs/IOS_OTA_NOWAIT_SPEC.md` 对齐。

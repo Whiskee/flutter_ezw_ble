@@ -62,6 +62,11 @@ internal class BleGattSessionCallback(
     private val isBluetoothEnabled: () -> Boolean,
     /** 处理 ATT/GATT 操作返回授权不足；连接状态回调不得调用这个恢复入口。 */
     private val recoverInsufficientAuthorization: (BluetoothGatt, BleDevice) -> Unit,
+    /**
+     * 处理 ATT/GATT 操作返回句柄失效：只刷新本端 attribute cache，让下一次 attempt 走空中
+     * 服务发现；不动 Bond、不计安全预算。连接状态回调同样不得调用这个恢复入口。
+     */
+    private val recoverStaleAttributeCache: (BluetoothGatt, BleDevice) -> Unit,
     /** 5403 写优先由 exact registry 认领，不能进入普通命令或 OTA 写队列。 */
     private val securityGateAttempts: BleAndroidSecurityGateAttemptRegistry,
     /** 用 admission/session/GATT 对象构造本 callback 唯一 Gate owner。 */
@@ -418,6 +423,10 @@ internal class BleGattSessionCallback(
                 // Descriptor write 已进入 GATT readiness 阶段；这里的 8 是 ATT/GATT 授权不足，
                 // 先恢复 cache/bond 视图，再按原失败语义终止为 CHARS_FAIL 触发重试。
                 recoverInsufficientAuthorization(gatt, device)
+            } else if (status == BluetoothGattStatus.GATT_INVALID_HANDLE) {
+                // CCCD 句柄同样来自本端 cache；句柄失效只刷新 cache，仍按 CHARS_FAIL 终止，
+                // 由下一次 attempt 重新空中发现服务。
+                recoverStaleAttributeCache(gatt, device)
             }
             sendLog(
                 BleLoggerTag.e,
@@ -538,6 +547,12 @@ internal class BleGattSessionCallback(
                 )
                 terminateSession(gatt, action.toTerminalState(), DEFAULT_MTU)
                 return
+            }
+            if (status == BluetoothGattStatus.GATT_INVALID_HANDLE) {
+                // 5403 句柄来自本端 GATT cache；对端回 Invalid Handle 说明 cache 仍是旧固件的数据库
+                // （典型是 OTA 后 Service Changed 晚于本写到达而未触发重新发现）。它不是安全证据：
+                // 只刷新 cache，再按 CHARS_FAIL 让下一次 attempt 走空中服务发现。
+                recoverStaleAttributeCache(gatt, device)
             }
             recordTraceStep(address, "security_gate", "failed", null, "GATT", status)
             sendLog(
