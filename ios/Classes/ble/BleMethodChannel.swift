@@ -129,11 +129,14 @@ enum BleMC: String {
             let iosServiceUuids = jsonData["iosServiceUuids"] as? [String] ?? []
             let includeUnfilteredScan = jsonData["includeUnfilteredScan"] as? Bool ?? true
             let includeNormalScanResults = jsonData["includeNormalScanResults"] as? Bool ?? false
+            // Legacy pure scans include application-mode advertisements too.
+            let includeUnfilteredPureScanResults = jsonData["includeUnfilteredPureScanResults"] as? Bool ?? true
             result(BleManager.shared.startExternalScan(
                 pureModel: turnOnPureModel,
                 iosServiceUuids: iosServiceUuids,
                 includeUnfilteredScan: includeUnfilteredScan,
-                includeNormalScanResults: includeNormalScanResults
+                includeNormalScanResults: includeNormalScanResults,
+                includeUnfilteredPureScanResults: includeUnfilteredPureScanResults
             ))
             return
         case .stopScan:

@@ -79,6 +79,7 @@ extension BleManager {
         // scan-then-connect 的挂起请求提前消费。
         if scanPureModel {
             let shouldEmitRawPureResult = !scanPureModelIncludesNormalResults ||
+                scanPureModelIncludesUnfilteredResults ||
                 scanPureServiceUuidHints.isEmpty ||
                 advertisementMatchesServiceUuidHint(advertisementData)
             if shouldEmitRawPureResult &&
@@ -320,7 +321,7 @@ extension BleManager {
         )
 
         // 3. 纯净模式不做 matchCount 聚合，立即回传。
-        sendMatchDevices(sn: pureSn, devices: [bleDevice])
+        sendMatchDevices(sn: pureSn, devices: [bleDevice], isPureScanResult: true)
     }
 
     private func advertisementMatchesServiceUuidHint(_ advertisementData: [String: Any]) -> Bool {
@@ -739,9 +740,11 @@ extension BleManager {
      *
      * Flutter 侧统一接收 BleMatchDevice JSON，因此单设备和多设备聚合都走这里。
      */
-    private func sendMatchDevices(sn: String, devices: [BleDevice]) {
+    private func sendMatchDevices(sn: String, devices: [BleDevice], isPureScanResult: Bool = false) {
         // 1. 先构造业务聚合模型。
-        let matchDevice = BleMatchDevice(sn: sn, devices: devices)
+        // Keep ordinary payloads compatible; tag only the raw shell so normal
+        // consumers can reject it before grouping or updating device identity.
+        let matchDevice = BleMatchDevice(sn: sn, devices: devices, isPureScanResult: isPureScanResult ? true : nil)
         do {
             // 2. JSON 序列化失败时不能发送半截数据。
             guard let jsonDic = try matchDevice.toJsonString() else {

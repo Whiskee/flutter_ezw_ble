@@ -77,6 +77,8 @@ class BleManager: NSObject {
     // 纯净扫描默认只上报原始广播；当 scan-then-connect 与外部 pure owner 共存时，
     // 继续执行普通解析，避免 DFU 诊断模式挡住前台业务扫描结果。
     var scanPureModelIncludesNormalResults = false
+    // Raw application-mode probes must survive ordinary parsing in mixed scans.
+    var scanPureModelIncludesUnfilteredResults = true
     // 纯净模式使用独立去重集合，避免 raw DFU 结果写入普通扫描缓存后挡住 MAC/SN 解析。
     var pureScanResultTempUuids: Set<String> = []
     // pure 与普通解析共存时，只允许命中过滤服务 UUID 的广播作为 raw DFU 结果上报。
@@ -212,6 +214,7 @@ class BleManager: NSObject {
     private var externalScanServiceUuids: [String] = []
     private var externalScanIncludeUnfilteredScan = true
     private var externalScanIncludeNormalResults = false
+    private var externalScanIncludeUnfilteredPureResults = true
     private var internalScanActive = false
     // Code 14 peer-pairing windows are independent internal scan owners. A
     // single Bool would let the first timeout release another active recovery
@@ -802,13 +805,15 @@ extension BleManager {
         pureModel: Bool = false,
         iosServiceUuids: [String] = [],
         includeUnfilteredScan: Bool = true,
-        includeNormalScanResults: Bool = false
+        includeNormalScanResults: Bool = false,
+        includeUnfilteredPureScanResults: Bool = true
     ) -> [String: Any] {
         externalScanActive = true
         externalScanPureModel = pureModel
         externalScanServiceUuids = normalizeServiceUuidStrings(iosServiceUuids)
         externalScanIncludeUnfilteredScan = includeUnfilteredScan
         externalScanIncludeNormalResults = includeNormalScanResults
+        externalScanIncludeUnfilteredPureResults = includeUnfilteredPureScanResults
         let result = reconcileScanWindow(reason: "externalStart")
         if (result["started"] as? Bool) != true {
             // A failed MethodChannel start does not grant an external owner. Clear
@@ -832,6 +837,7 @@ extension BleManager {
         externalScanServiceUuids = []
         externalScanIncludeUnfilteredScan = true
         externalScanIncludeNormalResults = false
+        externalScanIncludeUnfilteredPureResults = true
     }
 
     /**
@@ -872,14 +878,15 @@ extension BleManager {
         let serviceUuids = serviceUuidStrings.map { CBUUID(string: $0) }
         let effectivePureModel = externalScanPureModel || internalPureModel
         let includeNormalResults = effectivePureModel && hasNormalDemand
-        // Raw pure routing must follow the DFU owner's requested identity hints,
-        // not just the physical CoreBluetooth filter. Foreground mixed scans use
-        // nil services for ordinary discovery, while raw DFU events still must be
-        // limited to FE59 advertisements.
+        // Physical filters do not identify who requested raw application results:
+        // mode resolution needs those even with normal owners, while DFU-only
+        // keeps raw routing limited to its service UUID hints.
+        let includeUnfilteredPureResults = internalPureModel ||
+            (externalScanPureModel && externalScanIncludeUnfilteredPureResults)
         let pureHintUuidStrings = externalScanActive ? externalScanServiceUuids : []
         let serviceSignature = serviceUuidStrings.joined(separator: ",")
         let pureHintSignature = pureHintUuidStrings.joined(separator: ",")
-        let signature = "pure=\(effectivePureModel)|normal=\(includeNormalResults)|services=\(serviceSignature)|pureHints=\(pureHintSignature)"
+        let signature = "pure=\(effectivePureModel)|normal=\(includeNormalResults)|rawUnfiltered=\(includeUnfilteredPureResults)|services=\(serviceSignature)|pureHints=\(pureHintSignature)"
         if centralManager.isScanning && activeScanSignature == signature {
             loggerD(msg: "startScan: already running generation=\(activeScanGeneration), reason=\(reason), signature=\(signature)")
             return scanStartResult(
@@ -893,6 +900,7 @@ extension BleManager {
         }
         scanPureModel = effectivePureModel
         scanPureModelIncludesNormalResults = includeNormalResults
+        scanPureModelIncludesUnfilteredResults = includeUnfilteredPureResults
         scanPureServiceUuidHints = Set(pureHintUuidStrings)
         activeScanSignature = signature
         scanResultTemp.removeAll()
@@ -1017,6 +1025,7 @@ extension BleManager {
     private func clearScanProjection() {
         scanPureModel = false
         scanPureModelIncludesNormalResults = false
+        scanPureModelIncludesUnfilteredResults = true
         scanPureServiceUuidHints.removeAll()
         scanResultTemp.removeAll()
         pureScanResultTempUuids.removeAll()

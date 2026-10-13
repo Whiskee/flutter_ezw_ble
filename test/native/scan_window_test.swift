@@ -58,11 +58,13 @@ final class BleManager {
     var externalScanServiceUuids: [String] = []
     var externalScanIncludeUnfilteredScan = true
     var externalScanIncludeNormalResults = false
+    var externalScanIncludeUnfilteredPureResults = true
     var internalScanActive = false
     var peerPairingRecoveryScanOwnerKeys: Set<String> = []
     var startConnectInfos: [String] = []
     var scanPureModel = false
     var scanPureModelIncludesNormalResults = false
+    var scanPureModelIncludesUnfilteredResults = true
     var scanPureServiceUuidHints: Set<String> = []
     var scanResultTemp: [String] = []
     var pureScanResultTempUuids: Set<String> = []
@@ -116,7 +118,7 @@ func testOrdinaryDefaultsNil() {
 func testFe59OnlyForegroundAndBackground() {
     let manager = BleManager()
     UIApplication.shared.applicationState = .active
-    assertStart(manager.startExternalScan(pureModel: true, iosServiceUuids: ["FE59"], includeUnfilteredScan: false))
+    assertStart(manager.startExternalScan(pureModel: true, iosServiceUuids: ["FE59"], includeUnfilteredScan: false, includeUnfilteredPureScanResults: false))
     expect(lastServices(manager) == ["FE59"], "DFU-only foreground should physically filter FE59")
     expect(manager.scanPureServiceUuidHints == ["FE59"], "DFU raw hints should keep FE59")
     UIApplication.shared.applicationState = .background
@@ -127,7 +129,7 @@ func testFe59OnlyForegroundAndBackground() {
 func testMixedForegroundNilBackgroundFe59AndReleaseRestoresOrdinary() {
     let manager = BleManager()
     UIApplication.shared.applicationState = .active
-    assertStart(manager.startExternalScan(pureModel: true, iosServiceUuids: ["FE59"], includeUnfilteredScan: false))
+    assertStart(manager.startExternalScan(pureModel: true, iosServiceUuids: ["FE59"], includeUnfilteredScan: false, includeUnfilteredPureScanResults: false))
     manager.startConnectInfos = ["ordinary"]
     assertStart(manager.reconcileScanWindow(reason: "pending"))
     expect(lastServices(manager) == nil, "mixed foreground should use nil physical scan for ordinary discovery")
@@ -145,10 +147,25 @@ func testMixedForegroundNilBackgroundFe59AndReleaseRestoresOrdinary() {
     expect(manager.scanPureModel == false, "external release should clear pure mode when ordinary remains")
 }
 
+// Raw scope changes must reconfigure even while physical services stay nil.
+func testModeProbeRawScopeIndependentOfOrdinaryDemand() {
+    let manager = BleManager()
+    UIApplication.shared.applicationState = .active
+    assertStart(manager.startExternalScan(pureModel: true, iosServiceUuids: ["FE59"], includeUnfilteredScan: true, includeNormalScanResults: true, includeUnfilteredPureScanResults: false))
+    expect(lastServices(manager) == nil && !manager.scanPureModelIncludesUnfilteredResults, "normal owner must not widen DFU-only raw results")
+    let dfuGeneration = manager.activeScanGeneration
+    assertStart(manager.startExternalScan(pureModel: true, iosServiceUuids: ["FE59"], includeUnfilteredScan: true, includeNormalScanResults: true, includeUnfilteredPureScanResults: true))
+    expect(manager.activeScanGeneration > dfuGeneration && manager.scanPureModelIncludesUnfilteredResults, "dual-mode owner must reconfigure raw routing without changing physical scope")
+    expect(manager.scanPureModelIncludesNormalResults && lastServices(manager) == nil, "dual-mode owner must retain validated ordinary parsing")
+    UIApplication.shared.applicationState = .background
+    assertStart(manager.reconcileScanWindow(reason: "background"))
+    expect(lastServices(manager) == ["FE59"], "raw application demand must not erase background DFU service filter")
+}
+
 func testInternalDemandRegistersDespiteExistingDfuPhysicalScan() {
     let manager = BleManager()
     UIApplication.shared.applicationState = .background
-    assertStart(manager.startExternalScan(pureModel: true, iosServiceUuids: ["FE59"], includeUnfilteredScan: false))
+    assertStart(manager.startExternalScan(pureModel: true, iosServiceUuids: ["FE59"], includeUnfilteredScan: false, includeUnfilteredPureScanResults: false))
     expect(lastServices(manager) == ["FE59"], "precondition: DFU physical filter")
     UIApplication.shared.applicationState = .active
     assertStart(manager.startPairingRecoveryScanOwner(key: "peer-a"))
@@ -161,7 +178,7 @@ func testTwoPeerOwnersReleaseEitherOrderPreserveDfu() {
     for order in [["peer-a", "peer-b"], ["peer-b", "peer-a"]] {
         let manager = BleManager()
         UIApplication.shared.applicationState = .active
-        assertStart(manager.startExternalScan(pureModel: true, iosServiceUuids: ["FE59"], includeUnfilteredScan: false))
+        assertStart(manager.startExternalScan(pureModel: true, iosServiceUuids: ["FE59"], includeUnfilteredScan: false, includeUnfilteredPureScanResults: false))
         assertStart(manager.startPairingRecoveryScanOwner(key: "peer-a"))
         assertStart(manager.startPairingRecoveryScanOwner(key: "peer-b"), "alreadyRunning")
         manager.stopPairingRecoveryScanOwner(key: order[0])
@@ -213,6 +230,7 @@ UIApplication.shared.applicationState = .active
 testOrdinaryDefaultsNil()
 testFe59OnlyForegroundAndBackground()
 testMixedForegroundNilBackgroundFe59AndReleaseRestoresOrdinary()
+testModeProbeRawScopeIndependentOfOrdinaryDemand()
 testInternalDemandRegistersDespiteExistingDfuPhysicalScan()
 testTwoPeerOwnersReleaseEitherOrderPreserveDfu()
 testRejectedExternalStartCannotRevive()

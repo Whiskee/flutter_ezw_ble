@@ -126,22 +126,43 @@ struct PendingIdentityScanTests {
         let (mixedPure, mixedPeripheral, mixedOwner) = fixture()
         mixedPure.scanPureModel = true
         mixedPure.scanPureModelIncludesNormalResults = true
+        mixedPure.scanPureModelIncludesUnfilteredResults = false
         mixedPure.scanPureServiceUuidHints = ["FE59"]
         discover(mixedPure, mixedPeripheral, serviceUuids: ["FE59"])
         expect(BleEC.scanResult.events.count == 2, "pure+normal mode did not emit both raw and validated scan results")
         let mixedEvents = try BleEC.scanResult.events.map {
             try JSONDecoder().decode(BleMatchDevice.self, from: Data($0.utf8))
         }
-        expect(mixedEvents.contains { $0.sn == "R1TEST" }, "pure+normal mode lost validated ordinary SN")
+        expect(mixedEvents.contains { $0.sn == "R1TEST" && $0.isPureScanResult != true }, "pure+normal mode lost validated ordinary SN")
+        expect(mixedEvents.filter { $0.isPureScanResult == true }.count == 1, "raw scan event must identify its own route")
         expect(mixedPure.scanResultTemp.count == 1 && mixedPure.pureScanResultTempUuids.count == 1, "pure cache polluted ordinary scan cache or failed to dedupe raw result")
         expect(mixedPure.pendingReconnectIdentities[mixedOwner.key] != nil && mixedPure.armCalls == 0, "mixed pure scan consumed frozen owner")
 
         let (ordinaryMixedPure, ordinaryMixedPeripheral, _) = fixture()
         ordinaryMixedPure.scanPureModel = true
         ordinaryMixedPure.scanPureModelIncludesNormalResults = true
+        ordinaryMixedPure.scanPureModelIncludesUnfilteredResults = false
         ordinaryMixedPure.scanPureServiceUuidHints = ["FE59"]
         discover(ordinaryMixedPure, ordinaryMixedPeripheral)
         expect(BleEC.scanResult.events.count == 1 && ordinaryMixedPure.pureScanResultTempUuids.isEmpty && ordinaryMixedPure.scanResultTemp.count == 1, "ordinary mixed pure scan emitted raw random identity or skipped normal parsing")
+
+        // A dual-mode pure owner needs an application advertisement even without
+        // manufacturer data or FE59. Its raw event cannot populate normal cache,
+        // consume the frozen reconnect owner, or start a GATT attempt.
+        let (modeProbe, modePeripheral, modeOwner) = fixture()
+        modeProbe.scanPureModel = true
+        modeProbe.scanPureModelIncludesNormalResults = true
+        modeProbe.scanPureModelIncludesUnfilteredResults = true
+        modeProbe.scanPureServiceUuidHints = ["FE59"]
+        discover(modeProbe, modePeripheral, manufacturer: nil)
+        discover(modeProbe, modePeripheral, manufacturer: nil)
+        expect(BleEC.scanResult.events.count == 1 && modeProbe.scanResultTemp.isEmpty && modeProbe.pureScanResultTempUuids.count == 1, "mixed mode probe lost or duplicated the raw application candidate, or polluted ordinary cache")
+        if let payload = BleEC.scanResult.events.first {
+            let modeEvent = try JSONDecoder().decode(BleMatchDevice.self, from: Data(payload.utf8))
+            expect(modeEvent.isPureScanResult == true, "mode candidate must remain tagged as raw for ordinary consumers")
+            expect(modeEvent.devices.first?.uuid == modePeripheral.identifier.uuidString && modeEvent.devices.first?.name == name && modeEvent.belongConfig == configName, "raw mode candidate lost exact endpoint identity")
+        }
+        expect(modeProbe.pendingReconnectIdentities[modeOwner.key] != nil && modeProbe.armCalls == 0 && modeProbe.physicalConnectCalls == 0, "mode probe bypassed frozen reconnect admission")
 
         // Identity boundaries are real model matching: prefixes/config mismatch
         // are ordinary advertisements, never authorization for this exact owner.

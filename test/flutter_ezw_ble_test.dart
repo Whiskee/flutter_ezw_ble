@@ -39,6 +39,7 @@ class MockFlutterEzwBlePlatform
     List<String> iosServiceUuids = const [],
     bool includeUnfilteredScan = true,
     bool includeNormalScanResults = false,
+    bool includeUnfilteredPureScanResults = true,
   }) {
     throw UnimplementedError();
   }

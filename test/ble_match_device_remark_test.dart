@@ -10,7 +10,8 @@ void main() {
       expect(json['sn'], 'fixture-sn');
       expect(json['devices'], isEmpty);
       expect(json['remark'], remark);
-      expect(json.keys.toSet(), {'sn', 'devices', 'remark'});
+      expect(
+          json.keys.toSet(), {'sn', 'devices', 'remark', 'isPureScanResult'});
       final restored = BleMatchDevice.fromJson(json);
       expect(restored.sn, original.sn);
       expect(restored.remark, remark);
@@ -19,5 +20,20 @@ void main() {
   test('legacy cache without remark remains readable', () {
     expect(
         BleMatchDevice.fromJson({'sn': 'fixture', 'devices': []}).remark, '');
+  });
+  test('raw route survives decoding, copy and serialization', () {
+    final raw = BleMatchDevice.fromJson({
+      'sn': 'raw-shell',
+      'devices': [],
+      'isPureScanResult': true,
+    });
+    expect(raw.isPureScanResult, isTrue);
+    final copy = raw.copy();
+    expect(copy.isPureScanResult, isTrue);
+    expect(BleMatchDevice.fromJson(copy.toJson()).isPureScanResult, isTrue);
+    expect(
+        BleMatchDevice.fromJson({'sn': 'legacy', 'devices': []})
+            .isPureScanResult,
+        isFalse);
   });
 }

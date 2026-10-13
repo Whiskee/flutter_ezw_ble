@@ -68,6 +68,7 @@ final class BleManager {
     var bleConfigs: [BleConfig] = []
     var scanPureModel = false
     var scanPureModelIncludesNormalResults = false
+    var scanPureModelIncludesUnfilteredResults = true
     var scanPureServiceUuidHints: Set<String> = []
     var pureScanResultTempUuids: Set<String> = []
     var tasks: [String: BleReconnectTask] = [:]

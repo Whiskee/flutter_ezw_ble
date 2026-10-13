@@ -42,6 +42,7 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
     List<String> iosServiceUuids = const [],
     bool includeUnfilteredScan = true,
     bool includeNormalScanResults = false,
+    bool includeUnfilteredPureScanResults = true,
   }) async {
     final result = await methodChannel.invokeMethod<Object?>("startScan", {
       "turnOnPureModel": turnOnPureModel,
@@ -50,6 +51,8 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       "iosServiceUuids": iosServiceUuids,
       "includeUnfilteredScan": includeUnfilteredScan,
       "includeNormalScanResults": includeNormalScanResults,
+      // Physical scan width and raw candidate demand belong to different owners.
+      "includeUnfilteredPureScanResults": includeUnfilteredPureScanResults,
     });
     return BleScanStartResult.fromNative(result);
   }

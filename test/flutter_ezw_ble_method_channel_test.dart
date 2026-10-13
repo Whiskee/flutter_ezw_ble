@@ -153,6 +153,7 @@ void main() {
       iosServiceUuids: const ['', 'fe59', 'FE59', '180F'],
       includeUnfilteredScan: false,
       includeNormalScanResults: true,
+      includeUnfilteredPureScanResults: false,
     );
 
     expect(calls.map((call) => call.method), ['startScan', 'startScan']);
@@ -161,12 +162,14 @@ void main() {
       'iosServiceUuids': <String>[],
       'includeUnfilteredScan': true,
       'includeNormalScanResults': false,
+      'includeUnfilteredPureScanResults': true,
     });
     expect(calls[1].arguments, {
       'turnOnPureModel': true,
       'iosServiceUuids': ['', 'fe59', 'FE59', '180F'],
       'includeUnfilteredScan': false,
       'includeNormalScanResults': true,
+      'includeUnfilteredPureScanResults': false,
     });
   });
 
