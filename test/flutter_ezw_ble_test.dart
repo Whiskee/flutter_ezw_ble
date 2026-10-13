@@ -34,7 +34,13 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
-  Future<BleScanStartResult> startScan({bool turnOnPureModel = false}) {
+  Future<BleScanStartResult> startScan({
+    bool turnOnPureModel = false,
+    List<String> iosServiceUuids = const [],
+    bool includeUnfilteredScan = true,
+    bool includeNormalScanResults = false,
+    bool includeUnfilteredPureScanResults = true,
+  }) {
     throw UnimplementedError();
   }
 

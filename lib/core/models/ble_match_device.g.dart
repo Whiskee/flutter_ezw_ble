@@ -13,10 +13,12 @@ BleMatchDevice _$BleMatchDeviceFromJson(Map<String, dynamic> json) =>
               ?.map((e) => BleDevice.fromJson(e as Map<String, dynamic>))
               .toList() ??
           const [],
+      isPureScanResult: json['isPureScanResult'] as bool? ?? false,
     );
 
 Map<String, dynamic> _$BleMatchDeviceToJson(BleMatchDevice instance) =>
     <String, dynamic>{
       'sn': instance.sn,
       'devices': instance.devices.map((e) => e.toJson()).toList(),
+      'isPureScanResult': instance.isPureScanResult,
     };

@@ -74,10 +74,20 @@ class BleManager: NSObject {
     var hasInitializedBleConfigs = false
     //  - 搜索：纯净搜索模式，只返回单个设备，且只有名称，uuid
     lazy var scanPureModel: Bool = false
+    // 纯净扫描默认只上报原始广播；当 scan-then-connect 与外部 pure owner 共存时，
+    // 继续执行普通解析，避免 DFU 诊断模式挡住前台业务扫描结果。
+    var scanPureModelIncludesNormalResults = false
+    // Raw application-mode probes must survive ordinary parsing in mixed scans.
+    var scanPureModelIncludesUnfilteredResults = true
+    // 纯净模式使用独立去重集合，避免 raw DFU 结果写入普通扫描缓存后挡住 MAC/SN 解析。
+    var pureScanResultTempUuids: Set<String> = []
+    // pure 与普通解析共存时，只允许命中过滤服务 UUID 的广播作为 raw DFU 结果上报。
+    var scanPureServiceUuidHints: Set<String> = []
     //  - 搜素：获取结果临时缓存(DeviceInfo, 蓝牙对象)
     lazy var scanResultTemp: [(BleDevice, CBPeripheral)] = []
     /// Dart 用该 generation 区分连续扫描窗口；零表示原生未确认启动。
     private var scanGenerationSeed: Int64 = 0
+    private var activeScanGeneration: Int64 = 0
     //  - 当前连接请求缓存，用于原生回调反查 bleConfig
     lazy var activeConnectRequests: [BleEasyConnect] = []
     //  - 发起连接信息(所属蓝牙配置名称，UUID，设备名称, 发起时间， 是否是升级状态)
@@ -197,6 +207,20 @@ class BleManager: NSObject {
     private var isTransportRecoveryCycleActive = false
     //  - 最近一次已输出的扫描配置签名，用于避免每次 startScan 都重复刷配置详情。
     private var lastLoggedScanConfigSignature: String?
+    // MethodChannel 外部 owner（Dart 管理的 Discovery/DFU）与原生内部 scan-then-connect
+    // 共用同一个 CBCentralManager；这里保留外部意图，使内部 start/stop 不会覆盖 DFU 服务过滤。
+    private var externalScanActive = false
+    private var externalScanPureModel = false
+    private var externalScanServiceUuids: [String] = []
+    private var externalScanIncludeUnfilteredScan = true
+    private var externalScanIncludeNormalResults = false
+    private var externalScanIncludeUnfilteredPureResults = true
+    private var internalScanActive = false
+    // Code 14 peer-pairing windows are independent internal scan owners. A
+    // single Bool would let the first timeout release another active recovery
+    // window, so each reconnect key participates separately in scan arbitration.
+    private var peerPairingRecoveryScanOwnerKeys: Set<String> = []
+    private var activeScanSignature: String?
     //  =========== Get/Set
     //  - 当前蓝牙状态
     var currentBleState: Int {
@@ -448,18 +472,16 @@ extension BleManager {
         let revokedOtaSnapshots = g2OtaTransactions.endpointSnapshots(endpointIds: Array(endpointIds))
         let revokedOtaContexts = g2OtaTransactions.endpointContexts(endpointIds: Array(endpointIds))
         let revokedOtaEndpoints = g2OtaTransactions.revokeEndpoints(endpointIds)
-        var shouldStopOwnedPairingRecoveryScan = false
         endpointKeys.forEach { key in
             otaWriteQueues.removeValue(forKey: key)?.cancelAll(reason: "initConfigs revoked")
             pendingConnectionAdmissionTeardowns.removeValue(forKey: key)
             peripheralCancellationWatchdogs.removeValue(forKey: key)?.workItem.cancel()
             if let scanEntry = pairingRecoveryScanTimers.removeValue(forKey: key) {
                 scanEntry.timer.invalidate()
-                shouldStopOwnedPairingRecoveryScan = shouldStopOwnedPairingRecoveryScan || scanEntry.ownsScan
+                if scanEntry.ownsScan {
+                    stopPairingRecoveryScanOwner(key: key)
+                }
             }
-        }
-        if shouldStopOwnedPairingRecoveryScan {
-            stopScan()
         }
         pendingPhysicalConnectWatchdogs.remove(endpointIds: endpointIds).forEach { $0.cancel() }
         visiblePendingRecoveryWatchdogs.remove(endpointIds: endpointIds).forEach { $0.cancel() }
@@ -774,42 +796,138 @@ extension BleManager {
     }
     
     /**
+     * Dart 层外部扫描 owner 入口。
+     *
+     * iOS 后台不会稳定回调 nil-service 扫描结果；DFU owner 可传入 FE59 等服务 UUID。
+     * 外部意图与原生 scan-then-connect 意图分开保存，避免普通连接辅助扫描覆盖 DFU 过滤。
+     */
+    func startExternalScan(
+        pureModel: Bool = false,
+        iosServiceUuids: [String] = [],
+        includeUnfilteredScan: Bool = true,
+        includeNormalScanResults: Bool = false,
+        includeUnfilteredPureScanResults: Bool = true
+    ) -> [String: Any] {
+        externalScanActive = true
+        externalScanPureModel = pureModel
+        externalScanServiceUuids = normalizeServiceUuidStrings(iosServiceUuids)
+        externalScanIncludeUnfilteredScan = includeUnfilteredScan
+        externalScanIncludeNormalResults = includeNormalScanResults
+        externalScanIncludeUnfilteredPureResults = includeUnfilteredPureScanResults
+        let result = reconcileScanWindow(reason: "externalStart")
+        if (result["started"] as? Bool) != true {
+            // A failed MethodChannel start does not grant an external owner. Clear
+            // the DFU intent immediately so lifecycle transitions cannot revive a
+            // FE59 scan after Dart has already treated the owner as failed/released.
+            clearExternalScanIntent()
+            _ = reconcileScanWindow(reason: "externalStartFailed")
+        }
+        return result
+    }
+
+    /// 释放 Dart 外部 owner。若内部 scan-then-connect 仍在等待，scanner 会继续运行。
+    func stopExternalScan() {
+        clearExternalScanIntent()
+        _ = reconcileScanWindow(reason: "externalStop")
+    }
+
+    private func clearExternalScanIntent() {
+        externalScanActive = false
+        externalScanPureModel = false
+        externalScanServiceUuids = []
+        externalScanIncludeUnfilteredScan = true
+        externalScanIncludeNormalResults = false
+        externalScanIncludeUnfilteredPureResults = true
+    }
+
+    /**
      * 开始扫描设备
      *
      * [param] pureModel 是否开启纯净模式（只返回设备名称，UUID）
      */
     func startScan(pureModel: Bool = false) -> [String: Any] {
+        internalScanActive = true
+        return reconcileScanWindow(reason: "internalStart", internalPureModel: pureModel)
+    }
+
+    /// 根据外部 owner 与内部 scan-then-connect owner 合成唯一 CoreBluetooth 扫描窗口。
+    func reconcileScanWindow(reason: String, internalPureModel: Bool = false) -> [String: Any] {
         guard currentBleState == 5 else {
             return scanStartResult(started: false, reason: "bleUnavailable")
         }
         guard checkBleConfigIsConfigured() else {
             return scanStartResult(started: false, reason: "notConfigured")
         }
-        //  是否开启纯净模式
-        scanPureModel = pureModel
-        //  开始搜索
-        stopScan(isStartScan: true)
-        //  清空缓存
+        let hasInternalDemand = internalScanActive || !peerPairingRecoveryScanOwnerKeys.isEmpty || startConnectInfos.isNotEmpty
+        let shouldRun = externalScanActive || hasInternalDemand
+        guard shouldRun else {
+            if centralManager.isScanning {
+                centralManager.stopScan()
+            }
+            clearScanProjection()
+            return scanStartResult(started: false, reason: "stopped")
+        }
+        // 只有普通扫描需求存在时才在前台保持 nil-service 扫描；DFU 单独扫描即使在前台
+        // 也使用 FE59，方便验证过滤路径并减少无关广播。
+        let hasNormalDemand = hasInternalDemand || externalScanIncludeNormalResults
+        let shouldUseUnfilteredScan = UIApplication.shared.applicationState == .active &&
+            (hasInternalDemand || (externalScanActive && externalScanIncludeUnfilteredScan))
+        let serviceUuidStrings = externalScanActive && !shouldUseUnfilteredScan
+            ? externalScanServiceUuids
+            : []
+        let serviceUuids = serviceUuidStrings.map { CBUUID(string: $0) }
+        let effectivePureModel = externalScanPureModel || internalPureModel
+        let includeNormalResults = effectivePureModel && hasNormalDemand
+        // Physical filters do not identify who requested raw application results:
+        // mode resolution needs those even with normal owners, while DFU-only
+        // keeps raw routing limited to its service UUID hints.
+        let includeUnfilteredPureResults = internalPureModel ||
+            (externalScanPureModel && externalScanIncludeUnfilteredPureResults)
+        let pureHintUuidStrings = externalScanActive ? externalScanServiceUuids : []
+        let serviceSignature = serviceUuidStrings.joined(separator: ",")
+        let pureHintSignature = pureHintUuidStrings.joined(separator: ",")
+        let signature = "pure=\(effectivePureModel)|normal=\(includeNormalResults)|rawUnfiltered=\(includeUnfilteredPureResults)|services=\(serviceSignature)|pureHints=\(pureHintSignature)"
+        if centralManager.isScanning && activeScanSignature == signature {
+            loggerD(msg: "startScan: already running generation=\(activeScanGeneration), reason=\(reason), signature=\(signature)")
+            return scanStartResult(
+                started: true,
+                generation: activeScanGeneration,
+                reason: "alreadyRunning"
+            )
+        }
+        if centralManager.isScanning {
+            centralManager.stopScan()
+        }
+        scanPureModel = effectivePureModel
+        scanPureModelIncludesNormalResults = includeNormalResults
+        scanPureModelIncludesUnfilteredResults = includeUnfilteredPureResults
+        scanPureServiceUuidHints = Set(pureHintUuidStrings)
+        activeScanSignature = signature
         scanResultTemp.removeAll()
-        centralManager.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+        pureScanResultTempUuids.removeAll()
+        centralManager.scanForPeripherals(
+            withServices: serviceUuids.isEmpty ? nil : serviceUuids,
+            options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
+        )
         guard centralManager.isScanning else {
-            scanPureModel = false
+            clearScanProjection()
             loggerE(msg: "startScan: CoreBluetooth did not enter scanning state")
             return scanStartResult(started: false, reason: "systemCallFailed")
         }
         scanGenerationSeed += 1
         let generation = scanGenerationSeed
+        activeScanGeneration = generation
         // 生成本次扫描所使用的配置快照。搜索无结果时，首先要确认 native 真的拿到了
         // Dart 缓存配置；但同一配置重复开始扫描时只打印一次，避免日志噪声盖过扫描决策日志。
         let configSummary = bleConfigs.map { config in
             "\(config.name){filters=\(config.scan.nameFilters),matchCount=\(config.scan.matchCount)}"
         }.joined(separator: ";")
-        let configSignature = "\(pureModel)|\(configSummary)"
+        let configSignature = "\(signature)|\(configSummary)"
         if lastLoggedScanConfigSignature != configSignature {
             lastLoggedScanConfigSignature = configSignature
-            loggerD(msg: "startScan/config: pure=\(pureModel), state=\(centralManager.state.label), configs=[\(configSummary)]")
+            loggerD(msg: "startScan/config: pure=\(effectivePureModel), normalResults=\(includeNormalResults), services=\(serviceUuidStrings), state=\(centralManager.state.label), configs=[\(configSummary)]")
         }
-        loggerD(msg: "startScan: generation=\(generation)")
+        loggerD(msg: "startScan: generation=\(generation), reason=\(reason), services=\(serviceUuidStrings)")
         return scanStartResult(
             started: true,
             generation: generation,
@@ -830,25 +948,89 @@ extension BleManager {
         ]
     }
     
+
+    /// Registers one Code 14 fresh-advertisement scan owner. This is separate
+    /// from MethodChannel external owners and from legacy scan-then-connect so
+    /// overlapping peer-recovery windows cannot release one another.
+    func startPairingRecoveryScanOwner(key: String) -> [String: Any] {
+        let owner = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !owner.isEmpty else {
+            return scanStartResult(started: false, reason: "emptyOwner")
+        }
+        peerPairingRecoveryScanOwnerKeys.insert(owner)
+        let result = reconcileScanWindow(reason: "peerPairingStart")
+        if (result["started"] as? Bool) != true {
+            peerPairingRecoveryScanOwnerKeys.remove(owner)
+            _ = reconcileScanWindow(reason: "peerPairingStartFailed")
+        }
+        return result
+    }
+
+    /// Releases only the matching Code 14 scan owner, preserving other peer
+    /// recovery windows and external DFU scans that still require discovery.
+    func stopPairingRecoveryScanOwner(key: String) {
+        let owner = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !owner.isEmpty else { return }
+        peerPairingRecoveryScanOwnerKeys.remove(owner)
+        _ = reconcileScanWindow(reason: "peerPairingStop")
+    }
+
+    /// Used by global reconnect teardown. It releases only peer-recovery owners;
+    /// MethodChannel external scans remain governed by their own owner.
+    func stopAllPairingRecoveryScanOwners() {
+        guard !peerPairingRecoveryScanOwnerKeys.isEmpty else { return }
+        peerPairingRecoveryScanOwnerKeys.removeAll()
+        _ = reconcileScanWindow(reason: "peerPairingStopAll")
+    }
+
     /**
-     * 停止扫描设备
+     * 停止原生内部扫描 owner；MethodChannel 外部 owner 由 stopExternalScan 释放。
      */
     func stopScan(isStartScan: Bool = false) {
         guard checkIsFunctionCanBeCalled()else {
-            return
-        }
-        guard centralManager.isScanning else {
-            loggerD(msg: "stopScan: is not scanning")
             return
         }
         guard startConnectInfos.isEmpty else {
             loggerD(msg: "stopScan: connecting with scanning, not handle stop")
             return
         }
-        //  关闭纯净模式
-        scanPureModel = false
-        centralManager.stopScan()
+        internalScanActive = false
+        _ = reconcileScanWindow(reason: isStartScan ? "internalRestart" : "internalStop")
         loggerD(msg: "\(isStartScan ? "checking if scan is already running, stopping it first if necessary" : "stop scan")")
+    }
+
+    private func normalizeServiceUuidStrings(_ uuids: [String]) -> [String] {
+        var seen: Set<String> = []
+        return uuids.compactMap { uuid in
+            let value = uuid.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+            guard isSupportedScanServiceUuid(value), !seen.contains(value) else {
+                return nil
+            }
+            seen.insert(value)
+            return value
+        }
+    }
+
+    private func isSupportedScanServiceUuid(_ uuid: String) -> Bool {
+        let hex = CharacterSet(charactersIn: "0123456789ABCDEF")
+        if uuid.count == 4 || uuid.count == 8 {
+            return uuid.unicodeScalars.allSatisfy { hex.contains($0) }
+        }
+        if uuid.count == 36 {
+            return UUID(uuidString: uuid) != nil
+        }
+        return false
+    }
+
+    private func clearScanProjection() {
+        scanPureModel = false
+        scanPureModelIncludesNormalResults = false
+        scanPureModelIncludesUnfilteredResults = true
+        scanPureServiceUuidHints.removeAll()
+        scanResultTemp.removeAll()
+        pureScanResultTempUuids.removeAll()
+        activeScanSignature = nil
+        activeScanGeneration = 0
     }
 
     /**
@@ -2033,6 +2215,7 @@ extension BleManager {
      * 重置
      */
     func reset(preserveStateRestoration: Bool = false) {
+        stopAllPairingRecoveryScanOwners()
         stopScan()
         cancelAllConnectionAdmissions(reason: "reset")
         businessConnectionLeases.clear()
