@@ -67,10 +67,22 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// 开始扫描设备
   ///
   /// - param turnOnPureModel 是否开启纯模式
+  /// - param iosServiceUuids iOS 后台扫描需要的服务 UUID 过滤；Android 忽略。
+  /// - param includeUnfilteredScan 前台允许继续使用未过滤扫描，避免影响普通 BLE 发现。
+  /// - param includeNormalScanResults 纯模式同时需要普通解析结果时置 true。
   ///
-  Future<BleScanStartResult> startScan({bool turnOnPureModel = false}) {
+  Future<BleScanStartResult> startScan({
+    bool turnOnPureModel = false,
+    List<String> iosServiceUuids = const [],
+    bool includeUnfilteredScan = true,
+    bool includeNormalScanResults = false,
+  }) {
     throw UnimplementedError(
-      'startScan(turnOnPureModel: $turnOnPureModel) has not been implemented.',
+      'startScan(turnOnPureModel: $turnOnPureModel, '
+      'iosServiceUuids: $iosServiceUuids, '
+      'includeUnfilteredScan: $includeUnfilteredScan, '
+      'includeNormalScanResults: $includeNormalScanResults) '
+      'has not been implemented.',
     );
   }
 

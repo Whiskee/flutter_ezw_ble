@@ -38,28 +38,25 @@ extension BleManager {
             return
         }
 
-        // 2. 如果当前存在 scan-then-connect 请求，优先让扫描结果尝试唤醒连接流程。
-        // iOS 初次发现或冷启动恢复时 `peripheral.name` 可能为空，必须把广播名传进去参与匹配。
-        guard startConnectWithoutLocalStorage(
-            peripheral: peripheral,
-            advertisedName: advertisedName,
-            rssi: rssi.intValue
-        ) else {
-            return
-        }
-
-        // 3. 普通展示仍按扫描窗口去重，但身份解析不能被展示缓存挡住。
+        // 2. 普通展示仍按扫描窗口去重，但身份解析不能被展示缓存挡住。
         // frozen owner 的有效广播可能先进入该缓存，之后合法 S2 仍需解析同一 UUID。
         let isCachedInCurrentScanWindow = scanResultTemp.contains(where: { info in
             info.0.uuid == peripheral.identifier.uuidString
         })
 
-        // 4. 按配置 nameFilters 匹配目标设备，插件本体不硬编码任何设备型号。
+        // 3. 按配置 nameFilters 匹配目标设备，插件本体不硬编码任何设备型号。
         guard let bleConfig = bleConfigs.first(where: { config in
             config.scan.nameFilters.first { filter in
                 advertisedName.contains(filter)
             } != nil
         }) else {
+            if !startConnectWithoutLocalStorage(
+                peripheral: peripheral,
+                advertisedName: advertisedName,
+                rssi: rssi.intValue
+            ) {
+                return
+            }
             // 只对疑似目标设备输出 noConfig，避免把附近所有 BLE 广播都刷进 Flutter 日志。
             if shouldLogUnmatchedAdvertisedName(advertisedName) {
                 logScanDropOnce(
@@ -70,7 +67,7 @@ extension BleManager {
             return
         }
 
-        // 5. 命中配置后先打一次发现日志。后续如果 MAC/SN/matchCount 没过，
+        // 4. 命中配置后先打一次发现日志。后续如果 MAC/SN/matchCount 没过，
         // 这条日志能证明 CoreBluetooth didDiscover 已经进来。
         let manufactureData = advertisementData["kCBAdvDataManufacturerData"] as? Data
         logScanDropOnce(
@@ -78,15 +75,36 @@ extension BleManager {
             message: "scan/debug discovered name=\(advertisedName), uuid=\(peripheral.identifier.uuidString), config=\(bleConfig.name), rssi=\(rssi.intValue), mfrSize=\(manufactureData?.count ?? 0)"
         )
 
-        // 6. 纯净模式只展示原始设备，不执行 MAC/SN 规则，便于排查广播内容。
-        guard !scanPureModel else {
-            guard !isCachedInCurrentScanWindow else { return }
-            emitPureScanResult(
-                peripheral: peripheral,
-                advertisedName: advertisedName,
-                bleConfig: bleConfig,
-                rssi: rssi.intValue
-            )
+        // 5. 纯净模式先展示原始设备。DFU retry 依赖这条 raw 结果，不能被
+        // scan-then-connect 的挂起请求提前消费。
+        if scanPureModel {
+            let shouldEmitRawPureResult = !scanPureModelIncludesNormalResults ||
+                scanPureServiceUuidHints.isEmpty ||
+                advertisementMatchesServiceUuidHint(advertisementData)
+            if shouldEmitRawPureResult &&
+                !pureScanResultTempUuids.contains(peripheral.identifier.uuidString) {
+                pureScanResultTempUuids.insert(peripheral.identifier.uuidString)
+                emitPureScanResult(
+                    peripheral: peripheral,
+                    advertisedName: advertisedName,
+                    bleConfig: bleConfig,
+                    rssi: rssi.intValue
+                )
+            }
+            if !scanPureModelIncludesNormalResults {
+                return
+            }
+            // 外部 DFU pure owner 与普通 scan-then-connect 同时存在时，raw
+            // 结果独立上报，同时继续走普通 MAC/SN 解析，不让 DFU 诊断覆盖普通扫描。
+        }
+
+        // 6. 如果当前存在 scan-then-connect 请求，再让扫描结果尝试唤醒连接流程。
+        // iOS 初次发现或冷启动恢复时 `peripheral.name` 可能为空，必须把广播名传进去参与匹配。
+        guard startConnectWithoutLocalStorage(
+            peripheral: peripheral,
+            advertisedName: advertisedName,
+            rssi: rssi.intValue
+        ) else {
             return
         }
 
@@ -291,7 +309,8 @@ extension BleManager {
         // 1. 随机 SN 只用于单次调试展示，不参与真实业务绑定。
         let pureSn = UUID().uuidString
 
-        // 2. 构造最小 BleDevice 并写入扫描缓存，防止重复上报。
+        // 2. 构造最小 BleDevice。raw 结果不写普通 scanResultTemp，
+        // 否则随机 SN 会污染后续 MAC/SN 解析和前台普通扫描聚合。
         let bleDevice = peripheral.toBleDevice(
             belongConfig: bleConfig.name,
             sn: pureSn,
@@ -299,10 +318,18 @@ extension BleManager {
             mac: "",
             advertisedName: advertisedName
         )
-        scanResultTemp.append((bleDevice, peripheral))
 
         // 3. 纯净模式不做 matchCount 聚合，立即回传。
         sendMatchDevices(sn: pureSn, devices: [bleDevice])
+    }
+
+    private func advertisementMatchesServiceUuidHint(_ advertisementData: [String: Any]) -> Bool {
+        guard let serviceUuids = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] else {
+            return false
+        }
+        return serviceUuids.contains { serviceUuid in
+            scanPureServiceUuidHints.contains(serviceUuid.uuidString.uppercased())
+        }
     }
 
     /**

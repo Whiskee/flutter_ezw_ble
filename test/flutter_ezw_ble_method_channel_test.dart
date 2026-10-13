@@ -132,6 +132,44 @@ void main() {
     );
   });
 
+  test(
+      'startScan forwards optional iOS service filtering without changing defaults',
+      () async {
+    final calls = <MethodCall>[];
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (methodCall) async {
+      calls.add(methodCall);
+      return const <String, Object?>{
+        'started': true,
+        'generation': 7,
+        'reason': 'started',
+      };
+    });
+
+    final platform = MethodChannelEzwBle();
+    await platform.startScan();
+    await platform.startScan(
+      turnOnPureModel: true,
+      iosServiceUuids: const ['', 'fe59', 'FE59', '180F'],
+      includeUnfilteredScan: false,
+      includeNormalScanResults: true,
+    );
+
+    expect(calls.map((call) => call.method), ['startScan', 'startScan']);
+    expect(calls[0].arguments, {
+      'turnOnPureModel': false,
+      'iosServiceUuids': <String>[],
+      'includeUnfilteredScan': true,
+      'includeNormalScanResults': false,
+    });
+    expect(calls[1].arguments, {
+      'turnOnPureModel': true,
+      'iosServiceUuids': ['', 'fe59', 'FE59', '180F'],
+      'includeUnfilteredScan': false,
+      'includeNormalScanResults': true,
+    });
+  });
+
   test('sendCmd forwards the explicit OTA control bypass flag', () async {
     MethodCall? capturedCall;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger

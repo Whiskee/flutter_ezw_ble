@@ -67,6 +67,9 @@ final class BleManager {
     var connectedDevices: [BleConnectedDevice] = []
     var bleConfigs: [BleConfig] = []
     var scanPureModel = false
+    var scanPureModelIncludesNormalResults = false
+    var scanPureServiceUuidHints: Set<String> = []
+    var pureScanResultTempUuids: Set<String> = []
     var tasks: [String: BleReconnectTask] = [:]
     var armCalls = 0
     var activateCalls = 0

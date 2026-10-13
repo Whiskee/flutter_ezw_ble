@@ -37,9 +37,18 @@ struct PendingIdentityScanTests {
         return (manager, CBPeripheral(identifier: UUID(), name: nil), pending)
     }
 
-    static func discover(_ manager: BleManager, _ peripheral: CBPeripheral, manufacturer data: Data? = manufacturer, name advertisedName: String = name) {
+    static func discover(
+        _ manager: BleManager,
+        _ peripheral: CBPeripheral,
+        manufacturer data: Data? = manufacturer,
+        name advertisedName: String = name,
+        serviceUuids: [String] = []
+    ) {
         var advertisement: [String: Any] = [CBAdvertisementDataLocalNameKey: advertisedName]
         if let data { advertisement["kCBAdvDataManufacturerData"] = data }
+        if !serviceUuids.isEmpty {
+            advertisement[CBAdvertisementDataServiceUUIDsKey] = serviceUuids.map { CBUUID(string: $0) }
+        }
         manager.handleDiscoveredPeripheral(peripheral, advertisementData: advertisement, rssi: -55)
     }
 
@@ -113,6 +122,26 @@ struct PendingIdentityScanTests {
         discover(pure, purePeripheral, manufacturer: nil)
         discover(pure, purePeripheral, manufacturer: nil)
         expect(BleEC.scanResult.events.count == 1 && pure.pendingReconnectIdentities[pureOwner.key] != nil && pure.armCalls == 0, "pure mode duplicate behavior or frozen ownership changed")
+
+        let (mixedPure, mixedPeripheral, mixedOwner) = fixture()
+        mixedPure.scanPureModel = true
+        mixedPure.scanPureModelIncludesNormalResults = true
+        mixedPure.scanPureServiceUuidHints = ["FE59"]
+        discover(mixedPure, mixedPeripheral, serviceUuids: ["FE59"])
+        expect(BleEC.scanResult.events.count == 2, "pure+normal mode did not emit both raw and validated scan results")
+        let mixedEvents = try BleEC.scanResult.events.map {
+            try JSONDecoder().decode(BleMatchDevice.self, from: Data($0.utf8))
+        }
+        expect(mixedEvents.contains { $0.sn == "R1TEST" }, "pure+normal mode lost validated ordinary SN")
+        expect(mixedPure.scanResultTemp.count == 1 && mixedPure.pureScanResultTempUuids.count == 1, "pure cache polluted ordinary scan cache or failed to dedupe raw result")
+        expect(mixedPure.pendingReconnectIdentities[mixedOwner.key] != nil && mixedPure.armCalls == 0, "mixed pure scan consumed frozen owner")
+
+        let (ordinaryMixedPure, ordinaryMixedPeripheral, _) = fixture()
+        ordinaryMixedPure.scanPureModel = true
+        ordinaryMixedPure.scanPureModelIncludesNormalResults = true
+        ordinaryMixedPure.scanPureServiceUuidHints = ["FE59"]
+        discover(ordinaryMixedPure, ordinaryMixedPeripheral)
+        expect(BleEC.scanResult.events.count == 1 && ordinaryMixedPure.pureScanResultTempUuids.isEmpty && ordinaryMixedPure.scanResultTemp.count == 1, "ordinary mixed pure scan emitted raw random identity or skipped normal parsing")
 
         // Identity boundaries are real model matching: prefixes/config mismatch
         // are ordinary advertisements, never authorization for this exact owner.
