@@ -415,6 +415,10 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       methodChannel.invokeMethod("setConnectionTraceEnabled", enabled);
 
   @override
+  Future<void> setConnectionTraceSamplingPaused(bool paused) =>
+      methodChannel.invokeMethod("setConnectionTraceSamplingPaused", paused);
+
+  @override
   Future<void> openBleSettings() async =>
       methodChannel.invokeMethod("openBleSettings");
 

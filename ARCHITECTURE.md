@@ -193,6 +193,7 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `quiteUpgradeState` | `Future<void> quiteUpgradeState(String uuid, {int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0})` | 退出 OTA 状态；携带正 expected pair 时，只有当前物理 owner 匹配才消费 OTA marker 和 pending 写，避免旧 attempt 清掉新 attempt。链路仍有效时才恢复 `connected`，断连后到达的旧 OTA 回调不能复活连接态。 |
 | `disconnectForOtaReboot` | `Future<void> disconnectForOtaReboot(String uuid, String name, {int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0})` | OTA 安装成功后的固件 reboot teardown。携带正 expected pair 时，native 必须精确匹配当前 owner 后才 detach 旧物理 GATT/CBPeripheral、发 `disconnectFromSys` 并标记一次性 suppression；旧 pair 不能关闭或屏蔽新 attempt。0/0 仅保留旧调用兼容。 |
 | `setConnectionTraceEnabled` | `Future<void> setConnectionTraceEnabled(bool enabled)` | 打开/关闭原生连接 Trace。默认关闭；关闭只清进程内 Trace/RSSI 诊断缓存，不断开设备、不取消 autoReconnect、不补造当前链路。开启后仅从下一次真实物理 attempt 开始记录。 |
+| `setConnectionTraceSamplingPaused` | `Future<void> setConnectionTraceSamplingPaused(bool paused)` | iOS 仅暂停主动 RSSI 的 2 秒首读与 15 秒周期 Timer；保留 Trace 配置、被动事件和连接 owner。默认不暂停，Android 返回成功且 no-op。可在 central 创建前配置。 |
 | `setDebugLoggingEnabled` | `Future<void> setDebugLoggingEnabled(bool enabled)` | iOS 进程内 Debug 日志默认关闭；只控制文本构造与 logger EventChannel 发出。Error、业务事件、Trace 和连接所有权独立。Android 接受并返回成功，当前 no-op。可通过 `EzwBle.to.setDebugLoggingEnabled(enabled)` 或 `bleMC` 调用。 |
 | `openBleSettings` | `Future<void> openBleSettings()` | 跳系统蓝牙开关页。 |
 | `openAppSettings` | `Future<void> openAppSettings()` | 跳本 App 权限设置页。 |
@@ -250,6 +251,20 @@ owner/重试/终态行为不由这个日志开关控制。Android 此次仅增�
 原有 Android 日志行为。验证见 `test/ios_debug_logging_test.dart` 与
 `test/native/debug_logging_test.swift`：优化模式编译实际 policy、生产 logger/扫描
 helper 与完整 OTA 队列，验证关闭时零插值/零发出及业务写入和错误终态不变。
+
+`setConnectionTraceSamplingPaused(bool)` 是独立的 iOS 采样策略，不等同于关闭
+Trace。`BleNativeTraceRssiSampler` 不构造 Manager/central；暂停撤销 Timer，保留
+已请求采样的弱 peripheral/attempt 校验闭包。恢复与每次读之前重新验证当前
+peripheral、GATT readiness 和 trace attempt；迟到首读回调不能重新创建周期。
+没有 backlog 或补读，重复暂停/恢复不会生成重复 Timer。连接/鉴权/断连与被动
+Trace 记录不受此接口控制。宿主自行决定暂停条件，插件不定义夜间或业务策略。
+
+CoreBluetooth RSSI 回调没有请求 token。`BleNativeTraceRssiRequests` 因此用弱
+peripheral 对象及生产时 attempt 标识跟踪尚未回执的真实读，独立于 Trace 清理。
+同一对象旧读未结束时不发新读；旧对象回执不能消费新对象的在途记录。暂停期间
+回执只排空自己的记录，不更新 RSSI 诊断；账本不保留外设、不触发 timeout/retry。
+验证见 `test/native_trace_rssi_sampling_test.dart`：优化编译实际 sampler、Trace
+buffer 和 Manager 的采样/owner/回执方法，仅替代 CoreBluetooth 平台边界。
 
 iOS 的非 `poweredOn` 状态继续沿用既有连接 teardown；但只有公开状态
 `CBManagerState.poweredOff` 才能在断连 Trace 上标记 `bluetooth_adapter/4`。

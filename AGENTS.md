@@ -42,6 +42,7 @@
 - `receiveData` 的二进制 payload 跨 Method/EventChannel 时保持 Base64 约定。
 - Android `onConnectionStateChange` 的 status 使用 HCI/controller 断连语义；characteristic/descriptor 回调才使用 ATT/GATT 操作语义。数值 `8` 在前者是连接超时，严禁触发授权恢复/cache refresh/`needsScanBeforeConnect`；在后者是授权不足，必须走授权恢复后再按回调阶段终止。
 - 原生连接 Trace 默认关闭，只能由 `setConnectionTraceEnabled(bool)` 显式打开；关闭仅清进程内 Trace/RSSI 诊断缓存，不能断开设备、取消/调度 autoReconnect 或补造当前链路。`nativeTrace.attemptId` 是诊断 UUID，不能替代 `sessionGeneration/attemptGeneration` owner 校验；step 快照最多 32 条，溢出必须用连续 `stepSeq` + `trace/gap.droppedCount` 表达缺口。
+- RSSI 采样暂停约束见 `ARCHITECTURE.md` §6：`setConnectionTraceSamplingPaused` 只取消诊断 Timer，不能清 Trace、创建 central、停连接/鉴权/协议或调度回连；恢复须复验当前 peripheral/readiness/attempt。未回执 RSSI 必须按原 peripheral 对象归属，旧回执不得消费替换对象的新请求。
 - iOS Debug 日志默认关闭，宿主通过 `setDebugLoggingEnabled(bool)` 同步自己的 Debug 状态；门控必须早于插值、诊断 hex/summary、去重 key 消费及 EventChannel 缓冲。setter 只更新独立静态 policy，不得构造 `BleManager`/central、改 owner/重试/业务事件/Trace 或清错误日志；OTA 硬背压、外设释放和服务发现错误保留 Error。Android 当前只兼容 no-op。完整机制见 `ARCHITECTURE.md` §6。
 - Trace 发生时间必须在原生生产处用同一 wall/monotonic 锚点冻结；快照/重放不得改写，墙钟跳变仅标记 `clock_changed`。`physicalConnectionEvent` 只能由 exact owner 的真实物理回调写入，reset/取消/状态投影不得伪造；RSSI 只复用既有读请求。
 - iOS OTA 中 `psType == 1` 的 `sendCmdNoWait` 必须与 `OtaWriteQueue`、`canSendWriteWithoutResponse` 和 `docs/IOS_OTA_NOWAIT_SPEC.md` 对齐。

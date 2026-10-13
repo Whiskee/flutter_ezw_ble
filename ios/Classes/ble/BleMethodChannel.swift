@@ -71,6 +71,8 @@ enum BleMC: String {
     case quiteUpgradeState
     /// Enable/disable process-local native connection Trace.
     case setConnectionTraceEnabled
+    /// Pause RSSI timers without changing Trace, BLE ownership or startup.
+    case setConnectionTraceSamplingPaused
     /// Change Debug formatting/emission only; never construct BleManager here.
     case setDebugLoggingEnabled
     /// Open system Bluetooth settings.
@@ -374,6 +376,10 @@ enum BleMC: String {
             break
         case .setConnectionTraceEnabled:
             BleManager.shared.setConnectionTraceEnabled(arguments as? Bool == true)
+            break
+        case .setConnectionTraceSamplingPaused:
+            // This diagnostic policy also works before BleManager/central init.
+            BleNativeTraceRssiSampler.shared.setPaused(arguments as? Bool == true)
             break
         case .setDebugLoggingEnabled:
             // This policy exists before any central/manager. Logging settings

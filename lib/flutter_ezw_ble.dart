@@ -50,4 +50,8 @@ class EzwBle {
   /// iOS defaults to off before this call; Android currently accepts a no-op.
   Future<void> setDebugLoggingEnabled(bool enabled) =>
       bleMC.setDebugLoggingEnabled(enabled);
+
+  /// Stop only proactive iOS RSSI diagnostics; preserve passive BLE events.
+  Future<void> setConnectionTraceSamplingPaused(bool paused) =>
+      bleMC.setConnectionTraceSamplingPaused(paused);
 }
