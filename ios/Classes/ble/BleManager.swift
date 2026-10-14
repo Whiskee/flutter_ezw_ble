@@ -4496,9 +4496,12 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             loggerE(msg: "cmd response: \(peripheral.identifier.uuidString), error = No data")
             return
         }
-        //  2、设备是否存在并连接中
+        //  2、设备是否存在并连接中。这里必须匹配 CBPeripheral 对象身份；
+        //  UUID 相同的新连接不能消费旧 delegate/旧 characteristic 队列。
         guard let device = connectedDevices.first(where: { device in
-            device.peripheral.identifier.uuidString == peripheral.identifier.uuidString
+            device.peripheral === peripheral &&
+                device.peripheral.identifier.uuidString == peripheral.identifier.uuidString &&
+                device.peripheral.state == .connected
         }) else {
             loggerE(msg: "cmd response: \(peripheral.identifier.uuidString), device had already disconnected")
             return
@@ -4510,7 +4513,17 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             loggerE(msg: "cmd response: \(peripheral.identifier.uuidString), can not find chars")
             return
         }
-        let responseIdentity = otaResponseIdentity(
+        let receiveIdentity = receiveDataIdentity(
+            peripheral: peripheral,
+            characteristic: characteristic,
+            device: device,
+            privateService: privateService
+        )
+        if currentConnectionAdmission(uuid: peripheral.identifier.uuidString) != nil, receiveIdentity == nil {
+            loggerE(msg: "cmd response(char): \(peripheral.identifier.uuidString), drop notify from stale admission or characteristic")
+            return
+        }
+        let responseIdentity = receiveIdentity ?? otaResponseIdentity(
             uuid: peripheral.identifier.uuidString,
             device: device,
             psType: privateService.type
@@ -4532,17 +4545,68 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             attemptGeneration: responseIdentity?.attemptGeneration ?? 0,
             otaTransactionId: otaContext?.transactionId ?? "",
             otaGeneration: otaContext?.generation ?? 0,
-            otaInstanceId: otaContext?.instanceId ?? ""
+            otaInstanceId: otaContext?.instanceId ?? "",
+            receiveIdentity: receiveIdentity
         ).toMap()
         BleEC.receiveData.emit(bleCmdMap)
         loggerD(msg: "cmd response(char): \(peripheral.identifier.uuidString), chars = \(characteristic.uuid.uuidString), data length = \(data.count)")
+    }
+
+    private func receiveDataIdentity(
+        peripheral: CBPeripheral,
+        characteristic: CBCharacteristic,
+        device: BleConnectedDevice,
+        privateService: BlePrivateService
+    ) -> BleReceiveIdentity? {
+        let uuid = peripheral.identifier.uuidString
+        guard device.peripheral === peripheral,
+              peripheral.state == .connected,
+              device.readCharsDic[privateService.type] === characteristic else {
+            return nil
+        }
+        if let admission = currentConnectionAdmission(uuid: uuid) {
+            return BleReceiveIdentityPolicy.currentAdmissionIdentity(
+                uuid: uuid,
+                sessionGeneration: admission.sessionGeneration,
+                attemptGeneration: admission.generation,
+                isCurrentPipeline: isCurrentConnectionPipeline(peripheral),
+                isPeripheralConnected: peripheral.state == .connected,
+                isCachedReadCharacteristic: true
+            )
+        }
+        let reconnectTask = reconnectTasks.values.first { task in
+            isSameConnectTarget(
+                storedUuid: task.uuid,
+                storedName: task.name,
+                uuid: uuid,
+                name: peripheral.name ?? ""
+            )
+        }
+        guard let metadata = BleExplicitCancellationMetadataPolicy.resolve(
+            currentAdmission: nil,
+            reconnectTask: reconnectTask
+        ) else {
+            return nil
+        }
+        // Gate releases at business connected, but the physical link keeps
+        // delivering health/R1 notifications. Use only the accepted pair saved
+        // by the reconnect owner; never fall back to historical task metadata.
+        return BleReceiveIdentityPolicy.acceptedConnectionIdentity(
+            uuid: uuid,
+            sessionGeneration: metadata.sessionGeneration,
+            attemptGeneration: metadata.attemptGeneration,
+            isPeripheralConnected: peripheral.state == .connected,
+            isBusinessConnected: device.isConnected,
+            isUpgradeActive: upgradeStateRegistry.contains(uuid),
+            isCachedReadCharacteristic: true
+        )
     }
 
     private func otaResponseIdentity(
         uuid: String,
         device: BleConnectedDevice,
         psType: Int
-    ) -> BleExplicitCancellationMetadata? {
+    ) -> BleReceiveIdentity? {
         guard psType == 1 else {
             return nil
         }
@@ -4566,7 +4630,11 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
               metadata.attemptGeneration > 0 else {
             return nil
         }
-        return metadata
+        return BleReceiveIdentity(
+            uuid: uuid,
+            sessionGeneration: metadata.sessionGeneration,
+            attemptGeneration: metadata.attemptGeneration
+        )
     }
     
 }
