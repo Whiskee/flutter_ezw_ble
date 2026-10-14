@@ -5,6 +5,8 @@
 //  Created by Whiskee on 2025/1/4.
 //
 
+import Foundation
+
 struct BleCmd: Codable {
     //  设备唯一识别码
     var uuid: String
@@ -22,6 +24,8 @@ struct BleCmd: Codable {
     var otaTransactionId: String = ""
     var otaGeneration: Int64 = 0
     var otaInstanceId: String = ""
+    //  当前 notify callback 冻结的原生接收身份；不能从外层 legacy/OTA pair 推导。
+    var receiveIdentity: BleReceiveIdentity?
     
     func toMap() -> [String:Any] {
         var jsonMap: [String:Any] = [
@@ -36,6 +40,9 @@ struct BleCmd: Codable {
         ]
         if let data = data {
             jsonMap["data"] = data.base64EncodedString()
+        }
+        if let receiveIdentity = receiveIdentity {
+            jsonMap["receiveIdentity"] = receiveIdentity.toMap()
         }
         return jsonMap
     }

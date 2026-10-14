@@ -227,7 +227,7 @@ enum BleEventChannel {
 | `bleState` | `int`（iOS CoreBluetooth state 值，扩展 `6 = noLocation` 给 Android） | `BleState` | 蓝牙开关、定位权限变化。Android 主动查询、Activity start/resume 与扫描入口都会重新读取实时权限和开关，仅在状态变化时 push。 |
 | `scanResult` | JSON 字符串 | `BleMatchDevice.fromJson` | 一次扫描命中（按 `BleScan.matchCount` 已聚合好的"组合设备"）。 |
 | `connectStatus` | JSON 字符串 | `BleConnectModel.fromJson` | 连接流程的每一步推进（见 §8）；携带 `source`、兼容键 `generation`、`sessionGeneration` 与 `attemptGeneration`。`generation` 始终序列化为 Dart session generation；旧 payload 分别回退为 `unknown` / `0`。 |
-| `receiveData` | Map：`{uuid, psType, data:Base64, isSuccess, sessionGeneration, attemptGeneration, otaTransactionId, otaGeneration, otaInstanceId}` | `BleCmd.receiveMap` | 来自原生的特征值数据。**注意 `data` 字段是 Base64**，业务侧拿到的 `BleCmd.data` 已经是 `Uint8List`，背后由 `flutter_ezw_utils.encodeBase64()` 解码。`sessionGeneration/attemptGeneration` 由 Android 原 callback 冻结 exact GATT owner 后发布，旧事件或 unknown 为 0；非 OTA 同样保留 known identity。G2 OTA 事务持有期间还会附带 transaction 字段；Dart 必须同时校验 transaction 与 physical pair 后才消费 ACK/Notify。 |
+| `receiveData` | Map：`{uuid, psType, data:Base64, isSuccess, sessionGeneration, attemptGeneration, receiveIdentity:{uuid,sessionGeneration,attemptGeneration}, otaTransactionId, otaGeneration, otaInstanceId}` | `BleCmd.receiveMap` | 来自原生的特征值数据。**注意 `data` 字段是 Base64**，业务侧拿到的 `BleCmd.data` 已经是 `Uint8List`，背后由 `flutter_ezw_utils.encodeBase64()` 解码。`receiveIdentity` 是冻结的通知归属；Android 来自原 callback 的 exact GATT owner，iOS 来自当前 admission 或业务已接受 owner。旧事件、unknown 或非法 pair 不填 nested identity。G2 OTA 事务持有期间还会附带 transaction 字段；Dart 必须同时校验 transaction 与 physical pair 后才消费 ACK/Notify。 |
 | `logger` | String，含 `[d]-` / `[e]-` 前缀 | `String` | 仅 iOS 主动 push；业务侧自行根据前缀分级。 |
 
 iOS 的非 `poweredOn` 状态继续沿用既有连接 teardown；但只有公开状态
@@ -237,6 +237,10 @@ iOS 的非 `poweredOn` 状态继续沿用既有连接 teardown；但只有公开
 > **修改提示**：`receiveData` 的 `data` 走 Base64 是为了避开 MethodChannel 二进制流跨 isolate 的成本；新增二进制通道时建议沿用这套约定。
 
 `receiveData` 是纯传输边界，Android、iOS 与 Dart 都必须保留通知 payload 的完整字节序列，不在本层解析、截断或重排。G2 音频流当前可能携带 `200 字节 LC3 + 4 字节方向/角色标签 + 1 字节帧序号`；这些尾部字节由上层 `even_connect` 按协议拆分，再由音频算法解释。本仓回归测试固定覆盖 205 字节帧的 Base64 往返，避免依赖升级时静默丢失方向或说话人元数据。
+
+iOS 的 `receiveIdentity` 分两个生命周期取值：业务 `connected` / Gate 释放前只接受当前 admission，且必须同时命中同一 `CBPeripheral` 对象、`connected` 状态、当前配置的 read characteristic 对象和 `isCurrentConnectionPipeline`；缺失、0/负 generation、旧 session 或旧 attempt 都 fail-closed，active admission 存在但无法冻结身份时直接丢弃通知。业务已接受后，普通 R1 notify/健康推送可使用 reconnect owner 保留的最后成功 `(sessionGeneration, attemptGeneration)`，但仍要命中同一已连接 peripheral 和当前 read characteristic；这条后置路径只服务已通过业务连接的接收流，不得拿旧 reconnect task history 回填 pre-AUTH provenance。
+
+CoreBluetooth 不提供每条通知的底层 GATT handle token。iOS 的冻结身份只能证明当前 delegate 回调通过了 `CBPeripheral` 引用、连接状态、characteristic 对象和 admission/accepted-owner 检查，不能声称具备 Android callback handle 同级的硬件身份；若系统复用同一 `CBPeripheral/CBCharacteristic` 对象，本层没有更深 token 可区分。
 
 ### iOS 连接缓存约束
 
@@ -374,7 +378,7 @@ class BleCmd {
 
 接收端调用静态构造 `BleCmd.receiveMap(Map)` 走 Base64 解码；发送端直接构造对象但目前没有发送序列化路径——发送统一走 `EzwBle.to.bleMC.sendCmd(uuid, Uint8List)`。
 
-`BleReceiveIdentity` 是 immutable `{uuid, sessionGeneration, attemptGeneration}` 值；仅非空 UUID 和正整数 pair 为 known，缺失/非法 metadata 返回 null。JSON 嵌套 round-trip 保留 metadata，固件 payload 不变。来源只取原 callback 的 exact retained/admitted GATT，不从 terminal trace 或稍后当前连接反查。
+`BleReceiveIdentity` 是 immutable `{uuid, sessionGeneration, attemptGeneration}` 值；仅非空 UUID 和正整数 pair 为 known，缺失/非法 metadata 返回 null。JSON 嵌套 round-trip 保留 metadata，固件 payload 不变。来源只取原 callback 的 exact retained/admitted transport：Android 使用 GATT callback owner，iOS 使用 pre-AUTH current admission 或 business accepted owner，不从 terminal trace、reconnect 历史 fallback 或稍后当前连接反查。
 
 普通 `sendCmd(expectedAttempt: ...)` 校验同 UUID/正整数 pair，Android 在原队列实际取出时再次校验 exact retained GATT。过期项丢弃，不发 UUID-only 失败污染新请求，不触发重连。它不是取消/物理排空 API；iOS 显式返回 `owned_write_unsupported`，省略参数维持旧行为，OTA no-wait 契约不变。
 
@@ -963,7 +967,7 @@ autoReconnect owner，并在 terminal ledger 中保留 `committed/alreadyCommitt
 返回对应旧凭据的 `invalidated`，不得触碰新实例中的其他 owner；同实例未知事务仍保持未知。
 
 iOS notification 仍不具备 Android GATT callback handle 同级的 enqueue-time 身份。iOS 只能在
-当前 CBPeripheral、reconnect owner metadata 和 OTA transaction 同时一致时 stamp
+当前 CBPeripheral、冻结的 `receiveIdentity` 和 OTA transaction 同时一致时 stamp
 `otaTransactionId/otaGeneration/otaInstanceId`；Dart 消费前仍需同时校验 transaction 与
 physical pair，迟到或无法归属的通知交给 5s/30s/90s watchdog 收口。
 
