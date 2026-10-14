@@ -1687,7 +1687,7 @@ extension BleManager {
         reconnectTasks.values.forEach { $0.timer?.invalidate() }
         pairingRecoveryScanTimers.values.forEach { $0.timer.invalidate() }
         if pairingRecoveryScanTimers.values.contains(where: { $0.ownsScan }) {
-            stopScan()
+            stopAllPairingRecoveryScanOwners()
         }
         pairingRecoveryScanTimers.removeAll()
         reconnectTasks.removeAll()
@@ -1962,6 +1962,8 @@ extension BleManager {
     @objc func handleAppDidEnterBackground() {
         allowsSynchronousCoreBluetoothLookup = false
         pausePeerPairingRecoveryForAppInactivity(reason: "didEnterBackground")
+        // App 进入后台后，外部过滤扫描要从前台兼容的 nil-service 窗口切回服务 UUID 窗口。
+        _ = reconcileScanWindow(reason: "didEnterBackground")
         loggerD(msg: "appLifecycle: synchronous CoreBluetooth lookup disabled reason=didEnterBackground")
     }
 
@@ -1980,6 +1982,8 @@ extension BleManager {
      */
     @objc func handleAppDidBecomeActive() {
         allowsSynchronousCoreBluetoothLookup = true
+        // 回到前台时重新合成扫描窗口；若普通扫描 owner 与 DFU owner 共存，前台保持 nil-service。
+        _ = reconcileScanWindow(reason: "didBecomeActive")
         // inactive activation 只保留 exact owner，CoreBluetooth 的 system-connected
         // peripheral 可能在 didBecomeActive 之后才可查询。先冻结本次 deferred 快照，
         // 恢复 owner 后为每个仍同代的端点重启有界对账，避免一次瞬时 retrieve 未命中
@@ -2588,7 +2592,7 @@ extension BleManager {
         guard let entry = pairingRecoveryScanTimers.removeValue(forKey: key) else { return }
         entry.timer.invalidate()
         if entry.ownsScan {
-            stopScan()
+            stopPairingRecoveryScanOwner(key: key)
         }
     }
 
@@ -2644,7 +2648,10 @@ extension BleManager {
         loggerD(msg: "freshAdvertisementRetryScheduled owner=\(current.uuid), sessionGeneration=\(current.sessionGeneration), scanWindow=\(Int(automaticPairingRecoveryScanWindow))s, retryDelay=\(Int(pairingRecoveryRetryDelay))s")
     }
 
-    /// 在已有扫描上共享窗口；只有本任务主动开的扫描，超时才允许停止，避免抢占其他业务扫描。
+    /// 在已有扫描上共享窗口；Code 14 owner 总是登记内部扫描 lease。
+    /// 即使外部 DFU owner 已经让 CBCentralManager 处于 scanning，也必须调用
+    /// startScan() 把 ordinary demand 纳入仲裁；释放时 stopScan() 只释放内部 owner，
+    /// 不会停掉 MethodChannel 外部扫描。
     private func startPairingRecoveryDiscoveryIfNeeded(_ task: BleReconnectTask) {
         let key = reconnectKey(uuid: task.uuid)
         guard pairingRecoveryScanTimers[key] == nil,
@@ -2671,9 +2678,11 @@ extension BleManager {
             )
             return
         }
-        let ownsScan = !centralManager.isScanning
-        if ownsScan {
-            startScan()
+        let scanStart = startPairingRecoveryScanOwner(key: key)
+        let ownsScan = (scanStart["started"] as? Bool) == true
+        guard ownsScan else {
+            loggerD(msg: "autoReconnect: \(current.uuid)-\(current.name), pairing recovery scan owner was not acquired")
+            return
         }
         let scanWindow = current.source == .manualReconnect
             ? manualPairingRecoveryScanWindow
@@ -2690,7 +2699,7 @@ extension BleManager {
             }
             self.pairingRecoveryScanTimers.removeValue(forKey: key)
             if activeEntry.ownsScan {
-                self.stopScan()
+                self.stopPairingRecoveryScanOwner(key: key)
             }
             switch BlePeerPairingRecoveryPolicy.actionAfterWindowMiss(
                 source: current.source
@@ -2760,7 +2769,7 @@ extension BleManager {
         if let scanEntry = pairingRecoveryScanTimers.removeValue(forKey: entry.key) {
             scanEntry.timer.invalidate()
             if scanEntry.ownsScan {
-                stopScan()
+                stopPairingRecoveryScanOwner(key: entry.key)
             }
         }
         scanResultTemp.removeAll { info in

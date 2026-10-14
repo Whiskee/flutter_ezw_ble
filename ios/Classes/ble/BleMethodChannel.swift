@@ -130,10 +130,21 @@ enum BleMC: String {
         case .startScan:
             let jsonData: [String: Any] = arguments as? [String: Any] ?? [:]
             let turnOnPureModel = jsonData["turnOnPureModel"] as? Bool ?? false
-            result(BleManager.shared.startScan(pureModel: turnOnPureModel))
+            let iosServiceUuids = jsonData["iosServiceUuids"] as? [String] ?? []
+            let includeUnfilteredScan = jsonData["includeUnfilteredScan"] as? Bool ?? true
+            let includeNormalScanResults = jsonData["includeNormalScanResults"] as? Bool ?? false
+            // Legacy pure scans include application-mode advertisements too.
+            let includeUnfilteredPureScanResults = jsonData["includeUnfilteredPureScanResults"] as? Bool ?? true
+            result(BleManager.shared.startExternalScan(
+                pureModel: turnOnPureModel,
+                iosServiceUuids: iosServiceUuids,
+                includeUnfilteredScan: includeUnfilteredScan,
+                includeNormalScanResults: includeNormalScanResults,
+                includeUnfilteredPureScanResults: includeUnfilteredPureScanResults
+            ))
             return
         case .stopScan:
-            BleManager.shared.stopScan()
+            BleManager.shared.stopExternalScan()
             break
         case .isSystemConnectedPeripheral:
             let jsonData: [String: Any] = arguments as? [String: Any] ?? [:]

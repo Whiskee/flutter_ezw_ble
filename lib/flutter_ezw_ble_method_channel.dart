@@ -37,9 +37,22 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       );
 
   @override
-  Future<BleScanStartResult> startScan({bool turnOnPureModel = false}) async {
+  Future<BleScanStartResult> startScan({
+    bool turnOnPureModel = false,
+    List<String> iosServiceUuids = const [],
+    bool includeUnfilteredScan = true,
+    bool includeNormalScanResults = false,
+    bool includeUnfilteredPureScanResults = true,
+  }) async {
     final result = await methodChannel.invokeMethod<Object?>("startScan", {
       "turnOnPureModel": turnOnPureModel,
+      // iOS only: filtered DFU owners need a concrete service UUID while the app
+      // is in the background; default empty keeps the historical nil scan.
+      "iosServiceUuids": iosServiceUuids,
+      "includeUnfilteredScan": includeUnfilteredScan,
+      "includeNormalScanResults": includeNormalScanResults,
+      // Physical scan width and raw candidate demand belong to different owners.
+      "includeUnfilteredPureScanResults": includeUnfilteredPureScanResults,
     });
     return BleScanStartResult.fromNative(result);
   }

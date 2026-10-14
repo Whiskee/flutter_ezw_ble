@@ -10,6 +10,9 @@ part 'ble_match_device.g.dart';
 class BleMatchDevice {
   final String sn;
   final List<BleDevice> devices;
+  // Raw scan shells are for exact DFU/mode probes, never ordinary discovery.
+  @JsonKey(defaultValue: false)
+  final bool isPureScanResult;
 
   //  设备备注
   @JsonKey(includeToJson: false, includeFromJson: false)
@@ -61,6 +64,7 @@ class BleMatchDevice {
   BleMatchDevice(
     this.sn, {
     this.devices = const [],
+    this.isPureScanResult = false,
   });
 
   factory BleMatchDevice.fromJson(Map<String, dynamic> json) =>
@@ -70,9 +74,11 @@ class BleMatchDevice {
   Map<String, dynamic> toJson() =>
       _$BleMatchDeviceToJson(this)..['remark'] = remark;
 
-  BleMatchDevice copy() =>
-      BleMatchDevice(sn, devices: devices.map((match) => match.copy()).toList())
-        ..remark = remark;
+  BleMatchDevice copy() => BleMatchDevice(
+        sn,
+        devices: devices.map((match) => match.copy()).toList(),
+        isPureScanResult: isPureScanResult,
+      )..remark = remark;
 
   @override
   String toString() => jsonEncode(toJson());

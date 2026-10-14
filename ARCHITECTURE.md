@@ -171,7 +171,7 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `bleState` | `Future<int> bleState()` | 主动查询当前蓝牙状态码，配合 `BleStateExt.from(int)` 解码。 |
 | `bleRecoveryEpoch` | `Future<int> bleRecoveryEpoch()` | 只读查询当前进程 transport reset 周期；iOS final recovery activation 必须原样回传，Android 当前返回 0。 |
 | `initConfigs` | `Future<void> initConfigs(List<BleConfig> configs)` | **必须最先调用**。把多份配置一次性下发给原生层；下发参数是 `configs.map((c) => c.customToJson())`（保证嵌套 model 也序列化）。 |
-| `startScan` | `Future<void> startScan({bool turnOnPureModel = false})` | 启动扫描。`turnOnPureModel = true` 时跳过 SN/MAC 规则、回原始广播（用于排障）。 |
+| `startScan` | `Future<BleScanStartResult> startScan({bool turnOnPureModel = false, List<String> iosServiceUuids = const [], bool includeUnfilteredScan = true, bool includeNormalScanResults = false, bool includeUnfilteredPureScanResults = true})` | 启动扫描并确认正 generation。iOS 后台 DFU 使用 FE59 服务过滤；前台普通 owner 保持 nil-service 扫描。pure 与普通需求并存时独立解析、独立去重。DFU-only 将 `includeUnfilteredPureScanResults` 置 false，让 raw 仅匹配服务提示；双模式识别保留 true，允许未广播 FE59 的应用态候选，身份匹配仍由业务 owner 校验。Android 忽略 iOS 参数，保持原有 pure 行为。 |
 | `stopScan` | `Future<void> stopScan()` | 显式停止扫描。 |
 | `connectDevice` | `Future<void> connectDevice(String belongConfig, String uuid, String name, {String? sn, bool? afterUpgrade, bool directConnect = false})` | 发起连接。`belongConfig` 必须命中 `initConfigs` 注册过的配置名；`name` 在 iOS 端定位，`sn` 仅 Android 用；`afterUpgrade=true` 时走 OTA 后的特殊重连路径；`directConnect=true` 表示调用方明确接受本地/系统缓存直连，不再要求当前扫描窗口可见；默认 `false` 仍保持 scan-first。 |
 | `armAutoReconnectTargets` | `Future<void> armAutoReconnectTargets(List<BleDevice> devices)` | 只登记长期自动回连 owner，不立即打开 GATT/CoreBluetooth connect。保留给业务成功后的持久化与兼容调用。 |
