@@ -190,8 +190,8 @@ void main() {
           'private(set) static var didExperienceStateRestorationThisProcess',
         ),
       );
-      final latchIndex = manager
-          .indexOf('BleManager.didExperienceStateRestorationThisProcess = true');
+      final latchIndex = manager.indexOf(
+          'BleManager.didExperienceStateRestorationThisProcess = true');
       final escrowIndex = manager.indexOf(
         'escrowStateRestorationPeripheral(peripheral, source: "willRestoreState")',
       );
@@ -253,13 +253,15 @@ void main() {
     'connection event never re-escrows a peripheral already owned by an active '
     'connect request (2026-09-02 device: claimed leg held 21 s before GATT)',
     () {
-      final manager = File('ios/Classes/ble/BleManager.swift').readAsStringSync();
+      final manager =
+          File('ios/Classes/ble/BleManager.swift').readAsStringSync();
       final handler = manager.substring(
         manager.indexOf('connectionEventDidOccur event: CBConnectionEvent'),
-        manager.indexOf('didDisconnectPeripheral peripheral: CBPeripheral, timestamp'),
+        manager.indexOf(
+            'didDisconnectPeripheral peripheral: CBPeripheral, timestamp'),
       );
       final ownerGuard = handler.indexOf(
-        'findActiveConnectRequest(peripheral: peripheral) != nil',
+        'case .activeRequest:',
       );
       final escrow = handler.indexOf(
         'escrowStateRestorationPeripheral(peripheral, source: "connectionEvent")',
@@ -267,6 +269,7 @@ void main() {
       expect(ownerGuard, isNonNegative);
       expect(escrow, greaterThan(ownerGuard));
       expect(handler, contains('reason=activeConnectRequest'));
+      expect(handler, contains('connectionEvent active request'));
     },
   );
 }

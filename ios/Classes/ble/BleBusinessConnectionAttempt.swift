@@ -118,3 +118,45 @@ enum BleBusinessConnectionCommitPolicy {
         return .accepted
     }
 }
+
+/// Immutable inputs for heartbeat-driven invalidation of an already committed
+/// business owner. Keeping this decision pure makes the production MethodChannel
+/// bridge testable without constructing CoreBluetooth objects.
+struct BleBusinessConnectionInvalidationSnapshot {
+    let attempt: BleBusinessConnectionAttempt
+    let hasCommittedDevice: Bool
+    let isSamePeripheral: Bool
+    let isPeripheralConnected: Bool
+    let isG2Config: Bool
+    let autoReconnectEnabled: Bool
+    let hasReconnectIntent: Bool
+    let reconnectIntentMatchesAttempt: Bool
+    let hasNewerAdmission: Bool
+    let isOtaBusy: Bool
+    let alreadyInvalidated: Bool
+}
+
+/// Fail-closed policy for the iOS G2 heartbeat stale-connection breaker.
+enum BleBusinessConnectionInvalidationPolicy {
+    static func accepts(_ snapshot: BleBusinessConnectionInvalidationSnapshot) -> Bool {
+        let attempt = snapshot.attempt
+        guard !attempt.uuid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              attempt.sessionGeneration > 0,
+              attempt.attemptGeneration > 0 else {
+            return false
+        }
+        guard snapshot.hasCommittedDevice,
+              snapshot.isSamePeripheral,
+              snapshot.isPeripheralConnected,
+              snapshot.isG2Config,
+              snapshot.autoReconnectEnabled,
+              snapshot.hasReconnectIntent,
+              snapshot.reconnectIntentMatchesAttempt,
+              !snapshot.hasNewerAdmission,
+              !snapshot.isOtaBusy,
+              !snapshot.alreadyInvalidated else {
+            return false
+        }
+        return true
+    }
+}

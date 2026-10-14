@@ -574,6 +574,30 @@ void main() {
     expect(aborted, isTrue);
   });
 
+  test('invalidateBusinessConnection forwards exact attempt', () async {
+    MethodCall? capturedCall;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (methodCall) async {
+      capturedCall = methodCall;
+      return true;
+    });
+
+    final invalidated =
+        await MethodChannelEzwBle().invalidateBusinessConnection(
+      const BleBusinessConnectionAttempt(
+        uuid: 'left-uuid',
+        sessionGeneration: 51,
+        attemptGeneration: 13,
+      ),
+    );
+
+    expect(capturedCall?.method, 'invalidateBusinessConnection');
+    expect(capturedCall?.arguments, containsPair('uuid', 'left-uuid'));
+    expect(capturedCall?.arguments, containsPair('sessionGeneration', 51));
+    expect(capturedCall?.arguments, containsPair('attemptGeneration', 13));
+    expect(invalidated, isTrue);
+  });
+
   // test('getPlatformVersion', () async {
   //   expect(await platform.getPlatformVersion(), '42');
   // });

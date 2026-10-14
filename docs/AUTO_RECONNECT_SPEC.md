@@ -74,6 +74,12 @@ Public methods:
 - `abortBusinessConnection(BleBusinessConnectionAttempt)` removes only an exact
   matching lease. Stale aborts are no-ops and must not disconnect, remove
   persisted autoReconnect intent, or delete a newer prepared token.
+- `invalidateBusinessConnection(BleBusinessConnectionAttempt)` is the iOS G2
+  heartbeat stale-owner breaker. It accepts only the current committed
+  auto-reconnect owner with the exact positive session/attempt pair, rejects
+  stale/repeated/OTA/superseded attempts, installs the cancellation barrier
+  before publishing `timeout`, and keeps the durable reconnect target armed.
+  Android currently returns `false`.
 - `setConnectionTraceEnabled(enabled)` gates optional native connection Trace
   snapshots. The default is `false`. Disabling only clears process-local trace
   buffers and iOS RSSI timers; it must not disconnect, cancel, or reschedule
