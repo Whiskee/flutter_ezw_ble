@@ -80,6 +80,8 @@ enum class BleMC {
     QUITE_UPGRADE_STATE,
     /** 打开/关闭 native 连接 Trace；默认关闭且不改变连接/回连状态。 */
     SET_CONNECTION_TRACE_ENABLED,
+    /** iOS RSSI timer pause only; Android accepts without changing diagnostics. */
+    SET_CONNECTION_TRACE_SAMPLING_PAUSED,
     /** iOS Debug formatting gate; Android accepts without changing current logs. */
     SET_DEBUG_LOGGING_ENABLED,
     /** 清理本地连接缓存。 */
@@ -451,6 +453,9 @@ enum class BleMC {
             SET_CONNECTION_TRACE_ENABLED -> {
                 // 1. Trace 只控制诊断采集；关闭时 manager 仅清 Trace/RSSI 诊断缓存。
                 BleManager.instance.setConnectionTraceEnabled(arguments as? Boolean == true)
+            }
+            SET_CONNECTION_TRACE_SAMPLING_PAUSED -> {
+                // Compatibility no-op; do not construct a manager or change Trace/owners.
             }
             SET_DEBUG_LOGGING_ENABLED -> {
                 // Compatibility no-op: this optimization only changes iOS.

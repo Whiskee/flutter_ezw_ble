@@ -271,6 +271,11 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
+  Future<void> setConnectionTraceSamplingPaused(bool paused) {
+    throw UnimplementedError();
+  }
+
+  @override
   Future<void> cleanConnectCache() {
     throw UnimplementedError();
   }

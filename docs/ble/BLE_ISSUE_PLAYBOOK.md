@@ -1,5 +1,28 @@
 # BLE Issue Playbook
 
+## iOS proactive RSSI during a host diagnostics pause
+
+- Symptom: an enabled native Trace continues its 2-second initial RSSI read and
+  15-second periodic reads while the host has paused proactive diagnostics.
+  Closing Trace would also erase the passive diagnostic history.
+- Change: independent `setConnectionTraceSamplingPaused(bool)` cancels proactive
+  timers while preserving Trace authorization, passive events and all BLE owners.
+  A scheduler revision prevents delayed callbacks from rearming after pause;
+  current peripheral/readiness/attempt checks reject stale resume requests.
+- Late callback boundary: CoreBluetooth supplies no RSSI request token. A weak
+  request ledger keeps the original peripheral object/attempt until its callback
+  drains; it prevents overlapping reads on a reused object and prevents an old
+  object from consuming a replacement object's newer request.
+- Verification: `native_trace_rssi_sampling_test.dart` compiles production Swift
+  sampler, Trace buffer and Manager methods with a controlled scheduler and
+  CoreBluetooth boundary types. Coverage includes daytime cadence, initial pause,
+  late/reentrant callback, replacement, unfinished read, disable and disconnect.
+  Natural iOS suspension, real BLE wake and energy benefit still require device
+  testing; the automated checks do not establish those results.
+- Owner: plugin owns diagnostic sampling only; the host owns pause conditions.
+  Android accepts the method as a no-op. No connection, AUTH, ACK, FlowPolicy or
+  automatic-reconnect behavior changes.
+
 ## iOS process-exit watchdog during auto-reconnect activation
 
 Symptoms:

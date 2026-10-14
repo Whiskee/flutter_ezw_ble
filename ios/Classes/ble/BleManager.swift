@@ -164,7 +164,11 @@ class BleManager: NSObject {
     // Native Trace 默认关闭。开启后仅记录下一次真实物理 attempt，不改变连接/回连行为。
     var connectionTraceEnabled = false
     var nativeConnectionTraces: [String: BleNativeConnectionTraceBuffer] = [:]
-    var nativeTraceRssiTimers: [String: Timer] = [:]
+    // Sampling pause is independent from Trace authorization and passive events.
+    let nativeTraceRssiSampler = BleNativeTraceRssiSampler.shared
+    // Unfinished CoreBluetooth reads outlive sampling/trace replacement. This
+    // weak ledger prevents their callbacks from consuming a newer attempt.
+    let nativeTraceRssiRequests = BleNativeTraceRssiRequests()
     var nativeTraceRssiInFlightAttemptIds: [String: String] = [:]
     /// Trace 专用的前一连接状态，仅用于区分 Bond 恢复超时/取消与普通连接终态。
     var nativeTraceLastConnectStates: [String: BleConnectState] = [:]
@@ -2604,29 +2608,29 @@ extension BleManager {
         // Freeze the producer attempt into the timer. A replacement attempt may
         // reuse the same CoreBluetooth UUID but must never inherit this sampler.
         guard let expectedAttemptId = nativeConnectionTraces[key]?.attemptId else { return }
-        nativeTraceRssiTimers[key] = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { [weak self, weak peripheral] _ in
-            guard let self = self, let peripheral = peripheral else { return }
+        nativeTraceRssiSampler.start(key: key, isOwnerCurrent: { [weak self, weak peripheral] in
+            guard let self, let peripheral else { return false }
+            return self.isNativeTraceRssiOwnerCurrent(peripheral: peripheral, expectedAttemptId: expectedAttemptId)
+        }, read: { [weak self, weak peripheral] in
+            guard let self, let peripheral else { return }
             self.readNativeTraceRssi(peripheral: peripheral, expectedAttemptId: expectedAttemptId)
-            self.nativeTraceRssiTimers[key] = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: true) { [weak self, weak peripheral] _ in
-                guard let self = self, let peripheral = peripheral else { return }
-                self.readNativeTraceRssi(peripheral: peripheral, expectedAttemptId: expectedAttemptId)
-            }
-        }
+        })
     }
 
     func stopNativeTraceRssiSampling(uuid: String) {
         let key = reconnectKey(uuid: uuid)
-        nativeTraceRssiTimers.removeValue(forKey: key)?.invalidate()
+        nativeTraceRssiSampler.stop(key: key)
         nativeTraceRssiInFlightAttemptIds.removeValue(forKey: key)
     }
 
     func stopAllNativeTraceRssiSampling() {
-        nativeTraceRssiTimers.values.forEach { $0.invalidate() }
-        nativeTraceRssiTimers.removeAll()
+        nativeTraceRssiSampler.stopAll()
         nativeTraceRssiInFlightAttemptIds.removeAll()
     }
 
-    private func readNativeTraceRssi(peripheral: CBPeripheral, expectedAttemptId: String) {
+    /// The sampler's retained request is not a BLE owner. Revalidate the live
+    /// peripheral and current attempt before resume and every diagnostic read.
+    private func isNativeTraceRssiOwnerCurrent(peripheral: CBPeripheral, expectedAttemptId: String) -> Bool {
         let uuid = peripheral.identifier.uuidString
         let key = reconnectKey(uuid: uuid)
         // The Gate admission ends at business connected, while the physical
@@ -2637,13 +2641,20 @@ extension BleManager {
                 device.isConnected &&
                 device.isBleFlowCompleted
         }
-        guard connectionTraceEnabled,
+        return connectionTraceEnabled && peripheral.state == .connected &&
+            nativeConnectionTraces[key]?.attemptId == expectedAttemptId &&
+            (currentConnectionAdmission(uuid: uuid) != nil || hasExactBusinessOwner)
+    }
+
+    private func readNativeTraceRssi(peripheral: CBPeripheral, expectedAttemptId: String) {
+        let key = reconnectKey(uuid: peripheral.identifier.uuidString)
+        guard !nativeTraceRssiSampler.isPaused,
+              isNativeTraceRssiOwnerCurrent(peripheral: peripheral, expectedAttemptId: expectedAttemptId),
               let trace = nativeConnectionTraces[key],
-              trace.attemptId == expectedAttemptId,
-              nativeTraceRssiInFlightAttemptIds[key] == nil,
-              currentConnectionAdmission(uuid: uuid) != nil || hasExactBusinessOwner else {
+              nativeTraceRssiInFlightAttemptIds[key] == nil else {
             return
         }
+        guard nativeTraceRssiRequests.begin(peripheral: peripheral, attemptId: expectedAttemptId) else { return }
         nativeTraceRssiInFlightAttemptIds[key] = expectedAttemptId
         trace.markRssiRequested()
         peripheral.readRSSI()
@@ -4246,8 +4257,13 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
         let uuid = peripheral.identifier.uuidString
         let key = reconnectKey(uuid: uuid)
-        let inFlightAttemptId = nativeTraceRssiInFlightAttemptIds.removeValue(forKey: key)
-        guard connectionTraceEnabled,
+        let inFlightAttemptId = nativeTraceRssiRequests.finish(peripheral: peripheral)
+        guard let inFlightAttemptId, nativeTraceRssiInFlightAttemptIds[key] == inFlightAttemptId else { return }
+        nativeTraceRssiInFlightAttemptIds.removeValue(forKey: key)
+        // Do not clear in-flight requests when pausing: a late system callback
+        // must drain its original attempt before a resumed sampler can read.
+        guard !nativeTraceRssiSampler.isPaused,
+              isNativeTraceRssiOwnerCurrent(peripheral: peripheral, expectedAttemptId: inFlightAttemptId),
               let trace = nativeConnectionTraces[key],
               trace.attemptId == inFlightAttemptId else {
             return

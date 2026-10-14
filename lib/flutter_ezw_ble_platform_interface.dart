@@ -421,6 +421,13 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     );
   }
 
+  /// Pause iOS proactive RSSI sampling while preserving Trace configuration,
+  /// passive events and BLE owners. Defaults to unpaused; Android is a no-op.
+  Future<void> setConnectionTraceSamplingPaused(bool paused) {
+    throw UnimplementedError(
+        'setConnectionTraceSamplingPaused() has not been implemented.');
+  }
+
   /// 打开蓝牙设置页面
   Future<void> openBleSettings() {
     throw UnimplementedError('openBleSettings() has not been implemented.');
