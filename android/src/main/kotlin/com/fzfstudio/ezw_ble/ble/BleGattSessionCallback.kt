@@ -93,6 +93,10 @@ internal class BleGattSessionCallback(
     private val sendLog: (BleLoggerTag, String) -> Unit,
     /** Freeze only an actually retained GATT's pair before asynchronous delivery. */
     private val captureReceiveIdentity: (BluetoothGatt) -> BleBusinessConnectionAttempt? = { null },
+    /** type=2 逐包仅写 logcat；普通通道和 5s 汇总继续使用 sendLog。 */
+    private val sendLogcat: (BleLoggerTag, String) -> Unit = sendLog,
+    /** 窗口跟随 exact callback 生命周期，重连后的首包重新计时。 */
+    private val streamLogSummary: BleStreamLogSummary = BleStreamLogSummary { SystemClock.elapsedRealtime() },
 ) : BluetoothGattCallback() {
 
     /** 私有服务是否已全部解析完成；未完成时 descriptor/MTU 回调不应推进连接完成。 */
@@ -495,10 +499,15 @@ internal class BleGattSessionCallback(
             otaInstanceId = otaContext?.instanceId ?: "",
         ).toFlutterMap()
         emitReceiveData(bleCmdMap)
-        sendLog(
-            BleLoggerTag.d,
-            "Receive cmd(old): ${gatt.device.address}, type=${privateService.type}, length=${characteristic.value.size}, chartsType=${characteristic.writeType}",
-        )
+        val packetLog = "Receive cmd(old): ${gatt.device.address}, type=${privateService.type}, length=${characteristic.value.size}, chartsType=${characteristic.writeType}"
+        if (privateService.type == 2) {
+            sendLogcat(BleLoggerTag.d, packetLog)
+            streamLogSummary.record(characteristic.value.size)?.let { summary ->
+                sendLog(BleLoggerTag.d, "Receive stream: ${gatt.device.address}, type=2, $summary")
+            }
+        } else {
+            sendLog(BleLoggerTag.d, packetLog)
+        }
     }
 
     /**

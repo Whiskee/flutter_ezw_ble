@@ -12,6 +12,8 @@ import android.content.Context
 import android.content.Context.BLUETOOTH_SERVICE
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import com.fzfstudio.ezw_ble.ble.extension.resolveBleDeviceName
@@ -67,6 +69,11 @@ class BleManager private constructor() {
     /// =========== Constants
     //  - 主线程工局
     private lateinit var mainScope: CoroutineScope
+    // 高频事件共享一个有界主线程 drain；每次 init 创建新实例，旧 engine 不能复活新队列。
+    @Volatile
+    private var mainEventOutbox: BleMainEventOutbox? = null
+    // 仅由主线程 drain 访问；每个 engine lifetime 重置，首个慢批次也必须能告警。
+    private var lastOutboxDelayWarningAt: Long? = null
     //  - 搜索配置
     private val scanSettings by lazy {
         ScanSettings.Builder()
@@ -455,6 +462,17 @@ class BleManager private constructor() {
             return
         }
         mainScope = MainScope()
+        val eventHandler = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            Handler.createAsync(Looper.getMainLooper())
+        } else {
+            Handler(Looper.getMainLooper())
+        }
+        lastOutboxDelayWarningAt = null
+        mainEventOutbox = BleMainEventOutbox(
+            post = { runnable -> check(eventHandler.post(runnable)) { "Main event Handler rejected drain" } },
+            nowMillis = { SystemClock.elapsedRealtime() },
+            onDrained = ::logOutboxDelay,
+        )
         weakContext = WeakReference(context.applicationContext)
         //  初始化蓝牙工具
         bluetoothManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -594,7 +612,7 @@ class BleManager private constructor() {
                 }
                 if (identityError != null) {
                     queue.poll()
-                    BleEC.RECEIVE_DATA.event?.success(
+                    emitReceiveData(
                         cmd.copy(data = null, isSuccess = false).toFlutterMap(),
                     )
                     sendLog(BleLoggerTag.e, "Send cmd: ${cmd.uuid}, OTA identity mismatch, drop queued command: ${identityError.reason}")
@@ -3348,6 +3366,9 @@ class BleManager private constructor() {
      * 在Flutter引擎分离时调用，以释放所有资源，确保单例可以被重新初始化。
      */
     fun release() {
+        // detach 先退休出口，再执行会产生日志/终态的 reset；旧 drain 不得写入下一 engine。
+        mainEventOutbox?.release()
+        mainEventOutbox = null
         // 1. 调用现有的 reset 逻辑，断开所有连接并清空队列
         reset()
         // 2. 注销蓝牙状态监听器，防止内存泄漏
@@ -3975,6 +3996,10 @@ class BleManager private constructor() {
         sessionGeneration: Long = 0L,
     ): BleGattSessionCallback {
         val admission = registerConnectionAttempt(expectedUuid, source, sessionGeneration)
+        // binder 可在冻结 payload 后被挂起到 detach/init 之后；出口也绑定 callback 的
+        // engine lifetime，不能届时再读取 manager 的新 outbox。
+        val callbackOutbox = mainEventOutbox
+        val callbackScope = if (this::mainScope.isInitialized) mainScope else null
         return BleGattSessionCallback(
             expectedUuid = expectedUuid,
             sessionGeneration = admission.sessionGeneration,
@@ -4119,16 +4144,16 @@ class BleManager private constructor() {
                 activeG2OtaContextForEndpoint(uuid)
             },
             emitReceiveData = { map ->
-                // 9. EventChannel 必须回到 manager 的协程作用域，避免 callback 持有 Flutter 线程细节。
-                mainScope.launch {
-                    BleEC.RECEIVE_DATA.event?.success(map)
-                }
+                // 9. callback 已冻结 bytes/exact identity，只合并主线程调度，不重新归属。
+                if (callbackScope?.isActive == true) callbackOutbox?.emit(BleEC.RECEIVE_DATA, map)
             },
             captureReceiveIdentity = { gatt -> captureReceiveIdentity(gatt) },
             sendLog = { tag, message ->
                 // 10. 日志仍走 manager 统一出口，保持原有 BleManager:: 前缀和 EventChannel 推送。
-                sendLog(tag, message)
+                val formatted = writeLogcat(tag, message)
+                if (callbackScope?.isActive == true) callbackOutbox?.emit(BleEC.LOGGER, formatted)
             },
+            sendLogcat = { tag, message -> writeLogcat(tag, message) },
         )
     }
 
@@ -5179,22 +5204,21 @@ class BleManager private constructor() {
     ) {
         val legacyGeneration = sessionGeneration.takeIf { it > 0L } ?: attemptGeneration
         val nativeTrace = nativeTraceSnapshot(uuid)
-        mainScope.launch {
-            val json = JSONObject()
-                .put("uuid", uuid)
-                .put("name", name)
-                .put("connectState", state.toFlutterJsonValue())
-                .put("mtu", mtu)
-                .put("source", source.flutterValue)
-                .put("generation", legacyGeneration)
-                .put("sessionGeneration", legacyGeneration)
-                .put("attemptGeneration", attemptGeneration)
-                .also { payload ->
-                    nativeTrace?.let { payload.put("nativeTrace", it) }
-                }
-                .toString()
-            BleEC.CONNECT_STATUS.event?.success(json)
-        }
+        // 在生产线程冻结原有 JSON/Trace，延迟 drain 不能回读新 session 的状态。
+        val json = JSONObject()
+            .put("uuid", uuid)
+            .put("name", name)
+            .put("connectState", state.toFlutterJsonValue())
+            .put("mtu", mtu)
+            .put("source", source.flutterValue)
+            .put("generation", legacyGeneration)
+            .put("sessionGeneration", legacyGeneration)
+            .put("attemptGeneration", attemptGeneration)
+            .also { payload ->
+                nativeTrace?.let { payload.put("nativeTrace", it) }
+            }
+            .toString()
+        emitMainEvent(BleEC.CONNECT_STATUS, json)
     }
 
     private fun BleDevice.toFlutterJson(): JSONObject = JSONObject()
@@ -5544,15 +5568,39 @@ class BleManager private constructor() {
      *  处理日志
      */
     private fun sendLog(tag: BleLoggerTag, log: String) {
+        val message = writeLogcat(tag, log)
+        emitMainEvent(BleEC.LOGGER, message)
+    }
+
+    /** 音频逐包仍保留 logcat；只有窗口汇总才进入 Dart LOGGER。 */
+    private fun writeLogcat(tag: BleLoggerTag, log: String): String {
         val message = "${tag.tag}BleManager::$log"
         if (tag == BleLoggerTag.e) {
             Log.e(logcatTag, message)
         } else {
             Log.d(logcatTag, message)
         }
-        if (!this::mainScope.isInitialized || !mainScope.isActive) return
-        mainScope.launch {
-            BleEC.LOGGER.event?.success(message)
+        return message
+    }
+
+    /** 所有接收成功/失败都使用同一 FIFO，binder 线程不得直接调用 EventSink。 */
+    internal fun emitReceiveData(map: Map<String, Any?>) {
+        emitMainEvent(BleEC.RECEIVE_DATA, map)
+    }
+
+    /** 只由主线程 drain 调用；队列告警也共用 FIFO，必须先限频再入队。 */
+    private fun logOutboxDelay(delay: Long, sent: Int, remaining: Int) {
+        val now = SystemClock.elapsedRealtime()
+        val previous = lastOutboxDelayWarningAt
+        if (delay > 200L && (previous == null || now - previous >= 5_000L)) {
+            lastOutboxDelayWarningAt = now
+            sendLog(BleLoggerTag.e, "Main event outbox delayed: delayMs=$delay, sent=$sent, remaining=$remaining")
         }
+    }
+
+    private fun emitMainEvent(channel: BleEC, payload: Any) {
+        // 保留原日志的 scope 释放守卫，outbox 自身再阻止 release/emit 交错产生旧事件。
+        if (!this::mainScope.isInitialized || !mainScope.isActive) return
+        mainEventOutbox?.emit(channel, payload)
     }
 }

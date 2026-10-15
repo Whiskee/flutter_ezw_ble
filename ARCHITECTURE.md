@@ -228,7 +228,31 @@ enum BleEventChannel {
 | `scanResult` | JSON 字符串 | `BleMatchDevice.fromJson` | 一次扫描命中（按 `BleScan.matchCount` 已聚合好的"组合设备"）。 |
 | `connectStatus` | JSON 字符串 | `BleConnectModel.fromJson` | 连接流程的每一步推进（见 §8）；携带 `source`、兼容键 `generation`、`sessionGeneration` 与 `attemptGeneration`。`generation` 始终序列化为 Dart session generation；旧 payload 分别回退为 `unknown` / `0`。 |
 | `receiveData` | Map：`{uuid, psType, data:Base64, isSuccess, sessionGeneration, attemptGeneration, receiveIdentity:{uuid,sessionGeneration,attemptGeneration}, otaTransactionId, otaGeneration, otaInstanceId}` | `BleCmd.receiveMap` | 来自原生的特征值数据。**注意 `data` 字段是 Base64**，业务侧拿到的 `BleCmd.data` 已经是 `Uint8List`，背后由 `flutter_ezw_utils.encodeBase64()` 解码。`receiveIdentity` 是冻结的通知归属；Android 来自原 callback 的 exact GATT owner，iOS 来自当前 admission 或业务已接受 owner。旧事件、unknown 或非法 pair 不填 nested identity。G2 OTA 事务持有期间还会附带 transaction 字段；Dart 必须同时校验 transaction 与 physical pair 后才消费 ACK/Notify。 |
-| `logger` | String，含 `[d]-` / `[e]-` 前缀 | `String` | 仅 iOS 主动 push；业务侧自行根据前缀分级。 |
+| `logger` | String，含 `[d]-` / `[e]-` 前缀 | `String` | Android / iOS 原生日志；业务侧自行根据前缀分级。Android type=2 收包逐包保留 logcat，LOGGER 每 5 秒按 exact GATT callback 汇总包数和字节数。 |
+
+### Android 事件投递线程
+
+`RECEIVE_DATA`（含写入失败）、`CONNECT_STATUS`、`LOGGER` 共用
+`BleMainEventOutbox` FIFO。生产线程先冻结原有 payload、Base64 与 exact
+receive identity / Trace，再入队；只有主线程 drain 读取当前 listener 并调用
+`EventSink.success`。一个 drain 最多处理 64 个独立事件，剩余事件重新 post 一条消息；
+这限制单次占用主线程的包数，不限制队列容量，也不丢弃或合并通知 payload。
+API 28 起使用异步主 Handler，较早版本保留普通主 Handler。
+
+队列、调度与释放共享同步域，跨类型按入队顺序交付；listener 为空或单条 sink 抛异常
+仍会继续消费后续事件，异常仅写 logcat。drain 期间的新事件按 FIFO 继续进入本批或下一批。
+`clear` 保留已经挂起的 drain，`release` 退休该 lifetime 并清空待发事件；重新 init
+创建新 outbox，迟到旧 Runnable 不得消费新队列。原有 mainScope 释放守卫仍有效。
+GATT callback 同时冻结其 scope/outbox 引用，已通过身份检查但尚未入队的旧通知或日志
+也不能借 detach 后的新 engine 出口补发。
+`BLE_STATE`、`SCAN_STATE`、`SCAN_RESULT` 维持原投递路径。
+
+音频 type=2 仅减少 LOGGER 副本；原始接收事件仍一包一个，命令/OTA/文件通道日志不变。
+汇总窗口在首包启动，不引入 timer，结束 session 时未满窗口的计数直接随 callback 释放。
+最老待发事件排队超过 200ms 时通过现有 `[e]-` 前缀记录
+`delayMs/sent/remaining`，每 5 秒最多一次；它反映 native→Dart 交接等待，不能证明
+固件应答时长或物理链路异常。与其它 Looper 消息的交错粒度会随批处理改变，真机仍需验收
+首连/回连/解绑、持续收音以及 G2/R1 OTA。
 
 iOS 的非 `poweredOn` 状态继续沿用既有连接 teardown；但只有公开状态
 `CBManagerState.poweredOff` 才能在断连 Trace 上标记 `bluetooth_adapter/4`。

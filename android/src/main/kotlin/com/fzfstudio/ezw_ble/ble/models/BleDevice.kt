@@ -5,7 +5,7 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothStatusCodes
 import android.os.Build
 import android.util.Log
-import com.fzfstudio.ezw_ble.ble.BleEC
+import com.fzfstudio.ezw_ble.ble.BleManager
 import com.fzfstudio.ezw_ble.ble.BleOtaWriteSubmission
 import com.fzfstudio.ezw_ble.ble.models.enums.BleConfigOutAdapter
 import com.fzfstudio.ezw_ble.ble.models.enums.BleConnectState
@@ -142,7 +142,8 @@ class BleDevice(
 
         // 3. GATT 或 write characteristic 缺失说明 readiness 尚未完成，必须回传失败事件。
         if (gatt == null || writeChars == null) {
-            BleEC.RECEIVE_DATA.event?.success(
+            // writeNextCommand 可由 binder 写回调推进，失败也必须回 manager 的主线程出口。
+            BleManager.instance.emitReceiveData(
                 BleCmd.fail(uuid, psType).copy(
                     sessionGeneration = expectedSessionGeneration,
                     attemptGeneration = expectedAttemptGeneration,
@@ -163,7 +164,8 @@ class BleDevice(
 
         // 5. 原生写入失败时立即回传失败事件，避免 Dart 命令等待超时后才感知。
         if (!isSuccess) {
-            BleEC.RECEIVE_DATA.event?.success(
+            // 与 readiness 缺失分支共用 FIFO，避免 EventSink 抛异常阻断 native dequeue。
+            BleManager.instance.emitReceiveData(
                 BleCmd.fail(uuid, psType).copy(
                     sessionGeneration = expectedSessionGeneration,
                     attemptGeneration = expectedAttemptGeneration,
