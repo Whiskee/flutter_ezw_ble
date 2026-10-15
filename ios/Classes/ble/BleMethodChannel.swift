@@ -55,6 +55,8 @@ enum BleMC: String {
     case commitBusinessConnection
     /// Abort only the exact business-auth lease.
     case abortBusinessConnection
+    /// Invalidate the exact committed G2 business owner while preserving reconnect intent.
+    case invalidateBusinessConnection
     /// 仅补种 native 长期回连意图。
     case armAutoReconnectTargets
     /// 立即建立/复用所有目标的 CoreBluetooth pending connect。
@@ -193,6 +195,12 @@ enum BleMC: String {
         case .abortBusinessConnection:
             let data = arguments as? [String: Any] ?? [:]
             result(BleManager.shared.abortBusinessConnection(
+                BleBusinessConnectionAttempt(data: data)
+            ))
+            return
+        case .invalidateBusinessConnection:
+            let data = arguments as? [String: Any] ?? [:]
+            result(BleManager.shared.invalidateBusinessConnection(
                 BleBusinessConnectionAttempt(data: data)
             ))
             return

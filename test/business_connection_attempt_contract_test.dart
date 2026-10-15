@@ -54,6 +54,7 @@ void main() {
       expect(androidChannel, contains(method));
       expect(iosChannel, contains(method));
     }
+    expect(iosChannel, contains('invalidateBusinessConnection'));
 
     for (final status in [
       'accepted',
@@ -86,6 +87,10 @@ void main() {
         iosManager,
         contains(
             'return setConnected(uuid: attempt.uuid, expectedAttempt: attempt)'));
+    expect(iosManager, contains('businessConnection invalidate accepted'));
+    expect(iosManager, contains('traceCauseDomain: "businessHeartbeat"'));
+    expect(androidChannel, contains('INVALIDATE_BUSINESS_CONNECTION'));
+    expect(androidChannel, contains('return result.success(false)'));
     expect(iosManager,
         contains('expectedAttempt: BleBusinessConnectionAttempt? = nil'));
   });

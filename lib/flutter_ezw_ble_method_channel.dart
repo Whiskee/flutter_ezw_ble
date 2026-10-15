@@ -294,6 +294,16 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       false;
 
   @override
+  Future<bool> invalidateBusinessConnection(
+    BleBusinessConnectionAttempt attempt,
+  ) async =>
+      await methodChannel.invokeMethod<bool>(
+        'invalidateBusinessConnection',
+        attempt.toJson(),
+      ) ??
+      false;
+
+  @override
   Future<void> armAutoReconnectTargets(List<BleDevice> devices) async =>
       methodChannel.invokeMethod(
         "armAutoReconnectTargets",

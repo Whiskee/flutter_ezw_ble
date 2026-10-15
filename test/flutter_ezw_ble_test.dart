@@ -187,6 +187,13 @@ class MockFlutterEzwBlePlatform
   }
 
   @override
+  Future<bool> invalidateBusinessConnection(
+    BleBusinessConnectionAttempt attempt,
+  ) {
+    throw UnimplementedError();
+  }
+
+  @override
   Future<void> armAutoReconnectTargets(List<BleDevice> devices) {
     throw UnimplementedError();
   }

@@ -44,6 +44,8 @@ enum class BleMC {
     COMMIT_BUSINESS_CONNECTION,
     /** 只撤销 exact 业务鉴权 lease，不取消长期回连 owner。 */
     ABORT_BUSINESS_CONNECTION,
+    /** iOS G2 heartbeat 失效入口；Android 当前没有等价 native owner，固定 fail-closed。 */
+    INVALIDATE_BUSINESS_CONNECTION,
     /** 补种 native 自动回连目标，不发起前台连接。 */
     ARM_AUTO_RECONNECT_TARGETS,
     /** 立即建立/复用所有目标的 native 直连，并保留调用来源。 */
@@ -215,6 +217,12 @@ enum class BleMC {
                 return result.success(
                     BleManager.instance.abortBusinessConnection(attempt),
                 )
+            }
+            INVALIDATE_BUSINESS_CONNECTION -> {
+                // Android 的 GATT owner 与心跳失效对账仍由既有 reconcile 路径负责。
+                // 新跨平台 API 必须 fail-closed，避免误把 iOS 的 CoreBluetooth teardown
+                // 语义套到 Android passive reconnect supervisor 上。
+                return result.success(false)
             }
             ARM_AUTO_RECONNECT_TARGETS -> {
                 // 1. 旧缓存/进程恢复时，Dart 只补种长期回连意图，不打开 GATT。

@@ -149,6 +149,23 @@ extension BleManager {
         )
     }
 
+    /// Remove escrow bookkeeping that overlaps a current committed owner.
+    ///
+    /// Unlike hard cancel/finalize, this deliberately does not call
+    /// `cancelPeripheralConnection`: the live business owner or heartbeat
+    /// timeout path owns the physical teardown. The goal is only to stop an old
+    /// connection-event escrow from swallowing the owner's real terminal event.
+    func discardOverlappingStateRestorationEscrow(uuid: String, reason: String) {
+        let removed = restorationCoordinator.removePendingPeripherals(uuid: uuid, name: "")
+        guard !removed.isEmpty else { return }
+        recordAutoReconnectEvent(
+            type: "ios_restore_escrow_discarded",
+            uuid: uuid,
+            detail: "reason=\(reason), count=\(removed.count)"
+        )
+        loggerD(msg: "stateRestoration: discard overlapping escrow uuid=\(uuid), count=\(removed.count), reason=\(reason)")
+    }
+
     /// hard reset/clean 清除全部 escrow；startup preserve reset 不调用此入口。
     func cancelAllStateRestorationEscrow(reason: String) {
         cancelStateRestorationEscrowPeripherals(

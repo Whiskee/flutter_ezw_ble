@@ -310,6 +310,21 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     );
   }
 
+  /// Ask native to invalidate the exact committed business connection.
+  ///
+  /// iOS uses this for G2 heartbeat liveness: only the current committed
+  /// auto-reconnect owner may be invalidated, and native keeps the long-lived
+  /// reconnect intent while forcing the stale transport through the existing
+  /// timeout/reconnect path. Android currently returns false so callers keep
+  /// their existing platform-specific reconciliation behavior.
+  Future<bool> invalidateBusinessConnection(
+    BleBusinessConnectionAttempt attempt,
+  ) {
+    throw UnimplementedError(
+      'invalidateBusinessConnection(attempt: $attempt) has not been implemented.',
+    );
+  }
+
   /// 只补种 native 自动回连目标，不发起前台连接。
   ///
   /// 用于旧缓存/进程恢复场景：Dart 已知道用户允许 autoReconnect，但 native
