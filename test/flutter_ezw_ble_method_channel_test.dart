@@ -556,6 +556,35 @@ void main() {
     expect(status, BleBusinessConnectionStatus.attemptMismatch);
   });
 
+  test('business commit preserves exact identity and defaults native arming on',
+      () async {
+    final calls = <MethodCall>[];
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (methodCall) async {
+      calls.add(methodCall);
+      return 'accepted';
+    });
+    const attempt = BleBusinessConnectionAttempt(
+      uuid: 'temp-left',
+      sessionGeneration: 51,
+      attemptGeneration: 7,
+    );
+
+    // The Android opt-out must travel with the same exact AUTH commit, avoiding
+    // a separate disarm call that could race a disconnect or a newer owner.
+    await MethodChannelEzwBle().commitBusinessConnection(attempt);
+    await MethodChannelEzwBle().commitBusinessConnection(
+      attempt,
+      armAutoReconnect: false,
+    );
+
+    expect(calls.map((call) => call.method),
+        everyElement('commitBusinessConnection'));
+    expect(calls[0].arguments, {...attempt.toJson(), 'armAutoReconnect': true});
+    expect(
+        calls[1].arguments, {...attempt.toJson(), 'armAutoReconnect': false});
+  });
+
   test('abortBusinessConnection returns native boolean', () async {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (methodCall) async {

@@ -2469,7 +2469,7 @@ class BleManager private constructor() {
      *  主动设置连接成功
      */
     @Synchronized
-    fun setConnected(uuid: String): BleBusinessConnectionStatus {
+    fun setConnected(uuid: String, armAutoReconnect: Boolean = true): BleBusinessConnectionStatus {
         // 1、校验请求、pre-connected 标记和当前 admission，确保业务 connected 有合法代次。
         if (!checkIsFunctionCanBeCalled() || uuid.isEmpty()) {
             return BleBusinessConnectionStatus.INVALID_ARGUMENTS
@@ -2509,6 +2509,7 @@ class BleManager private constructor() {
             source = acceptedAdmission.source,
             generation = acceptedAdmission.sessionGeneration,
             attemptGeneration = acceptedAdmission.generation,
+            armAutoReconnect = armAutoReconnect,
         )
         // 4、业务确认 connected 后释放当前 Gate owner，允许下一 endpoint 开始 pipeline。
         completeBusinessConnectionAdmission(uuid)
@@ -2968,12 +2969,16 @@ class BleManager private constructor() {
     @Synchronized
     fun commitBusinessConnection(
         attempt: BleBusinessConnectionAttempt?,
+        armAutoReconnect: Boolean = true,
     ): BleBusinessConnectionStatus {
         val status = validateBusinessConnectionAttempt(attempt, requirePrepare = true)
         if (status != BleBusinessConnectionStatus.ACCEPTED || attempt == null) {
             return status
         }
-        return setConnected(attempt.uuid)
+        // A Temp leg can be business connected while its peer is still pairing.
+        // Only its Dart request owns retries until whole-device handoff seeds
+        // persistent targets; never let this policy bypass exact validation.
+        return setConnected(attempt.uuid, armAutoReconnect = armAutoReconnect)
     }
 
     /**
@@ -5442,6 +5447,7 @@ class BleManager private constructor() {
         generation: Long = currentAdmissions[reconnectKey(uuid)]?.sessionGeneration ?: 0L,
         attemptGeneration: Long = currentAdmissions[reconnectKey(uuid)]?.generation ?: 0L,
         scheduleAutoReconnect: Boolean = true,
+        armAutoReconnect: Boolean = true,
         traceCauseDomain: String? = null,
         traceCauseCode: Int? = null,
     ) {
@@ -5533,7 +5539,9 @@ class BleManager private constructor() {
             }?.let {
                 it.timeoutTimer?.cancel()
                 it.timeoutTimer = null
-                if (state == BleConnectState.CONNECTED) {
+                // Temporary pairing keeps foreground request identity authoritative.
+                // Skipping arm preserves connected/Gate semantics and existing owners.
+                if (state == BleConnectState.CONNECTED && armAutoReconnect) {
                     autoReconnectSupervisor.arm(it)
                 }
             }

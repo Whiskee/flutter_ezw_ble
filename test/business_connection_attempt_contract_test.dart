@@ -71,11 +71,12 @@ void main() {
 
     expect(androidManager, contains('querySystemGattConnectionState'));
     expect(androidManager, contains('hasCompleteGattReadiness'));
-    expect(androidManager, contains('return setConnected(attempt.uuid)'));
+    expect(androidManager,
+        contains('return setConnected(attempt.uuid, armAutoReconnect ='));
     expect(
         androidManager,
         contains(
-            'fun setConnected(uuid: String): BleBusinessConnectionStatus'));
+            'fun setConnected(uuid: String, armAutoReconnect: Boolean = true)'));
     expect(androidDevice, contains('notifiedPsTypes'));
     expect(androidDevice, contains('markNotifyReady'));
     expect(androidDevice, contains('containsAll(expectedTypes)'));

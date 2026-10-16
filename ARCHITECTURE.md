@@ -181,7 +181,7 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `devicePreConnected` | `Future<void> devicePreConnected(String uuid)` | G1/R1 兼容的“预连接”通知；G2 禁止使用该 UUID-only 接口。 |
 | `deviceConnected` | `Future<void> deviceConnected(String uuid)` | G1/R1 兼容的业务 connected 提交；G2 禁止使用该 UUID-only 接口。 |
 | `prepareBusinessConnection` | `Future<BleBusinessConnectionStatus> prepareBusinessConnection(BleBusinessConnectionAttempt attempt)` | G2 exact-attempt 预连接入口。`attempt` 必须来自同一次 `connectFinish` 的 `uuid/sessionGeneration/attemptGeneration`；同 token 幂等刷新有界鉴权宽限，不同 token 替换旧 lease。拒绝只返回状态，不取消长期 autoReconnect owner。 |
-| `commitBusinessConnection` | `Future<BleBusinessConnectionStatus> commitBusinessConnection(BleBusinessConnectionAttempt attempt)` | G2 exact-attempt 真连接入口。原生同时校验 prepare lease、当前 admission、物理连接、当前 GATT/CBPeripheral 身份，以及 write/read/notify readiness；只有成功发布 `connected` 后返回 `accepted`。 |
+| `commitBusinessConnection` | `Future<BleBusinessConnectionStatus> commitBusinessConnection(BleBusinessConnectionAttempt attempt, {bool armAutoReconnect = true})` | G2 exact-attempt 真连接入口。原生同时校验 prepare lease、当前 admission、物理连接、当前 GATT/CBPeripheral 身份，以及 write/read/notify readiness；只有成功发布 `connected` 后返回 `accepted`。Android Temp 首配可传 `armAutoReconnect: false`，仅跳过本次成功后的长期 owner 登记，仍发布同代 `connected` 并释放 Gate；iOS 保留既有行为。 |
 | `abortBusinessConnection` | `Future<bool> abortBusinessConnection(BleBusinessConnectionAttempt attempt)` | 只撤销完全匹配的 prepare lease；旧 token abort 不能删除新 lease，也不能断开 GATT、移除 autoReconnect owner 或伪造用户断连。 |
 | `invalidateBusinessConnection` | `Future<bool> invalidateBusinessConnection(BleBusinessConnectionAttempt attempt)` | iOS G2 心跳兜底入口。只接受当前已提交、仍物理 connected、开启 autoReconnect、正 session/attempt 且未被新 admission/OTA 替代的业务 owner；先建立 cancellation barrier，再以上一业务代次发布 `timeout`，保留长期回连意图。陈旧、重复、OTA 中或 Android 调用返回 `false`。 |
 | `sendCmd` | `Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0, bool allowDuringUpgrade = false, int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0, BleG2OtaContext? otaContext, BleBusinessConnectionAttempt? expectedAttempt})` | 普通命令 Future 到 channel/入队边界；可选 expectedAttempt 在 Android 原队列 dequeue 时复验 exact GATT。`psType` 是"私有服务类型"，对应 `BlePrivateService.type`（0=基础，1=OTA，2+=自定义）。升级态默认阻断非 OTA 写入；只有上层协议白名单确认的 AUTH、时间同步等恢复控制指令可显式传 `allowDuringUpgrade=true`。OTA 控制包携带正 `expectedSessionGeneration/expectedAttemptGeneration` 时，native 必须在实际 dispatch 前按当前物理 owner 校验；携带 `otaContext` 时还必须命中当前 G2 OTA transaction，避免旧 START/INFORMATION/RESULT 写入新 GATT 或越权清理。 |
@@ -502,6 +502,13 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 ### 8.6 原生自动回连（`autoReconnect`）
 
 `BleConfig.autoReconnect = true` 后，Android/iOS 原生层会在设备已经达到业务 `connected` 后注册一个长期回连意图。这个意图只处理系统异常断连和连接流程失败，不处理用户主动断连。
+
+Android 尚未完成整机首配的 Temp 可在 exact `commitBusinessConnection` 中设置
+`armAutoReconnect: false`，将重试继续交给原 Dart 请求，避免单腿成功后 supervisor
+生成另一 session、手动重试又被 pending promotion 复用。该参数默认 `true`，缺省的旧
+MethodChannel 调用和 UUID-only `deviceConnected` 仍登记 owner；iOS 忽略此 Android
+策略。`false` 不撤销已经存在的 owner，进入 Temp 前仍须完成既有 formal-to-Temp 释放
+屏障。整机业务成功并提交绑定意图后，由 `armAutoReconnectTargets` 补种正式长期目标。
 
 本次回连契约：
 
