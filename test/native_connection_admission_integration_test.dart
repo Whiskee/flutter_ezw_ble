@@ -367,7 +367,8 @@ void main() {
         contains('manualPendingReplacementThreshold: TimeInterval { 20.0 }'));
     expect(flow, contains('!session.hasObservedPhysicalContact'));
     // 阈值判断已按 trigger 分派；manual 触发仍必须落在 20 秒 manual 阈值上。
-    expect(flow, contains('replacementThreshold = manualPendingReplacementThreshold'));
+    expect(flow,
+        contains('replacementThreshold = manualPendingReplacementThreshold'));
     expect(flow, contains('elapsed >= replacementThreshold'));
     expect(flow, contains('!hasPeripheralCancellationBarrier(peripheral)'));
     expect(flow,
@@ -571,7 +572,7 @@ void main() {
     final policy = File(
       'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleBluetoothOffTerminalMetadataPolicy.kt',
     ).readAsStringSync();
-    final setConnectedStart = manager.indexOf('fun setConnected(uuid: String)');
+    final setConnectedStart = manager.indexOf('fun setConnected(uuid: String,');
     final setConnectedEnd =
         manager.indexOf('fun disconnect(', setConnectedStart);
     final setConnected = manager.substring(setConnectedStart, setConnectedEnd);

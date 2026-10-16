@@ -210,9 +210,13 @@ enum class BleMC {
                 )
             }
             COMMIT_BUSINESS_CONNECTION -> {
-                val attempt = (arguments as? Map<*, *>)?.toBusinessConnectionAttempt()
+                val payload = arguments as? Map<*, *>
+                val attempt = payload?.toBusinessConnectionAttempt()
+                // Older hosts omit this Android-only policy and keep arming. Temp
+                // pairing opts out without changing the exact admission identity.
+                val armAutoReconnect = payload?.get("armAutoReconnect") as? Boolean ?: true
                 return result.success(
-                    BleManager.instance.commitBusinessConnection(attempt).flutterValue,
+                    BleManager.instance.commitBusinessConnection(attempt, armAutoReconnect).flutterValue,
                 )
             }
             ABORT_BUSINESS_CONNECTION -> {

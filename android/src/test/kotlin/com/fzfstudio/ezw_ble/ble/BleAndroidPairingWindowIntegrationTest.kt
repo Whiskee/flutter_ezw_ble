@@ -4,6 +4,7 @@ import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.Context
@@ -18,6 +19,7 @@ import com.fzfstudio.ezw_ble.ble.services.BleStateListener.BluetoothStateCallbac
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import io.flutter.plugin.common.MethodChannel
 import org.json.JSONObject
 import org.mockito.Mockito
 import java.util.IdentityHashMap
@@ -189,6 +191,102 @@ class BleAndroidPairingWindowIntegrationTest {
         assertTrue(f.pendingStarts().isEmpty())
     }
 
+    @Test
+    fun `Temp exact commit leaves retry with Dart until whole pair handoff`() = fixture { f ->
+        f.foreground(f.left, 501L)
+        f.foreground(f.right, 502L)
+        f.contact(f.left)
+        f.left.bond = BluetoothDevice.BOND_BONDED
+        f.resume(f.left)
+        val first = f.readyForBusiness(f.left)
+        assertEquals(BleBusinessConnectionStatus.ACCEPTED, f.manager.prepareBusinessConnection(first))
+
+        // Exercise the actual channel decoder and exact native commit, rather than
+        // proving only a policy helper. One connected leg must still release Gate.
+        assertEquals("accepted", f.commitViaChannel(first, armAutoReconnect = false))
+        assertEquals(BleConnectState.CONNECTED, f.left.device.connectState)
+        assertFalse(f.hasOwner(f.left))
+        assertEquals(listOf(f.left.uuid, f.right.uuid), f.opened)
+        val connected = f.payloads().last {
+            it["uuid"] == f.left.uuid && it["connectState"] == "connected"
+        }
+        assertEquals(first.sessionGeneration, connected["sessionGeneration"])
+        assertEquals(first.attemptGeneration, connected["attemptGeneration"])
+
+        f.contact(f.right)
+        assertEquals(BleConnectState.START_BINDING, f.right.device.connectState)
+        f.disconnectFromSystem(f.left)
+        // No supervisor task means the real terminal schedule cannot open a
+        // competing passive GATT while the other leg waits for Bond.
+        assertEquals(listOf(f.left.uuid, f.right.uuid), f.opened)
+        assertFalse(f.hasOwner(f.left))
+        f.foreground(f.left, 503L)
+        val retry = f.admission(f.left)
+        assertEquals(503L, retry.sessionGeneration)
+        assertTrue(retry.generation > first.attemptGeneration)
+        assertEquals(listOf(f.left.uuid, f.right.uuid, f.left.uuid), f.opened)
+        f.contact(f.left)
+
+        f.right.bond = BluetoothDevice.BOND_BONDED
+        f.resume(f.right)
+        val right = f.readyForBusiness(f.right)
+        assertEquals(BleBusinessConnectionStatus.ACCEPTED, f.manager.prepareBusinessConnection(right))
+        assertEquals("accepted", f.commitViaChannel(right, armAutoReconnect = false))
+        val left = f.readyForBusiness(f.left)
+        assertEquals(BleBusinessConnectionStatus.ACCEPTED, f.manager.prepareBusinessConnection(left))
+        assertEquals("accepted", f.commitViaChannel(left, armAutoReconnect = false))
+        assertTrue(f.left.device.isConnected && f.right.device.isConnected)
+        assertFalse(f.hasOwner(f.left) || f.hasOwner(f.right))
+
+        // The existing formal handoff can now seed both durable targets without
+        // reopening either live GATT or changing the accepted foreground pair.
+        f.manager.armAutoReconnectTargets(listOf(f.seed(f.left), f.seed(f.right)))
+        assertTrue(f.hasOwner(f.left) && f.hasOwner(f.right))
+        assertEquals(listOf(f.left.uuid, f.right.uuid, f.left.uuid), f.opened)
+    }
+
+    @Test
+    fun `omitted and explicit true business commit keep native reconnect enabled`() {
+        listOf<Boolean?>(null, true).forEach { arm -> fixture { f ->
+            f.left.bond = BluetoothDevice.BOND_BONDED
+            f.foreground(f.left, 601L)
+            f.contact(f.left)
+            val attempt = f.readyForBusiness(f.left)
+            assertEquals(BleBusinessConnectionStatus.ACCEPTED, f.manager.prepareBusinessConnection(attempt))
+            assertEquals("accepted", f.commitViaChannel(attempt, arm))
+            assertTrue(f.hasOwner(f.left))
+            f.disconnectFromSystem(f.left)
+            assertEquals(listOf(f.left.uuid, f.left.uuid), f.opened)
+        } }
+    }
+
+    @Test
+    fun `Temp arm opt out cannot commit a stale token or consume the current lease`() = fixture { f ->
+        f.left.bond = BluetoothDevice.BOND_BONDED
+        f.foreground(f.left, 701L)
+        f.contact(f.left)
+        val current = f.readyForBusiness(f.left)
+        assertEquals(BleBusinessConnectionStatus.ACCEPTED, f.manager.prepareBusinessConnection(current))
+        val stale = current.copy(sessionGeneration = current.sessionGeneration - 1)
+        assertEquals("attemptMismatch", f.commitViaChannel(stale, armAutoReconnect = false))
+        assertFalse(f.left.device.isConnected)
+        assertFalse(f.hasOwner(f.left))
+        assertEquals(current.sessionGeneration, f.admission(f.left).sessionGeneration)
+        assertEquals("accepted", f.commitViaChannel(current, armAutoReconnect = false))
+        assertTrue(f.left.device.isConnected)
+    }
+
+    @Test
+    fun `legacy business connected still arms native reconnect by default`() = fixture { f ->
+        f.left.bond = BluetoothDevice.BOND_BONDED
+        f.foreground(f.left, 801L)
+        f.contact(f.left)
+        f.readyForBusiness(f.left)
+        f.manager.setPreConnected(f.left.uuid)
+        assertEquals(BleBusinessConnectionStatus.ACCEPTED, f.manager.setConnected(f.left.uuid))
+        assertTrue(f.hasOwner(f.left))
+    }
+
     private fun fixture(test: (Fixture) -> Unit) {
         Mockito.mockStatic(Log::class.java).use {
             Mockito.mockStatic(SystemClock::class.java).use { clock ->
@@ -234,6 +332,9 @@ class BleAndroidPairingWindowIntegrationTest {
         val bluetooth = Mockito.mock(BluetoothManager::class.java)
         val opened = mutableListOf<String>()
         val timeline = mutableListOf<String>()
+        // Authoritative Android connection queries track only delivered physical
+        // callbacks; the Manager still owns admission and business transitions.
+        val systemConnected = mutableListOf<BluetoothDevice>()
         var now = 0L
         // Async event delivery failures must fail the test instead of only printing to stderr.
         val asyncErrors = mutableListOf<Throwable>()
@@ -264,7 +365,7 @@ class BleAndroidPairingWindowIntegrationTest {
             })
             Mockito.`when`(adapter.isEnabled).thenReturn(true)
             Mockito.`when`(bluetooth.adapter).thenReturn(adapter)
-            Mockito.`when`(bluetooth.getConnectedDevices(BluetoothProfile.GATT)).thenReturn(emptyList())
+            Mockito.`when`(bluetooth.getConnectedDevices(BluetoothProfile.GATT)).thenAnswer { systemConnected.toList() }
             field("bluetoothManager", bluetooth)
             field("bleConfigs", listOf(config))
             field("bleState", 5)
@@ -302,7 +403,38 @@ class BleAndroidPairingWindowIntegrationTest {
         fun foreground(e: Endpoint, session: Long = 100L) = manager.connect(
             config.name, e.uuid, e.name, "SN", directConnect = true, sessionGeneration = session,
         )
-        fun contact(e: Endpoint) = e.callback!!.onConnectionStateChange(e.gatt, 0, BluetoothProfile.STATE_CONNECTED)
+        fun contact(e: Endpoint) {
+            if (!systemConnected.contains(e.remote)) systemConnected += e.remote
+            e.callback!!.onConnectionStateChange(e.gatt, 0, BluetoothProfile.STATE_CONNECTED)
+        }
+        /** Deliver the real terminal callback so Manager must decide whether to schedule. */
+        fun disconnectFromSystem(e: Endpoint) {
+            systemConnected.remove(e.remote)
+            e.callback!!.onConnectionStateChange(e.gatt, 0, BluetoothProfile.STATE_DISCONNECTED)
+        }
+        /** Fake only ATT readiness; prepare/commit still validate the real GATT/admission. */
+        fun readyForBusiness(e: Endpoint): BleBusinessConnectionAttempt {
+            e.device.update(e.gatt, 0, Mockito.mock(BluetoothGattCharacteristic::class.java),
+                Mockito.mock(BluetoothGattCharacteristic::class.java))
+            e.device.markNotifyReady(0)
+            val current = admission(e)
+            assertTrue(current.sessionGeneration > 0L && current.generation > 0L)
+            return BleBusinessConnectionAttempt(e.uuid, current.sessionGeneration, current.generation)
+        }
+        /** Use the public bridge to cover missing/true/false payload decoding in production. */
+        fun commitViaChannel(attempt: BleBusinessConnectionAttempt, armAutoReconnect: Boolean? = null): Any? {
+            var status: Any? = null
+            val result = Mockito.mock(MethodChannel.Result::class.java)
+            Mockito.doAnswer { call -> status = call.getArgument<Any?>(0); null }
+                .`when`(result).success(Mockito.any())
+            val payload = mutableMapOf<String, Any>("uuid" to attempt.uuid,
+                "sessionGeneration" to attempt.sessionGeneration, "attemptGeneration" to attempt.attemptGeneration)
+            if (armAutoReconnect != null) payload["armAutoReconnect"] = armAutoReconnect
+            BleMC.COMMIT_BUSINESS_CONNECTION.handle(Mockito.mock(Context::class.java), payload, result)
+            return status
+        }
+        fun hasOwner(e: Endpoint) = supervisor().endpointsMatching(e.uuid, e.name).contains(e.uuid)
+        fun seed(e: Endpoint) = BleReconnectSeed(config.name, e.uuid, e.name, "SN", 0)
         fun resume(e: Endpoint) {
             (invoke("createBleStateListener") as BluetoothStateCallback).onDeviceBondStateChanged(
                 e.remote, BluetoothDevice.BOND_BONDED, BluetoothDevice.BOND_BONDING,

@@ -8,7 +8,7 @@ For repository architecture and channel contracts, see `ARCHITECTURE.md`.
 
 ## Goal
 
-`flutter_ezw_ble` provides a native auto reconnect supervisor for devices that have already reached the business `connected` state. Android and iOS own reconnect scheduling, cancellation, backoff, and GATT readiness rebuild. Dart callers keep the existing `connectStatusEC` flow and only opt in through `BleConfig`.
+`flutter_ezw_ble` provides a native auto reconnect supervisor for devices that have already reached the business `connected` state. Android and iOS own reconnect scheduling, cancellation, backoff, and GATT readiness rebuild. Dart callers keep the existing `connectStatusEC` flow and opt in through `BleConfig`; Android temporary pairing may defer arming until whole-device handoff through the exact business commit described below.
 
 This design is intended for `even_connect` integration: `even_connect` declares which device configs support native auto reconnect, listens to the existing connection stream, sends the G2 business authentication command when `connectFinish` arrives, then calls the exact-attempt `prepareBusinessConnection` / `commitBusinessConnection` pair with that event's `uuid`, `sessionGeneration`, and `attemptGeneration`. `devicePreConnected(uuid)` / `deviceConnected(uuid)` remain as legacy G1/R1 compatibility APIs.
 
@@ -68,11 +68,23 @@ Public methods:
   that emitted `connectFinish`. Repeating the same token is idempotent and a
   different token replaces the old lease for that endpoint. The lease only opens
   the bounded auth grace window; rejection does not cancel the reconnect owner.
-- `commitBusinessConnection(BleBusinessConnectionAttempt)` is the G2 final
+- `commitBusinessConnection(BleBusinessConnectionAttempt, {armAutoReconnect = true})` is the G2 final
   business-connected boundary. Native must still own the same admission and
   physical GATT/CBPeripheral, the device must remain physically connected, and
   write/read/notify readiness for every configured private service must be
   complete. It returns `accepted` only after native has published `connected`.
+  Android temporary first-pairing callers pass `armAutoReconnect: false` to
+  retain foreground request ownership while the peer endpoint still pairs.
+  The exact token checks, positive status pair, connected publication and Gate
+  release are unchanged; only creation/refresh of the persistent supervisor
+  owner is skipped. This prevents an autonomous native retry from retaining its
+  own session while a later Dart request installs another exact session. The
+  flag does not disarm an existing owner: callers must complete their existing
+  formal-to-Temp cancellation barrier before starting temporary pairing. Once
+  the whole device succeeds and its binding intent commits, the existing
+  `armAutoReconnectTargets` handoff seeds both durable owners without reopening
+  the live GATTs. The default and omitted Android payload field remain `true`;
+  legacy `deviceConnected` and iOS behavior remain unchanged.
 - `abortBusinessConnection(BleBusinessConnectionAttempt)` removes only an exact
   matching lease. Stale aborts are no-ops and must not disconnect, remove
   persisted autoReconnect intent, or delete a newer prepared token.

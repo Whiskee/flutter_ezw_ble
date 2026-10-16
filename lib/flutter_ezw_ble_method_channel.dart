@@ -278,11 +278,14 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
 
   @override
   Future<BleBusinessConnectionStatus> commitBusinessConnection(
-    BleBusinessConnectionAttempt attempt,
-  ) async {
+    BleBusinessConnectionAttempt attempt, {
+    bool armAutoReconnect = true,
+  }) async {
     final raw = await methodChannel.invokeMethod<String>(
       'commitBusinessConnection',
-      attempt.toJson(),
+      // Keep the exact token intact; Android applies this policy only after its
+      // admission/readiness checks, while iOS retains its existing commit flow.
+      {...attempt.toJson(), 'armAutoReconnect': armAutoReconnect},
     );
     return bleBusinessConnectionStatusFromNative(raw);
   }

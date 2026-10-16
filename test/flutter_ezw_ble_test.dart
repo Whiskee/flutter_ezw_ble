@@ -177,8 +177,9 @@ class MockFlutterEzwBlePlatform
 
   @override
   Future<BleBusinessConnectionStatus> commitBusinessConnection(
-    BleBusinessConnectionAttempt attempt,
-  ) {
+    BleBusinessConnectionAttempt attempt, {
+    bool armAutoReconnect = true,
+  }) {
     throw UnimplementedError();
   }
 
