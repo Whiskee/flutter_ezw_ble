@@ -13,5 +13,7 @@ data class BlePendingScanConnect(
     val sn: String,
     val afterUpgrade: Boolean,
     val directConnect: Boolean,
+    /** Scan matching must not replace the original Dart request identity. */
+    val sessionGeneration: Long = 0L,
     val startTimeMs: Long = System.currentTimeMillis(),
 )

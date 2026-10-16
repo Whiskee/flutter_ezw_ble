@@ -125,6 +125,9 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     String? sn,
     bool? afterUpgrade,
     bool directConnect = false,
+    // Android foreground request identity survives queue/scan waits. Existing formal
+    // Supervisor pending owners keep UUID promotion; activation/rebind owns session takeover.
+    int? sessionGeneration,
   }) {
     throw UnimplementedError('connectDevice() has not been implemented.');
   }

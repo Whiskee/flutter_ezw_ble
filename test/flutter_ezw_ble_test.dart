@@ -66,6 +66,7 @@ class MockFlutterEzwBlePlatform
     String? sn,
     bool? afterUpgrade,
     bool directConnect = false,
+    int? sessionGeneration,
   }) {
     throw UnimplementedError();
   }

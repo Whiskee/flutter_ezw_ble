@@ -26,14 +26,17 @@ internal enum class BleConnectionAdmissionDecision {
 /**
  * Android 全局 BLE 连接准入 Gate 的纯状态机。
  *
- * Gate 只决定谁可以运行 service/characteristic/CCCD/业务鉴权 pipeline，不持有
- * BluetoothGatt。automatic 节点按物理 callback FIFO；manual 节点只提升等待队列，
+ * Gate 决定谁可以运行 service/characteristic/CCCD/业务鉴权 pipeline；可选的未 Bond
+ * reservation 还覆盖实际建链之前，但 Gate 本身不持有 BluetoothGatt。automatic 节点
+ * 按准入 FIFO；manual 节点只提升等待队列，
  * 绝不抢占 active owner。generation + sessionId 同时防止迟到 callback 复活旧连接。
  */
 internal class BleConnectionAdmissionGate {
     private val latestGenerations = mutableMapOf<String, Long>()
     private val manualQueue = mutableListOf<BleConnectionAdmission>()
     private val automaticQueue = mutableListOf<BleConnectionAdmission>()
+    // 预建链 reservation 在真实 callback 时转为普通 owner；不能被视为重复物理回调。
+    private val beforePhysical = mutableSetOf<Long>()
     private var active: BleConnectionAdmission? = null
     private var suspended = false
 
@@ -52,8 +55,12 @@ internal class BleConnectionAdmissionGate {
         }
         // 3、登记新代次，并移除同 endpoint 的旧排队节点。
         latestGenerations[key] = generation
-        manualQueue.removeAll { endpointKey(it.endpointId) == key && it.generation < generation }
-        automaticQueue.removeAll { endpointKey(it.endpointId) == key && it.generation < generation }
+        val superseded = (manualQueue + automaticQueue).filter {
+            endpointKey(it.endpointId) == key && it.generation < generation
+        }.map { it.sessionId }.toSet()
+        beforePhysical.removeAll(superseded)
+        manualQueue.removeAll { it.sessionId in superseded }
+        automaticQueue.removeAll { it.sessionId in superseded }
     }
 
     /**
@@ -71,9 +78,31 @@ internal class BleConnectionAdmissionGate {
         return latestGenerations[endpointKey(endpointId)]
     }
 
-    /** 按真实物理 callback 到达顺序提交；首个节点立即成为 owner，其余进入优先队列。 */
+    /** 未 Bond 目标先占用同一 Gate；等待期间调用方不得创建 GATT 或启动连接 timer。 */
+    @Synchronized
+    fun beforePhysicalConnect(admission: BleConnectionAdmission): BleConnectionAdmissionDecision {
+        val decision = enqueue(admission)
+        if (decision == BleConnectionAdmissionDecision.GRANTED ||
+            decision == BleConnectionAdmissionDecision.QUEUED
+        ) {
+            beforePhysical.add(admission.sessionId)
+        }
+        return decision
+    }
+
+    /** 按真实物理 callback 到达顺序提交；预建链 owner 的首个 callback 只转换一次。 */
     @Synchronized
     fun onPhysicalConnected(admission: BleConnectionAdmission): BleConnectionAdmissionDecision {
+        if (!suspended && latestGenerations[endpointKey(admission.endpointId)] == admission.generation &&
+            active?.sameSession(admission) == true && beforePhysical.remove(admission.sessionId)
+        ) {
+            return BleConnectionAdmissionDecision.GRANTED
+        }
+        return enqueue(admission)
+    }
+
+    /** 两种准入共用优先级与 stale 校验，不引入第二套调度所有权。 */
+    private fun enqueue(admission: BleConnectionAdmission): BleConnectionAdmissionDecision {
         // 1、按 suspended、generation、重复 session 依次做 fail-closed 校验。
         if (admission.endpointId.isBlank()) {
             return BleConnectionAdmissionDecision.INVALID_IDENTITY
@@ -117,6 +146,7 @@ internal class BleConnectionAdmissionGate {
             return null
         }
         // 2、释放当前 owner，并只 grant 下一位等待节点。
+        beforePhysical.remove(owner.sessionId)
         active = null
         return grantNext()
     }
@@ -162,6 +192,11 @@ internal class BleConnectionAdmissionGate {
             latestGenerations[key] = nextGeneration(latestGenerations[key] ?: 0L)
         }
         // 3、原子移除两类等待队列，避免逐个取消期间短暂 grant。
+        beforePhysical.removeAll { sessionId ->
+            (manualQueue + automaticQueue + listOfNotNull(active)).any {
+                it.sessionId == sessionId && endpointKey(it.endpointId) in keys
+            }
+        }
         manualQueue.removeAll { endpointKey(it.endpointId) in keys }
         automaticQueue.removeAll { endpointKey(it.endpointId) in keys }
         if (active?.let { endpointKey(it.endpointId) in keys } != true) {
@@ -183,6 +218,7 @@ internal class BleConnectionAdmissionGate {
         if (endpointId.isBlank()) {
             return null
         }
+        beforePhysical.remove(sessionId)
         manualQueue.removeAll { it.matches(endpointId, generation, sessionId) }
         automaticQueue.removeAll { it.matches(endpointId, generation, sessionId) }
         if (active?.matches(endpointId, generation, sessionId) != true) {
@@ -223,6 +259,7 @@ internal class BleConnectionAdmissionGate {
             nextGeneration(generation)
         }
         active = null
+        beforePhysical.clear()
         manualQueue.clear()
         automaticQueue.clear()
     }

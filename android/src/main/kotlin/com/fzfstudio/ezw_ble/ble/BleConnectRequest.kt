@@ -30,6 +30,8 @@ internal data class BleConnectRequest(
     val directConnect: Boolean,
     /** Waiting-device requests should not be mistaken for a foreground noDeviceFound. */
     val isWaitingDevice: Boolean,
+    /** Optional Dart request session; scan and queue continuations preserve this exact owner. */
+    val sessionGeneration: Long = 0L,
 ) {
     /**
      * Builds the fixed connect/request log line.
