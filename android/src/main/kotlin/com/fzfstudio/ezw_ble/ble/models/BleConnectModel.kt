@@ -14,4 +14,6 @@ data class BleConnectModel(
     /** Serialized as the legacy session-generation field for old Dart consumers. */
     val generation: Long = sessionGeneration,
     val nativeTrace: Map<String, Any?>? = null,
+    /** 控制面进度，不能冒充真实 physical contact。 */
+    val pairingPhase: String? = null,
 ): GsonSerializable()

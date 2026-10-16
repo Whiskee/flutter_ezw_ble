@@ -161,6 +161,9 @@ enum BleMC: String {
             // so Swift Codable never sees NSNull for Bool fields.
             jsonData["afterUpgrade"] = jsonData["afterUpgrade"] as? Bool ?? false
             jsonData["directConnect"] = jsonData["directConnect"] as? Bool ?? false
+            // Optional Android foreground request identity has no CoreBluetooth meaning.
+            // Accept shared callers without altering the existing iOS session allocator.
+            jsonData.removeValue(forKey: "sessionGeneration")
             BleEC.logger.emit("[d]-BleChannel::connectDevice args uuid=\(jsonData["uuid"] as? String ?? ""), name=\(jsonData["name"] as? String ?? ""), sn=\(jsonData["sn"] as? String ?? ""), config=\(jsonData["belongConfig"] as? String ?? ""), afterUpgrade=\(jsonData["afterUpgrade"] as? Bool ?? false), directConnect=\(jsonData["directConnect"] as? Bool ?? false)")
             if let easyConnect: BleEasyConnect = jsonData.decodeTo() {
                 BleManager.shared.connect(easyConnect: easyConnect)

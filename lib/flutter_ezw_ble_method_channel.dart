@@ -85,6 +85,9 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
     String? sn,
     bool? afterUpgrade,
     bool directConnect = false,
+    // Android foreground request identity survives queue/scan waits. Existing formal
+    // Supervisor pending owners keep UUID promotion; activation/rebind owns session takeover.
+    int? sessionGeneration,
   }) async =>
       methodChannel.invokeMethod("connectDevice", {
         "belongConfig": belongConfig,
@@ -93,6 +96,7 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
         "sn": sn,
         "afterUpgrade": afterUpgrade ?? false,
         "directConnect": directConnect,
+        if (sessionGeneration != null) "sessionGeneration": sessionGeneration,
       });
 
   @override

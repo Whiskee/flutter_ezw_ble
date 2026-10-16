@@ -59,7 +59,7 @@ void main() {
     expect(
         androidSupervisor,
         contains(
-            'createConnectCallback(task.uuid, task.source, task.sessionGeneration)'));
+            'startGattWhenAdmitted(reservedDevice, task.source, reservedSession)'));
     expect(iosConnect, contains('case sessionGeneration'));
     expect(
         iosConnect,
@@ -107,7 +107,7 @@ void main() {
     expect(
       androidSupervisor,
       contains(
-        'createConnectCallback(task.uuid, task.source, task.sessionGeneration)',
+        'startGattWhenAdmitted(reservedDevice, task.source, reservedSession)',
       ),
     );
     expect(androidManager, contains('reason = if (requestedSessionInstalled)'));

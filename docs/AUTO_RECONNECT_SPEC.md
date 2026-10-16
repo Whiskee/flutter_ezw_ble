@@ -25,6 +25,8 @@ Add these fields to `BleConfig`:
 | `autoReconnectUseNativePassive` | `true` | Allows platform passive reconnect paths when active reconnect cannot see the device. |
 | `securityGate` | `null` | Optional Android/iOS protected-write gate. G2 uses 5403 to establish/verify link security before ordinary Notify/AUTH; Android falls back to exact-session Bond only when old firmware lacks a writable gate. |
 | `androidHighReliabilityMode` | `false` | Uses Android 1M-first, RSSI-adaptive PHY and traffic-aware connection priority for explicitly opted-in configs. |
+| `androidBondTimeout` | `null` | Optional independent system Bond wait in milliseconds. Unset keeps the legacy `connectTimeout` budget; G2 opts into 30,000 ms. |
+| `androidSerializeUnbonded` | `false` | With `initiateBinding=true`, reserves the shared Gate before creating an unbonded endpoint's GATT. G2 opts in; bonded endpoints keep the existing pending-link behavior. |
 
 `autoReconnectUseNativePassive` is now a legacy compatibility field. Reconnect
 activation always uses the platform-native pending/direct path and never falls
@@ -237,9 +239,17 @@ Waiting in the global admission queue is not part of `connectTimeout`. The
 business-pipeline timeout starts only after a real
 `STATE_CONNECTED` / `didConnect` callback has been granted the Gate. On Android,
 an `initiateBinding=true` owner may first hold that same Gate while system bonding
-completes; service discovery starts only after `BOND_BONDED`. The timeout remains
-active through bonding and `connectFinish` until final
-`deviceConnected`, with the existing bounded auth grace.
+completes; service discovery starts only after `BOND_BONDED`. Without
+`androidBondTimeout`, the legacy timeout remains active through Bond and
+`connectFinish` until final `deviceConnected`, with the existing bounded auth
+grace. A positive finite `androidBondTimeout` replaces that timer only during
+Bond: entering Bond invalidates any already-running ordinary timeout callback;
+Bond success resumes one fresh `connectTimeout` for GATT/AUTH. At the Bond
+deadline, the exact owner re-reads framework `bondState`: `BONDED` resumes once
+even if its broadcast is delayed; an incomplete Bond takes one security failure
+and terminal teardown. Duplicate `STATE_CONNECTED`/Bond callbacks preserve the
+same phase timer and discovery guard. G2 sets 30 seconds per leg; the upper
+connection layer owns the separate 120-second whole-round cap.
 
 Android bounds only the pre-physical-callback lifetime of each pending
 `connectGatt(autoConnect=true)` by `BleConfig.connectTimeout` (minimum 1s). On
@@ -261,9 +271,21 @@ pending connect is not recycled by this Android-specific deadline.
 
 ## Global Connection Admission Gate
 
-All targets may be pending at the physical-link layer at the same time. From
-the first physical callback onward, one process-wide Gate serializes service
-discovery, characteristic discovery, CCCD/notify setup, and business auth:
+By default, all targets may be pending at the physical-link layer at the same
+time. Android configs with `androidSerializeUnbonded=true` and
+`initiateBinding=true` reserve the same process-wide Gate before creating an
+unbonded endpoint's GATT, through both foreground and Supervisor openers. A
+queued reservation has no GATT and no pre-physical/pipeline timer. It allocates
+one positive native attempt; the eventual opener reuses that identity. It holds
+the Gate through Bond, GATT readiness and business commit or terminal teardown.
+Every next-owner dispatcher distinguishes a pre-physical opener from an already
+physical pipeline; cancellation invalidates the reservation before any next
+GATT can open, and closes the old GATT before granting the next opener.
+Already-bonded endpoints and configs without the opt-in keep the existing
+parallel pending-link behavior.
+
+From the first physical callback onward, the Gate serializes service discovery,
+characteristic discovery, CCCD/notify setup, and business auth:
 
 - automatic callbacks enter FIFO order;
 - a manual reconnect already waiting is preferred over automatic waiters;
@@ -288,6 +310,19 @@ Every admission is identified by endpoint + attemptGeneration + session and, at
 the platform boundary, the exact GATT/peripheral object. Status events expose
 the Dart sessionGeneration separately so a reconnect batch can remain stable
 while native retries advance attempt ownership. Stale callbacks fail closed.
+
+`connectDevice(..., sessionGeneration: positiveSession)` optionally freezes a
+Dart request identity before scan wait or admission; absent/zero keeps the legacy
+native allocation, and iOS accepts the field without changing its allocator.
+This identity belongs to a new foreground request; existing formal Supervisor
+pending owners retain the established UUID promotion behavior. Switching that
+formal session uses activation/rebind, not ordinary `connectDevice` takeover.
+Android pairing progress uses existing `connectStatus` with `connectState` set to
+`connecting`, optional `pairingPhase` (`queuedBeforePhysical`, `bonding`,
+`bonded`) and the same positive session/native attempt, UUID, name and source.
+This control progress is available with Trace disabled, does not mutate device
+connection state and never manufactures physical contact. Callers validate the
+exact current request before their ordinary connection-status guard.
 
 Android Manager and Gate maintain the same per-endpoint attempt-generation
 high-water mark. A batch cancellation advances that mark exactly once before

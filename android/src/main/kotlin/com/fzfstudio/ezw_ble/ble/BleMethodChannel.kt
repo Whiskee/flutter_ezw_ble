@@ -170,6 +170,8 @@ enum class BleMC {
                 val name = jsonMap?.get("name") as? String ?: ""
                 val sn = jsonMap?.get("sn") as? String ?: ""
                 val afterUpgrade = jsonMap?.get("afterUpgrade") as Boolean? == true
+                // A positive Dart request session is frozen before scan/admission waits.
+                val sessionGeneration = (jsonMap?.get("sessionGeneration") as? Number)?.toLong() ?: 0L
                 val directConnect = jsonMap?.get("directConnect") as Boolean? == true
 
                 // 2. 旧 API 约定 uuid/sn 必须同时存在。参数非法时必须让 Future 失败，
@@ -188,6 +190,7 @@ enum class BleMC {
                     sn,
                     afterUpgrade = afterUpgrade,
                     directConnect = directConnect,
+                    sessionGeneration = sessionGeneration,
                 )
             }
             DEVICE_PRE_CONNECTED -> {
@@ -544,6 +547,9 @@ private fun Map<*, *>.toBleConfig(): BleConfig? {
         autoReconnectMaxAttempts = get("autoReconnectMaxAttempts").toIntOrDefault(0),
         autoReconnectUseNativePassive = get("autoReconnectUseNativePassive") as? Boolean ?: true,
         androidHighReliabilityMode = get("androidHighReliabilityMode") as? Boolean ?: false,
+        // Old Dart configs omit these opt-ins and retain the previous timing/parallelism.
+        androidBondTimeout = (get("androidBondTimeout") as? Number)?.toDouble(),
+        androidSerializeUnbonded = get("androidSerializeUnbonded") as? Boolean ?: false,
     )
 }
 

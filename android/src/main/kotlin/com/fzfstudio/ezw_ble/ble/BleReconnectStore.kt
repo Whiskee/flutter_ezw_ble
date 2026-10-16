@@ -278,6 +278,9 @@ internal class BleReconnectStore {
             put("autoReconnectMaxAttempts", autoReconnectMaxAttempts)
             put("autoReconnectUseNativePassive", autoReconnectUseNativePassive)
             put("androidHighReliabilityMode", androidHighReliabilityMode)
+            // Persist pairing policy so process restoration uses the same opt-in behavior.
+            androidBondTimeout?.let { put("androidBondTimeout", it) }
+            put("androidSerializeUnbonded", androidSerializeUnbonded)
         }
     }
 
@@ -365,6 +368,8 @@ internal class BleReconnectStore {
             autoReconnectMaxAttempts = optInt("autoReconnectMaxAttempts", 0),
             autoReconnectUseNativePassive = optBoolean("autoReconnectUseNativePassive", true),
             androidHighReliabilityMode = optBoolean("androidHighReliabilityMode", false),
+            androidBondTimeout = optDouble("androidBondTimeout", Double.NaN).takeIf { it.isFinite() && it > 0.0 },
+            androidSerializeUnbonded = optBoolean("androidSerializeUnbonded", false),
         )
     }
 

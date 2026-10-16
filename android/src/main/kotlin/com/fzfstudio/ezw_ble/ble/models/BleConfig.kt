@@ -33,6 +33,10 @@ data class BleConfig(
     val autoReconnectUseNativePassive: Boolean = true,
     /** Android 高可靠链路模式；只由明确需要高吞吐且易受遮挡的设备配置开启。 */
     val androidHighReliabilityMode: Boolean = false,
+    /** 独立系统 Bond 等待预算；null 保留历史 connectTimeout 行为。 */
+    val androidBondTimeout: Double? = null,
+    /** 仅启用的未 Bond endpoint 在 GATT 创建前取得全局 Gate。 */
+    val androidSerializeUnbonded: Boolean = false,
 ): GsonSerializable() {
 
     companion object {

@@ -30,6 +30,12 @@ class BleConfig {
   final bool autoReconnectUseNativePassive;
   //  Android 高可靠链路模式：以 1M 建链，并按 RSSI/流量动态调整 PHY 与连接优先级
   final bool androidHighReliabilityMode;
+
+  /// Android 系统 Bond 的独立等待上限（毫秒）；未设置保留历史连接计时。
+  final double? androidBondTimeout;
+
+  /// 未配对 endpoint 在创建 GATT 前排队，避免另一腿在等待 SMP 时链路超时。
+  final bool androidSerializeUnbonded;
   //  iOS 可选安全门禁：受保护写特征触发系统配对/加密后，才上报 connectFinish。
   final BleSecurityGate? securityGate;
 
@@ -46,6 +52,8 @@ class BleConfig {
     this.autoReconnectUseNativePassive = true,
     this.androidHighReliabilityMode = false,
     this.securityGate,
+    this.androidBondTimeout,
+    this.androidSerializeUnbonded = false,
   });
 
   factory BleConfig.fromJson(Map<String, dynamic> json) =>
