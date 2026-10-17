@@ -1021,3 +1021,35 @@ A `physical_connection` step carries `physicalConnectionEvent=connected|disconne
 Snapshot `rssiStatus` describes existing sampling evidence: `not_requested` before a read is requested, `not_observable` while no requested read result is available, `read_failed` when a read failed without a valid sample, and `available` when a valid sample is retained (with its original age). Old/unsupported sources are `not_observable` upstream. No new read or timer is introduced. The 32-step buffer retains the start, physical callbacks and earliest failure while evicting intermediate detail with a cumulative gap marker.
 
 Validation: `fvm flutter test`; `swiftc ios/Classes/ble/BleNativeConnectionTrace.swift test/native/connection_trace_test.swift -o /tmp/native-trace-tests` then `/tmp/native-trace-tests` exercises delayed delivery, clock jumps, RSSI evidence and overflow using injected clocks. Real-device lifecycle and radio behavior remain separate acceptance.
+
+### iOS runtime common notifications (charging idle)
+
+`getRuntimeCommonOwner(uuid)` is a read-only query of the current business-connected,
+flow-complete, non-OTA reconnect owner. It returns the positive session/attempt pair
+only while the owner and actual peripheral/read characteristic remain current.
+`setRuntimeCommonNotifications(uuid, sessionGeneration, attemptGeneration, revision,
+enabled)` changes only `psType=0`; `confirmed` plus the matching `enabled` is success.
+`stale/notConnected/busy/failed/unknown/unavailable` do not prove the requested CCCD.
+Android explicitly reports unsupported (`null` owner / `unavailable` result).
+
+`BleRuntimeCommonNotifications` serializes a peripheral/characteristic object's
+operations. Runtime callbacks route before the initialization Gate, without changing
+readiness counters or republishing connected/AUTH. A timeout returns unknown but
+keeps its physical operation in flight. An older false callback must drain before
+a newer true can be submitted. A matching paused/unconfirmed lane returns typed
+`COMMON_NOT_READY` at both native common write edges; other private services and a
+new positive physical attempt retain normal initialization semantics.
+
+`disconnectForRuntimeNotificationRecovery` accepts only the current exact positive
+pair, latest desired=true revision, unknown lane, and non-OTA live owner. It requests
+at most one real CoreBluetooth cancel per physical lane and returns `reconnecting`;
+it never changes OTA markers/queues or synthesizes terminal/connected. The real
+disconnect callback retires that object's lane and the existing reconnect flow does
+the normal new attempt/subscriptions/AUTH. Explicit owner revocation/reset also
+retires its own lane. No timers retry BLE operations or create background execution.
+
+Business common receive events verify the current peripheral and read characteristic
+object before attaching their successful runtime pair to the existing outer
+`BleCmd` fields. Initialization/AUTH keeps its original zero pair. This does not
+supply `receiveIdentity`, enable iOS expected-attempt writes, or claim Android GATT
+handle provenance.

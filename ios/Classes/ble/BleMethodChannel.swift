@@ -17,6 +17,10 @@ enum BleMC: String {
     case bleState
     /// Query the process-local transport reset epoch without mutating owners.
     case bleRecoveryEpoch
+    /// iOS runtime common notification control, independent of GATT readiness.
+    case getRuntimeCommonOwner
+    case setRuntimeCommonNotifications
+    case disconnectForRuntimeNotificationRecovery
     /// Replace the native BLE configuration table.
     case initConfigs
     /// Start scan with optional pure scan mode.
@@ -112,6 +116,33 @@ enum BleMC: String {
             return
         case .bleRecoveryEpoch:
             result(BleManager.shared.currentBleRecoveryEpoch)
+            return
+        case .getRuntimeCommonOwner:
+            let data = arguments as? [String: Any] ?? [:]
+            result(BleManager.shared.getRuntimeCommonOwner(uuid: data["uuid"] as? String ?? ""))
+            return
+        case .setRuntimeCommonNotifications:
+            let data = arguments as? [String: Any] ?? [:]
+            guard let enabled = data["enabled"] as? Bool else {
+                result(FlutterError(code: "INVALID_RUNTIME_COMMON_ARGUMENTS",
+                    message: "Runtime common desired state is required", details: nil))
+                return
+            }
+            BleManager.shared.setRuntimeCommonNotifications(
+                uuid: data["uuid"] as? String ?? "",
+                sessionGeneration: (data["sessionGeneration"] as? NSNumber)?.int64Value ?? 0,
+                attemptGeneration: (data["attemptGeneration"] as? NSNumber)?.int64Value ?? 0,
+                revision: (data["revision"] as? NSNumber)?.int64Value ?? 0,
+                enabled: enabled,
+                result: result)
+            return
+        case .disconnectForRuntimeNotificationRecovery:
+            let data = arguments as? [String: Any] ?? [:]
+            result(BleManager.shared.disconnectForRuntimeNotificationRecovery(
+                uuid: data["uuid"] as? String ?? "",
+                sessionGeneration: (data["sessionGeneration"] as? NSNumber)?.int64Value ?? 0,
+                attemptGeneration: (data["attemptGeneration"] as? NSNumber)?.int64Value ?? 0,
+                revision: (data["revision"] as? NSNumber)?.int64Value ?? 0))
             return
         case .initConfigs:
             let jsonArray: Array<[String: Any]> = arguments as? Array<[String: Any]> ?? []
@@ -324,7 +355,7 @@ enum BleMC: String {
             let expectedAttemptGeneration = (jsonData["expectedAttemptGeneration"] as? NSNumber)?.int64Value ?? 0
             let otaContext = BleG2OtaContext(data: jsonData["otaContext"] as? [String: Any])
             if let data = jsonData["data"] as? FlutterStandardTypedData {
-                BleManager.shared.sendCmd(
+                let error = BleManager.shared.sendCmd(
                     uuid: uuid,
                     data: data.data,
                     psType: psType,
@@ -333,6 +364,7 @@ enum BleMC: String {
                     expectedAttemptGeneration: expectedAttemptGeneration,
                     otaContext: otaContext
                 )
+                if let error { result(error); return }
             }
             // CoreBluetooth does not expose a reliable per-packet success callback here;
             // return after enqueueing to preserve the historical Dart contract.

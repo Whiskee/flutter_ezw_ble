@@ -669,3 +669,16 @@ hard cancel reachability without linear memory growth.
 - Authentication hang after `connectFinish` times out and retries instead of getting stuck.
 - G2 scan results are displayed only after both legs are matched by `matchCount = 2`.
 - G2 is marked business-connected only after `AUTHENTICATION` returns `authMgr.secAuth == true`; right-leg `PIPE_ROLE_CHANGE` and `TIME_SYNC` run before final `deviceConnected`.
+
+### Runtime common CCCD recovery
+
+The iOS charging-idle API reads only a successful business reconnect owner's paired
+positive `lastConnectedGeneration/lastConnectedAttemptGeneration`, requiring
+`sessionGeneration == lastConnectedGeneration`, current objects, full business
+connection, and no OTA. It never combines historical attempt with a newer session.
+An unknown runtime CCCD operation with latest desired=true may request one actual
+`cancelPeripheralConnection` through `disconnectForRuntimeNotificationRecovery`.
+This preserves the reconnect owner, leaves OTA state alone, and emits no synthetic
+terminal. Only real didDisconnect ends the old physical lane and schedules the
+existing reconnect flow. No FlowPolicy, retry count, gate or GATT-readiness changes
+are introduced. A new positive attempt is not blocked by the old runtime write fence.
