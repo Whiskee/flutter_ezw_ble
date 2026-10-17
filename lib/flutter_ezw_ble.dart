@@ -1,3 +1,5 @@
+export 'core/models/ble_runtime_common.dart';
+
 import 'package:flutter_ezw_ble/flutter_ezw_ble_event_channel.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_method_channel.dart';
 import 'package:flutter_ezw_ble/core/models/ble_cmd.dart';

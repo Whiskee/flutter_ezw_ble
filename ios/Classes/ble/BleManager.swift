@@ -96,6 +96,8 @@ class BleManager: NSObject {
     lazy var preConnectedDevices: Set<String> = []
     //  - OTA WriteWithoutResponse 写队列(key: peripheral.identifier.uuidString)
     //  - 仅在 sendCmdNoWait + psType==1 路径上使用, 详见 docs/IOS_OTA_NOWAIT_SPEC.md §4.2
+    /// Runtime common CCCD state is independent of initialization readiness.
+    let runtimeCommonNotifications = BleRuntimeCommonNotifications()
     private lazy var otaWriteQueues: [String: OtaWriteQueue] = [:]
     //  - 原生自动回连任务，只有业务 connected 后才会加入
     lazy var reconnectTasks: [String: BleReconnectTask] = [:]
@@ -1607,6 +1609,7 @@ extension BleManager {
      *  - 升级中仅允许 OTA 通道和上层协议白名单确认的恢复控制指令
      *
      */
+    @discardableResult
     func sendCmd(
         uuid: String,
         data: Data,
@@ -1615,9 +1618,9 @@ extension BleManager {
         expectedSessionGeneration: Int64 = 0,
         expectedAttemptGeneration: Int64 = 0,
         otaContext: BleG2OtaContext? = nil
-    ) {
+    ) -> FlutterError? {
         guard checkIsFunctionCanBeCalled() else {
-            return
+            return nil
         }
         // OTA 数据通道天然放行；common 只有 AUTH/时间同步等由业务协议显式标记后
         // 才能越过升级态，普通业务写入仍保持阻断。
@@ -1627,19 +1630,19 @@ extension BleManager {
             allowDuringUpgrade: allowDuringUpgrade
         ) else {
             loggerE(msg: "sendCmd: \(uuid), type=\(psType), cannot send non-OTA commands during upgrade")
-            return
+            return nil
         }
         guard let device = connectedDevices.first(where: { device in
             device.peripheral.identifier.uuidString == uuid
         }) else {
             loggerE(msg: "sendCmd: \(uuid), type=\(psType), device cache missing")
-            return
+            return nil
         }
         if let admission = currentConnectionAdmission(uuid: uuid) {
             guard let session = peripheralConnectionSessions[admission.sessionId],
                   session.peripheral === device.peripheral else {
                 loggerE(msg: "sendCmd: \(uuid), type=\(psType), attempt stale, sessionGeneration=\(admission.sessionGeneration), attemptGeneration=\(admission.generation)")
-                return
+                return nil
             }
         }
         if psType == 1,
@@ -1651,15 +1654,21 @@ extension BleManager {
                otaContext: otaContext
            ) {
             loggerE(msg: "sendCmd: \(uuid), type=\(psType), \(identityError.message ?? "attempt identity mismatch")")
-            return
+            return nil
         }
         guard let writeChars = device.writeCharsDic[psType] else {
             loggerE(msg: "sendCmd: \(uuid), type=\(psType), write characteristic missing")
-            return
+            return nil
+        }
+        // Runtime pause must reject at the actual write edge, including callers
+        // that bypass the SDK queue. Other characteristics retain their contract.
+        if let error = runtimeCommonWriteError(uuid: uuid, psType: psType, device: device) {
+            return error
         }
         //  根据不同uuid类型获取不同的服务特征
         device.peripheral.writeValue(data, for: writeChars, type: .withoutResponse)
         loggerD(msg: "sendCmd: \(uuid), type=\(psType), writeChars=\(writeChars.uuid.uuidString), data length =\(data.count)")
+        return nil
     }
 
     /**
@@ -1791,6 +1800,11 @@ extension BleManager {
                 pending: queueDepthForOta(uuid: uuid)
             ))
         } else {
+            // Pause has a typed failure even on the legacy no-wait common path.
+            if let error = runtimeCommonWriteError(uuid: uuid, psType: psType, device: device) {
+                result(error)
+                return
+            }
             //  - 4.4、保持现有非 OTA 行为: WriteWithoutResponse 立即返回, 不做背压
             device.peripheral.writeValue(data, for: writeChars, type: .withoutResponse)
             loggerD(msg: "sendCmdNoWait: \(uuid), type=\(psType), writeChars=\(writeChars.uuid.uuidString), data length=\(data.count)")
@@ -2029,6 +2043,7 @@ extension BleManager {
             timer.invalidate()
         }
         scanConnectTimeoutTimers.removeAll()
+        runtimeCommonNotifications.removeAll()
         upgradeStateRegistry.clear()
         preConnectedDevices.removeAll()
         // 冷启动 reset 发生在 willRestoreState 和账号 target 加载之间时保留 escrow；
@@ -3798,6 +3813,7 @@ extension BleManager: CBCentralManagerDelegate {
             retireG2OtaEndpoints(invalidatedOtaEndpoints, reason: "central \(central.state.label)", snapshots: invalidatedOtaSnapshots)
             clearG2OtaRecoveryGrants(contextsByEndpoint: invalidatedOtaContexts)
             //  - 1.1、移除所有升级设备，避免退出OTA时，重置会连接状态的设备
+            runtimeCommonNotifications.removeAll()
             upgradeStateRegistry.clear()
             //  - 1.2、系统级蓝牙关闭：把连接中/已连接端点标记为 .disconnectFromSys，
             //         让 Dart 状态机先退出陈旧连接态；长期回连 task 仍由 native 暂停并在恢复后继续。
@@ -3919,6 +3935,7 @@ extension BleManager: CBCentralManagerDelegate {
     
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, timestamp: CFAbsoluteTime, isReconnecting: Bool, error: (any Error)?) {
         loggerE(msg: "didDisconnectPeripheral: timestamp = \(timestamp), isReconnecting = \(isReconnecting), error = \(String(describing: error))")
+        runtimeCommonNotifications.terminal(uuid: peripheral.identifier.uuidString, peripheralId: ObjectIdentifier(peripheral))
         if consumePeripheralCancellationBarrier(peripheral) { return }
         recordPhysicalTrace(peripheral, event: "disconnected")
         if handleStateRestorationEscrowTerminal(
@@ -3983,6 +4000,7 @@ extension BleManager: CBCentralManagerDelegate {
      *  设备断连回调
      */
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        runtimeCommonNotifications.terminal(uuid: peripheral.identifier.uuidString, peripheralId: ObjectIdentifier(peripheral))
         if consumePeripheralCancellationBarrier(peripheral) { return }
         recordPhysicalTrace(peripheral, event: "disconnected")
         if handleStateRestorationEscrowTerminal(
@@ -4028,6 +4046,15 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
      */
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         let tag = "didUpdateNotification"
+        // Business-connected has released the initialization Gate. Runtime false
+        // callbacks must be consumed before that guard, without changing counters.
+        if runtimeCommonNotifications.didUpdate(
+            uuid: peripheral.identifier.uuidString,
+            peripheralId: ObjectIdentifier(peripheral),
+            characteristicId: ObjectIdentifier(characteristic),
+            enabled: characteristic.isNotifying,
+            failed: error != nil
+        ) { return }
         guard isCurrentConnectionPipeline(peripheral) else { return }
         if let error = error {
             let nsError = error as NSError
@@ -4307,6 +4334,13 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             loggerE(msg: "cmd response: \(peripheral.identifier.uuidString), can not find chars")
             return
         }
+        // Charging eligibility needs live source provenance. Do not stamp a
+        // replaced CBPeripheral/read characteristic with the current UUID owner.
+        // This does not grant the separate Android owned-write receipt contract.
+        if privateService.type == 0 {
+            guard device.peripheral === peripheral,
+                  device.readCharsDic[0] === characteristic else { return }
+        }
         let responseIdentity = otaResponseIdentity(
             uuid: peripheral.identifier.uuidString,
             device: device,
@@ -4319,14 +4353,19 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
         let otaContext = privateService.type == 1
             ? g2OtaTransactions.activeContext(for: peripheral.identifier.uuidString)
             : nil
-        //  4、发送指令到flutter。OTA response 必须带 exact pair，供 Dart 绑定当前恢复轮次。
+        let commonIdentity = privateService.type == 0
+            ? runtimeCommonSnapshot(uuid: peripheral.identifier.uuidString)?.identity
+            : nil
+        //  4、OTA identity keeps its existing contract; common business packets
+        // additionally identify their currently validated successful attempt.
+        // AUTH packets before business commit retain the original zero pair.
         let bleCmdMap = BleCmd(
             uuid: peripheral.identifier.uuidString,
             psType: privateService.type,
             data: data,
             isSuccess: error == nil,
-            sessionGeneration: responseIdentity?.sessionGeneration ?? 0,
-            attemptGeneration: responseIdentity?.attemptGeneration ?? 0,
+            sessionGeneration: responseIdentity?.sessionGeneration ?? commonIdentity?.sessionGeneration ?? 0,
+            attemptGeneration: responseIdentity?.attemptGeneration ?? commonIdentity?.attemptGeneration ?? 0,
             otaTransactionId: otaContext?.transactionId ?? "",
             otaGeneration: otaContext?.generation ?? 0,
             otaInstanceId: otaContext?.instanceId ?? ""

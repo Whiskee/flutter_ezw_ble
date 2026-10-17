@@ -28,3 +28,5 @@ export 'core/models/ble_sn_rule.dart';
 export 'core/models/ble_status.dart';
 export 'core/models/ble_device_hardware.dart';
 export 'core/models/ble_receive_identity.dart';
+
+export 'core/models/ble_runtime_common.dart';
