@@ -14,9 +14,9 @@ struct BleCmd: Codable {
     var data: Data?
     //  是否成功
     var isSuccess: Bool = true
-    //  OTA recovery batch 业务 session；0 表示旧事件或非 OTA。
+    //  OTA recovery / 已确认common业务owner的session；0表示初始化或未知。
     var sessionGeneration: Int64 = 0
-    //  Native 物理连接 attempt；0 表示旧事件或非 OTA。
+    //  Native物理attempt；common只在当前对象与已确认业务owner匹配时附带。
     var attemptGeneration: Int64 = 0
     //  G2 OTA transaction identity. Empty/0 表示旧事件或非 OTA；Dart 必须 fail closed。
     var otaTransactionId: String = ""

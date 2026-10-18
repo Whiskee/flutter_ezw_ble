@@ -26,6 +26,10 @@ enum class BleMC {
     BLE_STATE,
     /** iOS transport reset epoch；Android 当前固定返回 0。 */
     BLE_RECOVERY_EPOCH,
+    /** iOS runtime CCCD control: Android explicitly reports unsupported. */
+    GET_RUNTIME_COMMON_OWNER,
+    SET_RUNTIME_COMMON_NOTIFICATIONS,
+    DISCONNECT_FOR_RUNTIME_NOTIFICATION_RECOVERY,
     /** 初始化 BLE 配置列表。 */
     INIT_CONFIGS,
     /** 开始扫描设备。 */
@@ -141,6 +145,10 @@ enum class BleMC {
             }
             BLE_RECOVERY_EPOCH -> {
                 return result.success(0L)
+            }
+            GET_RUNTIME_COMMON_OWNER -> return result.success(null)
+            SET_RUNTIME_COMMON_NOTIFICATIONS, DISCONNECT_FOR_RUNTIME_NOTIFICATION_RECOVERY -> {
+                return result.success(mapOf("status" to "unavailable"))
             }
             INIT_CONFIGS -> {
                 // 1. Dart 传入的是 List<Map>，这里转换成原生配置模型。

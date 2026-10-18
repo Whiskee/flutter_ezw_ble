@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:flutter_ezw_ble/core/models/ble_runtime_common.dart';
 import 'dart:typed_data';
 
 import 'package:flutter_ezw_ble/core/models/ble_config.dart';
@@ -27,6 +28,21 @@ class MockFlutterEzwBlePlatform
   Future<int> bleState() {
     throw UnimplementedError();
   }
+
+  @override
+  Future<BleRuntimeCommonOwner?> getRuntimeCommonOwner(String uuid) async => null;
+
+  @override
+  Future<BleRuntimeCommonResult> setRuntimeCommonNotifications(String uuid, {
+    required int sessionGeneration, required int attemptGeneration,
+    required int revision, required bool enabled,
+  }) async => const BleRuntimeCommonResult(status: BleRuntimeCommonStatus.unavailable);
+
+  @override
+  Future<BleRuntimeCommonResult> disconnectForRuntimeNotificationRecovery(String uuid, {
+    required int sessionGeneration, required int attemptGeneration,
+    required int revision,
+  }) async => const BleRuntimeCommonResult(status: BleRuntimeCommonStatus.unavailable);
 
   @override
   Future<void> initConfigs(List<BleConfig> configs) {

@@ -1649,6 +1649,9 @@ extension BleManager {
             // central scan，不能只丢 timer 后让扫描无限运行。
             cancelPairingRecoveryDiscovery(key: key)
             reconnectTasks.removeValue(forKey: key)
+            // Explicit owner revocation retires only that endpoint's runtime
+            // CCCD transaction. Recovery cancels do not enter this path.
+            runtimeCommonNotifications.terminal(uuid: task.uuid)
             loggerD(msg: "autoReconnect: \(task.uuid)-\(task.name), task cancelled")
         }
     }
@@ -1659,6 +1662,7 @@ extension BleManager {
      *  这里只清理 runtime task/alias；是否删除 persisted owner 由调用入口显式决定。
      */
     func cancelAllReconnectTasks() {
+        runtimeCommonNotifications.removeAll()
         reconnectTasks.values.forEach { $0.timer?.invalidate() }
         pairingRecoveryScanTimers.values.forEach { $0.timer.invalidate() }
         if pairingRecoveryScanTimers.values.contains(where: { $0.ownsScan }) {
