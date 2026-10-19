@@ -796,14 +796,16 @@ internal class BleGattSessionCallback(
         // 2. GATT readiness 完成后上报 connectFinish，等待 Dart 业务认证后再进入 connected。
         recordTraceStep(address, "gatt_ready", "success", null, null, null)
         handleConnectState(address, name, BleConnectState.CONNECT_FINISH, mtu)
-        // 3. 建连 hint 不能把已连上的 1M 链路切到 2M；在 GATT ready 后再请求一次。
-        //    PHY 回调异步到达，不得挡住 connectFinish。
-        BleAndroidPreferredPhy.requestLe2m(
-            gatt = gatt,
-            endpoint = address,
-            reason = "connectFinish",
-            logger = { sendLog(BleLoggerTag.d, it) },
-        )
+        // 3. 高可靠模式由 RSSI 自适应独占 PHY 请求，不能在 readiness 后绕过其 1M 偏好。
+        //    普通模式保留 2M hint；PHY 回调异步到达，不得挡住 connectFinish。
+        if (!device.belongConfig.androidHighReliabilityMode) {
+            BleAndroidPreferredPhy.requestLe2m(
+                gatt = gatt,
+                endpoint = address,
+                reason = "connectFinish",
+                logger = { sendLog(BleLoggerTag.d, it) },
+            )
+        }
         sendLog(BleLoggerTag.d, "Connect call back: $address, connect finish")
     }
 
