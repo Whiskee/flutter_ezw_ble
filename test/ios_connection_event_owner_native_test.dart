@@ -20,11 +20,28 @@ void main() {
       '${directory.path}/CoreBluetooth.o',
     ]);
     expect(stub.exitCode, 0, reason: '${stub.stdout}\n${stub.stderr}');
+    // Execute the real terminal flow as well as the coordinator policy. Only
+    // CoreBluetooth cancel/rearm/log boundaries below are test adapters.
+    final flowSource = File('ios/Classes/ble/BleStateRestorationFlow.swift')
+        .readAsStringSync();
+    final flowStart =
+        flowSource.indexOf('func handleStateRestorationEscrowTerminal(');
+    var flowEnd = flowSource.indexOf('{', flowStart);
+    var flowDepth = 0;
+    do {
+      if (flowSource[flowEnd] == '{') flowDepth++;
+      if (flowSource[flowEnd] == '}') flowDepth--;
+      flowEnd++;
+    } while (flowDepth > 0);
+    final flowFile = File('${directory.path}/escrow-flow.swift');
+    await flowFile.writeAsString(
+        'import CoreBluetooth\nimport Foundation\nextension EscrowManagerFixture {\n${flowSource.substring(flowStart, flowEnd)}\n}');
     final executable = '${directory.path}/owner-test';
     final compile = await Process.run('swiftc', [
       '-I',
       directory.path,
       '${directory.path}/CoreBluetooth.o',
+      flowFile.path,
       'ios/Classes/ble/BleConnectionEventOwnershipPolicy.swift',
       'ios/Classes/ble/BleNativeConnectionTrace.swift',
       'ios/Classes/ble/models/BleConnect.swift',
@@ -35,6 +52,7 @@ void main() {
       'ios/Classes/ble/models/BleSecurityGate.swift',
       'ios/Classes/ble/models/BleSnRule.swift',
       'ios/Classes/ble/BleConnectionAdmissionGate.swift',
+      'ios/Classes/ble/BleReconnectFailurePolicy.swift',
       'ios/Classes/ble/BleStateRestorationCoordinator.swift',
       'test/native/connection_event_owner_policy_test.swift',
       '-o',

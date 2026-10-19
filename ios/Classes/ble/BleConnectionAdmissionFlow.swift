@@ -64,7 +64,8 @@ extension BleManager {
         var physicallyConnectedDevice: BleConnectedDevice?
         for index in indexes {
             let device = connectedDevices[index]
-            if device.isConnected, device.peripheral.state == .connected {
+            if device.isConnected, device.peripheral.state == .connected,
+               peripheralValidity.isValid(device.peripheral) {
                 if physicallyConnectedDevice == nil {
                     physicallyConnectedDevice = device
                 }
@@ -521,11 +522,20 @@ extension BleManager {
               !peripheralCancellationBarrierGate.isBlocking(endpointId: admission.endpointId) else {
             return
         }
+        guard peripheralValidity.isValid(peripheral) else {
+            retireUndispatchedReconnectAttempt(peripheral, deferredForObject: true)
+            return
+        }
+        if let task = reconnectTasks[reconnectKey(uuid: admission.endpointId)],
+           deferInvalidParametersRetryIfNeeded(task) {
+            retireUndispatchedReconnectAttempt(peripheral, deferredForObject: false)
+            return
+        }
         switch peripheral.state {
         case .connected:
             enqueuePhysicalConnectionThroughGate(peripheral)
         case .disconnected:
-            connectPeripheral(peripheral, autoReconnect: autoReconnect)
+            guard connectPeripheral(peripheral, autoReconnect: autoReconnect) else { return }
             startPendingPhysicalConnectWatchdog(
                 peripheral,
                 admission: admission,
@@ -545,13 +555,36 @@ extension BleManager {
                 )
             }
         default:
-            connectPeripheral(peripheral, autoReconnect: autoReconnect)
+            guard connectPeripheral(peripheral, autoReconnect: autoReconnect) else { return }
             startPendingPhysicalConnectWatchdog(
                 peripheral,
                 admission: admission,
                 autoReconnect: autoReconnect
             )
             loggerD(msg: "admission gate: \(admission.endpointId), force drive after state settle timeout, generation=\(admission.generation), reason=\(reason)")
+        }
+    }
+
+    /// A physical-dispatch preflight can reject after a foreground/queued path
+    /// registered its admission. Release only that untouched exact object owner;
+    /// otherwise the later retry would see a phantom pending request forever.
+    func retireUndispatchedReconnectAttempt(_ peripheral: CBPeripheral, deferredForObject: Bool) {
+        let uuid = peripheral.identifier.uuidString
+        guard let admission = currentConnectionAdmission(uuid: uuid),
+              let session = peripheralConnectionSessions[admission.sessionId],
+              session.peripheral === peripheral,
+              !session.hasObservedPhysicalContact else { return }
+        removeActiveConnectRequest(uuid: uuid, name: session.deviceName)
+        releaseConnectionAdmissionAndStartNext(admission, invalidateEndpoint: true)
+        let key = reconnectKey(uuid: uuid)
+        if deferredForObject, var task = reconnectTasks[key],
+           task.sessionGeneration == admission.sessionGeneration {
+            // Preserve the endpoint intent. Foreground activation or a validated
+            // fresh advertisement will resolve it; do not poll an invalid object.
+            task.timer?.invalidate()
+            task.timer = nil
+            task.deferredByAppInactivity = true
+            reconnectTasks[key] = task
         }
     }
 
@@ -617,6 +650,7 @@ extension BleManager {
 
     /// pipeline callback 必须同时匹配 generation/session/peripheral 对象身份。
     func isCurrentConnectionPipeline(_ peripheral: CBPeripheral) -> Bool {
+        guard peripheralValidity.isValid(peripheral) else { return false }
         guard let admission = currentConnectionAdmission(uuid: peripheral.identifier.uuidString),
               let session = peripheralConnectionSessions[admission.sessionId] else {
             loggerD(msg: "admission gate: \(peripheral.identifier.uuidString), stale pipeline callback ignored")
@@ -633,6 +667,12 @@ extension BleManager {
 
     /// 真实物理连接回调的唯一入口；只在此刻发 source-tagged contactDevice。
     func enqueuePhysicalConnectionThroughGate(_ peripheral: CBPeripheral) {
+        // Admission identity alone cannot authorize an object invalidated by a
+        // central reset; reject before contact, cache replacement or GATT grant.
+        guard peripheralValidity.isValid(peripheral) else {
+            retireUndispatchedReconnectAttempt(peripheral, deferredForObject: true)
+            return
+        }
         // 1、校验 current admission、session 和 CBPeripheral 对象身份，旧 callback 直接关闭。
         guard let admission = currentConnectionAdmission(uuid: peripheral.identifier.uuidString),
               var session = peripheralConnectionSessions[admission.sessionId],
@@ -730,7 +770,8 @@ extension BleManager {
             releaseOrphanedConnectionAdmission(expected, reason: "missing session at grant")
             return
         }
-        guard session.peripheral.identifier.uuidString.caseInsensitiveCompare(admission.endpointId) == .orderedSame else {
+        guard peripheralValidity.isValid(session.peripheral),
+              session.peripheral.identifier.uuidString.caseInsensitiveCompare(admission.endpointId) == .orderedSame else {
             releaseOrphanedConnectionAdmission(expected, reason: "peripheral identity mismatch at grant")
             return
         }

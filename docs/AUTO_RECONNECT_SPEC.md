@@ -551,6 +551,47 @@ passes it unchanged with activation; another reset between the query and
 activation makes that request stale. Arm-only calls, connection events, old
 timers, and lifecycle compensation preserve the barrier.
 
+Peripherals held before a running transport falls below `poweredOff` are no
+longer reusable objects, even when their UUID still matches the target. A weak
+object registry tracks provenance independently of the Dart recovery epoch:
+ordinary poweredOff/on keeps the existing pending policy, while resetting (or
+unknown after the central has first poweredOn) invalidates prior objects.
+Bootstrap unknown does not discard a fresh willRestoreState object received
+before the central's first state callback. Only a new retrieve, discovery or
+explicit restoration input renews an object; cached reads and late connection
+callbacks never renew it. Inactive owners with no valid object retain intent
+and defer without polling until a validated advertisement or active lookup.
+
+An exact `CBErrorDomain.invalidParameters` failure records an endpoint-owned
+monotonic deadline before terminal cleanup. Retry delays are 1, 2, 4, 8, 16,
+then 30 seconds capped, without a retry exhaustion terminal. Only business
+connected resets the episode; newer Dart sessions or UUID migration preserve
+it. Activation, lifecycle, scan, direct-attempt and final physical-dispatch
+entries share the deadline. The single timer checks owner identity, session,
+transport epoch and job token; cancellation or replacement cannot drive a
+new owner. A physical-dispatch rejection retires only its untouched exact
+admission/request, so it cannot leave a phantom pending owner blocking retry.
+Validated ordinary MAC/SN advertisements wake a current epoch-authorized UUID
+deferred owner before display deduplication, without bypassing Code 14 or OTA
+admission. Code 1 does not consume the Bond/security recovery budget.
+
+Ownerless restoration escrow parks an exact Code 1 terminal instead of rearming
+immediately. Its endpoint backoff transfers on claim and is also visible to any
+intervening scan/lifecycle activation. The normal owner owns the only retry timer;
+claim before deadline returns a deferred ACK without registering a request or
+admission. Invalid pre-reset escrow objects contribute only identity/debt and
+fall back to retrieve/deferred recovery. Ordinary connection events cannot renew
+object provenance, and terminal/physical/GATT boundaries reject invalid or
+non-current objects before UUID-wide teardown or system reconnect adoption.
+
+Executable regression: `fvm flutter test test/ios_reset_reconnect_failure_native_test.dart`
+runs the production policy and extracted production scheduler, physical driver,
+validated-advertisement, callback/adoption and claim methods with fake time and
+platform spies. The escrow coordinator and full scan pipeline have executable
+regressions as well; wiring checks supplement these behavioral tests. Real daemon reset, iPhone background
+scheduling and dual-leg/R1 recovery still require device acceptance; these tests
+do not prove the customer's process termination cause or firmware reset source.
+
 Name-only `identityPending` owners carry the same process-local epoch and an
 `awaitingRecoveryActivation` flag even though no UUID task exists yet. An
 unknown/resetting/off activation retains that exact identity and allocates no

@@ -89,12 +89,14 @@ struct PendingIdentityScanTests {
         expect(frozen.armCalls == 1 && frozen.activateCalls == 1 && frozen.physicalConnectCalls == 0, "ready resolution allocated duplicate physical work")
         discover(frozen, peripheral)
         expect(frozen.armCalls == 1 && BleEC.scanResult.events.count == 2, "resolved owner or ordinary result duplicated")
+        expect(frozen.validatedWakeCalls >= 2, "display dedup swallowed validated UUID wake-up")
 
         // Empty manufacturer packets never become normal scan events while the
         // owner is frozen, and cannot clear or arm the pending identity.
         for invalidData: Data? in [nil, Data()] {
             let (invalid, device, pending) = fixture()
             discover(invalid, device, manufacturer: invalidData)
+            expect(invalid.validatedWakeCalls == 0, "mfr0 reached validated UUID wake-up")
             expect(BleEC.scanResult.events.isEmpty && invalid.scanResultTemp.isEmpty && invalid.pendingReconnectIdentities[pending.key] != nil && invalid.armCalls == 0, "mfr0 leaked or consumed frozen owner")
         }
         let (ready, readyPeripheral, _) = fixture(awaiting: false)
@@ -108,6 +110,7 @@ struct PendingIdentityScanTests {
             autoReconnect: true
         )]
         discover(snRejected, snPeripheral)
+        expect(snRejected.validatedWakeCalls == 0, "SN rejected advertisement reached UUID wake-up")
         expect(BleEC.scanResult.events.isEmpty && snRejected.pendingReconnectIdentities[snOwner.key] != nil && snRejected.armCalls == 0, "frozen advertisement bypassed configured SN filter")
 
         for state in [CBManagerState.unknown, .resetting, .poweredOff] {

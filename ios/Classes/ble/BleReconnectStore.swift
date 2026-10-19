@@ -93,6 +93,11 @@ enum BlePeerPairingFailureAction: String {
  *  该任务只描述“应该继续尝试恢复物理链路”的意图，不代表私有服务或业务认证已恢复。
  */
 struct BleReconnectTask {
+    /// Stable across session updates and UUID migration; hard cancellation drops
+    /// this token so a late retry cannot drive a replacement owner.
+    var ownerToken = UUID()
+    /// Code 1 is an endpoint episode, not a generic reconnect attempt budget.
+    var invalidParametersBackoff = BleInvalidParametersBackoff()
     /// 目标所属配置，用于重建 BleEasyConnect。
     let belongConfig: String
     /// CoreBluetooth peripheral identifier。

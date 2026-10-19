@@ -29,6 +29,9 @@ extension BleManager {
         advertisementData: [String: Any],
         rssi: NSNumber
     ) {
+        // didDiscover supplies a current CoreBluetooth object; a cached object
+        // cannot regain validity merely by being read during reconnect.
+        if centralManager.state == .poweredOn { peripheralValidity.observe(peripheral) }
         // 1. 优先使用广播 local name。CoreBluetooth 的 peripheral.name 可能要到连接后才稳定，
         // 如果只看 peripheral.name，刚安装或未连接过的设备会被误判成“无名称”而搜索不到。
         guard let advertisedName = resolveAdvertisedName(
@@ -123,8 +126,6 @@ extension BleManager {
 
         // ready owner 解析优先于展示去重；重复普通广播仍只发布一次，旧 S1
         // 在 resolver 内保持冻结，不会因为展示缓存或新扫描窗口获得连接许可。
-        guard !isCachedInCurrentScanWindow else { return }
-
         // Code 14 恢复必须等待失败之后的新目标广告；该分支只消费精确 owner，不把结果
         // 暴露为普通扫描设备，也不依赖制造商数据，避免配对失配期间漏掉同一已绑定戒指。
         if resumePeerPairingRecoveryIfMatched(
@@ -167,6 +168,13 @@ extension BleManager {
             return
         }
 
+        // A valid new object can wake a deferred UUID owner even if this UUID
+        // was already displayed in the same scan window before reset.
+        resumeDeferredReconnectFromFreshAdvertisement(
+            peripheral: peripheral, advertisedName: advertisedName,
+            belongConfig: bleConfig.name, sn: deviceSn, mac: deviceMac, rssi: rssi.intValue
+        )
+        guard !isCachedInCurrentScanWindow else { return }
         // 10. 设备身份完整后，缓存并按 matchCount 决定是否聚合上报。
         emitMatchedScanResult(
             peripheral: peripheral,
@@ -417,6 +425,9 @@ extension BleManager {
             mac: mac,
             advertisedName: advertisedName
         )
+        // A deferred-owner wake may already have installed this fresh object;
+        // keep matchCount aggregation at one cache entry per endpoint.
+        scanResultTemp.removeAll { $0.0.uuid == bleDevice.uuid }
         scanResultTemp.append((bleDevice, peripheral))
 
         // 2. 单设备配置立即发送。
