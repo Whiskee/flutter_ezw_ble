@@ -173,7 +173,7 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `initConfigs` | `Future<void> initConfigs(List<BleConfig> configs)` | **必须最先调用**。把多份配置一次性下发给原生层；下发参数是 `configs.map((c) => c.customToJson())`（保证嵌套 model 也序列化）。 |
 | `startScan` | `Future<BleScanStartResult> startScan({bool turnOnPureModel = false, List<String> iosServiceUuids = const [], bool includeUnfilteredScan = true, bool includeNormalScanResults = false, bool includeUnfilteredPureScanResults = true})` | 启动扫描并确认正 generation。iOS 后台 DFU 使用 FE59 服务过滤；前台普通 owner 保持 nil-service 扫描。pure 与普通需求并存时独立解析、独立去重。DFU-only 将 `includeUnfilteredPureScanResults` 置 false，让 raw 仅匹配服务提示；双模式识别保留 true，允许未广播 FE59 的应用态候选，身份匹配仍由业务 owner 校验。Android 忽略 iOS 参数，保持原有 pure 行为。 |
 | `stopScan` | `Future<void> stopScan()` | 显式停止扫描。 |
-| `connectDevice` | `Future<void> connectDevice(String belongConfig, String uuid, String name, {String? sn, bool? afterUpgrade, bool directConnect = false})` | 发起连接。`belongConfig` 必须命中 `initConfigs` 注册过的配置名；`name` 在 iOS 端定位，`sn` 仅 Android 用；`afterUpgrade=true` 时走 OTA 后的特殊重连路径；`directConnect=true` 表示调用方明确接受本地/系统缓存直连，不再要求当前扫描窗口可见；默认 `false` 仍保持 scan-first。 |
+| `connectDevice` | `Future<void> connectDevice(String belongConfig, String uuid, String name, {String? sn, bool? afterUpgrade, bool directConnect = false, int? sessionGeneration})` | 发起连接。`belongConfig` 必须命中 `initConfigs` 注册过的配置名；`name` 在 iOS 端定位，`sn` 仅 Android 用；`afterUpgrade=true` 时走 OTA 后的特殊重连路径；`directConnect=true` 表示调用方明确接受本地/系统缓存直连，不再要求当前扫描窗口可见；默认 `false` 仍保持 scan-first。 |
 | `armAutoReconnectTargets` | `Future<void> armAutoReconnectTargets(List<BleDevice> devices)` | 只登记长期自动回连 owner，不立即打开 GATT/CoreBluetooth connect。保留给业务成功后的持久化与兼容调用。 |
 | `activateAutoReconnectTargets` | `Future<List<BleReconnectActivationResult>> activateAutoReconnectTargets(List<BleDevice> devices, {BleConnectSource source = BleConnectSource.autoReconnect, BleReconnectActivationMode mode = BleReconnectActivationMode.initial, int sessionGeneration = 0, int recoveryEpoch = 0, BleG2OtaContext? otaContext})` | 对全部目标立即建立/复用/对账原生 pending 直连并逐目标返回接管结果；`resolved` 表示已有稳定身份，`identityPending` 表示 iOS 已按配置与完整名称持有待解析 owner，`rejected` 表示原生没有接管。`ownerDisposition` 进一步区分 `created/reused/repaired/deferred/rejected`，上层复用 batch 时必须用 `reconcile` 重新确认实时 owner，不能把历史 ACK 等同于当前 native owner。`promotion` 使用手动提升语义，不创建重复连接。iOS transport reset 后还必须携带刚读取的 exact `recoveryEpoch`，连续 reset 的旧周期请求不得消费新门禁。G2 OTA 专用恢复可携带 `otaContext`，native 仅对当前 transaction 的未完成 endpoint 准入；普通 activation 不得绕过 OTA transaction 门禁。 |
 | `notifyAutoReconnectTargetVisible` | `Future<bool> notifyAutoReconnectTargetVisible({required String uuid, String name = ''})` | 上层并行扫描重新看到目标时提示原生。Android 接管该 UUID 尚未物理连接的 exact passive GATT 或其 pending retry，并在全局单槽位中执行一次 `autoConnect=false` 直连；随后仍保留长期 passive owner。iOS 保持普通 pending connect owner，固定返回 `false`。 |
@@ -181,8 +181,9 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `devicePreConnected` | `Future<void> devicePreConnected(String uuid)` | G1/R1 兼容的“预连接”通知；G2 禁止使用该 UUID-only 接口。 |
 | `deviceConnected` | `Future<void> deviceConnected(String uuid)` | G1/R1 兼容的业务 connected 提交；G2 禁止使用该 UUID-only 接口。 |
 | `prepareBusinessConnection` | `Future<BleBusinessConnectionStatus> prepareBusinessConnection(BleBusinessConnectionAttempt attempt)` | G2 exact-attempt 预连接入口。`attempt` 必须来自同一次 `connectFinish` 的 `uuid/sessionGeneration/attemptGeneration`；同 token 幂等刷新有界鉴权宽限，不同 token 替换旧 lease。拒绝只返回状态，不取消长期 autoReconnect owner。 |
-| `commitBusinessConnection` | `Future<BleBusinessConnectionStatus> commitBusinessConnection(BleBusinessConnectionAttempt attempt)` | G2 exact-attempt 真连接入口。原生同时校验 prepare lease、当前 admission、物理连接、当前 GATT/CBPeripheral 身份，以及 write/read/notify readiness；只有成功发布 `connected` 后返回 `accepted`。 |
+| `commitBusinessConnection` | `Future<BleBusinessConnectionStatus> commitBusinessConnection(BleBusinessConnectionAttempt attempt, {bool armAutoReconnect = true})` | G2 exact-attempt 真连接入口。原生同时校验 prepare lease、当前 admission、物理连接、当前 GATT/CBPeripheral 身份，以及 write/read/notify readiness；只有成功发布 `connected` 后返回 `accepted`。Android Temp 首配可传 `armAutoReconnect: false`，仅跳过本次成功后的长期 owner 登记，仍发布同代 `connected` 并释放 Gate；iOS 保留既有行为。 |
 | `abortBusinessConnection` | `Future<bool> abortBusinessConnection(BleBusinessConnectionAttempt attempt)` | 只撤销完全匹配的 prepare lease；旧 token abort 不能删除新 lease，也不能断开 GATT、移除 autoReconnect owner 或伪造用户断连。 |
+| `invalidateBusinessConnection` | `Future<bool> invalidateBusinessConnection(BleBusinessConnectionAttempt attempt)` | iOS G2 心跳兜底入口。只接受当前已提交、仍物理 connected、开启 autoReconnect、正 session/attempt 且未被新 admission/OTA 替代的业务 owner；先建立 cancellation barrier，再以上一业务代次发布 `timeout`，保留长期回连意图。陈旧、重复、OTA 中或 Android 调用返回 `false`。 |
 | `sendCmd` | `Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0, bool allowDuringUpgrade = false, int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0, BleG2OtaContext? otaContext, BleBusinessConnectionAttempt? expectedAttempt})` | 普通命令 Future 到 channel/入队边界；可选 expectedAttempt 在 Android 原队列 dequeue 时复验 exact GATT。`psType` 是"私有服务类型"，对应 `BlePrivateService.type`（0=基础，1=OTA，2+=自定义）。升级态默认阻断非 OTA 写入；只有上层协议白名单确认的 AUTH、时间同步等恢复控制指令可显式传 `allowDuringUpgrade=true`。OTA 控制包携带正 `expectedSessionGeneration/expectedAttemptGeneration` 时，native 必须在实际 dispatch 前按当前物理 owner 校验；携带 `otaContext` 时还必须命中当前 G2 OTA transaction，避免旧 START/INFORMATION/RESULT 写入新 GATT 或越权清理。 |
 | `sendCmdNoWait` | `Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0, int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0, BleG2OtaContext? otaContext})` | OTA 连发入口。Android：`psType == 1` 走 per-endpoint `WRITE_TYPE_NO_RESPONSE` 队列；同步 BUSY 保留原包，Future 等本包 `onCharacteristicWrite` 成功后返回，4s 停滞/teardown typed fail，避免固定延时撞 GATT 单槽位。iOS：`psType == 1` 走 `WriteWithoutResponse` + `canSendWriteWithoutResponse` 背压队列（见 `ios/Classes/ble/OtaWriteQueue.swift` 与 `docs/IOS_OTA_NOWAIT_SPEC.md`）。OTA RAW 携带正 expected pair 时，native 在入队/提交前按当前物理 owner 校验；携带 `otaContext` 时还必须命中当前 G2 OTA transaction。其它 `psType` 保持历史 no-wait 语义。 |
 | `sendOtaPacketBatch` | `Future<void> sendOtaPacketBatch(String uuid, List<Uint8List> framedPackets, {int psType = 1, int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0})` | 批量接收已封装 OTA 小包但仍逐包提交；Future 等最后一包提交，失败丢弃本批剩余包。每包复验冻结的 exact physical pair。 |
@@ -228,8 +229,8 @@ enum BleEventChannel {
 | --- | --- | --- | --- |
 | `bleState` | `int`（iOS CoreBluetooth state 值，扩展 `6 = noLocation` 给 Android） | `BleState` | 蓝牙开关、定位权限变化。Android 主动查询、Activity start/resume 与扫描入口都会重新读取实时权限和开关，仅在状态变化时 push。 |
 | `scanResult` | JSON 字符串 | `BleMatchDevice.fromJson` | 一次扫描命中（按 `BleScan.matchCount` 已聚合好的"组合设备"）。 |
-| `connectStatus` | JSON 字符串 | `BleConnectModel.fromJson` | 连接流程的每一步推进（见 §8）；携带 `source`、兼容键 `generation`、`sessionGeneration` 与 `attemptGeneration`。`generation` 始终序列化为 Dart session generation；旧 payload 分别回退为 `unknown` / `0`。 |
-| `receiveData` | Map：`{uuid, psType, data:Base64, isSuccess, sessionGeneration, attemptGeneration, otaTransactionId, otaGeneration, otaInstanceId}` | `BleCmd.receiveMap` | 来自原生的特征值数据。**注意 `data` 字段是 Base64**，业务侧拿到的 `BleCmd.data` 已经是 `Uint8List`，背后由 `flutter_ezw_utils.encodeBase64()` 解码。`sessionGeneration/attemptGeneration` 由 Android 原 callback 冻结 exact GATT owner 后发布，旧事件或 unknown 为 0；非 OTA 同样保留 known identity。G2 OTA 事务持有期间还会附带 transaction 字段；Dart 必须同时校验 transaction 与 physical pair 后才消费 ACK/Notify。 |
+| `connectStatus` | JSON 字符串 | `BleConnectModel.fromJson` | 连接流程的每一步推进（见 §8）；可选 `pairingPhase` 表示 Android 配对控制进度（见 §11.4），不作为真实物理连接证据；携带 `source`、兼容键 `generation`、`sessionGeneration` 与 `attemptGeneration`。`generation` 始终序列化为 Dart session generation；旧 payload 分别回退为 `unknown` / `0`。 |
+| `receiveData` | Map：`{uuid, psType, data:Base64, isSuccess, sessionGeneration, attemptGeneration, receiveIdentity:{uuid,sessionGeneration,attemptGeneration}, otaTransactionId, otaGeneration, otaInstanceId}` | `BleCmd.receiveMap` | 来自原生的特征值数据。**注意 `data` 字段是 Base64**，业务侧拿到的 `BleCmd.data` 已经是 `Uint8List`，背后由 `flutter_ezw_utils.encodeBase64()` 解码。`receiveIdentity` 是冻结的通知归属；Android 来自原 callback 的 exact GATT owner，iOS 来自当前 admission 或业务已接受 owner。旧事件、unknown 或非法 pair 不填 nested identity。G2 OTA 事务持有期间还会附带 transaction 字段；Dart 必须同时校验 transaction 与 physical pair 后才消费 ACK/Notify。 |
 | `logger` | String，含 `[d]-` / `[e]-` 前缀 | `String` | 仅 iOS 主动 push；业务侧自行根据前缀分级。 |
 
 iOS 的非 `poweredOn` 状态继续沿用既有连接 teardown；但只有公开状态
@@ -239,6 +240,10 @@ iOS 的非 `poweredOn` 状态继续沿用既有连接 teardown；但只有公开
 > **修改提示**：`receiveData` 的 `data` 走 Base64 是为了避开 MethodChannel 二进制流跨 isolate 的成本；新增二进制通道时建议沿用这套约定。
 
 `receiveData` 是纯传输边界，Android、iOS 与 Dart 都必须保留通知 payload 的完整字节序列，不在本层解析、截断或重排。G2 音频流当前可能携带 `200 字节 LC3 + 4 字节方向/角色标签 + 1 字节帧序号`；这些尾部字节由上层 `even_connect` 按协议拆分，再由音频算法解释。本仓回归测试固定覆盖 205 字节帧的 Base64 往返，避免依赖升级时静默丢失方向或说话人元数据。
+
+iOS 的 `receiveIdentity` 分两个生命周期取值：业务 `connected` / Gate 释放前只接受当前 admission，且必须同时命中同一 `CBPeripheral` 对象、`connected` 状态、当前配置的 read characteristic 对象和 `isCurrentConnectionPipeline`；缺失、0/负 generation、旧 session 或旧 attempt 都 fail-closed，active admission 存在但无法冻结身份时直接丢弃通知。业务已接受后，普通 R1 notify/健康推送可使用 reconnect owner 保留的最后成功 `(sessionGeneration, attemptGeneration)`，但仍要命中同一已连接 peripheral 和当前 read characteristic；这条后置路径只服务已通过业务连接的接收流，不得拿旧 reconnect task history 回填 pre-AUTH provenance。
+
+CoreBluetooth 不提供每条通知的底层 GATT handle token。iOS 的冻结身份只能证明当前 delegate 回调通过了 `CBPeripheral` 引用、连接状态、characteristic 对象和 admission/accepted-owner 检查，不能声称具备 Android callback handle 同级的硬件身份；若系统复用同一 `CBPeripheral/CBCharacteristic` 对象，本层没有更深 token 可区分。
 
 ### iOS 连接缓存约束
 
@@ -265,6 +270,8 @@ class BleConfig {
   final int    autoReconnectMaxAttempts;      // 兼容/日志字段，不再作为停止条件
   final bool   autoReconnectUseNativePassive; // 是否允许平台被动回连，默认 true
   final bool   androidHighReliabilityMode;    // Android 1M 建链 + RSSI/流量自适应，默认 false
+  final double? androidBondTimeout;          // Android 独立 Bond 等待毫秒；null 保留 connectTimeout
+  final bool androidSerializeUnbonded;       // 未 Bond 腿建链前使用共享 Gate，默认 false
 }
 ```
 
@@ -354,6 +361,7 @@ class BleConnectModel {
   final int sessionGeneration;        // Dart reconnect batch epoch；JSON 兼容键 generation 也写这个值
   final int attemptGeneration;        // 原生 Gate attempt epoch；只用于诊断与迟到 callback 归属
   final BleNativeConnectionTrace? nativeTrace; // 可选原生物理连接 Trace 快照
+  final String? pairingPhase;          // queuedBeforePhysical / bonding / bonded；旧平台为空
   int get generation => sessionGeneration; // 旧调用方兼容别名
 }
 ```
@@ -376,7 +384,7 @@ class BleCmd {
 
 接收端调用静态构造 `BleCmd.receiveMap(Map)` 走 Base64 解码；发送端直接构造对象但目前没有发送序列化路径——发送统一走 `EzwBle.to.bleMC.sendCmd(uuid, Uint8List)`。
 
-`BleReceiveIdentity` 是 immutable `{uuid, sessionGeneration, attemptGeneration}` 值；仅非空 UUID 和正整数 pair 为 known，缺失/非法 metadata 返回 null。JSON 嵌套 round-trip 保留 metadata，固件 payload 不变。来源只取原 callback 的 exact retained/admitted GATT，不从 terminal trace 或稍后当前连接反查。
+`BleReceiveIdentity` 是 immutable `{uuid, sessionGeneration, attemptGeneration}` 值；仅非空 UUID 和正整数 pair 为 known，缺失/非法 metadata 返回 null。JSON 嵌套 round-trip 保留 metadata，固件 payload 不变。来源只取原 callback 的 exact retained/admitted transport：Android 使用 GATT callback owner，iOS 使用 pre-AUTH current admission 或 business accepted owner，不从 terminal trace、reconnect 历史 fallback 或稍后当前连接反查。
 
 普通 `sendCmd(expectedAttempt: ...)` 校验同 UUID/正整数 pair，Android 在原队列实际取出时再次校验 exact retained GATT。过期项丢弃，不发 UUID-only 失败污染新请求，不触发重连。它不是取消/物理排空 API；iOS 显式返回 `owned_write_unsupported`，省略参数维持旧行为，OTA no-wait 契约不变。
 
@@ -464,7 +472,7 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 
 ### 8.4 连接前扫描策略：`directConnect` vs scan-first
 
-`connectDevice(..., directConnect: false)` 仍是普通发现页/首次前台连接的兼容路径。**冷启动恢复、蓝牙关闭后恢复、自动回连和已绑定设备的手动重连不再走本节的 scan-first 路由**；这些场景统一调用 `activateAutoReconnectTargets`，先对所有目标建立/复用 pending 直连，上层可同时扫描最多 20s 用于补缓存，但扫描不是连接前置条件。
+`connectDevice` 可选 `sessionGeneration`：Android 在扫描等待前冻结正的 Dart request session，建链前排队和真正 callback 共用该 session 与一次分配的 native attempt；未传/非正数保留原分配规则。iOS 兼容接收但沿用自己的 allocator。此可选值服务新的前台请求；已有 formal Supervisor pending owner 仍按原有 UUID promotion 复用，不通过普通 `connectDevice` 接管为另一个 session，跨 formal owner 代次切换使用既有 activation/rebind。`connectDevice(..., directConnect: false)` 仍是普通发现页/首次前台连接的兼容路径。**冷启动恢复、蓝牙关闭后恢复、自动回连和已绑定设备的手动重连不再走本节的 scan-first 路由**；这些场景统一调用 `activateAutoReconnectTargets`，先对所有目标建立/复用 pending 直连，上层可同时扫描最多 20s 用于补缓存，但扫描不是连接前置条件。
 
 普通首次连接的兼容行为如下：
 
@@ -491,11 +499,18 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 
 - 任一非"连接中"终态（connected / 断开 / 错误）到达 → `handleConnectState` 清除该定时器。
 - `connectFinish`（BLE 物理连接完成、但应用层鉴权尚未完成）**不清除**定时器，作为鉴权阶段的安全兜底。
-- **鉴权宽限（重点）**：G1/R1 继续通过 `devicePreConnected(uuid)` / `deviceConnected(uuid)` 进入有界宽限并提交业务 connected。G2 必须从 `connectFinish` 冻结 `uuid/sessionGeneration/attemptGeneration`，通过 `prepareBusinessConnection(attempt)` / `commitBusinessConnection(attempt)` 完成两阶段提交；旧 attempt 只能 exact abort，不能删除新 lease。无论哪条路径，宽限二次到期仍未 connected 都强制上报 `timeout`，避免永久卡在 `connectFinish`。
+- **鉴权宽限（重点）**：G1/R1 继续通过 `devicePreConnected(uuid)` / `deviceConnected(uuid)` 进入有界宽限并提交业务 connected。G2 必须从 `connectFinish` 冻结 `uuid/sessionGeneration/attemptGeneration`，通过 `prepareBusinessConnection(attempt)` / `commitBusinessConnection(attempt)` 完成两阶段提交；旧 attempt 只能 exact abort，不能删除新 lease。业务 connected 后，iOS 普通 notify 可在外层 `sessionGeneration/attemptGeneration` 携带已接受业务 pair 作为存活证据；命令准入仍以 `receiveIdentity` 与业务层 current-command 校验为准。无论哪条路径，宽限二次到期仍未 connected 都强制上报 `timeout`，避免永久卡在 `connectFinish`。
 
 ### 8.6 原生自动回连（`autoReconnect`）
 
 `BleConfig.autoReconnect = true` 后，Android/iOS 原生层会在设备已经达到业务 `connected` 后注册一个长期回连意图。这个意图只处理系统异常断连和连接流程失败，不处理用户主动断连。
+
+Android 尚未完成整机首配的 Temp 可在 exact `commitBusinessConnection` 中设置
+`armAutoReconnect: false`，将重试继续交给原 Dart 请求，避免单腿成功后 supervisor
+生成另一 session、手动重试又被 pending promotion 复用。该参数默认 `true`，缺省的旧
+MethodChannel 调用和 UUID-only `deviceConnected` 仍登记 owner；iOS 忽略此 Android
+策略。`false` 不撤销已经存在的 owner，进入 Temp 前仍须完成既有 formal-to-Temp 释放
+屏障。整机业务成功并提交绑定意图后，由 `armAutoReconnectTargets` 补种正式长期目标。
 
 本次回连契约：
 
@@ -773,6 +788,10 @@ connectFinish 上报给 Dart
 - 当前已经 `CONNECTED/UPGRADE`：迟到的 bond 失败不应覆盖连接成功态。
 - 当前已经 `TIMEOUT/DISCONNECT_FROM_SYS`：bond 失败通常是后续副作用，应避免再次把语义改成 `BOUND_FAIL`，否则上层会把可重试链路误判成 777 终态。
 
+Android G2 额外设置 `androidSerializeUnbonded=true`：foreground 与 Supervisor 在创建未 Bond 腿的 GATT 前取得同一个全局 Gate；排队期间没有 GATT，不启动 pre-physical deadline 或连接 timer。已 Bond/R1 与未启用配置保留现有 pending 行为。owner 直到业务 commit 或终态才释放；取消、reset、解绑先撤销待建链 reservation，旧 GATT 关闭后 next dispatcher 才允许打开下一腿。
+
+`androidBondTimeout` 未配置时保留原计时；G2 设置 30000ms，仅在系统 Bond 阶段暂停并失效旧普通 timer。30 秒到期先重读系统 `bondState`：已经 `BONDED` 则 exact owner 只恢复一次，否则按安全失败拆掉本 attempt；成功后重新启动 GATT/AUTH 的普通 20 秒 timer，重复广播/物理回调不得延长或丢失当前 phase。`connectStatus` 的 `pairingPhase=queuedBeforePhysical/bonding/bonded` 始终携带同一正 session/native attempt、UUID/name/source；它在 Trace 关闭时仍发送，`connectState=connecting` 仅供上层校验本次 request 后控制等待展示，不修改 native 设备状态、不伪造 contact。整轮 120 秒硬上限由上层连接层独立维护。
+
 Android G2/R1 的系统 Bond 与后续安全/业务认证是独立阶段：G2/R1 保持 `initiateBinding=true`，未 Bond 时由 `createBond()` 作为唯一系统配对入口；G2 随后仍须写 5403 验证共享密钥，R1 在 `connectFinish` 后仍须完成协议 `pairAuth`。G1 保持 `initiateBinding=false`。G2 缺少 5403 时直接兼容旧固件 readiness；发现服务后的补 Bond 只用于历史 false-config 或 Bond 状态竞态，不是正常新固件流程。
 
 ### 11.5 Android 连接回调状态码的处理原则
@@ -965,7 +984,7 @@ autoReconnect owner，并在 terminal ledger 中保留 `committed/alreadyCommitt
 返回对应旧凭据的 `invalidated`，不得触碰新实例中的其他 owner；同实例未知事务仍保持未知。
 
 iOS notification 仍不具备 Android GATT callback handle 同级的 enqueue-time 身份。iOS 只能在
-当前 CBPeripheral、reconnect owner metadata 和 OTA transaction 同时一致时 stamp
+当前 CBPeripheral、冻结的 `receiveIdentity` 和 OTA transaction 同时一致时 stamp
 `otaTransactionId/otaGeneration/otaInstanceId`；Dart 消费前仍需同时校验 transaction 与
 physical pair，迟到或无法归属的通知交给 5s/30s/90s watchdog 收口。
 

@@ -178,6 +178,10 @@ class BleManager: NSObject {
     // the same endpoint replaces the old one, while stale abort/cleanup paths
     // must not remove a newer token.
     let businessConnectionLeases = BleBusinessConnectionLeaseRegistry()
+    // Heartbeat invalidation is a one-shot teardown per accepted business
+    // attempt. Repeated watchdog completions from Dart must not create multiple
+    // timeout events or cancellation barriers for the same committed session.
+    var invalidatedBusinessConnectionAttempts: Set<String> = []
     // Protected-write security gates sit between normal GATT readiness and
     // connectFinish; success belongs only to the exact active admission.
     let securityGateAttempts = BleSecurityGateAttemptRegistry()
@@ -1116,6 +1120,9 @@ extension BleManager {
             return .missingPrepare
         }
         loggerD(msg: "setConnected: \(uuid) connected")
+        // A fresh business commit supersedes any one-shot heartbeat invalidation
+        // debt from the previous owner of this endpoint.
+        clearBusinessInvalidations(uuid: uuid)
         //  移除预连接状态
         preConnectedDevices.remove(uuid)
         businessConnectionLeases.remove(endpointKey: reconnectKey(uuid: uuid))
@@ -1195,6 +1202,47 @@ extension BleManager {
         return true
     }
 
+    /**
+     * Invalidate a stale committed G2 business session from the heartbeat layer.
+     *
+     * This is intentionally narrower than `disconnect`: it preserves the
+     * long-lived autoReconnect owner, refuses stale/OTA/replaced attempts, then
+     * drives the existing timeout teardown with the original business epoch so
+     * Dart leaves the old connected state and native reconnects normally.
+     */
+    func invalidateBusinessConnection(_ attempt: BleBusinessConnectionAttempt) -> Bool {
+        let key = businessInvalidationKey(attempt)
+        guard let context = businessInvalidationContext(attempt: attempt),
+              BleBusinessConnectionInvalidationPolicy.accepts(context.snapshot) else {
+            loggerD(msg: "businessConnection invalidate rejected: uuid=\(attempt.uuid), sessionGeneration=\(attempt.sessionGeneration), attemptGeneration=\(attempt.attemptGeneration)")
+            return false
+        }
+        invalidatedBusinessConnectionAttempts.insert(key)
+        // A committed owner wins over any stale escrow for the same UUID. Remove
+        // only the overlapping escrow bookkeeping; do not cancel the physical
+        // peripheral here because the timeout path below owns the real teardown.
+        discardOverlappingStateRestorationEscrow(
+            uuid: attempt.uuid,
+            reason: "businessHeartbeat invalidate"
+        )
+        // Establish the cancellation barrier before publishing timeout. The
+        // subsequent CoreBluetooth didDisconnect may lack a token, so the
+        // barrier prevents that old teardown from killing the next generation.
+        beginPeripheralCancellationBarrier(context.device.peripheral)
+        handleConnectState(
+            uuid: attempt.uuid,
+            name: context.device.peripheral.name ?? "",
+            state: .timeout,
+            source: .autoReconnect,
+            generation: attempt.sessionGeneration,
+            attemptGeneration: attempt.attemptGeneration,
+            traceCauseDomain: "businessHeartbeat",
+            tag: "business heartbeat invalidation"
+        )
+        loggerD(msg: "businessConnection invalidate accepted: uuid=\(attempt.uuid), sessionGeneration=\(attempt.sessionGeneration), attemptGeneration=\(attempt.attemptGeneration)")
+        return true
+    }
+
     private func validateBusinessConnectionAttempt(
         _ attempt: BleBusinessConnectionAttempt,
         requirePrepare: Bool
@@ -1228,6 +1276,136 @@ extension BleManager {
             isPeripheralConnected: session?.peripheral.state == .connected,
             isGattReady: readiness?.isComplete == true
         )
+    }
+
+    private func businessInvalidationKey(_ attempt: BleBusinessConnectionAttempt) -> String {
+        "\(attempt.uuid.lowercased())#\(attempt.sessionGeneration)#\(attempt.attemptGeneration)"
+    }
+
+    private func clearBusinessInvalidations(uuid: String) {
+        let normalized = uuid.lowercased()
+        // Set does not support the RangeReplaceableCollection removeAll(where:)
+        // overload on the Swift toolchains used by the app build. Rebuild the
+        // debt set so session exit clears only attempts for this endpoint.
+        invalidatedBusinessConnectionAttempts = invalidatedBusinessConnectionAttempts.filter { key in
+            !key.hasPrefix("\(normalized)#")
+        }
+    }
+
+    private func isG2BusinessConfig(_ config: BleConfig, peripheralName: String) -> Bool {
+        let evidence = ([config.name, peripheralName] + config.scan.nameFilters)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+        // The heartbeat stale-session breaker is scoped to G2. The production
+        // configs and advertisements both carry G2 in either the config name,
+        // scan filters, or peripheral name; R1/ring configs fail closed here.
+        return evidence.contains { $0.contains("g2") }
+    }
+
+    private func reconnectTaskForBusinessOwner(
+        uuid: String,
+        name: String
+    ) -> BleReconnectTask? {
+        let key = reconnectKey(uuid: uuid)
+        return reconnectTasks[key] ?? reconnectTasks.values.first { task in
+            isSameConnectTarget(
+                storedUuid: task.uuid,
+                storedName: task.name,
+                uuid: uuid,
+                name: name
+            )
+        }
+    }
+
+    private func businessInvalidationContext(
+        attempt: BleBusinessConnectionAttempt
+    ) -> (
+        device: BleConnectedDevice,
+        snapshot: BleBusinessConnectionInvalidationSnapshot
+    )? {
+        let device = connectedDevices.first { device in
+            device.peripheral.identifier.uuidString.caseInsensitiveCompare(attempt.uuid) == .orderedSame
+        }
+        let name = device?.peripheral.name ?? ""
+        let task = reconnectTaskForBusinessOwner(uuid: attempt.uuid, name: name)
+        let ownerMetadata = device.flatMap { committedBusinessConnectionMetadata(for: $0.peripheral) }
+        let hasNewerAdmission = currentConnectionAdmission(uuid: attempt.uuid) != nil
+        let otaBusy = upgradeStateRegistry.contains(attempt.uuid) ||
+            g2OtaTransactions.isEndpointOwned(attempt.uuid)
+        let matchesAttempt = ownerMetadata?.sessionGeneration == attempt.sessionGeneration &&
+            ownerMetadata?.attemptGeneration == attempt.attemptGeneration
+        let snapshot = BleBusinessConnectionInvalidationSnapshot(
+            attempt: attempt,
+            hasCommittedDevice: device?.isConnected == true,
+            isSamePeripheral: ownerMetadata != nil,
+            isPeripheralConnected: device?.peripheral.state == .connected,
+            isG2Config: device.map { isG2BusinessConfig($0.belongConfig, peripheralName: name) } ?? false,
+            autoReconnectEnabled: device?.belongConfig.autoReconnect == true,
+            hasReconnectIntent: task != nil,
+            reconnectIntentMatchesAttempt: matchesAttempt,
+            hasNewerAdmission: hasNewerAdmission,
+            isOtaBusy: otaBusy,
+            alreadyInvalidated: invalidatedBusinessConnectionAttempts.contains(
+                businessInvalidationKey(attempt)
+            )
+        )
+        guard let device else {
+            return nil
+        }
+        return (device, snapshot)
+    }
+
+    /// Returns the accepted business epoch only for the current committed owner.
+    /// This is used for liveness metadata and for keeping stale SR escrow from
+    /// swallowing a real post-commit system disconnect.
+    private func committedBusinessConnectionMetadata(
+        for peripheral: CBPeripheral
+    ) -> BleExplicitCancellationMetadata? {
+        guard let device = connectedDevices.first(where: {
+            $0.peripheral === peripheral && $0.isConnected
+        }) else {
+            return nil
+        }
+        let task = reconnectTaskForBusinessOwner(
+            uuid: device.peripheral.identifier.uuidString,
+            name: device.peripheral.name ?? ""
+        )
+        guard let metadata = BleExplicitCancellationMetadataPolicy.resolve(
+            currentAdmission: nil,
+            reconnectTask: task
+        ),
+              metadata.sessionGeneration > 0,
+              metadata.attemptGeneration > 0,
+              task?.lastConnectedGeneration == metadata.sessionGeneration,
+              task?.lastConnectedAttemptGeneration == metadata.attemptGeneration else {
+            return nil
+        }
+        return metadata
+    }
+
+    private func currentAdmissionOwnsPeripheral(_ peripheral: CBPeripheral) -> BleConnectionAdmission? {
+        guard let admission = currentConnectionAdmission(uuid: peripheral.identifier.uuidString),
+              let session = peripheralConnectionSessions[admission.sessionId],
+              session.peripheral === peripheral else {
+            return nil
+        }
+        return admission
+    }
+
+    private func connectionEventOwner(
+        for peripheral: CBPeripheral
+    ) -> (owner: BleConnectionEventOwner, admission: BleConnectionAdmission?, committed: BleExplicitCancellationMetadata?) {
+        let admission = currentAdmissionOwnsPeripheral(peripheral)
+        let committed = committedBusinessConnectionMetadata(for: peripheral)
+        let owner = BleConnectionEventOwnershipPolicy.resolve(
+            hasActiveRequest: findActiveConnectRequest(peripheral: peripheral) != nil,
+            hasCurrentAdmissionForPeripheral: admission != nil,
+            hasCommittedBusinessOwner: committed != nil
+        )
+        return (owner, admission, committed)
+    }
+
+    private func shouldStateRestorationEscrowHandleTerminal(_ peripheral: CBPeripheral) -> Bool {
+        connectionEventOwner(for: peripheral).owner == .stateRestorationEscrow
     }
     
     /**
@@ -3966,6 +4144,9 @@ extension BleManager {
         var deferredAdmissionTeardown = false
         //  2、设备连接状态为失败或断连就要设置连接设备连接状态为false
         let cacheIndexes = connectionCacheIndexes(uuid: uuid, name: name)
+        if shouldCloseTransport {
+            clearBusinessInvalidations(uuid: uuid)
+        }
         if shouldCloseTransport, cacheIndexes.isNotEmpty {
             // 历史版本可能因 retrieve 返回不同对象而留下同 UUID 多条缓存。
             // 终态必须失效全部条目，不能只更新第一条后让回连看到另一条假已连接记录。
@@ -4297,7 +4478,13 @@ extension BleManager: CBCentralManagerDelegate {
             // 当成 claim 前的 "hold before claim" 吞掉，直到 60 s pending watchdog 才发现
             // （2026-09-02 真机 SR：左腿系统连上后 21 s 才进 GATT，题词 / Dashboard 因
             // 单腿未连失败）。watchdog 仍是丢回调时的兜底，此处不改变它。
-            if findActiveConnectRequest(peripheral: peripheral) != nil {
+            let eventOwner = connectionEventOwner(for: peripheral)
+            switch eventOwner.owner {
+            case .activeRequest:
+                discardOverlappingStateRestorationEscrow(
+                    uuid: uuid,
+                    reason: "connectionEvent active request"
+                )
                 recordAutoReconnectEvent(
                     type: "ios_connection_event_ignored",
                     uuid: uuid,
@@ -4310,6 +4497,35 @@ extension BleManager: CBCentralManagerDelegate {
                 // 宽限内正常 didConnect 会取消它；到期才经 barrier 替换并重新 connect。
                 armPeerConnectedContactGrace(peripheral, reason: "connectionEvent peerConnected")
                 return
+            case .currentAdmission:
+                discardOverlappingStateRestorationEscrow(
+                    uuid: uuid,
+                    reason: "connectionEvent current admission"
+                )
+                recordAutoReconnectEvent(
+                    type: "ios_connection_event_ignored",
+                    uuid: uuid,
+                    name: name,
+                    detail: "reason=currentAdmission, generation=\(eventOwner.admission?.generation ?? 0)"
+                )
+                loggerD(msg: "connectionEvent peer connected: uuid=\(uuid), name=\(name), current GATT/AUTH admission owns it, skip escrow")
+                return
+            case .committedBusinessOwner:
+                discardOverlappingStateRestorationEscrow(
+                    uuid: uuid,
+                    reason: "connectionEvent committed owner"
+                )
+                let metadata = eventOwner.committed
+                recordAutoReconnectEvent(
+                    type: "ios_connection_event_ignored",
+                    uuid: uuid,
+                    name: name,
+                    detail: "reason=committedBusinessOwner, sessionGeneration=\(metadata?.sessionGeneration ?? 0), attemptGeneration=\(metadata?.attemptGeneration ?? 0)"
+                )
+                loggerD(msg: "connectionEvent peer connected: uuid=\(uuid), name=\(name), committed business owner owns it, skip escrow")
+                return
+            case .stateRestorationEscrow:
+                break
             }
             // connection event 只提供物理对象；先进入 escrow，再由现有 exact owner
             // activation 接入 admission/GATT/AUTH，禁止把系统连接直接投影成业务成功。
@@ -4330,7 +4546,7 @@ extension BleManager: CBCentralManagerDelegate {
         loggerE(msg: "didDisconnectPeripheral: timestamp = \(timestamp), isReconnecting = \(isReconnecting), error = \(String(describing: error))")
         if consumePeripheralCancellationBarrier(peripheral) { return }
         recordPhysicalTrace(peripheral, event: "disconnected")
-        if handleStateRestorationEscrowTerminal(
+        if shouldStateRestorationEscrowHandleTerminal(peripheral) && handleStateRestorationEscrowTerminal(
             peripheral,
             systemIsReconnecting: isReconnecting,
             reason: "didDisconnect isReconnecting=\(isReconnecting)"
@@ -4380,7 +4596,7 @@ extension BleManager: CBCentralManagerDelegate {
      */
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         if consumePeripheralCancellationBarrier(peripheral) { return }
-        if handleStateRestorationEscrowTerminal(
+        if shouldStateRestorationEscrowHandleTerminal(peripheral) && handleStateRestorationEscrowTerminal(
             peripheral,
             systemIsReconnecting: false,
             reason: "didFailToConnect error=\(String(describing: error))"
@@ -4394,7 +4610,7 @@ extension BleManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         if consumePeripheralCancellationBarrier(peripheral) { return }
         recordPhysicalTrace(peripheral, event: "disconnected")
-        if handleStateRestorationEscrowTerminal(
+        if shouldStateRestorationEscrowHandleTerminal(peripheral) && handleStateRestorationEscrowTerminal(
             peripheral,
             systemIsReconnecting: false,
             reason: "didDisconnect legacy error=\(String(describing: error))"
@@ -4707,9 +4923,12 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             loggerE(msg: "cmd response: \(peripheral.identifier.uuidString), error = No data")
             return
         }
-        //  2、设备是否存在并连接中
+        //  2、设备是否存在并连接中。这里必须匹配 CBPeripheral 对象身份；
+        //  UUID 相同的新连接不能消费旧 delegate/旧 characteristic 队列。
         guard let device = connectedDevices.first(where: { device in
-            device.peripheral.identifier.uuidString == peripheral.identifier.uuidString
+            device.peripheral === peripheral &&
+                device.peripheral.identifier.uuidString == peripheral.identifier.uuidString &&
+                device.peripheral.state == .connected
         }) else {
             loggerE(msg: "cmd response: \(peripheral.identifier.uuidString), device had already disconnected")
             return
@@ -4721,7 +4940,17 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             loggerE(msg: "cmd response: \(peripheral.identifier.uuidString), can not find chars")
             return
         }
-        let responseIdentity = otaResponseIdentity(
+        let receiveIdentity = receiveDataIdentity(
+            peripheral: peripheral,
+            characteristic: characteristic,
+            device: device,
+            privateService: privateService
+        )
+        if currentConnectionAdmission(uuid: peripheral.identifier.uuidString) != nil, receiveIdentity == nil {
+            loggerE(msg: "cmd response(char): \(peripheral.identifier.uuidString), drop notify from stale admission or characteristic")
+            return
+        }
+        let responseIdentity = receiveIdentity ?? otaResponseIdentity(
             uuid: peripheral.identifier.uuidString,
             device: device,
             psType: privateService.type
@@ -4743,17 +4972,68 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             attemptGeneration: responseIdentity?.attemptGeneration ?? 0,
             otaTransactionId: otaContext?.transactionId ?? "",
             otaGeneration: otaContext?.generation ?? 0,
-            otaInstanceId: otaContext?.instanceId ?? ""
+            otaInstanceId: otaContext?.instanceId ?? "",
+            receiveIdentity: receiveIdentity
         ).toMap()
         BleEC.receiveData.emit(bleCmdMap)
         loggerD(msg: "cmd response(char): \(peripheral.identifier.uuidString), chars = \(characteristic.uuid.uuidString), data length = \(data.count)")
+    }
+
+    private func receiveDataIdentity(
+        peripheral: CBPeripheral,
+        characteristic: CBCharacteristic,
+        device: BleConnectedDevice,
+        privateService: BlePrivateService
+    ) -> BleReceiveIdentity? {
+        let uuid = peripheral.identifier.uuidString
+        guard device.peripheral === peripheral,
+              peripheral.state == .connected,
+              device.readCharsDic[privateService.type] === characteristic else {
+            return nil
+        }
+        if let admission = currentConnectionAdmission(uuid: uuid) {
+            return BleReceiveIdentityPolicy.currentAdmissionIdentity(
+                uuid: uuid,
+                sessionGeneration: admission.sessionGeneration,
+                attemptGeneration: admission.generation,
+                isCurrentPipeline: isCurrentConnectionPipeline(peripheral),
+                isPeripheralConnected: peripheral.state == .connected,
+                isCachedReadCharacteristic: true
+            )
+        }
+        let reconnectTask = reconnectTasks.values.first { task in
+            isSameConnectTarget(
+                storedUuid: task.uuid,
+                storedName: task.name,
+                uuid: uuid,
+                name: peripheral.name ?? ""
+            )
+        }
+        guard let metadata = BleExplicitCancellationMetadataPolicy.resolve(
+            currentAdmission: nil,
+            reconnectTask: reconnectTask
+        ) else {
+            return nil
+        }
+        // Gate releases at business connected, but the physical link keeps
+        // delivering health/R1 notifications. Use only the accepted pair saved
+        // by the reconnect owner; never fall back to historical task metadata.
+        return BleReceiveIdentityPolicy.acceptedConnectionIdentity(
+            uuid: uuid,
+            sessionGeneration: metadata.sessionGeneration,
+            attemptGeneration: metadata.attemptGeneration,
+            isPeripheralConnected: peripheral.state == .connected,
+            isBusinessConnected: device.isConnected,
+            isUpgradeActive: upgradeStateRegistry.contains(uuid),
+            isCachedReadCharacteristic: true
+        )
     }
 
     private func otaResponseIdentity(
         uuid: String,
         device: BleConnectedDevice,
         psType: Int
-    ) -> BleExplicitCancellationMetadata? {
+    ) -> BleReceiveIdentity? {
         guard psType == 1 else {
             return nil
         }
@@ -4777,7 +5057,11 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
               metadata.attemptGeneration > 0 else {
             return nil
         }
-        return metadata
+        return BleReceiveIdentity(
+            uuid: uuid,
+            sessionGeneration: metadata.sessionGeneration,
+            attemptGeneration: metadata.attemptGeneration
+        )
     }
     
 }

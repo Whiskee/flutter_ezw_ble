@@ -5,6 +5,8 @@
 //  Created by Whiskee on 2025/1/3.
 //
 
+import Foundation
+
 struct BleConfig: Codable {
     //  配置名称
     let name: String

@@ -9,13 +9,19 @@ public enum CBManagerState {
     case unknown, resetting, poweredOff, poweredOn
 }
 
+public enum CBPeripheralState {
+    case disconnected, connecting, connected, disconnecting
+}
+
 public final class CBPeripheral {
     public let identifier: UUID
     public var name: String?
+    public var state: CBPeripheralState
 
-    public init(identifier: UUID, name: String?) {
+    public init(identifier: UUID, name: String?, state: CBPeripheralState = .disconnected) {
         self.identifier = identifier
         self.name = name
+        self.state = state
     }
 }
 

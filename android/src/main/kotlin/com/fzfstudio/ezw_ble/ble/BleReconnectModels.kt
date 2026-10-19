@@ -49,6 +49,8 @@ internal data class BleReconnectTask(
      * 保存一次 `autoConnect=false` 的直连句柄，二者都必须按 exact identity 回收。
      */
     var passiveGatt: BluetoothGatt? = null,
+    /** Prephysical admission owns a request but has no GATT or physical deadline yet. */
+    var pendingAdmission: Boolean = false,
     /** 当前 GATT 是否来自一次扫描可见后的真实直连。 */
     var pendingVisibleDirectConnect: Boolean = false,
     /** 当前目标是否等待获得全局可见性直连槽位。 */

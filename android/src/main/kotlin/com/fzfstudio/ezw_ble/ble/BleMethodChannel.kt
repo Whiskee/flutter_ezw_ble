@@ -44,6 +44,8 @@ enum class BleMC {
     COMMIT_BUSINESS_CONNECTION,
     /** 只撤销 exact 业务鉴权 lease，不取消长期回连 owner。 */
     ABORT_BUSINESS_CONNECTION,
+    /** iOS G2 heartbeat 失效入口；Android 当前没有等价 native owner，固定 fail-closed。 */
+    INVALIDATE_BUSINESS_CONNECTION,
     /** 补种 native 自动回连目标，不发起前台连接。 */
     ARM_AUTO_RECONNECT_TARGETS,
     /** 立即建立/复用所有目标的 native 直连，并保留调用来源。 */
@@ -172,6 +174,8 @@ enum class BleMC {
                 val name = jsonMap?.get("name") as? String ?: ""
                 val sn = jsonMap?.get("sn") as? String ?: ""
                 val afterUpgrade = jsonMap?.get("afterUpgrade") as Boolean? == true
+                // A positive Dart request session is frozen before scan/admission waits.
+                val sessionGeneration = (jsonMap?.get("sessionGeneration") as? Number)?.toLong() ?: 0L
                 val directConnect = jsonMap?.get("directConnect") as Boolean? == true
 
                 // 2. 旧 API 约定 uuid/sn 必须同时存在。参数非法时必须让 Future 失败，
@@ -190,6 +194,7 @@ enum class BleMC {
                     sn,
                     afterUpgrade = afterUpgrade,
                     directConnect = directConnect,
+                    sessionGeneration = sessionGeneration,
                 )
             }
             DEVICE_PRE_CONNECTED -> {
@@ -209,9 +214,13 @@ enum class BleMC {
                 )
             }
             COMMIT_BUSINESS_CONNECTION -> {
-                val attempt = (arguments as? Map<*, *>)?.toBusinessConnectionAttempt()
+                val payload = arguments as? Map<*, *>
+                val attempt = payload?.toBusinessConnectionAttempt()
+                // Older hosts omit this Android-only policy and keep arming. Temp
+                // pairing opts out without changing the exact admission identity.
+                val armAutoReconnect = payload?.get("armAutoReconnect") as? Boolean ?: true
                 return result.success(
-                    BleManager.instance.commitBusinessConnection(attempt).flutterValue,
+                    BleManager.instance.commitBusinessConnection(attempt, armAutoReconnect).flutterValue,
                 )
             }
             ABORT_BUSINESS_CONNECTION -> {
@@ -219,6 +228,12 @@ enum class BleMC {
                 return result.success(
                     BleManager.instance.abortBusinessConnection(attempt),
                 )
+            }
+            INVALIDATE_BUSINESS_CONNECTION -> {
+                // Android 的 GATT owner 与心跳失效对账仍由既有 reconcile 路径负责。
+                // 新跨平台 API 必须 fail-closed，避免误把 iOS 的 CoreBluetooth teardown
+                // 语义套到 Android passive reconnect supervisor 上。
+                return result.success(false)
             }
             ARM_AUTO_RECONNECT_TARGETS -> {
                 // 1. 旧缓存/进程恢复时，Dart 只补种长期回连意图，不打开 GATT。
@@ -586,6 +601,9 @@ private fun Map<*, *>.toBleConfig(): BleConfig? {
         autoReconnectMaxAttempts = get("autoReconnectMaxAttempts").toIntOrDefault(0),
         autoReconnectUseNativePassive = get("autoReconnectUseNativePassive") as? Boolean ?: true,
         androidHighReliabilityMode = get("androidHighReliabilityMode") as? Boolean ?: false,
+        // Old Dart configs omit these opt-ins and retain the previous timing/parallelism.
+        androidBondTimeout = (get("androidBondTimeout") as? Number)?.toDouble(),
+        androidSerializeUnbonded = get("androidSerializeUnbonded") as? Boolean ?: false,
     )
 }
 

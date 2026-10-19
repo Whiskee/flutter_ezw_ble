@@ -66,6 +66,7 @@ class MockFlutterEzwBlePlatform
     String? sn,
     bool? afterUpgrade,
     bool directConnect = false,
+    int? sessionGeneration,
   }) {
     throw UnimplementedError();
   }
@@ -176,13 +177,21 @@ class MockFlutterEzwBlePlatform
 
   @override
   Future<BleBusinessConnectionStatus> commitBusinessConnection(
-    BleBusinessConnectionAttempt attempt,
-  ) {
+    BleBusinessConnectionAttempt attempt, {
+    bool armAutoReconnect = true,
+  }) {
     throw UnimplementedError();
   }
 
   @override
   Future<bool> abortBusinessConnection(BleBusinessConnectionAttempt attempt) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<bool> invalidateBusinessConnection(
+    BleBusinessConnectionAttempt attempt,
+  ) {
     throw UnimplementedError();
   }
 

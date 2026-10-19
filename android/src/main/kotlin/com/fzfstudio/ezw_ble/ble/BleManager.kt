@@ -106,6 +106,15 @@ class BleManager private constructor() {
     private val connectionSessionSequence = AtomicLong(0L)
     private val currentAdmissions: MutableMap<String, BleConnectionAdmission> =
         Collections.synchronizedMap(mutableMapOf())
+    // 只保存尚未创建 GATT 的 exact reservation；取消先移除 opener，迟到 grant 无法建链。
+    private data class PendingGattStart(
+        val admission: BleConnectionAdmission,
+        val device: BleDevice,
+        val start: (BleConnectionAdmission) -> Boolean,
+    )
+    private val pendingGattStarts = mutableMapOf<Long, PendingGattStart>()
+    // Reuse the native cancellable scheduler boundary; Bond deadlines have no UI/lifecycle dependency.
+    private var bondWaitScheduler: BleReconnectAttemptScheduler = TimerBleReconnectAttemptScheduler { it() }
     private val admittedGattSessions: MutableMap<Long, GrantedGattSession> =
         Collections.synchronizedMap(mutableMapOf())
     //  - Gate 释放后仍保存业务 connected session 的 exact admission + GATT identity；
@@ -141,7 +150,7 @@ class BleManager private constructor() {
 
     /** Gate 排队期间保留真实 GATT；只有获得准入后才启动 timeout 和 service discovery。 */
     private data class GrantedGattSession(
-        val admission: BleConnectionAdmission,
+        var admission: BleConnectionAdmission,
         val gatt: BluetoothGatt,
         val device: BleDevice,
         val afterUpgrade: Boolean,
@@ -152,7 +161,12 @@ class BleManager private constructor() {
          * 只有该 exact session 的成功 Bond 才能清除此防御性标志并重新发现服务。
          */
         var legacySecurityGateFallbackBinding: Boolean = false,
-    )
+    ) {
+        /** Runtime phase ownership survives source promotion of the same GATT session. */
+        var connectTimeoutEpoch: Long = 0L
+        var bondWaitTimer: BleReconnectScheduleHandle? = null
+        var bondWaitActive: Boolean = false
+    }
 
     /** 业务 connected 已释放 Gate，但物理 GATT 仍长期存活。 */
     private data class BusinessConnectedGattSession(
@@ -389,6 +403,10 @@ class BleManager private constructor() {
                     sessionGeneration = sessionGeneration,
                 )
             },
+            startGattWhenAdmitted = { device, source, session, start ->
+                startGattWithAdmission(device, source, session, start = start)
+            },
+            cancelPendingGatt = { uuid -> cancelPendingGattStart(uuid) },
             promotePendingAdmission = { uuid -> promotePendingAttempt(uuid) },
             persistReconnectTarget = { device -> persistReconnectTarget(device) },
             handleConnectState = { uuid, name, state -> handleConnectState(uuid, name, state) },
@@ -825,7 +843,7 @@ class BleManager private constructor() {
         currentAdmissions.keys
             .filter { it in endpointKeys }
             .forEach { currentAdmissions.remove(it) }
-        revokedAdmissionSessions.forEach { admittedGattSessions.remove(it.admission.sessionId) }
+        revokedAdmissionSessions.forEach { admittedGattSessions.remove(it.admission.sessionId)?.also { it.bondWaitTimer?.cancel() } }
         endpointKeys.forEach {
             businessConnectedGattSessions.remove(it)
             lastEpochAcceptedAdmissions.remove(it)
@@ -861,7 +879,7 @@ class BleManager private constructor() {
             }
 
         // 4. 被撤销 active 完整 teardown 后，才允许未撤权 endpoint 开始 pipeline。
-        next?.let { startGrantedGattPipeline(it) }
+        next?.let { dispatchGrantedAdmission(it) }
         sendLog(
             BleLoggerTag.d,
             "Auto reconnect: revoked configs=$configNames endpoints=${endpointIds.size}",
@@ -1114,12 +1132,15 @@ class BleManager private constructor() {
             )
             return false
         }
-        currentAdmissions.remove(key)?.let { admittedGattSessions.remove(it.sessionId) }
+        currentAdmissions.remove(key)?.let {
+            pendingGattStarts.remove(it.sessionId)
+            admittedGattSessions.remove(it.sessionId)?.bondWaitTimer?.cancel()
+        }
         val next = invalidateConnectionAttempts(setOf(uuid))
         businessConnectionLeases.remove(key)
         sendCmdQueues.remove(key)
         device.releaseAndClear()
-        next?.let { startGrantedGattPipeline(it) }
+        next?.let { dispatchGrantedAdmission(it) }
         sendLog(
             BleLoggerTag.e,
             "Auto reconnect: $uuid, reconcile repaired orphan manager GATT",
@@ -1262,7 +1283,7 @@ class BleManager private constructor() {
      * 最后打开 GATT。断连后的长期自动回连由自动回连 supervisor 负责，不在这里调度。
      */
     @Synchronized
-    fun connect(belongConfig: String, uuid: String, name: String, sn: String, isWaitingDevice: Boolean = false, afterUpgrade: Boolean = false, directConnect: Boolean = false) {
+    fun connect(belongConfig: String, uuid: String, name: String, sn: String, isWaitingDevice: Boolean = false, afterUpgrade: Boolean = false, directConnect: Boolean = false, sessionGeneration: Long = 0L) {
         // 1. 把散落的入参先收敛成请求对象，后续日志和路由判断都使用同一份上下文。
         val request = BleConnectRequest(
             belongConfig = belongConfig,
@@ -1272,6 +1293,7 @@ class BleManager private constructor() {
             afterUpgrade = afterUpgrade,
             directConnect = directConnect,
             isWaitingDevice = isWaitingDevice,
+            sessionGeneration = sessionGeneration,
         )
 
         // 2. 入口级前置条件只处理“必然不能连接”的情况，避免后续步骤重复判空。
@@ -1279,6 +1301,8 @@ class BleManager private constructor() {
 
         // 3. 已绑定设备的手动点击如果已有长期 pending autoConnect，只提升同一 session 的
         // source/Gate 优先级并复用 GATT，不能取消 task 后再打开重复 GATT。
+        // Optional foreground request identity does not take over a formal owner; that session
+        // transition belongs to activateAutoReconnectTargets/rebind, not this legacy promotion.
         if (autoReconnectSupervisor.promotePendingAttempt(request.uuid)) {
             sendLog(
                 BleLoggerTag.d,
@@ -1327,20 +1351,20 @@ class BleManager private constructor() {
     private fun guardForegroundConnectRequest(request: BleConnectRequest): BleConfig? {
         // 1. 蓝牙/权限不可用时必须给 Dart 一个终态。只 return 会让 UI 停在 connecting。
         if (!checkBleStatus()) {
-            handleConnectState(request.uuid, request.name, BleConnectState.BLE_ERROR)
+            handleConnectState(request.uuid, request.name, BleConnectState.BLE_ERROR, generation = request.sessionGeneration)
             sendLog(BleLoggerTag.e, "Start connect: ${request.uuid}, ble unavailable state=$currentBleState")
             return null
         }
 
         // 2. 配置缺失也是明确终态，不能被通用可调用检查静默吞掉。
         if (!checkBleConfigIsConfigured()) {
-            handleConnectState(request.uuid, request.name, BleConnectState.NO_BLE_CONFIG_FOUND)
+            handleConnectState(request.uuid, request.name, BleConnectState.NO_BLE_CONFIG_FOUND, generation = request.sessionGeneration)
             return null
         }
 
         // 3. uuid 是 Android connectGatt 的最低身份信息，缺失时无法继续。
         if (request.uuid.isEmpty()) {
-            handleConnectState(request.uuid, request.name, BleConnectState.EMPTY_UUID)
+            handleConnectState(request.uuid, request.name, BleConnectState.EMPTY_UUID, generation = request.sessionGeneration)
             sendLog(BleLoggerTag.e, "Start connect: ${request.uuid}, Empty uuid")
             return null
         }
@@ -1348,7 +1372,7 @@ class BleManager private constructor() {
         // 4. 配置决定扫描规则、私有服务和连接超时，不存在时必须明确失败。
         val bleConfig = bleConfigs.firstOrNull { it.name == request.belongConfig }
         if (bleConfig == null) {
-            handleConnectState(request.uuid, request.name, BleConnectState.NO_BLE_CONFIG_FOUND)
+            handleConnectState(request.uuid, request.name, BleConnectState.NO_BLE_CONFIG_FOUND, generation = request.sessionGeneration)
             sendLog(BleLoggerTag.e, "Start connect: ${request.uuid}, no config")
             return null
         }
@@ -1791,7 +1815,7 @@ class BleManager private constructor() {
         }
         if (currentMatchesFrozenPair) {
             currentAdmissions.remove(key)?.let { admission ->
-                admittedGattSessions.remove(admission.sessionId)
+                admittedGattSessions.remove(admission.sessionId)?.also { it.bondWaitTimer?.cancel() }
             }
         }
         connectedDevices.firstOrNull { it.uuid.equals(uuid, ignoreCase = true) }?.let { device ->
@@ -2035,7 +2059,7 @@ class BleManager private constructor() {
         scanRefreshGenerations[refreshKey] = refreshGeneration
 
         // 3. 扫描刷新期间先上报 connecting，避免 UI 在蓝牙恢复后长时间停留在 idle。
-        handleConnectState(plan.request.uuid, plan.request.name, BleConnectState.CONNECTING)
+        handleConnectState(plan.request.uuid, plan.request.name, BleConnectState.CONNECTING, generation = plan.request.sessionGeneration)
 
         // 4. 开启扫描后延迟检查目标是否出现；未出现则 fast-fail，避免盲连 GATT 超时。
         startScan()
@@ -2050,7 +2074,7 @@ class BleManager private constructor() {
                 stopScan()
                 if (!isTargetVisibleInScan(plan.request.uuid, plan.request.name, plan.request.sn)) {
                     connectedDevices.removeAll { it.uuid == plan.request.uuid && it.myGatt == null }
-                    handleConnectState(plan.request.uuid, plan.request.name, BleConnectState.NO_DEVICE_FOUND)
+                    handleConnectState(plan.request.uuid, plan.request.name, BleConnectState.NO_DEVICE_FOUND, generation = plan.request.sessionGeneration)
                     sendLog(BleLoggerTag.e, "Start connect: ${plan.request.uuid}, no device found after refresh scan")
                     return@launch
                 }
@@ -2070,6 +2094,7 @@ class BleManager private constructor() {
                     true,
                     plan.request.afterUpgrade,
                     plan.request.directConnect,
+                    plan.request.sessionGeneration,
                 )
             } finally {
                 // 7. 只有当前 owner 才能清理 map，避免旧任务 finally 删除新任务 generation。
@@ -2096,7 +2121,7 @@ class BleManager private constructor() {
 
         // 2. 移除尚未打开 GATT 的临时设备缓存，避免下次连接误以为已有设备。
         connectedDevices.removeAll { it.uuid == plan.request.uuid && it.myGatt == null }
-        handleConnectState(plan.request.uuid, plan.request.name, BleConnectState.BOUND_FAIL)
+        handleConnectState(plan.request.uuid, plan.request.name, BleConnectState.BOUND_FAIL, generation = plan.request.sessionGeneration)
         sendLog(BleLoggerTag.e, "Start connect: ${plan.request.uuid}, device name missing, cannot bind")
         return true
     }
@@ -2123,7 +2148,7 @@ class BleManager private constructor() {
         }
 
         // 3. 进入 connecting 让 UI 展示“正在等待目标出现”，而不是仍停在可点击状态。
-        handleConnectState(plan.request.uuid, plan.request.name, BleConnectState.CONNECTING)
+        handleConnectState(plan.request.uuid, plan.request.name, BleConnectState.CONNECTING, generation = plan.request.sessionGeneration)
 
         // 4. 入队的请求保留原始入参，扫描命中后会带 isWaitingDevice=true 重入 connect。
         pendingScanConnects.add(
@@ -2134,6 +2159,7 @@ class BleManager private constructor() {
                 sn = plan.request.sn,
                 afterUpgrade = plan.request.afterUpgrade,
                 directConnect = plan.request.directConnect,
+                sessionGeneration = plan.request.sessionGeneration,
             ),
         )
 
@@ -2170,6 +2196,24 @@ class BleManager private constructor() {
             bleDevice = plan.remoteDevice.toBleDevice(plan.config, resolvedName, plan.request.sn, 0)
             connectedDevices.add(bleDevice)
             return bleDevice
+        }
+
+        // A queued request has no native connecting state yet; reuse it instead of allocating
+        // another attempt that would strand the previous prephysical Gate reservation.
+        val pendingAdmission = currentAdmissions[reconnectKey(plan.request.uuid)]
+        if (pendingAdmission != null && pendingGattStarts.containsKey(pendingAdmission.sessionId)) {
+            if (plan.request.sessionGeneration > pendingAdmission.sessionGeneration) {
+                // A new Dart intent must not inherit the previous request's identity. There is
+                // no GATT to close here; revoke the exact queued opener before registering anew.
+                cancelConnectionAdmission(plan.request.uuid, "new foreground request replaced queued intent")
+            } else {
+                // Same/legacy request can reuse the queue, but an old positive request cannot
+                // rewrite or relabel the current owner as its own session.
+                if (plan.request.sessionGeneration <= 0L ||
+                    plan.request.sessionGeneration == pendingAdmission.sessionGeneration
+                ) sendPairingProgress(pendingAdmission, bleDevice.name, "queuedBeforePhysical")
+                return null
+            }
         }
 
         // 3. 普通重入遇到 connecting 直接返回；扫描补偿重入必须放行，否则会卡死在 connecting。
@@ -2230,50 +2274,114 @@ class BleManager private constructor() {
      * 这个函数是前台连接的最后一步；所有扫描、缓存、可见性和名称校验都必须在调用前完成。
      */
     private fun openForegroundGatt(plan: BleConnectPlan, bleDevice: BleDevice) {
-        // 1. 默认主动连接使用 autoConnect=false，自动回连 passive 连接由 supervisor 独立处理。
-        val connectCallBack = createConnectCallBack(
-            plan.request.uuid,
-            source = BleConnectSource.FOREGROUND,
+        startGattWithAdmission(
+            bleDevice,
+            BleConnectSource.FOREGROUND,
+            sessionGeneration = plan.request.sessionGeneration,
             afterUpgrade = plan.request.afterUpgrade,
-        )
-        // 扫描等待路径在此刻才拥有真实物理 attempt；把已命中的 scan 合并到
-        // 同一个 native attempt，避免生成无法关联 attemptId 的孤立扫描记录。
-        if (plan.request.isWaitingDevice) {
-            recordNativeTraceStep(plan.request.uuid, "scan", "success")
-        }
-        val gatt = AndroidBleGattConnector.connect(
-            device = plan.remoteDevice,
-            context = weakContext?.get(),
-            autoConnect = false,
-            callback = connectCallBack,
-            highReliabilityMode = bleDevice.belongConfig.androidHighReliabilityMode,
-        )
-
-        // 2. 系统拒绝创建 GATT 时，本 attempt 必须终止并释放 Gate generation。
-        if (gatt == null) {
-            handleConnectState(
-                plan.request.uuid,
-                plan.resolvedName ?: bleDevice.name,
-                BleConnectState.SYSTEM_ERROR,
-                source = BleConnectSource.FOREGROUND,
+        ) { callback ->
+            // 扫描记录仍属于同一个已分配 attempt，排队不代表物理接触。
+            if (plan.request.isWaitingDevice) {
+                recordNativeTraceStep(plan.request.uuid, "scan", "success")
+            }
+            val gatt = AndroidBleGattConnector.connect(
+                device = plan.remoteDevice,
+                context = weakContext?.get(),
+                autoConnect = false,
+                callback = callback,
+                highReliabilityMode = bleDevice.belongConfig.androidHighReliabilityMode,
             )
-            cancelConnectionAdmission(plan.request.uuid, reason = "connectGatt returned null")
+            if (gatt == null) {
+                handleConnectState(
+                    plan.request.uuid,
+                    plan.resolvedName ?: bleDevice.name,
+                    BleConnectState.SYSTEM_ERROR,
+                    source = BleConnectSource.FOREGROUND,
+                )
+                false
+            } else {
+                bleDevice.update(gatt)
+                handleConnectState(
+                    plan.request.uuid,
+                    plan.resolvedName ?: bleDevice.name,
+                    BleConnectState.CONNECTING,
+                    source = BleConnectSource.FOREGROUND,
+                )
+                true
+            }
+        }
+    }
+
+    /** G2 未 Bond 请求在建链之前取得既有 Gate；普通配置保持原来的并行 pending 路径。 */
+    @Synchronized
+    private fun startGattWithAdmission(
+        device: BleDevice,
+        source: BleConnectSource,
+        sessionGeneration: Long = 0L,
+        afterUpgrade: Boolean = false,
+        start: (BleGattSessionCallback) -> Boolean,
+    ) {
+        val admission = registerConnectionAttempt(device.uuid, source, sessionGeneration)
+        val opener: (BleConnectionAdmission) -> Boolean = { current ->
+            start(createConnectCallBack(
+                device.uuid,
+                current.source,
+                afterUpgrade,
+                current.sessionGeneration,
+                reservedAdmission = current,
+            ))
+        }
+        val serialize = device.belongConfig.androidSerializeUnbonded &&
+            device.belongConfig.initiateBinding &&
+            runCatching { bluetoothAdapter.getRemoteDevice(device.uuid).bondState }
+                .getOrNull() != BluetoothDevice.BOND_BONDED
+        if (!serialize) {
+            if (!opener(admission)) cancelConnectionAdmission(device.uuid, "GATT start rejected")
             return
         }
+        pendingGattStarts[admission.sessionId] = PendingGattStart(admission, device, opener)
+        when (connectionAdmissionGate.beforePhysicalConnect(admission)) {
+            BleConnectionAdmissionDecision.GRANTED -> dispatchGrantedAdmission(admission)
+            BleConnectionAdmissionDecision.QUEUED -> sendPairingProgress(admission, device.name, "queuedBeforePhysical")
+            else -> cancelConnectionAdmission(device.uuid, "prephysical admission rejected")
+        }
+    }
 
-        // 3. GATT 句柄必须立即写回缓存，后续 service/notify 回调都按 uuid 找这条 session。
-        bleDevice.update(gatt)
+    /** 所有 Gate next 出口都经过这里；只有 exact reservation 可以真正创建下一腿 GATT。 */
+    @Synchronized
+    private fun dispatchGrantedAdmission(admission: BleConnectionAdmission) {
+        val current = currentAdmissionFor(admission)
+        if (current == null || !connectionAdmissionGate.isActive(current)) {
+            pendingGattStarts.remove(admission.sessionId)
+            releaseOrphanedAdmission(admission, "stale grant")
+            return
+        }
+        val pending = pendingGattStarts.remove(current.sessionId)
+        if (pending != null) {
+            if (!pending.start(current)) cancelConnectionAdmission(current.endpointId, "deferred GATT start rejected")
+        } else {
+            startGrantedGattPipeline(current)
+        }
+    }
 
-        // 4. Gate 排队时间不计入 connectTimeout；timeout 只在 startGrantedGattPipeline 中启动。
-        handleConnectState(
-            plan.request.uuid,
-            plan.resolvedName ?: bleDevice.name,
-            BleConnectState.CONNECTING,
-            source = BleConnectSource.FOREGROUND,
-        )
-        sendLog(
-            BleLoggerTag.d,
-            "Start connect: ${plan.request.uuid} connecting, belong config = ${bleDevice.belongConfig}, after upgrade = ${plan.request.afterUpgrade}",
+    /** Supervisor 只撤销尚未建链的 reservation，不触碰其它 live GATT/session。 */
+    @Synchronized
+    private fun cancelPendingGattStart(uuid: String) {
+        val current = currentAdmissions[reconnectKey(uuid)] ?: return
+        if (pendingGattStarts.containsKey(current.sessionId)) {
+            cancelConnectionAdmission(uuid, "supervisor pending reservation cancelled")
+        }
+    }
+
+    /** 控制进度独立于可关闭的 Trace，且永远不伪造 CONTACT_DEVICE 或提升设备状态。 */
+    private fun sendPairingProgress(admission: BleConnectionAdmission, name: String, phase: String) {
+        val current = currentAdmissionFor(admission) ?: return
+        sendConnectState(
+            current.endpointId, name, BleConnectState.CONNECTING,
+            source = current.source,
+            sessionGeneration = current.sessionGeneration,
+            attemptGeneration = current.generation,
+            pairingPhase = phase,
         )
     }
 
@@ -2284,6 +2392,7 @@ class BleManager private constructor() {
      *  永久豁免会让 Dart 端鉴权异常/挂起(deviceConnected 永不到达)的设备永久停在
      *  connectFinish，App UI 一直显示"连接中"且无法自愈。
      */
+    @Synchronized
     private fun startConnectTimeout(
         bleConfig: BleConfig,
         uuid: String,
@@ -2292,19 +2401,23 @@ class BleManager private constructor() {
         isAuthGrace: Boolean = false,
         admission: BleConnectionAdmission? = currentAdmissions[reconnectKey(uuid)],
     ) {
+        val timerSession = admission?.let { admittedGattSessions[it.sessionId] }
+        val timerEpoch = timerSession?.let { ++it.connectTimeoutEpoch }
         val timeoutTimer = Timer()
         timeoutTimer.schedule(object : TimerTask() {
-            override fun run() {
+            override fun run() = synchronized(this@BleManager) {
+                // Cancelling Timer does not revoke an already running task. Phase identity does.
+                if (timerSession != null && timerSession.connectTimeoutEpoch != timerEpoch) return@synchronized
                 // 1、旧 admission 已失效时直接退出，避免 timer 写入新连接 session。
                 // Gate owner 已变化说明本 timer 属于旧 generation/session，必须静默退出。
                 if (admission != null && currentAdmissionFor(admission) == null) {
-                    return
+                    return@synchronized
                 }
                 // 2、物理连接已完成时只清理当前 timer，不再产生 timeout。
                 val device = connectedDevices.firstOrNull { it.uuid == uuid }
                 if (device?.isConnected == true) {
                     device.timeoutTimer = null
-                    return
+                    return@synchronized
                 }
                 // 3、鉴权中的 pre-connected 只续一次有界宽限期，避免永久停在 connecting。
                 if (preConnectedDevices.contains(uuid) && !isAuthGrace) {
@@ -2317,7 +2430,7 @@ class BleManager private constructor() {
                         isAuthGrace = true,
                         admission = admission,
                     )
-                    return
+                    return@synchronized
                 }
                 // 4、宽限到期仍未连接时进入 timeout，收口 UI 和 native session。
                 sendLog(BleLoggerTag.e, "Start connect: $uuid, connect time out${if (isAuthGrace) " (auth grace expired)" else ""}")
@@ -2346,7 +2459,7 @@ class BleManager private constructor() {
                                 state = recoveryAction.toConnectState(),
                             )
                         }
-                        return
+                        return@synchronized
                     }
                 }
                 // 4.1、先记录 timeout 断连状态，避免随后系统回调重复落终态。
@@ -2393,7 +2506,7 @@ class BleManager private constructor() {
      *  主动设置连接成功
      */
     @Synchronized
-    fun setConnected(uuid: String): BleBusinessConnectionStatus {
+    fun setConnected(uuid: String, armAutoReconnect: Boolean = true): BleBusinessConnectionStatus {
         // 1、校验请求、pre-connected 标记和当前 admission，确保业务 connected 有合法代次。
         if (!checkIsFunctionCanBeCalled() || uuid.isEmpty()) {
             return BleBusinessConnectionStatus.INVALID_ARGUMENTS
@@ -2433,6 +2546,7 @@ class BleManager private constructor() {
             source = acceptedAdmission.source,
             generation = acceptedAdmission.sessionGeneration,
             attemptGeneration = acceptedAdmission.generation,
+            armAutoReconnect = armAutoReconnect,
         )
         // 4、业务确认 connected 后释放当前 Gate owner，允许下一 endpoint 开始 pipeline。
         completeBusinessConnectionAdmission(uuid)
@@ -2515,7 +2629,7 @@ class BleManager private constructor() {
         }
 
         // 4、旧逻辑设备完全退出后，才允许仍获授权的其它逻辑设备进入 GATT pipeline。
-        next?.let { startGrantedGattPipeline(it) }
+        next?.let { dispatchGrantedAdmission(it) }
         sendLog(
             BleLoggerTag.d,
             "Cancel auto reconnect targets: endpoints=$endpointIds, " +
@@ -2732,7 +2846,7 @@ class BleManager private constructor() {
         currentAdmissions.keys
             .filter { it in endpointKeys }
             .forEach { currentAdmissions.remove(it) }
-        admissionSessions.forEach { admittedGattSessions.remove(it.admission.sessionId) }
+        admissionSessions.forEach { admittedGattSessions.remove(it.admission.sessionId)?.also { it.bondWaitTimer?.cancel() } }
         endpointKeys.forEach {
             businessConnectionLeases.remove(it)
             businessConnectedGattSessions.remove(it)
@@ -2786,7 +2900,7 @@ class BleManager private constructor() {
                 runCatching { gatt.close() }
             }
 
-        next?.let { startGrantedGattPipeline(it) }
+        next?.let { dispatchGrantedAdmission(it) }
         sendLog(
             BleLoggerTag.d,
             "Release device runtime: endpoints=$endpointIds, persisted reconnect owner preserved",
@@ -2892,12 +3006,16 @@ class BleManager private constructor() {
     @Synchronized
     fun commitBusinessConnection(
         attempt: BleBusinessConnectionAttempt?,
+        armAutoReconnect: Boolean = true,
     ): BleBusinessConnectionStatus {
         val status = validateBusinessConnectionAttempt(attempt, requirePrepare = true)
         if (status != BleBusinessConnectionStatus.ACCEPTED || attempt == null) {
             return status
         }
-        return setConnected(attempt.uuid)
+        // A Temp leg can be business connected while its peer is still pairing.
+        // Only its Dart request owns retries until whole-device handoff seeds
+        // persistent targets; never let this policy bypass exact validation.
+        return setConnected(attempt.uuid, armAutoReconnect = armAutoReconnect)
     }
 
     /**
@@ -3432,6 +3550,8 @@ class BleManager private constructor() {
         securityGateAttempts.clear()
         pendingSecurityRetryVisibility.clear()
         currentAdmissions.clear()
+        pendingGattStarts.clear()
+        admittedGattSessions.values.forEach { it.bondWaitTimer?.cancel() }
         admittedGattSessions.clear()
         businessConnectedGattSessions.clear()
         lastEpochAcceptedAdmissions.clear()
@@ -3732,6 +3852,8 @@ class BleManager private constructor() {
             securityGateAttempts.clear()
             pendingSecurityRetryVisibility.clear()
             currentAdmissions.clear()
+            pendingGattStarts.clear()
+            admittedGattSessions.values.forEach { it.bondWaitTimer?.cancel() }
             admittedGattSessions.clear()
             businessConnectedGattSessions.clear()
             businessConnectionLeases.clear()
@@ -4064,7 +4186,7 @@ class BleManager private constructor() {
                 stopScan()
             }
             connectedDevices.removeAll { it.uuid == pending.uuid && it.myGatt == null }
-            handleConnectState(pending.uuid, pending.name, BleConnectState.NO_DEVICE_FOUND)
+            handleConnectState(pending.uuid, pending.name, BleConnectState.NO_DEVICE_FOUND, generation = pending.sessionGeneration)
             sendLog(BleLoggerTag.d, "Start connect: ${pending.uuid}, scan-then-connect timeout")
         }
     }
@@ -4088,6 +4210,7 @@ class BleManager private constructor() {
                 isWaitingDevice = true,
                 afterUpgrade = pending.afterUpgrade,
                 directConnect = pending.directConnect,
+                sessionGeneration = pending.sessionGeneration,
             )
         }
     }
@@ -4159,8 +4282,10 @@ class BleManager private constructor() {
         source: BleConnectSource,
         afterUpgrade: Boolean = false,
         sessionGeneration: Long = 0L,
+        reservedAdmission: BleConnectionAdmission? = null,
     ): BleGattSessionCallback {
-        val admission = registerConnectionAttempt(expectedUuid, source, sessionGeneration)
+        // Queue allocation and physical callback must share one attempt, never allocate again at grant.
+        val admission = reservedAdmission ?: registerConnectionAttempt(expectedUuid, source, sessionGeneration)
         return BleGattSessionCallback(
             expectedUuid = expectedUuid,
             sessionGeneration = admission.sessionGeneration,
@@ -4391,6 +4516,9 @@ class BleManager private constructor() {
             // 2、Manager 与随后的 Gate.cancelEndpoints 同步进入同一个 next generation。
             connectionAttemptGenerations[key] = nextConnectionGeneration(highWater)
         }
+        pendingGattStarts.entries.removeAll { (_, pending) ->
+            normalized.any { it.equals(pending.admission.endpointId, ignoreCase = true) }
+        }
         return connectionAdmissionGate.cancelEndpoints(normalized)
     }
 
@@ -4435,12 +4563,16 @@ class BleManager private constructor() {
         // pending physical deadline 只覆盖 `connectGatt(true)` 到 STATE_CONNECTED 之间。
         // 必须在进入 Gate 前清除，确保 queued endpoint 不会被 watchdog 关闭。
         autoReconnectSupervisor.onPassivePhysicalConnected(device.uuid, gatt)
-        admittedGattSessions[admission.sessionId] = GrantedGattSession(
-            admission = admission,
-            gatt = gatt,
-            device = device,
-            afterUpgrade = afterUpgrade,
-        )
+        // A duplicate STATE_CONNECTED must retain the phase timer and discovery idempotency.
+        // Replacing this exact session would orphan its Bond timer and allow duplicate discovery.
+        if (admittedGattSessions[admission.sessionId] == null) {
+            admittedGattSessions[admission.sessionId] = GrantedGattSession(
+                admission = admission,
+                gatt = gatt,
+                device = device,
+                afterUpgrade = afterUpgrade,
+            )
+        }
         val decision = connectionAdmissionGate.onPhysicalConnected(admission)
         sendLog(
             BleLoggerTag.d,
@@ -4462,7 +4594,7 @@ class BleManager private constructor() {
                     generation = admission.sessionGeneration,
                     attemptGeneration = admission.generation,
                 )
-                startGrantedGattPipeline(admission)
+                dispatchGrantedAdmission(admission)
             }
             BleConnectionAdmissionDecision.QUEUED -> {
                 handleConnectState(
@@ -4478,7 +4610,7 @@ class BleManager private constructor() {
             BleConnectionAdmissionDecision.DUPLICATE ->
                 sendLog(BleLoggerTag.d, "Admission gate: ${device.uuid}, duplicate callback ignored")
             else -> {
-                admittedGattSessions.remove(admission.sessionId)
+                admittedGattSessions.remove(admission.sessionId)?.also { it.bondWaitTimer?.cancel() }
                 runCatching { gatt.disconnect() }
                 runCatching { gatt.close() }
                 sendLog(
@@ -4525,7 +4657,7 @@ class BleManager private constructor() {
      * 在 Gate 内选择主动配对、等待系统配对或直接服务发现。
      *
      * 1、false-config 与已配对设备直接发现服务；Android G2/R1 未配对时先主动 Bond。
-     * 2、等待/发起配对时先上报 START_BINDING，并持续占有 Gate 与连接 timeout。
+     * 2、等待/发起配对时先上报 START_BINDING，并持有 Gate；opt-in 配置改用独立 Bond timer。
      * 3、只有权威成功广播或 createBond 后 framework 已同步进入 BONDED 才恢复服务发现。
      */
     private fun startBondBeforeGattReadiness(
@@ -4556,6 +4688,7 @@ class BleManager private constructor() {
             GateGrantedBondAction.DISCOVER_SERVICES ->
                 startGrantedServiceDiscovery(admission, reason = "gate granted")
             GateGrantedBondAction.WAIT_FOR_BOND -> {
+                beginBondWait(admission, session)
                 handleConnectState(
                     session.device.uuid,
                     session.device.name,
@@ -4566,6 +4699,50 @@ class BleManager private constructor() {
                 )
             }
             GateGrantedBondAction.START_BOND -> startGrantedSystemBond(admission, session)
+        }
+    }
+
+    /** 系统交互有独立预算；广播晚于 framework 状态更新时按权威状态收敛一次。 */
+    @Synchronized
+    private fun beginBondWait(admission: BleConnectionAdmission, session: GrantedGattSession) {
+        val timeout = session.device.belongConfig.androidBondTimeout
+            ?.takeIf { it.isFinite() && it > 0.0 } ?: return
+        if (session.bondWaitActive || currentAdmissionFor(admission) == null ||
+            !connectionAdmissionGate.isActive(admission) || session.device.myGatt !== session.gatt
+        ) return
+        session.bondWaitActive = true
+        ++session.connectTimeoutEpoch
+        session.device.timeoutTimer?.cancel()
+        session.device.timeoutTimer = null
+        sendPairingProgress(admission, session.device.name, "bonding")
+        session.bondWaitTimer = bondWaitScheduler.schedule(timeout.toLong().coerceAtLeast(1L)) {
+            synchronized(this@BleManager) {
+                val current = currentAdmissionFor(admission) ?: return@synchronized
+                if (admittedGattSessions[current.sessionId] !== session || !session.bondWaitActive ||
+                    !connectionAdmissionGate.isActive(current) || session.device.myGatt !== session.gatt
+                ) return@synchronized
+                // Do not classify BONDING from a stale callback snapshot as failure after the
+                // system already committed BONDED. Both paths use the same idempotent resume.
+                if (systemBondStateOf(session.gatt.device.bondState) == SystemBondState.BONDED) {
+                    if (session.legacySecurityGateFallbackBinding) {
+                        restartGrantedServiceDiscoveryAfterLegacyBond(current, "bond deadline observed bonded")
+                    } else {
+                        startGrantedServiceDiscovery(current, "bond deadline observed bonded")
+                    }
+                    return@synchronized
+                }
+                session.bondWaitActive = false
+                session.bondWaitTimer?.cancel()
+                session.bondWaitTimer = null
+                val action = handleSecurityGateFailure(
+                    current, session.gatt, session.device, "AndroidBondTimeout", 0,
+                )
+                if (action != BleAndroidSecurityRecoveryAction.DUPLICATE_IGNORED) {
+                    terminateConnectionAdmission(
+                        current, session.gatt, session.device.name, action.toConnectState(),
+                    )
+                }
+            }
         }
     }
 
@@ -4611,6 +4788,7 @@ class BleManager private constructor() {
             GateGrantedBondAction.WAIT_FOR_BOND -> {
                 synchronized(device) {
                     session.legacySecurityGateFallbackBinding = true
+                    beginBondWait(current, session)
                     handleConnectState(
                         device.uuid,
                         device.name,
@@ -4661,6 +4839,7 @@ class BleManager private constructor() {
 
             // 2、状态必须先进入 START_BINDING；快速广播随后才能被 exact guard 接受。
             session.legacySecurityGateFallbackBinding = rediscoverAfterBond
+            beginBondWait(current, session)
             handleConnectState(
                 session.device.uuid,
                 session.device.name,
@@ -4787,6 +4966,16 @@ class BleManager private constructor() {
                 )
                 return
             }
+            if (session.bondWaitActive) {
+                session.bondWaitActive = false
+                session.bondWaitTimer?.cancel()
+                session.bondWaitTimer = null
+                sendPairingProgress(current, session.device.name, "bonded")
+                startConnectTimeout(
+                    session.device.belongConfig, session.device.uuid, session.device.name,
+                    afterUpgrade = false, admission = current,
+                )
+            }
             session.serviceDiscoveryStarted = true
             runCatching { session.gatt.discoverServices() }.getOrDefault(false)
         }
@@ -4825,7 +5014,7 @@ class BleManager private constructor() {
         invalidateEndpoint: Boolean,
     ) {
         releaseConnectionAdmission(admission, invalidateEndpoint)
-            ?.let { startGrantedGattPipeline(it) }
+            ?.let { dispatchGrantedAdmission(it) }
     }
 
     /**
@@ -4839,11 +5028,14 @@ class BleManager private constructor() {
         invalidateEndpoint: Boolean,
     ): BleConnectionAdmission? {
         val current = currentAdmissionFor(admission) ?: return null
+        pendingGattStarts.remove(current.sessionId)
         admittedGattSessions[current.sessionId]?.let { session ->
+            session.bondWaitTimer?.cancel()
+            session.bondWaitActive = false
             securityGateAttempts.cancel(securityGateOwner(current, session.gatt))
         }
         currentAdmissions.remove(reconnectKey(current.endpointId))
-        admittedGattSessions.remove(current.sessionId)
+        admittedGattSessions.remove(current.sessionId)?.also { it.bondWaitTimer?.cancel() }
         businessConnectionLeases.remove(reconnectKey(current.endpointId))
         return if (invalidateEndpoint) {
             invalidateConnectionAttempts(setOf(current.endpointId))
@@ -4943,7 +5135,7 @@ class BleManager private constructor() {
 
         // 2. Gate 释放后立即启动其它 endpoint。当前 endpoint 的 retry 在后续状态出口调度。
         val next = releaseConnectionAdmission(current, invalidateEndpoint = true)
-        next?.let { startGrantedGattPipeline(it) }
+        next?.let { dispatchGrantedAdmission(it) }
 
         // 3. source 只对当前失败 attempt 有效；supervisor.schedule 会把下一轮复位为 autoReconnect。
         handleConnectState(
@@ -4968,8 +5160,8 @@ class BleManager private constructor() {
             admission.endpointId,
             admission.generation,
             admission.sessionId,
-        )?.let { startGrantedGattPipeline(it) }
-        admittedGattSessions.remove(admission.sessionId)
+        )?.let { dispatchGrantedAdmission(it) }
+        admittedGattSessions.remove(admission.sessionId)?.also { it.bondWaitTimer?.cancel() }
         sendLog(BleLoggerTag.d, "Admission gate: ${admission.endpointId}, ignored orphan exact session, reason=$reason")
     }
 
@@ -4998,7 +5190,8 @@ class BleManager private constructor() {
         val promoted = current.copy(source = BleConnectSource.MANUAL_RECONNECT)
         currentAdmissions[key] = promoted
         admittedGattSessions[current.sessionId]?.let { session ->
-            admittedGattSessions[current.sessionId] = session.copy(admission = promoted)
+            // Promotion changes priority/source only; do not reset phase timers or discovery guards.
+            session.admission = promoted
         }
         connectionAdmissionGate.promote(uuid, current.generation, current.sessionId)
     }
@@ -5010,13 +5203,16 @@ class BleManager private constructor() {
             return
         }
         val key = reconnectKey(uuid)
-        currentAdmissions.remove(key)?.let { admittedGattSessions.remove(it.sessionId) }
+        currentAdmissions.remove(key)?.let {
+            pendingGattStarts.remove(it.sessionId)
+            admittedGattSessions.remove(it.sessionId)?.bondWaitTimer?.cancel()
+        }
         securityGateAttempts.cancelEndpoint(uuid)
         pendingSecurityRetryVisibility.remove(key)
         // Business prepare is scoped to the exact admission; cancelling Gate
         // invalidates the auth grace without touching persisted reconnect owner.
         businessConnectionLeases.remove(key)
-        invalidateConnectionAttempts(setOf(uuid))?.let { startGrantedGattPipeline(it) }
+        invalidateConnectionAttempts(setOf(uuid))?.let { dispatchGrantedAdmission(it) }
         sendLog(BleLoggerTag.d, "Admission gate: $uuid cancelled, reason=$reason")
     }
 
@@ -5068,10 +5264,12 @@ class BleManager private constructor() {
                 val key = reconnectKey(uuid)
                 val device = findConnectedDevice(uuid)
                 currentAdmissions.remove(key)
-                invalidateConnectionAttempts(setOf(uuid))?.let { startGrantedGattPipeline(it) }
+                val next = invalidateConnectionAttempts(setOf(uuid))
                 businessConnectionLeases.remove(key)
                 sendCmdQueues.remove(key)
                 device?.releaseAndClear() ?: runCatching { gatt.close() }
+                // next may create an unbonded GATT, so retire the old physical handle first.
+                next?.let { dispatchGrantedAdmission(it) }
                 sendLog(
                     BleLoggerTag.d,
                     "Admission gate: $uuid, invalidated exact pending passive GATT before physical callback",
@@ -5120,7 +5318,7 @@ class BleManager private constructor() {
 
         // 2、没有另一条健康 Manager owner 时，清理这个 endpoint 的全部 orphan 状态。
         val staleAdmission = currentAdmissions.remove(key)
-        staleAdmission?.let { admittedGattSessions.remove(it.sessionId) }
+        staleAdmission?.let { admittedGattSessions.remove(it.sessionId)?.also { it.bondWaitTimer?.cancel() } }
         val next = invalidateConnectionAttempts(setOf(uuid))
         businessConnectionLeases.remove(key)
         sendCmdQueues.remove(key)
@@ -5131,7 +5329,7 @@ class BleManager private constructor() {
                 staleGatt.close()
             }
         }
-        next?.let { startGrantedGattPipeline(it) }
+        next?.let { dispatchGrantedAdmission(it) }
         sendLog(
             BleLoggerTag.e,
             "Admission gate: $uuid, repaired stale pending owner, " +
@@ -5209,7 +5407,7 @@ class BleManager private constructor() {
             discardOtaWriteQueueForSession(uuid, reason = "OTA recovery session rebind")
             device.releaseAndClear()
             device.connectState = BleConnectState.NONE
-            next?.let { startGrantedGattPipeline(it) }
+            next?.let { dispatchGrantedAdmission(it) }
             sendLog(
                 BleLoggerTag.d,
                 "Admission gate: $uuid, OTA recovery retired exact business owner " +
@@ -5240,7 +5438,7 @@ class BleManager private constructor() {
 
         // 3、先撤销 exact callback 归属；Gate 返回的其它 endpoint 可以在旧句柄关闭后继续。
         currentAdmissions.remove(key)
-        admittedGattSessions.remove(admission.sessionId)
+        admittedGattSessions.remove(admission.sessionId)?.also { it.bondWaitTimer?.cancel() }
         businessConnectionLeases.remove(key)
         businessConnectedGattSessions.remove(key)
         val next = invalidateConnectionAttempts(setOf(uuid))
@@ -5250,7 +5448,7 @@ class BleManager private constructor() {
         sendCmdQueues.remove(key)
         discardWriteQueuesForSession(uuid, reason = "session rebind")
         device.releaseAndClear()
-        next?.let { startGrantedGattPipeline(it) }
+        next?.let { dispatchGrantedAdmission(it) }
         sendLog(
             BleLoggerTag.d,
             "Admission gate: $uuid, session rebind invalidated exact owner " +
@@ -5373,6 +5571,7 @@ class BleManager private constructor() {
         source: BleConnectSource = BleConnectSource.UNKNOWN,
         sessionGeneration: Long = 0L,
         attemptGeneration: Long = 0L,
+        pairingPhase: String? = null,
     ) {
         val legacyGeneration = sessionGeneration.takeIf { it > 0L } ?: attemptGeneration
         val nativeTrace = nativeTraceSnapshot(uuid)
@@ -5388,6 +5587,7 @@ class BleManager private constructor() {
                 .put("attemptGeneration", attemptGeneration)
                 .also { payload ->
                     nativeTrace?.let { payload.put("nativeTrace", it) }
+                    pairingPhase?.let { payload.put("pairingPhase", it) }
                 }
                 .toString()
             BleEC.CONNECT_STATUS.event?.success(json)
@@ -5444,6 +5644,7 @@ class BleManager private constructor() {
         generation: Long = currentAdmissions[reconnectKey(uuid)]?.sessionGeneration ?: 0L,
         attemptGeneration: Long = currentAdmissions[reconnectKey(uuid)]?.generation ?: 0L,
         scheduleAutoReconnect: Boolean = true,
+        armAutoReconnect: Boolean = true,
         traceCauseDomain: String? = null,
         traceCauseCode: Int? = null,
     ) {
@@ -5535,7 +5736,9 @@ class BleManager private constructor() {
             }?.let {
                 it.timeoutTimer?.cancel()
                 it.timeoutTimer = null
-                if (state == BleConnectState.CONNECTED) {
+                // Temporary pairing keeps foreground request identity authoritative.
+                // Skipping arm preserves connected/Gate semantics and existing owners.
+                if (state == BleConnectState.CONNECTED && armAutoReconnect) {
                     autoReconnectSupervisor.arm(it)
                 }
             }

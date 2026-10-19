@@ -22,6 +22,7 @@ BleConnectModel _$BleConnectModelFromJson(Map<String, dynamic> json) =>
           ? null
           : BleNativeConnectionTrace.fromJson(
               json['nativeTrace'] as Map<String, dynamic>),
+      pairingPhase: json['pairingPhase'] as String?,
     );
 
 Map<String, dynamic> _$BleConnectModelToJson(BleConnectModel instance) =>
@@ -34,7 +35,8 @@ Map<String, dynamic> _$BleConnectModelToJson(BleConnectModel instance) =>
       'source': _$BleConnectSourceEnumMap[instance.source]!,
       'generation': instance.sessionGeneration,
       'attemptGeneration': instance.attemptGeneration,
-      'nativeTrace': instance.nativeTrace,
+      'nativeTrace': instance.nativeTrace?.toJson(),
+      'pairingPhase': instance.pairingPhase,
     };
 
 const _$BleConnectSourceEnumMap = {

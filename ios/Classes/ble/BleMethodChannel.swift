@@ -55,6 +55,8 @@ enum BleMC: String {
     case commitBusinessConnection
     /// Abort only the exact business-auth lease.
     case abortBusinessConnection
+    /// Invalidate the exact committed G2 business owner while preserving reconnect intent.
+    case invalidateBusinessConnection
     /// 仅补种 native 长期回连意图。
     case armAutoReconnectTargets
     /// 立即建立/复用所有目标的 CoreBluetooth pending connect。
@@ -163,6 +165,9 @@ enum BleMC: String {
             // so Swift Codable never sees NSNull for Bool fields.
             jsonData["afterUpgrade"] = jsonData["afterUpgrade"] as? Bool ?? false
             jsonData["directConnect"] = jsonData["directConnect"] as? Bool ?? false
+            // Optional Android foreground request identity has no CoreBluetooth meaning.
+            // Accept shared callers without altering the existing iOS session allocator.
+            jsonData.removeValue(forKey: "sessionGeneration")
             BleEC.logger.emit("[d]-BleChannel::connectDevice args uuid=\(jsonData["uuid"] as? String ?? ""), name=\(jsonData["name"] as? String ?? ""), sn=\(jsonData["sn"] as? String ?? ""), config=\(jsonData["belongConfig"] as? String ?? ""), afterUpgrade=\(jsonData["afterUpgrade"] as? Bool ?? false), directConnect=\(jsonData["directConnect"] as? Bool ?? false)")
             if let easyConnect: BleEasyConnect = jsonData.decodeTo() {
                 BleManager.shared.connect(easyConnect: easyConnect)
@@ -197,6 +202,12 @@ enum BleMC: String {
         case .abortBusinessConnection:
             let data = arguments as? [String: Any] ?? [:]
             result(BleManager.shared.abortBusinessConnection(
+                BleBusinessConnectionAttempt(data: data)
+            ))
+            return
+        case .invalidateBusinessConnection:
+            let data = arguments as? [String: Any] ?? [:]
+            result(BleManager.shared.invalidateBusinessConnection(
                 BleBusinessConnectionAttempt(data: data)
             ))
             return

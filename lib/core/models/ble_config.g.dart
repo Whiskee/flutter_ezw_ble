@@ -27,6 +27,9 @@ BleConfig _$BleConfigFromJson(Map<String, dynamic> json) => BleConfig(
           ? null
           : BleSecurityGate.fromJson(
               json['securityGate'] as Map<String, dynamic>),
+      androidBondTimeout: (json['androidBondTimeout'] as num?)?.toDouble(),
+      androidSerializeUnbonded:
+          json['androidSerializeUnbonded'] as bool? ?? false,
     );
 
 Map<String, dynamic> _$BleConfigToJson(BleConfig instance) => <String, dynamic>{
@@ -41,5 +44,7 @@ Map<String, dynamic> _$BleConfigToJson(BleConfig instance) => <String, dynamic>{
       'autoReconnectMaxAttempts': instance.autoReconnectMaxAttempts,
       'autoReconnectUseNativePassive': instance.autoReconnectUseNativePassive,
       'androidHighReliabilityMode': instance.androidHighReliabilityMode,
+      'androidBondTimeout': instance.androidBondTimeout,
+      'androidSerializeUnbonded': instance.androidSerializeUnbonded,
       'securityGate': instance.securityGate,
     };

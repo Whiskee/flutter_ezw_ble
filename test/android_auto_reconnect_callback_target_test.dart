@@ -31,14 +31,14 @@ void main() {
       managerSource,
       matches(
         RegExp(
-          r'createConnectCallBack\(\s*plan\.request\.uuid,\s*source = BleConnectSource\.FOREGROUND',
+          r'startGattWithAdmission\(\s*bleDevice,\s*BleConnectSource\.FOREGROUND',
         ),
       ),
     );
     expect(
       reconnectSource,
       contains(
-          'createConnectCallback(task.uuid, task.source, task.sessionGeneration)'),
+          'startGattWhenAdmitted(reservedDevice, task.source, reservedSession)'),
     );
   });
 

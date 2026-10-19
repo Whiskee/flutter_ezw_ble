@@ -25,6 +25,10 @@ class BleConnectModel {
   final int attemptGeneration;
   final BleNativeConnectionTrace? nativeTrace;
 
+  /// Android 配对控制进度，沿用 exact session/attempt，不能作为物理连接证据。
+  /// 当前值为 queuedBeforePhysical、bonding、bonded；旧平台可以省略。
+  final String? pairingPhase;
+
   /// Backward-compatible alias for payloads that used one generation field.
   @JsonKey(includeFromJson: false, includeToJson: false)
   int get generation => sessionGeneration;
@@ -39,6 +43,7 @@ class BleConnectModel {
     int? generation,
     this.attemptGeneration = 0,
     this.nativeTrace,
+    this.pairingPhase,
   }) : sessionGeneration = generation ?? sessionGeneration;
 
   factory BleConnectModel.fromJson(Map<String, dynamic> json) {

@@ -125,6 +125,9 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     String? sn,
     bool? afterUpgrade,
     bool directConnect = false,
+    // Android foreground request identity survives queue/scan waits. Existing formal
+    // Supervisor pending owners keep UUID promotion; activation/rebind owns session takeover.
+    int? sessionGeneration,
   }) {
     throw UnimplementedError('connectDevice() has not been implemented.');
   }
@@ -292,9 +295,14 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
 
   /// Commit business connected only if the same prepared attempt still owns the
   /// native admission, physical link, and complete GATT readiness.
+  ///
+  /// Android temporary pairing callers can defer creating a persistent native
+  /// owner until whole-device handoff. This does not cancel an existing owner;
+  /// iOS and legacy callers retain their current auto-reconnect behavior.
   Future<BleBusinessConnectionStatus> commitBusinessConnection(
-    BleBusinessConnectionAttempt attempt,
-  ) {
+    BleBusinessConnectionAttempt attempt, {
+    bool armAutoReconnect = true,
+  }) {
     throw UnimplementedError(
       'commitBusinessConnection(attempt: $attempt) has not been implemented.',
     );
@@ -307,6 +315,21 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   Future<bool> abortBusinessConnection(BleBusinessConnectionAttempt attempt) {
     throw UnimplementedError(
       'abortBusinessConnection(attempt: $attempt) has not been implemented.',
+    );
+  }
+
+  /// Ask native to invalidate the exact committed business connection.
+  ///
+  /// iOS uses this for G2 heartbeat liveness: only the current committed
+  /// auto-reconnect owner may be invalidated, and native keeps the long-lived
+  /// reconnect intent while forcing the stale transport through the existing
+  /// timeout/reconnect path. Android currently returns false so callers keep
+  /// their existing platform-specific reconciliation behavior.
+  Future<bool> invalidateBusinessConnection(
+    BleBusinessConnectionAttempt attempt,
+  ) {
+    throw UnimplementedError(
+      'invalidateBusinessConnection(attempt: $attempt) has not been implemented.',
     );
   }
 

@@ -54,6 +54,7 @@ void main() {
       expect(androidChannel, contains(method));
       expect(iosChannel, contains(method));
     }
+    expect(iosChannel, contains('invalidateBusinessConnection'));
 
     for (final status in [
       'accepted',
@@ -70,11 +71,12 @@ void main() {
 
     expect(androidManager, contains('querySystemGattConnectionState'));
     expect(androidManager, contains('hasCompleteGattReadiness'));
-    expect(androidManager, contains('return setConnected(attempt.uuid)'));
+    expect(androidManager,
+        contains('return setConnected(attempt.uuid, armAutoReconnect ='));
     expect(
         androidManager,
         contains(
-            'fun setConnected(uuid: String): BleBusinessConnectionStatus'));
+            'fun setConnected(uuid: String, armAutoReconnect: Boolean = true)'));
     expect(androidDevice, contains('notifiedPsTypes'));
     expect(androidDevice, contains('markNotifyReady'));
     expect(androidDevice, contains('containsAll(expectedTypes)'));
@@ -86,6 +88,10 @@ void main() {
         iosManager,
         contains(
             'return setConnected(uuid: attempt.uuid, expectedAttempt: attempt)'));
+    expect(iosManager, contains('businessConnection invalidate accepted'));
+    expect(iosManager, contains('traceCauseDomain: "businessHeartbeat"'));
+    expect(androidChannel, contains('INVALIDATE_BUSINESS_CONNECTION'));
+    expect(androidChannel, contains('return result.success(false)'));
     expect(iosManager,
         contains('expectedAttempt: BleBusinessConnectionAttempt? = nil'));
   });
