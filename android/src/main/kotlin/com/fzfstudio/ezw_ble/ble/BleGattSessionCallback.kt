@@ -486,10 +486,10 @@ internal class BleGattSessionCallback(
             otaInstanceId = otaContext?.instanceId ?: "",
         ).toFlutterMap()
         emitReceiveData(bleCmdMap)
-        sendLog(
-            BleLoggerTag.d,
-            "Receive cmd(old): ${gatt.device.address}, type=${privateService.type}, length=${characteristic.value.size}, chartsType=${characteristic.writeType}",
-        )
+        // ACK/notify 必须先原样分发；只在构造成功接收元数据之前门控 OTA 逐包诊断。
+        BleOtaDebugLogPolicy.logReceiveCallback(privateService.type, { sendLog(BleLoggerTag.d, it) }) {
+            "Receive cmd(old): ${gatt.device.address}, type=${privateService.type}, length=${characteristic.value.size}, chartsType=${characteristic.writeType}"
+        }
     }
 
     /**
@@ -560,10 +560,18 @@ internal class BleGattSessionCallback(
 
         // 5. 其余 characteristic write 状态交给 manager 精确匹配普通/OTA owner；OTA Future
         //    只有在这里成功后才完成，不能再把同步提交成功当成 GATT 单槽位已经释放。
-        sendLog(BleLoggerTag.d, "Send cmd: $address, write call back is success = ${status == BluetoothGatt.GATT_SUCCESS}, status=$operationStatus")
+        val psType = device.psTypeForWriteCharacteristic(characteristic)
+        // 只门控已确认 OTA 成功回调的详情构造；下面的 owner 分发与 Future 完成始终执行。
+        BleOtaDebugLogPolicy.logWriteCallback(
+            psType = psType,
+            success = status == BluetoothGatt.GATT_SUCCESS,
+            logger = { sendLog(BleLoggerTag.d, it) },
+        ) {
+            "Send cmd: $address, write call back is success = ${status == BluetoothGatt.GATT_SUCCESS}, status=$operationStatus"
+        }
         onCharacteristicWriteComplete(
             address,
-            device.psTypeForWriteCharacteristic(characteristic),
+            psType,
             status,
             operationStatus,
         )

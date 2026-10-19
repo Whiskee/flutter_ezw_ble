@@ -4,7 +4,8 @@
 `d8f546bea55789cc3670d73a7f2dba6e348ca207`，未提交或推送。
 
 本次在原生日志生产处避免关闭 Debug 时的插值和 EventChannel 发出。新增
-`EzwBle.to.setDebugLoggingEnabled(bool)`，iOS 每进程默认关闭；Android 接受 no-op。
+`EzwBle.to.setDebugLoggingEnabled(bool)`，iOS 每进程默认关闭；Android 在本次 iOS 修复时
+接受 no-op，2026-10-19 起仅控制 OTA 成功逐包详情，当前契约见 `ARCHITECTURE.md` §6。
 setter 只写独立静态 policy，不构造 BLE manager/central，不改 SR、owner、重试、
 连接状态 JSON、通知 payload、恢复事件账本或 Trace。启动直接日志、扫描诊断预处理
 和 OTA String 回调都在求值前门控。Error 保留，服务发现错误和 OTA 硬背压/外设释放

@@ -98,7 +98,9 @@ internal class BleAndroidOtaWriteQueue(
                 completion = completion,
             ),
         )
-        logger("[ezw_ble][ota][android] enqueued endpoint=$endpoint bytes=${data.size} pending=$queueDepth")
+        BleOtaDebugLogPolicy.logPacketDetail(logger) {
+            "[ezw_ble][ota][android] enqueued endpoint=$endpoint bytes=${data.size} pending=$queueDepth"
+        }
         pump()
     }
 
@@ -133,7 +135,9 @@ internal class BleAndroidOtaWriteQueue(
                 inFlight = null
                 clearWait()
                 if (success) {
-                    logger("[ezw_ble][ota][android] completed endpoint=$endpoint status=$statusName pending=$queueDepth")
+                    BleOtaDebugLogPolicy.logPacketDetail(logger) {
+                        "[ezw_ble][ota][android] completed endpoint=$endpoint status=$statusName pending=$queueDepth"
+                    }
                     completed.completion(null)
                 } else {
                     logger("[ezw_ble][ota][android] failed endpoint=$endpoint status=$statusName pending=$queueDepth")
@@ -256,7 +260,9 @@ internal class BleAndroidOtaWriteQueue(
                     inFlight = head
                     waitStartedAtMillis = nowMillis()
                     lastBackpressure = null
-                    logger("[ezw_ble][ota][android] submitted endpoint=$endpoint bytes=${head.data.size} pending=$queueDepth")
+                    BleOtaDebugLogPolicy.logPacketDetail(logger) {
+                        "[ezw_ble][ota][android] submitted endpoint=$endpoint bytes=${head.data.size} pending=$queueDepth"
+                    }
                     scheduleWatchdog()
                     return
                 }
