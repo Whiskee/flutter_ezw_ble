@@ -3496,13 +3496,16 @@ class BleManager private constructor() {
             generation = acceptedAdmission.sessionGeneration,
             attemptGeneration = acceptedAdmission.generation,
         )
-        // 已连上的 1M 链路不会因为 connectGatt hint 自动变 2M；进入 OTA 再请求一次。
-        BleAndroidPreferredPhy.requestLe2m(
-            gatt = connectedDevice.myGatt,
-            endpoint = uuid,
-            reason = "enterUpgradeState",
-            logger = { sendLog(BleLoggerTag.d, it) },
-        )
+        // 高可靠模式继续由当前 session 的 RSSI 自适应控制 PHY，OTA 不能另写 2M 偏好。
+        // 普通模式保留进入 OTA 时的 2M 请求，不改变准入、状态或数据发送时序。
+        if (!connectedDevice.belongConfig.androidHighReliabilityMode) {
+            BleAndroidPreferredPhy.requestLe2m(
+                gatt = connectedDevice.myGatt,
+                endpoint = uuid,
+                reason = "enterUpgradeState",
+                logger = { sendLog(BleLoggerTag.d, it) },
+            )
+        }
         sendLog(BleLoggerTag.d, "EnterUpgradeState: $uuid Into upgrade state")
     }
 
