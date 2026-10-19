@@ -1,4 +1,5 @@
 import Foundation
+import Flutter
 
 final class FakeOtaPeripheral: OtaWritePeripheral {
     let otaEndpointId = "ios-left"
@@ -93,6 +94,10 @@ struct OtaWriteQueueLogTests {
         try cancelledSoftThrottleTimerCannotDriveNewAttempt()
         try hardBackpressureStallTimerDoesNotRestartOnPoll()
         try stalledOtaStillLogsDiagnostic()
+        try singleStallReportsPostCleanupDepth()
+        try batchStallReportsPostCleanupDepth()
+        try batchStallPreservesOtherPendingOwners()
+        try stalledAdmissionDoesNotClaimCleanupEvidence()
         try fileBatchKeepsExistingRoutineLogs()
         try verifiedAckDoesNotResetPartial64PacketBudget()
         try verifiedAckDoesNotReleaseSoftWaitAndKeepsMeasurements()
@@ -581,9 +586,196 @@ struct OtaWriteQueueLogTests {
         try assert(logs.contains { $0.contains("[ezw_ble][ota] stalled") }, "expected stalled OTA diagnostic log: \(logs)")
     }
 
+    /// The legacy pending value includes the failed head. A recovery decision needs
+    /// a separate snapshot of unsent items after removing that exact request.
+    private static func singleStallReportsPostCleanupDepth() throws {
+        let peripheral = FakeOtaPeripheral()
+        peripheral.canSendWriteWithoutResponse = false
+        let clock = FakeOtaClock()
+        let scheduler = FakeOtaScheduler()
+        let queue = OtaWriteQueue(peripheral: peripheral, clock: clock, scheduler: scheduler)
+        var results: [Any?] = []
+        var callbackDepths: [Int] = []
+        var submitted = 0
 
+        queue.enqueue(
+            data: Data([0x01]),
+            target: OtaWriteTarget(characteristicUUID: "ota-write") { _, _ in
+                submitted += 1
+                return true
+            },
+            expectedSessionGeneration: 37,
+            expectedAttemptGeneration: 9,
+            result: {
+                callbackDepths.append(queue.queueDepth)
+                results.append($0)
+            }
+        )
+        clock.monotonicNow += 15
+        // A ready callback with canSend still false reaches the real stall path;
+        // the scheduled poll remains available to simulate a cancelled late block.
+        queue.onPeripheralReadyToSendWriteWithoutResponse()
+        peripheral.canSendWriteWithoutResponse = true
+        queue.onPeripheralReadyToSendWriteWithoutResponse()
+        scheduler.runOldestIncludingCancelled()
 
+        try assert(results.count == 1 && callbackDepths == [0], "single stall must finish after removing its head, once")
+        try assert(submitted == 0 && queue.queueDepth == 0, "late readiness cannot send the failed single write")
+        let details = try stalledDetails(results[0])
+        try assert(details["pending"] as? Int == 1, "legacy single pending must still include the failed head")
+        try assert(details["remainingPending"] as? Int == 0, "single stall must report zero unsent items after cleanup")
+        try assert(details["endpoint"] as? String == "ios-left" &&
+            details["session"] as? Int64 == 37 && details["attempt"] as? Int64 == 9,
+            "cleanup evidence must retain the exact endpoint and physical owner")
+        try assert(details["reason"] as? String == "canSend=false" && details["wait"] as? TimeInterval == 15,
+            "cleanup evidence must preserve the actual stall reason and wait")
+    }
 
+    /// Exercise both a completely unsent RAW batch and a partially submitted one.
+    /// Failed siblings are removed before the one batch result, not treated as
+    /// unrelated residual work merely because legacy pending was greater than one.
+    private static func batchStallReportsPostCleanupDepth() throws {
+        for alreadySubmitted in [0, 2] {
+            let peripheral = FakeOtaPeripheral()
+            peripheral.canSendWriteWithoutResponse = alreadySubmitted > 0
+            let clock = FakeOtaClock()
+            let scheduler = FakeOtaScheduler()
+            let queue = OtaWriteQueue(peripheral: peripheral, clock: clock, scheduler: scheduler)
+            var submitted: [Data] = []
+            var results: [Any?] = []
+            var callbackDepths: [Int] = []
+            let packets = (0..<5).map { Data([UInt8($0)]) }
+
+            queue.enqueueBatch(
+                packets: packets,
+                target: OtaWriteTarget(characteristicUUID: "ota-write") { _, packet in
+                    submitted.append(packet)
+                    if submitted.count == alreadySubmitted {
+                        peripheral.canSendWriteWithoutResponse = false
+                    }
+                    return true
+                },
+                expectedSessionGeneration: 37,
+                expectedAttemptGeneration: 9,
+                result: {
+                    callbackDepths.append(queue.queueDepth)
+                    results.append($0)
+                }
+            )
+            try assert(submitted == Array(packets.prefix(alreadySubmitted)) && results.isEmpty,
+                "fixture must stall at the intended batch boundary")
+            clock.monotonicNow += 15
+            queue.onPeripheralReadyToSendWriteWithoutResponse()
+            peripheral.canSendWriteWithoutResponse = true
+            queue.onPeripheralReadyToSendWriteWithoutResponse()
+            scheduler.runOldestIncludingCancelled()
+            queue.cancelAll(reason: "exact attempt cleanup after stall")
+
+            try assert(results.count == 1 && callbackDepths == [0], "failed batch must settle once after dropping only its siblings")
+            try assert(submitted == Array(packets.prefix(alreadySubmitted)) && queue.queueDepth == 0,
+                "late ready, old poll and later cleanup must not submit failed batch tails")
+            let details = try stalledDetails(results[0])
+            try assert(details["pending"] as? Int == packets.count - alreadySubmitted,
+                "legacy pending must retain the stalled batch's pre-cleanup depth")
+            try assert(details["remainingPending"] as? Int == 0,
+                "fully removed batch must report zero remainingPending even when legacy pending exceeds one")
+        }
+    }
+
+    /// Zero is only safe when the whole native queue is empty. Another batch or a
+    /// single write must survive failed-batch cleanup and remain frozen for recovery.
+    private static func batchStallPreservesOtherPendingOwners() throws {
+        for otherIsBatch in [false, true] {
+            let peripheral = FakeOtaPeripheral()
+            peripheral.canSendWriteWithoutResponse = false
+            let clock = FakeOtaClock()
+            let scheduler = FakeOtaScheduler()
+            let queue = OtaWriteQueue(peripheral: peripheral, clock: clock, scheduler: scheduler)
+            var failedResults: [Any?] = []
+            var otherResults: [Any?] = []
+            var callbackDepths: [Int] = []
+            var submitted = 0
+            let target = OtaWriteTarget(characteristicUUID: "ota-write") { _, _ in
+                submitted += 1
+                return true
+            }
+            queue.enqueueBatch(packets: [Data([1]), Data([2]), Data([3])], target: target, result: {
+                callbackDepths.append(queue.queueDepth)
+                failedResults.append($0)
+            })
+            if otherIsBatch {
+                queue.enqueueBatch(packets: [Data([4]), Data([5])], target: target,
+                    result: { otherResults.append($0) })
+            } else {
+                queue.enqueue(data: Data([4]), target: target, result: { otherResults.append($0) })
+            }
+            let residualCount = otherIsBatch ? 2 : 1
+            clock.monotonicNow += 15
+            queue.onPeripheralReadyToSendWriteWithoutResponse()
+            peripheral.canSendWriteWithoutResponse = true
+            queue.onPeripheralReadyToSendWriteWithoutResponse()
+            scheduler.runOldestIncludingCancelled()
+
+            try assert(failedResults.count == 1 && callbackDepths == [residualCount],
+                "failed batch callback must observe only the unrelated residual queue")
+            try assert(otherResults.isEmpty && queue.queueDepth == residualCount && submitted == 0,
+                "other owner must remain pending and frozen, not be cancelled or submitted by late work")
+            let details = try stalledDetails(failedResults[0])
+            try assert(details["pending"] as? Int == 3 + residualCount,
+                "legacy pending must include the failed head, its siblings and other pending work")
+            try assert(details["remainingPending"] as? Int == residualCount,
+                "cleanup evidence must count another batch or single write as residual")
+            queue.cancelAll(reason: "exact recovery teardown")
+            try assert(failedResults.count == 1 && otherResults.count == 1 && queue.queueDepth == 0,
+                "only explicit teardown may complete the unrelated pending owner, once")
+        }
+    }
+
+    /// Reentrant admission during the failure callback is a rejected new request,
+    /// not the just-cleaned request. It must not receive a false zero-depth proof.
+    private static func stalledAdmissionDoesNotClaimCleanupEvidence() throws {
+        let peripheral = FakeOtaPeripheral()
+        peripheral.canSendWriteWithoutResponse = false
+        let clock = FakeOtaClock()
+        let scheduler = FakeOtaScheduler()
+        let queue = OtaWriteQueue(peripheral: peripheral, clock: clock, scheduler: scheduler)
+        var failedResults: [Any?] = []
+        var rejectedResults: [Any?] = []
+        var submitted = 0
+        let target = OtaWriteTarget(characteristicUUID: "ota-write") { _, _ in
+            submitted += 1
+            return true
+        }
+        queue.enqueueBatch(packets: [Data([1]), Data([2])], target: target, result: { value in
+            failedResults.append(value)
+            queue.enqueue(data: Data([3]), target: target, result: { rejectedResults.append($0) })
+            queue.enqueueBatch(packets: [Data([4]), Data([5])], target: target,
+                result: { rejectedResults.append($0) })
+        })
+        clock.monotonicNow += 15
+        queue.onPeripheralReadyToSendWriteWithoutResponse()
+
+        try assert(failedResults.count == 1 && rejectedResults.count == 2 && submitted == 0 && queue.queueDepth == 0,
+            "reentrant new single and batch must be rejected without enqueueing")
+        for result in rejectedResults {
+            let details = try stalledDetails(result)
+            try assert(details["remainingPending"] == nil,
+                "admission rejection is not evidence that the rejected request was cleaned up")
+            try assert(details["pending"] as? Int == 0 && details["reason"] as? String != "canSend=false",
+                "admission rejection must retain its distinct reason and actual queue depth")
+        }
+    }
+
+    /// Read the actual native FlutterError payload, never a source-text surrogate.
+    private static func stalledDetails(_ result: Any?) throws -> [String: Any] {
+        guard let error = result as? FlutterError,
+              error.code == "ota_write_stalled",
+              let details = error.details as? [String: Any] else {
+            throw NSError(domain: "OtaWriteQueueLogTests", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "expected structured ota_write_stalled error"])
+        }
+        return details
+    }
     private static func fileBatchKeepsExistingRoutineLogs() throws {
         let peripheral = FakeOtaPeripheral()
         let clock = FakeOtaClock()

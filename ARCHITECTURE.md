@@ -946,6 +946,7 @@ iOS 端 OTA 通道走单独的 per-peripheral 写队列 `OtaWriteQueue`，目标
 - **硬阻塞恢复**：`disconnectForOtaRecovery(endpoint, expectedSession, expectedAttempt, otaContext)` 是写阻塞专用接口；G2 必须同时匹配当前事务和 exact physical pair，隔离旧写队列并发起真实 CoreBluetooth disconnect，不伪造断连事件、不复用 reboot suppression。整组 transaction gate 仍保留，只有后续受控 `recover` 能取得恢复准入。返回 `accepted`、`alreadyDisconnected`、`staleIdentity` 或 `unavailable`；无事务的 legacy 调用不得清理 transaction-owned endpoint。
 - **挂起 await 兜底**：断连/蓝牙 OFF/`reset()`/配置撤销/外设释放时 `OtaWriteQueue.cancelAll()` 会对所有 pending 写入回调 `ota_write_cancelled`；蓝牙 OFF 已使全部物理 GATT session 失效，必须在清 upgrade marker 前取消并移除所有 OTA 队列。改这条兜底必须保证**任何路径都不会让 Dart `await` 永远挂着**。
 - **批量通道**：OTA 与 `psType == 3` 文件 RAW 都可一次入队 already-framed 小包；两者队列实例独立，Future 在最后一包提交后完成，Android 三条写路径继续共享 GATT 单槽位。iOS connection interval 协商与 `psType == 0` write type 切换仍不在本期范围。
+- **停滞清理证据**：实际队首超时后，先撤销同批尚未提交的尾包，再在唯一错误回调前写入 `remainingPending`（清理后该队列尚未提交的条目数）。旧 `pending` 保持清理前含失败队首的口径；其它批次/单包不得为凑零而清除。队列继续保持 stalled，迟到 ready/timer 不能续发旧包。入队前拒绝没有本次清理过程，不携带该新字段。新 SDK 只有严格整数 `remainingPending == 0` 且原有 exact identity/无断连等条件全部满足，才可选择已有的整窗直写重发；旧 SDK 仍按 `pending` 保守恢复。该字段不证明系统栈 drain、固件接收或真实 ACK，不改变 15 秒硬阻塞、64 包软节流或重试预算。
 
 ### 12.7 G2 OTA native transaction registry
 
