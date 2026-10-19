@@ -1,5 +1,7 @@
 import 'dart:typed_data';
 
+import 'core/models/ble_runtime_common.dart';
+
 import 'package:flutter_ezw_ble/core/models/ble_config.dart';
 import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
 import 'package:flutter_ezw_ble/core/models/ble_device.dart';
@@ -56,6 +58,38 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// iOS final recovery activation 必须回传此值；Android 当前返回 0。
   Future<int> bleRecoveryEpoch() {
     throw UnimplementedError('bleRecoveryEpoch() has not been implemented.');
+  }
+
+  /// iOS-only read of the current exact business-connected common owner.
+  Future<BleRuntimeCommonOwner?> getRuntimeCommonOwner(String uuid) {
+    throw UnimplementedError(
+      'getRuntimeCommonOwner() has not been implemented.',
+    );
+  }
+
+  /// Serializes runtime common CCCD changes; only confirmed is success.
+  Future<BleRuntimeCommonResult> setRuntimeCommonNotifications(
+    String uuid, {
+    required int sessionGeneration,
+    required int attemptGeneration,
+    required int revision,
+    required bool enabled,
+  }) {
+    throw UnimplementedError(
+      'setRuntimeCommonNotifications() has not been implemented.',
+    );
+  }
+
+  /// An unknown CCCD lane may request one real exact-owner disconnect.
+  Future<BleRuntimeCommonResult> disconnectForRuntimeNotificationRecovery(
+    String uuid, {
+    required int sessionGeneration,
+    required int attemptGeneration,
+    required int revision,
+  }) {
+    throw UnimplementedError(
+      'disconnectForRuntimeNotificationRecovery() has not been implemented.',
+    );
   }
 
   /// 设置蓝牙配置
@@ -494,6 +528,16 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     throw UnimplementedError('quiteUpgradeState() has not been implemented.');
   }
 
+  /// Control iOS Debug and Android OTA successful-packet detail before formatting.
+  ///
+  /// Defaults to false in each native process. Error logs and connection Trace
+  /// are independent. Android errors, stages and non-OTA logs are preserved.
+  Future<void> setDebugLoggingEnabled(bool enabled) {
+    throw UnimplementedError(
+      'setDebugLoggingEnabled(enabled: $enabled) has not been implemented.',
+    );
+  }
+
   /// Enable or disable native connection trace snapshots.
   ///
   /// The default native value is false. Disabling must only clear trace/RSSI
@@ -502,6 +546,13 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     throw UnimplementedError(
       'setConnectionTraceEnabled(enabled: $enabled) has not been implemented.',
     );
+  }
+
+  /// Pause iOS proactive RSSI sampling while preserving Trace configuration,
+  /// passive events and BLE owners. Defaults to unpaused; Android is a no-op.
+  Future<void> setConnectionTraceSamplingPaused(bool paused) {
+    throw UnimplementedError(
+        'setConnectionTraceSamplingPaused() has not been implemented.');
   }
 
   /// 打开蓝牙设置页面

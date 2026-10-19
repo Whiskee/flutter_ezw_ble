@@ -32,6 +32,7 @@ void main() {
       directory.path,
       '${directory.path}/CoreBluetooth.o',
       '${directory.path}/flutter_ezw_utils.o',
+      'ios/Classes/ble/BleDebugLogPolicy.swift',
       'ios/Classes/ble/BleScanPipeline.swift',
       'ios/Classes/ble/BlePendingReconnectIdentity.swift',
       'ios/Classes/ble/BleRecoveryActivationGate.swift',

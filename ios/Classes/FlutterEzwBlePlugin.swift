@@ -36,7 +36,7 @@ public class FlutterEzwBlePlugin: NSObject, FlutterPlugin, FlutterApplicationLif
         if !launchedHeadlessInBackground,
            UIApplication.shared.applicationState == .background {
             launchedHeadlessInBackground = true
-            BleEC.logger.emit(
+            BleDebugLogPolicy.emit(
                 "[d]-stateRestoration: app launched headless in background (applicationState=background)"
             )
         }
@@ -47,7 +47,7 @@ public class FlutterEzwBlePlugin: NSObject, FlutterPlugin, FlutterApplicationLif
         }
 
         launchedForBluetoothStateRestoration = true
-        BleEC.logger.emit(
+        BleDebugLogPolicy.emit(
             "[d]-stateRestoration: app launched for bluetooth central id=\(BleManager.restorationIdentifier)"
         )
     }

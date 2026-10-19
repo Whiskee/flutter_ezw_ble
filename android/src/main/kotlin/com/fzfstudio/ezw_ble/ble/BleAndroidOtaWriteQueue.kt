@@ -205,10 +205,10 @@ internal class BleAndroidOtaWriteQueue(
                 // 尚未提交，因此绝不能完成它的 Future；解除屏障后再驱动排队写入。
                 cancelledInFlightCallbackPending = false
                 clearWait()
-                logFileOnly {
+                logger(
                     "[ezw_ble][$channel][android] drained cancelled callback " +
-                        "endpoint=$endpoint status=$statusName pending=$queueDepth"
-                }
+                        "endpoint=$endpoint status=$statusName pending=$queueDepth",
+                )
                 pump()
                 return true
             }
@@ -354,7 +354,7 @@ internal class BleAndroidOtaWriteQueue(
                     head.batch?.backpressureCount = (head.batch?.backpressureCount ?: 0) + 1
                     markWaitStarted(contributesToBatchMetrics = true)
                     if (!failIfStalled(submission.reason, submission)) {
-                        logFileOnly { "[ezw_ble][$channel][android] backpressure endpoint=$endpoint status=${submission.status} pending=$queueDepth" }
+                        logger("[ezw_ble][$channel][android] backpressure endpoint=$endpoint status=${submission.status} pending=$queueDepth")
                         scheduleWatchdog()
                     }
                     return
@@ -485,11 +485,11 @@ internal class BleAndroidOtaWriteQueue(
     }
 
     /**
-     * OTA RAW can submit thousands of successful packets per upgrade; keep those routine
-     * milestones silent while leaving the shared FILE queue's existing diagnostics intact.
+     * Keep 240 batch completion/metrics and 233 lazy Debug packet diagnostics together.
+     * Ordinary OTA does not format successful packets; FILE diagnostics stay independent.
      */
     private inline fun logFileOnly(message: () -> String) {
-        if (channel != BleWriteChannel.OTA) {
+        if (channel != BleWriteChannel.OTA || BleOtaDebugLogPolicy.enabled) {
             logger(message())
         }
     }

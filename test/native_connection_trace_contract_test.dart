@@ -28,6 +28,8 @@ void main() {
 
   test('iOS connection trace is gated and RSSI sampling is exact guarded', () {
     final manager = File('ios/Classes/ble/BleManager.swift').readAsStringSync();
+    final sampler = File('ios/Classes/ble/BleNativeTraceRssiSampler.swift')
+        .readAsStringSync();
     final method =
         File('ios/Classes/ble/BleMethodChannel.swift').readAsStringSync();
     final admission = File('ios/Classes/ble/BleConnectionAdmissionFlow.swift')
@@ -39,14 +41,14 @@ void main() {
     expect(manager, contains('nativeConnectionTraces.removeAll()'));
     expect(admission, contains('startNativeTrace(endpointId: endpointId)'));
     expect(manager, contains('nativeTrace: nativeTraceSnapshot(uuid: uuid)'));
-    expect(manager, contains('Timer.scheduledTimer(withTimeInterval: 2.0'));
-    expect(manager, contains('Timer.scheduledTimer(withTimeInterval: 15.0'));
+    expect(sampler, contains('schedule(2.0, false)'));
+    expect(sampler, contains('schedule(15.0, true)'));
     expect(manager, contains('nativeTraceRssiInFlightAttemptIds[key] == nil'));
     expect(
       manager,
       contains('nativeTraceRssiInFlightAttemptIds[key] = expectedAttemptId'),
     );
-    expect(manager, contains('trace.attemptId == expectedAttemptId'));
+    expect(manager, contains('nativeConnectionTraces[key]?.attemptId == expectedAttemptId'));
     expect(manager, contains('device.peripheral === peripheral'));
     expect(manager, contains('device.isConnected &&'));
     expect(manager, contains('device.isBleFlowCompleted'));

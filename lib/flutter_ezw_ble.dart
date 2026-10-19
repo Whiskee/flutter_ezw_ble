@@ -1,3 +1,5 @@
+export 'core/models/ble_runtime_common.dart';
+
 import 'package:flutter_ezw_ble/flutter_ezw_ble_event_channel.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_method_channel.dart';
 import 'package:flutter_ezw_ble/core/models/ble_cmd.dart';
@@ -45,4 +47,14 @@ class EzwBle {
 
   /// 构造函数
   EzwBle._init();
+
+  /// Apply the host's Debug setting without changing BLE or Trace ownership.
+  /// Defaults to off for iOS Debug logs and Android OTA successful-packet detail.
+  /// Android errors, stages and other BLE traffic keep their existing logs.
+  Future<void> setDebugLoggingEnabled(bool enabled) =>
+      bleMC.setDebugLoggingEnabled(enabled);
+
+  /// Stop only proactive iOS RSSI diagnostics; preserve passive BLE events.
+  Future<void> setConnectionTraceSamplingPaused(bool paused) =>
+      bleMC.setConnectionTraceSamplingPaused(paused);
 }

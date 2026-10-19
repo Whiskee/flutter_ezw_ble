@@ -1,4 +1,11 @@
 import Foundation
+
+// Logger EventChannel is a platform boundary; the gate remains production code.
+final class NativeLogSink {
+    var events: [String] = []
+    func emit(_ message: String) { events.append(message) }
+}
+enum BleEC { static let logger = NativeLogSink() }
 import Flutter
 
 final class FakeOtaPeripheral: OtaWritePeripheral {
@@ -567,6 +574,7 @@ struct OtaWriteQueueLogTests {
         let queue = OtaWriteQueue(
             peripheral: peripheral,
             logger: { logs.append($0) },
+            errorLogger: { logs.append($0) },
             clock: clock,
             scheduler: scheduler
         )

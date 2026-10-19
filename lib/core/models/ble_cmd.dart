@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 import 'ble_receive_identity.dart';
 import 'ble_ota_window.dart';
+import 'ble_runtime_common.dart';
 
 import 'package:flutter_ezw_utils/extension/string_ext.dart';
 import 'package:flutter_ezw_utils/json/unit8list_converter.dart';
@@ -28,6 +29,16 @@ class BleCmd {
   /// Optional native real-ACK proof; outer attempt fields cannot synthesize it.
   @JsonKey(fromJson: BleOtaWindowReceipt.fromJson)
   final BleOtaWindowReceipt? otaWindowReceipt;
+  /// Observation-only common source, supplied after native verifies the current
+  /// peripheral/read-characteristic objects and successful business owner.
+  /// This is not [receiveIdentity] and must not authorize owned command dispatch.
+  @JsonKey(includeFromJson: false, includeToJson: false)
+  BleRuntimeCommonOwner? get runtimeCommonOwner =>
+      psType == 0 && sessionGeneration > 0 && attemptGeneration > 0
+          ? BleRuntimeCommonOwner(uuid: uuid,
+              sessionGeneration: sessionGeneration,
+              attemptGeneration: attemptGeneration)
+          : null;
 
   BleCmd(
     this.uuid,
