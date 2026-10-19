@@ -86,7 +86,7 @@ enum class BleMC {
     SET_CONNECTION_TRACE_ENABLED,
     /** iOS RSSI timer pause only; Android accepts without changing diagnostics. */
     SET_CONNECTION_TRACE_SAMPLING_PAUSED,
-    /** iOS Debug formatting gate; Android accepts without changing current logs. */
+    /** iOS Debug 与 Android OTA 成功逐包详情门控；错误、阶段和业务流程独立。 */
     SET_DEBUG_LOGGING_ENABLED,
     /** 清理本地连接缓存。 */
     CLEAN_CONNECT_CACHE,
@@ -466,8 +466,8 @@ enum class BleMC {
                 // Compatibility no-op; do not construct a manager or change Trace/owners.
             }
             SET_DEBUG_LOGGING_ENABLED -> {
-                // Compatibility no-op: this optimization only changes iOS.
-                // Do not initialize the manager or change Android log policy.
+                // 仅写静态 policy；宿主可在 BLE 初始化前设置，禁止访问 manager/改 owner。
+                BleOtaDebugLogPolicy.setEnabled(arguments as? Boolean == true)
             }
             CLEAN_CONNECT_CACHE -> {
                 // 1. 调试/恢复入口：清理插件侧连接缓存。

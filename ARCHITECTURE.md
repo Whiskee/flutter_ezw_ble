@@ -194,7 +194,7 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `disconnectForOtaReboot` | `Future<void> disconnectForOtaReboot(String uuid, String name, {int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0})` | OTA 安装成功后的固件 reboot teardown。携带正 expected pair 时，native 必须精确匹配当前 owner 后才 detach 旧物理 GATT/CBPeripheral、发 `disconnectFromSys` 并标记一次性 suppression；旧 pair 不能关闭或屏蔽新 attempt。0/0 仅保留旧调用兼容。 |
 | `setConnectionTraceEnabled` | `Future<void> setConnectionTraceEnabled(bool enabled)` | 打开/关闭原生连接 Trace。默认关闭；关闭只清进程内 Trace/RSSI 诊断缓存，不断开设备、不取消 autoReconnect、不补造当前链路。开启后仅从下一次真实物理 attempt 开始记录。 |
 | `setConnectionTraceSamplingPaused` | `Future<void> setConnectionTraceSamplingPaused(bool paused)` | iOS 仅暂停主动 RSSI 的 2 秒首读与 15 秒周期 Timer；保留 Trace 配置、被动事件和连接 owner。默认不暂停，Android 返回成功且 no-op。可在 central 创建前配置。 |
-| `setDebugLoggingEnabled` | `Future<void> setDebugLoggingEnabled(bool enabled)` | iOS 进程内 Debug 日志默认关闭；只控制文本构造与 logger EventChannel 发出。Error、业务事件、Trace 和连接所有权独立。Android 接受并返回成功，当前 no-op。可通过 `EzwBle.to.setDebugLoggingEnabled(enabled)` 或 `bleMC` 调用。 |
+| `setDebugLoggingEnabled` | `Future<void> setDebugLoggingEnabled(bool enabled)` | iOS Debug 日志及 Android OTA 成功逐包详情每进程默认关闭；只控制文本构造与日志发出。Error、业务事件、Trace 和连接所有权独立。Android 保留全部失败、阶段与非 OTA 日志。可通过 `EzwBle.to.setDebugLoggingEnabled(enabled)` 或 `bleMC` 调用。 |
 | `openBleSettings` | `Future<void> openBleSettings()` | 跳系统蓝牙开关页。 |
 | `openAppSettings` | `Future<void> openAppSettings()` | 跳本 App 权限设置页。 |
 | `resetBle` | `Future<void> resetBle()` | 让原生层重置内部 BLE 栈状态（清队列、断所有连接、清缓存）。 |
@@ -247,10 +247,23 @@ summary 只在开启后构造，关闭期间不消费扫描诊断去重键。OTA
 Error 日志保持可用；真实服务发现错误在 teardown 前保留 exact admission 诊断。
 OTA `ota_write_stalled` 和外设释放失败使用独立 Error 回调，普通主动取消仍为 Debug。
 连接状态 JSON、完整通知 payload、扫描业务缓存、Trace、原生恢复事件账本及任何
-owner/重试/终态行为不由这个日志开关控制。Android 此次仅增加兼容 no-op，不更改
-原有 Android 日志行为。验证见 `test/ios_debug_logging_test.dart` 与
+owner/重试/终态行为不由这个日志开关控制。iOS 验证见 `test/ios_debug_logging_test.dart` 与
 `test/native/debug_logging_test.swift`：优化模式编译实际 policy、生产 logger/扫描
 helper 与完整 OTA 队列，验证关闭时零插值/零发出及业务写入和错误终态不变。
+
+Android 使用独立、进程内默认 `false` 的 `BleOtaDebugLogPolicy`，通过 volatile 值使
+MethodChannel 的开关立即对 GATT callback/OTA 队列可见。setter 只更新该值，不能初始化
+`BleManager`，也没有 build、线上/本地或环境差异。lazy helper 在插值和 logger 调用前
+仅跳过 OTA 队列 `enqueued/submitted/completed` 成功逐包详情，以及已解析 `psType == 1`
+的成功 characteristic write 回调和成功 notify 元数据日志；开启后保留原格式，关闭期间不缓存或补发。
+notify 的 `emitReceiveData` 始终先原样执行，完整 Base64 payload、receive identity、
+session/attempt 与 OTA transaction 身份均不进入门控；空 GATT/characteristic 和未知
+read UUID 的 Error 保持可见。
+队列失败、同步拒绝、BUSY 背压、stall、取消、旧 callback drain、全部非 OTA/未知通道
+写回调与 OTA 阶段/事务日志保持可见。门控不包围提交、watchdog、owner 检查、回调或
+Future 完成，`sendLog` 和 native/Dart 日志桥保持原样。行为回归见
+`BleAndroidOtaWriteQueueTest`、`BleOtaWriteCallbackLoggingTest`、`BleOtaReceiveCallbackLoggingTest` 与
+`BleOtaDebugLogPolicyTest`；本地 JVM 测试不代表真实 OTA 或功耗验证。
 
 `setConnectionTraceSamplingPaused(bool)` 是独立的 iOS 采样策略，不等同于关闭
 Trace。`BleNativeTraceRssiSampler` 不构造 Manager/central；暂停撤销 Timer，保留

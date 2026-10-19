@@ -435,10 +435,10 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     throw UnimplementedError('quiteUpgradeState() has not been implemented.');
   }
 
-  /// Control iOS native Debug logging before formatting and channel emission.
+  /// Control iOS Debug and Android OTA successful-packet detail before formatting.
   ///
   /// Defaults to false in each native process. Error logs and connection Trace
-  /// are independent. Android accepts this API without changing its logging.
+  /// are independent. Android errors, stages and non-OTA logs are preserved.
   Future<void> setDebugLoggingEnabled(bool enabled) {
     throw UnimplementedError(
       'setDebugLoggingEnabled(enabled: $enabled) has not been implemented.',
