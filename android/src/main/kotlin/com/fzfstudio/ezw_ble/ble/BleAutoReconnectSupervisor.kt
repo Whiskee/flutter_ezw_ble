@@ -244,13 +244,17 @@ internal class BleAutoReconnectSupervisor(
         if (sessionAction == BleReconnectSessionUpdateAction.REBUILD_PHYSICAL_OWNER) {
             val exactGatt = task.passiveGatt
             val previousSessionGeneration = task.sessionGeneration
+            // Manager 已回收该 GATT 时 exact 撤销会拒绝；只剩 Supervisor 引用的 STALE 孤儿
+            // owner 先走 stale 修复，否则更高 session 永远装不上，手动连接恒被拒。
             if (
                 exactGatt != null &&
-                invalidatePassiveGattForSessionRebind(
-                    device.uuid,
-                    exactGatt,
-                    previousSessionGeneration,
-                    task.otaRecoveryContext,
+                (
+                    invalidatePassiveGattForSessionRebind(
+                        device.uuid,
+                        exactGatt,
+                        previousSessionGeneration,
+                        task.otaRecoveryContext,
+                    ) || repairStaleOwnerForSessionRebind(device.uuid, exactGatt, task.otaRecoveryContext)
                 )
             ) {
                 val rebound = synchronized(this) {
@@ -969,12 +973,12 @@ internal class BleAutoReconnectSupervisor(
         task.timer?.cancel()
         task.timer = null
         task.pendingPassiveRetry = false
-        task.pendingPhysicalDeadline?.cancel()
-        task.pendingPhysicalDeadline = null
 
         // 3. 已连接/已有 passive GATT 时不重复打开新 GATT。pending GATT 的 deadline
         //    会独立回收未收到物理 callback 的 zombie handle；Gate grant 后仍只由业务
         //    pipeline 使用 connectTimeout，不能把 queued 等待算进来。
+        //    因此这里提前返回时必须保留该 GATT 的 deadline：Manager 的 stale 修复可能
+        //    已回收它，只剩 deadline 能把孤儿 owner 交回 schedule 重建。
         val currentDevice = connectedDevices.firstOrNull { it.uuid.equals(uuid, ignoreCase = true) }
         if (
             currentDevice?.connectState?.isConnected == true ||
@@ -982,10 +986,14 @@ internal class BleAutoReconnectSupervisor(
         ) {
             sendLog(
                 BleLoggerTag.d,
-                "Auto reconnect: $uuid, ignored because state=${currentDevice?.connectState} passiveGatt=${task.passiveGatt != null}",
+                "Auto reconnect: $uuid, ignored because state=${currentDevice?.connectState} " +
+                    "passiveGatt=${task.passiveGatt != null} deadline=${task.pendingPhysicalDeadline != null}",
             )
             return
         }
+        // 3.1、确认没有存活 owner 后才清理上一轮遗留的 deadline；新 GATT 会挂载自己的 deadline。
+        task.pendingPhysicalDeadline?.cancel()
+        task.pendingPhysicalDeadline = null
 
         // 4. 蓝牙关闭期间暂停，不把这次 timer 计为失败。
         if (!isBluetoothEnabled() || bleState() != BLE_STATE_ON) {
@@ -1325,6 +1333,35 @@ internal class BleAutoReconnectSupervisor(
         uuid: String,
         exactGatt: BluetoothGatt,
     ): BlePendingOwnerDisposition = invalidatePendingPassiveGatt(uuid, exactGatt)
+
+    /**
+     * 更高 session 的 exact 换绑被 Manager 拒绝后，回收只剩 Supervisor 引用的孤儿 owner。
+     *
+     * 断连调度与对账/手动激活并发时，Manager 的 stale 修复可能已回收 Supervisor 仍引用的
+     * GATT，exact 换绑因 Manager 不再持有它而恒失败。这里只接受健康分类为 STALE 且被
+     * Manager 确认回收的 owner；已入 Gate、业务 connected 或 Manager 另有健康 owner 时
+     * 仍返回 false，保持原有拒绝语义。OTA recovery 的旧 owner 只能由 Manager 按事务凭据
+     * exact 退役，这里不放宽该约束。
+     */
+    private fun repairStaleOwnerForSessionRebind(
+        uuid: String,
+        exactGatt: BluetoothGatt,
+        otaRecoveryContext: BleG2OtaNativeContext?,
+    ): Boolean {
+        if (
+            otaRecoveryContext != null ||
+            classifyPendingPassiveGattOwner(uuid, exactGatt) != BlePendingOwnerHealth.STALE
+        ) {
+            return false
+        }
+        val disposition = repairStalePendingOwner(uuid, exactGatt)
+        if (disposition == BlePendingOwnerDisposition.STALE_OWNER_DROPPED) {
+            // Manager 保留了另一条健康 owner；只清 Supervisor 旧引用，不在此安装新 session。
+            clearRecycledPendingOwner(uuid, exactGatt)
+        }
+        return disposition == BlePendingOwnerDisposition.INVALIDATED ||
+            disposition == BlePendingOwnerDisposition.REPAIRED_STALE_OWNER
+    }
 
     /** Manager 已回收 exact owner 后，清除 Supervisor 对旧 GATT/deadline/timer 的全部引用。 */
     private fun clearRecycledPendingOwner(uuid: String, exactGatt: BluetoothGatt) {
