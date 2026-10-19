@@ -595,14 +595,33 @@ private extension OtaWriteQueue {
         }
     }
 
+    /// Complete one queue item, retiring only its failed batch before publishing
+    /// the error. A stall's post-cleanup count proves local unsent-queue state,
+    /// never CoreBluetooth drain or a firmware ACK.
     func completeItem(_ item: OtaWriteItem, _ value: Any?) {
-        guard let batch = item.batch else {
-            item.result(value)
+        if let error = value {
+            if let batch = item.batch {
+                pending.removeAll { $0.batch === batch }
+            }
+            var completion: Any = error
+            if let stalled = error as? FlutterError,
+               stalled.code == "\(channel)_write_stalled",
+               var details = stalled.details as? [String: Any] {
+                // Keep legacy `pending` (including the failed head) for diagnostics.
+                // Snapshot after same-batch cleanup and before callback reentrancy;
+                // other batches/singles stay queued, and the stall gate stays shut.
+                details["remainingPending"] = pending.count
+                completion = FlutterError(code: stalled.code, message: stalled.message, details: details)
+            }
+            if let batch = item.batch {
+                batch.settle(completion)
+            } else {
+                item.result(completion)
+            }
             return
         }
-        if let error = value {
-            pending.removeAll { $0.batch === batch }
-            batch.settle(error)
+        guard let batch = item.batch else {
+            item.result(nil)
             return
         }
         batch.remaining -= 1
@@ -696,8 +715,8 @@ private extension OtaWriteQueue {
         }
     }
 
-    /// 15 秒仍不可写才终止队首请求。只完成 exact head，剩余 pending 等真实断连
-    /// 或 attempt cleanup 取消，避免一个 stalled write 批量制造多个上层失败。
+    /// 15 秒仍不可写才终止队首请求；同批尾包在错误返回前撤销，其它请求仍须等
+    /// exact recovery/cleanup。保持 stall gate，迟到 ready 不能复活未提交的旧包。
     func shouldCompleteStalledBackpressure(reason: String) -> Bool {
         guard let startedAt = backpressureStartedAtMonotonic else {
             return false

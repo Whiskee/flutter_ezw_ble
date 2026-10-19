@@ -157,10 +157,18 @@ final class OtaWriteQueue {
 生产实现还必须保留有界 watchdog：队首请求首次因
 `canSendWriteWithoutResponse == false` 无法提交时开始计时，继续保留原 pending、ready
 回调和 100ms 重查；连续 15 秒仍不可写，才以 `ota_write_stalled` 结束该 exact 队首请求，
-并等待 Dart 侧触发 exact OTA recovery disconnect。15 秒内 callback 或重查确认
+并保持 stalled 门禁，等待 Dart 的既有恢复处理。15 秒内 callback 或重查确认
 `canSend == true` 时，只提交原 pending 一次并取消 watchdog。每次等待/清理必须推进内部
 episode，使旧 timer 在取消、reset 或新 attempt 建立后不能驱动新 pending。ready 回调不能在
 `canSend` 仍为 false 时重置起始时间，否则虚假/过早 callback 会让 fail-closed 窗口无限延长。
+
+实际队首超时的错误回调前，先移除其同一 batch 中尚未提交的尾包；保留其它 batch/单包。
+`pending` 保留清理前含失败队首的历史口径，新增 `remainingPending` 表示上述清理后的
+本地未提交条目数。只发布一次错误，迟到 ready/timer 仍被 stalled/episode 门禁拦截。
+入队前直接拒绝未执行本次清理，不携带新字段。SDK 可在严格整数 `remainingPending == 0`
+且同一 OTA generation、exact physical identity、无当前腿断连等既有条件均成立时，
+沿现有直写兜底用新 syncId 重发整个 RAW 窗口；非零/无效证据继续保守恢复，旧 SDK 不变。
+本地队列清空不等于 CoreBluetooth drain 或固件 ACK，进度仍只认真实协议响应。
 
 ### 4.3 兜底路径
 
@@ -332,8 +340,8 @@ Bluetooth OFF 或迟到 OTA exit 都不能复活旧连接，也不能让旧清�
   `ota_write_cancelled` 结束,不留 Dart await;
 - 队首写入连续 14.9 秒不可提交 → 原 pending 仍等待；随后 ready 只提交原请求一次，不重连；
 - 队首写入连续 15 秒不可提交 → 仅该 exact noResponse head 以 `ota_write_stalled`
-  结束，迟到 ready/timer/callback 不得发送旧包，details 带
-  `endpoint/reason/wait/pending/session/attempt`；
+  结束所属请求（batch 同时清除未提交尾包），迟到 ready/timer/callback 不得发送旧包，details 带
+  `endpoint/reason/wait/pending/remainingPending/session/attempt`；其它请求保留并计入残留；
 - exact recovery cancel/replacement 清理后，新 episode 可正常发送；
 - App 退后台 / 锁屏期间不掉包(iOS 后台 BLE 允许 OTA 类长时操作)。
 
