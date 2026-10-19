@@ -87,6 +87,8 @@ struct BleConnectModel: Codable {
 enum BleConnectSource: String, Codable {
     case unknown
     case autoReconnect
+    // Android-only wake provenance may appear in shared model payloads; decoding
+    // preserves it without changing CoreBluetooth reconnect ownership.
     case androidCdm
     case androidBlePendingIntent
     case manualReconnect

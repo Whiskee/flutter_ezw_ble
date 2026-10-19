@@ -67,6 +67,10 @@ enum BleMC: String {
     case sendCmd
     /// Send without waiting; OTA uses the no-response backpressure queue.
     case sendCmdNoWait
+    /// Submit a batch of already-framed OTA packets; Future waits for the last packet.
+    case sendOtaPacketBatch
+    /// Submit a batch of already-framed file packets; Future waits for the last packet.
+    case sendFilePacketBatch
     /// Mark a device as entering OTA mode.
     case enterUpgradeState
     /// Mark a device as leaving OTA mode.
@@ -374,6 +378,55 @@ enum BleMC: String {
                 expectedSessionGeneration: expectedSessionGeneration,
                 expectedAttemptGeneration: expectedAttemptGeneration,
                 otaContext: otaContext,
+                otaWindowCredit: jsonData["otaWindowCredit"] as? [String: Any],
+                result: result
+            )
+            return
+        case .sendOtaPacketBatch:
+            let jsonData: [String: Any] = arguments as? [String: Any] ?? [:]
+            let uuid: String = jsonData["uuid"] as? String ?? ""
+            let psType: Int = jsonData["psType"] as? Int ?? BlePsTypeValue.ota
+            // Monotonic native duration ends when CoreBluetooth accepted the last submission.
+            let metricsRequested = jsonData["metricsRequested"] as? Bool ?? false
+            let batchStartedAt = ProcessInfo.processInfo.systemUptime
+            let packets = Self.decodeFramedBatchPackets(jsonData["packets"])
+            BleManager.shared.sendOtaPacketBatch(
+                uuid: uuid,
+                packets: packets,
+                psType: psType,
+                expectedSessionGeneration: (jsonData["expectedSessionGeneration"] as? NSNumber)?.int64Value ?? 0,
+                expectedAttemptGeneration: (jsonData["expectedAttemptGeneration"] as? NSNumber)?.int64Value ?? 0,
+                otaContext: BleG2OtaContext(data: jsonData["otaContext"] as? [String: Any]),
+                otaWindow: jsonData["otaWindow"] as? [String: Any],
+                metricsRequested: metricsRequested,
+                result: { value in
+                    guard metricsRequested else {
+                        result(value)
+                        return
+                    }
+                    guard value == nil || value is [String: Any] else {
+                        result(value)
+                        return
+                    }
+                    var metrics = value as? [String: Any] ?? [:]
+                    metrics.merge([
+                        "elapsedMs": max(0, Int((ProcessInfo.processInfo.systemUptime - batchStartedAt) * 1_000)),
+                        "packetCount": packets.count,
+                        "wireBytes": packets.reduce(0) { $0 + $1.count },
+                        "completionKind": "corebluetooth_submitted"
+                    ]) { _, latest in latest }
+                    result(metrics)
+                }
+            )
+            return
+        case .sendFilePacketBatch:
+            let jsonData: [String: Any] = arguments as? [String: Any] ?? [:]
+            let uuid: String = jsonData["uuid"] as? String ?? ""
+            let psType: Int = jsonData["psType"] as? Int ?? BlePsTypeValue.file
+            BleManager.shared.sendFilePacketBatch(
+                uuid: uuid,
+                packets: Self.decodeFramedBatchPackets(jsonData["packets"]),
+                psType: psType,
                 result: result
             )
             return
@@ -441,5 +494,19 @@ enum BleMC: String {
             break
         }
         result(nil)
+    }
+
+    /// 解码 Dart 一次提交的 OTA / 文件 framed 小包。
+    ///
+    /// StandardMessageCodec 通常给出 `FlutterStandardTypedData`；无法识别的元素直接丢弃，
+    /// 由原生入口的空批次 fail closed 兜底，绝不静默补零。
+    private static func decodeFramedBatchPackets(_ raw: Any?) -> [Data] {
+        if let typed = raw as? [FlutterStandardTypedData] {
+            return typed.map { $0.data }
+        }
+        if let items = raw as? [Any] {
+            return items.compactMap { ($0 as? FlutterStandardTypedData)?.data }
+        }
+        return []
     }
 }

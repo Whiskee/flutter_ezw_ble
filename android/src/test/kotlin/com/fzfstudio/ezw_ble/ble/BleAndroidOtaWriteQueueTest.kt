@@ -240,15 +240,238 @@ class BleAndroidOtaWriteQueueTest {
         assertEquals(0, queue.queueDepth)
     }
 
+    @Test
+    fun `batch completes only after the last characteristic write callback`() {
+        val submissions = mutableListOf<ByteArray>()
+        val completions = mutableListOf<BleOtaWriteError?>()
+        val queue = queue(
+            submit = { data ->
+                submissions.add(data.copyOf())
+                BleOtaWriteSubmission.accepted()
+            },
+        )
+
+        queue.enqueueBatch(
+            listOf(byteArrayOf(0x01), byteArrayOf(0x02), byteArrayOf(0x03)),
+        ) { completions.add(it) }
+
+        assertEquals(1, submissions.size)
+        assertEquals(emptyList(), completions)
+
+        queue.onCharacteristicWriteComplete(true, true, 0, "GATT_SUCCESS")
+        assertEquals(2, submissions.size)
+        assertEquals(emptyList(), completions)
+
+        queue.onCharacteristicWriteComplete(true, true, 0, "GATT_SUCCESS")
+        assertEquals(3, submissions.size)
+        assertEquals(emptyList(), completions)
+
+        queue.onCharacteristicWriteComplete(true, true, 0, "GATT_SUCCESS")
+        assertEquals(listOf<BleOtaWriteError?>(null), completions)
+        assertEquals(0, queue.queueDepth)
+    }
+
+    @Test
+    fun `batch metrics report native backpressure without changing completion`() {
+        var nowMillis = 0L
+        val submissions = mutableListOf<ByteArray>()
+        val dispositions = ArrayDeque(
+            listOf(
+                BleOtaWriteSubmission.busy(status = 201, reason = "GATT write request busy"),
+                BleOtaWriteSubmission.accepted(),
+                BleOtaWriteSubmission.accepted(),
+            ),
+        )
+        val completions = mutableListOf<BleOtaWriteError?>()
+        val metrics = mutableListOf<BleAndroidOtaBatchQueueMetrics>()
+        val queue = queue(
+            submit = { data ->
+                submissions.add(data.copyOf())
+                dispositions.removeFirst()
+            },
+            nowMillis = { nowMillis },
+        )
+
+        queue.enqueueBatch(
+            listOf(byteArrayOf(0x01), byteArrayOf(0x02)),
+            metrics = { metrics.add(it) },
+        ) { completions.add(it) }
+        nowMillis = 75L
+        queue.onCharacteristicWriteComplete(false, true, 0, "GATT_SUCCESS")
+        queue.onCharacteristicWriteComplete(true, true, 0, "GATT_SUCCESS")
+        queue.onCharacteristicWriteComplete(true, true, 0, "GATT_SUCCESS")
+
+        assertEquals(listOf<BleOtaWriteError?>(null), completions)
+        assertEquals(1, metrics.single().backpressureCount)
+        assertEquals(75L, metrics.single().backpressureWaitMillis)
+        assertEquals(0, metrics.single().softThrottleCount)
+        assertEquals(3, submissions.size)
+    }
+
+    @Test
+    fun `batch failure drops remaining packets and settles once`() {
+        val submissions = mutableListOf<ByteArray>()
+        val completions = mutableListOf<BleOtaWriteError?>()
+        val queue = queue(
+            submit = { data ->
+                submissions.add(data.copyOf())
+                BleOtaWriteSubmission.accepted()
+            },
+        )
+
+        queue.enqueueBatch(
+            listOf(byteArrayOf(0x01), byteArrayOf(0x02), byteArrayOf(0x03)),
+        ) { completions.add(it) }
+
+        queue.onCharacteristicWriteComplete(
+            ownsInFlight = true,
+            success = false,
+            status = 133,
+            statusName = "GATT_ERROR",
+        )
+
+        assertEquals(1, submissions.size)
+        assertEquals(1, completions.size)
+        assertEquals("ota_write_unavailable", completions.single()?.code)
+        assertEquals(0, queue.queueDepth)
+    }
+
+    @Test
+    fun `file channel batch reports file scoped errors and never touches an ota queue`() {
+        val otaCompletions = mutableListOf<BleOtaWriteError?>()
+        val fileCompletions = mutableListOf<BleOtaWriteError?>()
+        val otaQueue = queue(submit = { BleOtaWriteSubmission.accepted() })
+        val fileQueue = queue(
+            submit = { BleOtaWriteSubmission.accepted() },
+            channel = BleWriteChannel.FILE,
+        )
+
+        otaQueue.enqueue(byteArrayOf(0x01)) { otaCompletions.add(it) }
+        fileQueue.enqueueBatch(listOf(byteArrayOf(0x02), byteArrayOf(0x03))) {
+            fileCompletions.add(it)
+        }
+
+        // Leaving OTA cancels only the OTA attempt. A shared queue would settle the file batch
+        // here and abort a transfer the user never cancelled.
+        otaQueue.cancelAttempt("quiteUpgradeState")
+
+        assertEquals("ota_write_cancelled", otaCompletions.single()?.code)
+        assertEquals(emptyList(), fileCompletions)
+        assertEquals(2, fileQueue.queueDepth)
+
+        fileQueue.onCharacteristicWriteComplete(true, true, 0, "GATT_SUCCESS")
+        fileQueue.onCharacteristicWriteComplete(
+            ownsInFlight = true,
+            success = false,
+            status = 133,
+            statusName = "GATT_ERROR",
+        )
+
+        assertEquals("file_write_unavailable", fileCompletions.single()?.code)
+        assertEquals(0, fileQueue.queueDepth)
+    }
+
+    @Test
+    fun `batch preserves exact owner and drops remaining packets after owner changes`() {
+        // 首包 callback 前发生换代，第二包必须仍携带旧 pair 并被拒绝，不能借新 owner 续写。
+        var currentAttempt = 9L
+        val seen = mutableListOf<Pair<Long, Long>>()
+        val completed = mutableListOf<BleOtaWriteError?>()
+        val queue = BleAndroidOtaWriteQueue(
+            endpoint = "g2-left",
+            submit = { _, session, attempt, _, _, _ ->
+                seen.add(session to attempt)
+                if (attempt == currentAttempt) BleOtaWriteSubmission.accepted()
+                else BleOtaWriteSubmission.rejected(null, "attempt identity mismatch")
+            },
+            scheduler = FakeScheduler(),
+            nowMillis = { 0L },
+        )
+        queue.enqueueBatch(
+            listOf(byteArrayOf(1), byteArrayOf(2), byteArrayOf(3)),
+            sessionGeneration = 37L,
+            attemptGeneration = 9L,
+        ) { completed.add(it) }
+        currentAttempt = 10L
+        queue.onCharacteristicWriteComplete(true, true, 0, "GATT_SUCCESS")
+        assertEquals(listOf(37L to 9L, 37L to 9L), seen)
+        assertEquals("ota_write_unavailable", completed.single()?.code)
+        assertEquals(0, queue.queueDepth)
+    }
+
+    @Test
+    fun `successful ota batches stay quiet while diagnostics and file logs remain`() {
+        val otaLogs = mutableListOf<String>()
+        val otaQueue = queue(
+            submit = { BleOtaWriteSubmission.accepted() },
+            logger = { otaLogs.add(it) },
+        )
+
+        otaQueue.enqueueBatch(List(96) { byteArrayOf(it.toByte()) }) {}
+        repeat(96) {
+            otaQueue.onCharacteristicWriteComplete(true, true, 0, "GATT_SUCCESS")
+        }
+
+        assertEquals(
+            emptyList(),
+            otaLogs.filter { it.contains("enqueued") || it.contains("submitted") || it.contains("completed") },
+        )
+
+        otaQueue.enqueue(byteArrayOf(0x01)) {}
+        otaQueue.onCharacteristicWriteComplete(true, false, 133, "GATT_ERROR")
+        assertEquals(
+            listOf("[ezw_ble][ota][android] failed endpoint=g2-left status=GATT_ERROR pending=0"),
+            otaLogs,
+        )
+
+        val fileLogs = mutableListOf<String>()
+        val fileQueue = queue(
+            submit = { BleOtaWriteSubmission.accepted() },
+            logger = { fileLogs.add(it) },
+            channel = BleWriteChannel.FILE,
+        )
+        fileQueue.enqueue(byteArrayOf(0x01)) {}
+        fileQueue.onCharacteristicWriteComplete(true, true, 0, "GATT_SUCCESS")
+        fileQueue.enqueueBatch(listOf(byteArrayOf(0x02), byteArrayOf(0x03))) {}
+        repeat(2) {
+            fileQueue.onCharacteristicWriteComplete(true, true, 0, "GATT_SUCCESS")
+        }
+
+        assertEquals(
+            true,
+            fileLogs.any { it.contains("[ezw_ble][file][android] enqueued") },
+        )
+        assertEquals(
+            true,
+            fileLogs.any { it.contains("[ezw_ble][file][android] submitted") },
+        )
+        assertEquals(
+            true,
+            fileLogs.any { it.contains("[ezw_ble][file][android] completed") },
+        )
+        assertEquals(
+            true,
+            fileLogs.any { it.contains("[ezw_ble][file][android] batch enqueued") },
+        )
+        assertEquals(
+            true,
+            fileLogs.any { it.contains("[ezw_ble][file][android] batch completed") },
+        )
+    }
+
     private fun queue(
         submit: (ByteArray) -> BleOtaWriteSubmission,
         scheduler: BleOtaWriteScheduler = FakeScheduler(),
         nowMillis: () -> Long = { 0L },
+        channel: String = BleWriteChannel.OTA,
+        logger: (String) -> Unit = {},
     ): BleAndroidOtaWriteQueue = BleAndroidOtaWriteQueue(
         endpoint = "g2-left",
         submit = { data, _, _, _, _, _ -> submit(data) },
         scheduler = scheduler,
         nowMillis = nowMillis,
+        channel = channel,
+        logger = logger,
     )
 
     private class FakeScheduler : BleOtaWriteScheduler {

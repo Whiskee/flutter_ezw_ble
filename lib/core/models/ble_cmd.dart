@@ -1,5 +1,6 @@
 import 'dart:typed_data';
 import 'ble_receive_identity.dart';
+import 'ble_ota_window.dart';
 
 import 'package:flutter_ezw_utils/extension/string_ext.dart';
 import 'package:flutter_ezw_utils/json/unit8list_converter.dart';
@@ -24,10 +25,15 @@ class BleCmd {
   @JsonKey(fromJson: BleReceiveIdentity.fromJson)
   final BleReceiveIdentity? receiveIdentity;
 
+  /// Optional native real-ACK proof; outer attempt fields cannot synthesize it.
+  @JsonKey(fromJson: BleOtaWindowReceipt.fromJson)
+  final BleOtaWindowReceipt? otaWindowReceipt;
+
   BleCmd(
     this.uuid,
     this.psType, {
     this.receiveIdentity,
+    this.otaWindowReceipt,
     this.data,
     this.isSuccess = false,
     this.sessionGeneration = 0,
@@ -81,6 +87,7 @@ class BleCmd {
       // Native receive admission is an independently nullable proof. Never
       // infer it from the legacy/OTA command pair on the outer event map.
       receiveIdentity: BleReceiveIdentity.fromJson(receiveIdentity),
+      otaWindowReceipt: BleOtaWindowReceipt.fromJson(data['otaWindowReceipt']),
     );
   }
 }

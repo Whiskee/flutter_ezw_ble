@@ -76,6 +76,10 @@ enum class BleMC {
     SEND_CMD,
     /** 发送不等待写入回调的 GATT 指令。 */
     SEND_CMD_NO_WAIT,
+    /** 一次提交一组已封装 OTA 小包；Future 等最后一包 GATT callback。 */
+    SEND_OTA_PACKET_BATCH,
+    /** 一次提交一组已封装文件小包；Future 等最后一包 GATT callback。 */
+    SEND_FILE_PACKET_BATCH,
     /** 标记设备进入升级状态。 */
     ENTER_UPGRADE_STATE,
     /** 标记设备退出升级状态。 */
@@ -444,6 +448,73 @@ enum class BleMC {
                 }
                 return
             }
+            SEND_OTA_PACKET_BATCH -> {
+                // 1. 批次参数是 already-framed 小包列表；Future 必须等最后一包写回调。
+                val jsonMap = arguments as Map<*, *>?
+                val uuid = jsonMap?.get("uuid") as? String ?: ""
+                val psType = jsonMap?.get("psType") as Int? ?: 1
+                val packets = decodeFramedBatchPackets(jsonMap?.get("packets"))
+                // Diagnostic-only clock starts before native admission; this is not device receipt.
+                val metricsRequested = jsonMap?.get("metricsRequested") == true
+                val batchStartedAtMs = android.os.SystemClock.elapsedRealtime()
+                // 批次与单包沿用同一 exact owner，必须传到每个排队 Item。
+                val expectedSessionGeneration =
+                    (jsonMap?.get("expectedSessionGeneration") as? Number)?.toLong() ?: 0L
+                val expectedAttemptGeneration =
+                    (jsonMap?.get("expectedAttemptGeneration") as? Number)?.toLong() ?: 0L
+                val otaContext = jsonMap?.get("otaContext") as? Map<*, *>
+                var nativeQueueMetrics: BleAndroidOtaBatchQueueMetrics? = null
+                var frozenLinkMetrics: Map<String, Any> = emptyMap()
+                BleManager.instance.sendOtaPacketBatch(
+                    uuid,
+                    packets,
+                    psType,
+                    expectedSessionGeneration,
+                    expectedAttemptGeneration,
+                    otaTransactionId = otaContext?.get("transactionId") as? String ?: "",
+                    otaGeneration = otaContext?.get("generation").toStrictLongOrDefault(),
+                    otaInstanceId = otaContext?.get("instanceId") as? String ?: "",
+                    queueMetrics = { metrics -> nativeQueueMetrics = metrics },
+                    linkMetrics = { metrics -> frozenLinkMetrics = metrics },
+                ) { error ->
+                    if (error == null) {
+                        result.success(
+                            if (metricsRequested) mutableMapOf<String, Any>(
+                                "elapsedMs" to (android.os.SystemClock.elapsedRealtime() - batchStartedAtMs).toInt(),
+                                "packetCount" to packets.size,
+                                "wireBytes" to packets.sumOf { it.size },
+                                "completionKind" to "gatt_write_callback",
+                            ).also { metrics ->
+                                metrics.putAll(frozenLinkMetrics)
+                                nativeQueueMetrics?.let { queueMetrics ->
+                                    metrics["nativeQueueBackpressureCount"] = queueMetrics.backpressureCount
+                                    metrics["nativeQueueBackpressureWaitMs"] = queueMetrics.backpressureWaitMillis.toInt()
+                                    metrics["nativeQueueSoftThrottleCount"] = queueMetrics.softThrottleCount
+                                }
+                            } else null,
+                        )
+                    } else {
+                        result.error(error.code, error.reason, error.details)
+                    }
+                }
+                return
+            }
+            SEND_FILE_PACKET_BATCH -> {
+                // 1. 文件 RAW 批次与 OTA 同样是 already-framed 小包；Future 等最后一包写回调，
+                //    上层据此才能启动固件 8s ACK 计时。
+                val jsonMap = arguments as Map<*, *>?
+                val uuid = jsonMap?.get("uuid") as? String ?: ""
+                val psType = jsonMap?.get("psType") as Int? ?: 3
+                val packets = decodeFramedBatchPackets(jsonMap?.get("packets"))
+                BleManager.instance.sendFilePacketBatch(uuid, packets, psType) { error ->
+                    if (error == null) {
+                        result.success(null)
+                    } else {
+                        result.error(error.code, error.reason, error.details)
+                    }
+                }
+                return
+            }
             ENTER_UPGRADE_STATE -> {
                 // 1. 升级态会影响断连后的重连清理策略。
                 val uuid = arguments as? String ?: ""
@@ -656,6 +727,28 @@ private fun parseG2OtaEndpoints(value: Any?): List<BleG2OtaEndpointIdentity> {
             )
         }
         ?: emptyList()
+}
+
+/**
+ * 解码 Dart 一次提交的 OTA / 文件 framed 小包。
+ *
+ * StandardMessageCodec 通常给出 ByteArray；个别通道实现会给出 ByteBuffer，
+ * 这里都转成独立副本，避免原生队列和 Dart 共享可变缓冲区。
+ */
+private fun decodeFramedBatchPackets(raw: Any?): List<ByteArray> {
+    val items = raw as? List<*> ?: return emptyList()
+    return items.mapNotNull { item ->
+        when (item) {
+            is ByteArray -> item.copyOf()
+            is java.nio.ByteBuffer -> {
+                val duplicate = item.asReadOnlyBuffer()
+                val bytes = ByteArray(duplicate.remaining())
+                duplicate.get(bytes)
+                bytes
+            }
+            else -> null
+        }
+    }
 }
 
 /**

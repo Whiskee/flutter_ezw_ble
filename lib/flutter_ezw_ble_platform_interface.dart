@@ -8,6 +8,8 @@ import 'package:flutter_ezw_ble/core/models/ble_ota_recovery_disconnect_result.d
 import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_business_connection_attempt.dart';
 import 'package:flutter_ezw_ble/core/models/ble_scan_start_result.dart';
+import 'package:flutter_ezw_ble/core/models/ota_batch_metrics.dart';
+import 'package:flutter_ezw_ble/core/models/ble_ota_window.dart';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
 import 'flutter_ezw_ble_method_channel.dart';
@@ -414,8 +416,60 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     int expectedSessionGeneration = 0,
     int expectedAttemptGeneration = 0,
     BleG2OtaContext? otaContext,
+    BleOtaWindowReceipt? otaWindowCredit,
   }) {
     throw UnimplementedError('sendCmdNoWait() has not been implemented.');
+  }
+
+  /// 一次提交一组已经完成 Even 协议封装的 OTA 小包。
+  ///
+  /// [uuid] 是 endpoint / 设备标识，不是 characteristic UUID；写特征仍由 [psType]
+  /// 解析。Future 必须等本批最后一包被原生队列真正提交成功后才完成，不能在入队时
+  /// 返回，否则上层 5s 固件 ACK 计时会提前启动。
+  /// 正 expected pair 冻结整批物理 owner，原生每包提交前复验；默认 0/0 保留旧调用兼容。
+  Future<void> sendOtaPacketBatch(
+    String uuid,
+    List<Uint8List> framedPackets, {
+    int psType = 1,
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+    BleG2OtaContext? otaContext,
+  }) {
+    throw UnimplementedError('sendOtaPacketBatch() has not been implemented.');
+  }
+
+  /// Diagnostic variant of the same batch write; the result never represents firmware ACK.
+  Future<OtaBatchMetrics?> sendOtaPacketBatchMeasured(
+    String uuid,
+    List<Uint8List> framedPackets, {
+    int psType = 1,
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+    BleG2OtaContext? otaContext,
+    BleOtaWindow? otaWindow,
+  }) async {
+    await sendOtaPacketBatch(
+      uuid,
+      framedPackets,
+      psType: psType,
+      expectedSessionGeneration: expectedSessionGeneration,
+      expectedAttemptGeneration: expectedAttemptGeneration,
+      otaContext: otaContext,
+    );
+    return null;
+  }
+
+  /// 一次提交一组已经完成 Even 协议封装的文件小包。
+  ///
+  /// 与 [sendOtaPacketBatch] 语义相同但通道独立：原生用另一条队列承载，退出升级只取消 OTA，
+  /// 不会打断正在传输的文件批次；升级态仍然拒绝文件写入。Future 必须等本批最后一包被原生队列
+  /// 真正提交成功后才完成，否则上层 8s 固件 ACK 计时会提前启动。
+  Future<void> sendFilePacketBatch(
+    String uuid,
+    List<Uint8List> framedPackets, {
+    int psType = 3,
+  }) {
+    throw UnimplementedError('sendFilePacketBatch() has not been implemented.');
   }
 
   /// 进入升级模式

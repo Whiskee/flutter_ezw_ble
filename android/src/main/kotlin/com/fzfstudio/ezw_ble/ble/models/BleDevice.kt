@@ -62,6 +62,14 @@ class BleDevice(
     val myGatt: BluetoothGatt?
         get() = gatt
 
+    /** Last negotiated ATT MTU observed on the current session; used only for diagnostics. */
+    @Volatile
+    var negotiatedMtu: Int? = null
+
+    /** Last write payload limit observed from MTU negotiation; null means unknown. */
+    @Volatile
+    var writeLimitBytes: Int? = null
+
     /** 业务层确认后的 connected 状态。 */
     val isConnected: Boolean
         get() = connectState == BleConnectState.CONNECTED
@@ -110,6 +118,8 @@ class BleDevice(
         // 3. close 释放 native GATT 资源，否则后续扫描/连接可能被旧 session 占用。
         gatt?.close()
         gatt = null
+        negotiatedMtu = null
+        writeLimitBytes = null
 
         // 4. 清空读写特征缓存；每次物理回连都必须重新 discover services/enable notify。
         writeAndReadList.clear()

@@ -8,6 +8,8 @@ import 'package:flutter_ezw_ble/core/models/ble_ota_recovery_disconnect_result.d
 import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_business_connection_attempt.dart';
 import 'package:flutter_ezw_ble/core/models/ble_scan_start_result.dart';
+import 'package:flutter_ezw_ble/core/models/ota_batch_metrics.dart';
+import 'package:flutter_ezw_ble/core/models/ble_ota_window.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble.dart';
 
 import 'flutter_ezw_ble_platform_interface.dart';
@@ -403,6 +405,7 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
     int expectedSessionGeneration = 0,
     int expectedAttemptGeneration = 0,
     BleG2OtaContext? otaContext,
+    BleOtaWindowReceipt? otaWindowCredit,
   }) async {
     final arguments = <String, Object?>{
       "uuid": uuid,
@@ -412,11 +415,131 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       // 且 psType==1 时启用 strict guard；旧调用保留 0 以维持兼容。
       "expectedSessionGeneration": expectedSessionGeneration,
       "expectedAttemptGeneration": expectedAttemptGeneration,
+      // Piggyback only a validated real-ACK receipt; no extra channel round trip.
+      if (otaWindowCredit != null) 'otaWindowCredit': otaWindowCredit.toJson(),
     };
     if (otaContext != null) {
       arguments.addAll(otaContext.toMethodArguments());
     }
     return methodChannel.invokeMethod<void>("sendCmdNoWait", arguments);
+  }
+
+  /// 把 even_connect 已组好的 OTA 协议小包一次交给原生队列。
+  ///
+  /// 插件不拆 4KB、不改字节；Android 仍保持单槽 GATT 写，iOS 由
+  /// `OtaWriteQueue` 在背压允许时连续泵送。空列表和非 OTA 通道直接拒绝，
+  /// 避免把未定义语义伪装成成功。
+  @override
+  Future<void> sendOtaPacketBatch(
+    String uuid,
+    List<Uint8List> framedPackets, {
+    int psType = 1,
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+    BleG2OtaContext? otaContext,
+  }) async {
+    await _sendOtaPacketBatch(
+      uuid,
+      framedPackets,
+      psType: psType,
+      expectedSessionGeneration: expectedSessionGeneration,
+      expectedAttemptGeneration: expectedAttemptGeneration,
+      otaContext: otaContext,
+      measured: false,
+    );
+  }
+
+  /// Opt-in native timing leaves the established void batch API unchanged.
+  @override
+  Future<OtaBatchMetrics?> sendOtaPacketBatchMeasured(
+    String uuid,
+    List<Uint8List> framedPackets, {
+    int psType = 1,
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+    BleG2OtaContext? otaContext,
+    BleOtaWindow? otaWindow,
+  }) async =>
+      OtaBatchMetrics.fromNative(await _sendOtaPacketBatch(
+        uuid,
+        framedPackets,
+        psType: psType,
+        expectedSessionGeneration: expectedSessionGeneration,
+        expectedAttemptGeneration: expectedAttemptGeneration,
+        otaContext: otaContext,
+        measured: true,
+        otaWindow: otaWindow,
+      ));
+
+  Future<Object?> _sendOtaPacketBatch(
+    String uuid,
+    List<Uint8List> framedPackets, {
+    required int psType,
+    required int expectedSessionGeneration,
+    required int expectedAttemptGeneration,
+    required BleG2OtaContext? otaContext,
+    required bool measured,
+    BleOtaWindow? otaWindow,
+  }) async {
+    if (framedPackets.isEmpty) {
+      throw ArgumentError.value(
+        framedPackets,
+        'framedPackets',
+        'sendOtaPacketBatch requires at least one already-framed OTA packet',
+      );
+    }
+    if (psType != 1) {
+      throw ArgumentError.value(
+        psType,
+        'psType',
+        'sendOtaPacketBatch only supports the OTA channel (psType=1)',
+      );
+    }
+    final arguments = <String, Object?>{
+      'uuid': uuid,
+      'packets': framedPackets,
+      'psType': psType,
+      // 整批冻结同一物理 owner；native 每包提交前复验，不能跨重连发送剩余 RAW。
+      'expectedSessionGeneration': expectedSessionGeneration,
+      'expectedAttemptGeneration': expectedAttemptGeneration,
+      if (measured) 'metricsRequested': true,
+      if (otaWindow != null) 'otaWindow': otaWindow.toJson(),
+    };
+    if (otaContext != null) {
+      arguments.addAll(otaContext.toMethodArguments());
+    }
+    return methodChannel.invokeMethod<Object?>('sendOtaPacketBatch', arguments);
+  }
+
+  /// 把 even_connect 已组好的文件协议小包一次交给原生队列。
+  ///
+  /// 与 OTA 批次共用队列实现但通道实例独立，因此 `quiteUpgradeState` 不会取消文件传输。
+  /// 空列表和非文件通道直接拒绝，避免把未定义语义伪装成成功。
+  @override
+  Future<void> sendFilePacketBatch(
+    String uuid,
+    List<Uint8List> framedPackets, {
+    int psType = 3,
+  }) async {
+    if (framedPackets.isEmpty) {
+      throw ArgumentError.value(
+        framedPackets,
+        'framedPackets',
+        'sendFilePacketBatch requires at least one already-framed file packet',
+      );
+    }
+    if (psType != 3) {
+      throw ArgumentError.value(
+        psType,
+        'psType',
+        'sendFilePacketBatch only supports the file channel (psType=3)',
+      );
+    }
+    await methodChannel.invokeMethod<void>('sendFilePacketBatch', {
+      'uuid': uuid,
+      'packets': framedPackets,
+      'psType': psType,
+    });
   }
 
   @override

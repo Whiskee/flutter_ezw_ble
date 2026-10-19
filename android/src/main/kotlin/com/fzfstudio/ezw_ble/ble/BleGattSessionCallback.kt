@@ -495,10 +495,12 @@ internal class BleGattSessionCallback(
             otaInstanceId = otaContext?.instanceId ?: "",
         ).toFlutterMap()
         emitReceiveData(bleCmdMap)
-        sendLog(
-            BleLoggerTag.d,
-            "Receive cmd(old): ${gatt.device.address}, type=${privateService.type}, length=${characteristic.value.size}, chartsType=${characteristic.writeType}",
-        )
+        if (privateService.type != BlePsType.OTA) {
+            sendLog(
+                BleLoggerTag.d,
+                "Receive cmd(old): ${gatt.device.address}, type=${privateService.type}, length=${characteristic.value.size}, chartsType=${characteristic.writeType}",
+            )
+        }
     }
 
     /**
@@ -575,10 +577,15 @@ internal class BleGattSessionCallback(
 
         // 5. 其余 characteristic write 状态交给 manager 精确匹配普通/OTA owner；OTA Future
         //    只有在这里成功后才完成，不能再把同步提交成功当成 GATT 单槽位已经释放。
-        sendLog(BleLoggerTag.d, "Send cmd: $address, write call back is success = ${status == BluetoothGatt.GATT_SUCCESS}, status=$operationStatus")
+        val writtenPsType = device.psTypeForWriteCharacteristic(characteristic)
+        if (writtenPsType != BlePsType.OTA || status != BluetoothGatt.GATT_SUCCESS) {
+            // OTA success callbacks arrive once per RAW packet/window and are accounted for by
+            // queue completions/metrics; keep failures visible because they are causal evidence.
+            sendLog(BleLoggerTag.d, "Send cmd: $address, write call back is success = ${status == BluetoothGatt.GATT_SUCCESS}, status=$operationStatus")
+        }
         onCharacteristicWriteComplete(
             address,
-            device.psTypeForWriteCharacteristic(characteristic),
+            writtenPsType,
             status,
             operationStatus,
         )
@@ -598,11 +605,16 @@ internal class BleGattSessionCallback(
         }
 
         // 2. stale GATT 的 MTU 回调不能推进当前连接。
-        if (gatt == null || currentExpectedDeviceForGatt(gatt, "mtu changed") == null) {
+        val device = if (gatt == null) null else currentExpectedDeviceForGatt(gatt, "mtu changed")
+        if (gatt == null || device == null) {
             return
         }
 
         // 3. 保留旧行为：MTU 成功/失败都进入连接完成判断。
+        if (status == BluetoothGatt.GATT_SUCCESS) {
+            device.negotiatedMtu = mtu
+            device.writeLimitBytes = (mtu - 3).coerceAtLeast(0)
+        }
         recordTraceMtu(
             gatt.device.address,
             if (status == BluetoothGatt.GATT_SUCCESS) "success" else "failed",
@@ -614,6 +626,19 @@ internal class BleGattSessionCallback(
             "Connect call back: ${gatt.device.address} change mtu ${if (status == BluetoothGatt.GATT_SUCCESS) "success" else "failed"}, new mtu value = $mtu, connecting flow is finish",
         )
         connectingFlowFinish(gatt, mtu)
+    }
+
+    /**
+     * PHY 读回只用于确认当前链路是 1M 还是 2M，不得影响连接状态机。
+     */
+    override fun onPhyRead(gatt: BluetoothGatt?, txPhy: Int, rxPhy: Int, status: Int) {
+        super.onPhyRead(gatt, txPhy, rxPhy, status)
+        val address = gatt?.device?.address ?: return
+        sendLog(
+            BleLoggerTag.d,
+            "[ezw_ble][phy] read endpoint=$address tx=${BleAndroidPreferredPhy.describe(txPhy)} " +
+                "rx=${BleAndroidPreferredPhy.describe(rxPhy)} status=$status",
+        )
     }
 
     /**
@@ -701,6 +726,14 @@ internal class BleGattSessionCallback(
     /** 记录 controller 最终采用的 PHY；setPreferredPhy 只是偏好，真实结果以该回调为准。 */
     override fun onPhyUpdate(gatt: BluetoothGatt, txPhy: Int, rxPhy: Int, status: Int) {
         super.onPhyUpdate(gatt, txPhy, rxPhy, status)
+        // OTA 的 2M 请求与高可靠模式共用同一个 framework 回调；先记录 controller
+        // 的真实选择，再让 exact GATT owner 决定是否更新连接质量状态。
+        sendLog(
+            BleLoggerTag.d,
+            "[ezw_ble][phy] update endpoint=${gatt.device.address} " +
+                "tx=${BleAndroidPreferredPhy.describe(txPhy)} " +
+                "rx=${BleAndroidPreferredPhy.describe(rxPhy)} status=$status",
+        )
         val device = currentExpectedDeviceForGatt(gatt, "PHY update") ?: return
         if (!device.belongConfig.androidHighReliabilityMode) {
             return
@@ -763,6 +796,14 @@ internal class BleGattSessionCallback(
         // 2. GATT readiness 完成后上报 connectFinish，等待 Dart 业务认证后再进入 connected。
         recordTraceStep(address, "gatt_ready", "success", null, null, null)
         handleConnectState(address, name, BleConnectState.CONNECT_FINISH, mtu)
+        // 3. 建连 hint 不能把已连上的 1M 链路切到 2M；在 GATT ready 后再请求一次。
+        //    PHY 回调异步到达，不得挡住 connectFinish。
+        BleAndroidPreferredPhy.requestLe2m(
+            gatt = gatt,
+            endpoint = address,
+            reason = "connectFinish",
+            logger = { sendLog(BleLoggerTag.d, it) },
+        )
         sendLog(BleLoggerTag.d, "Connect call back: $address, connect finish")
     }
 
