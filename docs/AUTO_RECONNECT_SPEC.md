@@ -3,6 +3,10 @@
 This is the active plugin contract for native BLE auto reconnect. Android Companion Device
 Manager is intentionally out of scope for the active implementation; older CDM
 documents in this repo are archived research notes, not current APIs.
+The `androidCdm` and `androidBlePendingIntent` connection sources identify
+which App wake path initiated an existing automatic reconnect session. They do
+not make this plugin the owner of CDM association or PendingIntent scanning;
+both retain the same automatic security-recovery budget as `autoReconnect`.
 
 For repository architecture and channel contracts, see `ARCHITECTURE.md`.
 

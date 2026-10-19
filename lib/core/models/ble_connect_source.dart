@@ -11,6 +11,8 @@ enum BleConnectSource {
   foreground,
 }
 
+/// Android background wake and iOS restoration are automatic owners, not
+/// manual repair attempts. Keep this classification consistent with native.
 extension BleConnectSourceSemantics on BleConnectSource {
   bool get isAutomaticReconnect => switch (this) {
         BleConnectSource.autoReconnect ||

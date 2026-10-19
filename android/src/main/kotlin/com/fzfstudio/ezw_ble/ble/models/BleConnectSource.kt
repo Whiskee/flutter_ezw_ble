@@ -19,6 +19,7 @@ enum class BleConnectSource(val flutterValue: String) {
     @SerializedName("foreground")
     FOREGROUND("foreground");
 
+    /** Wake provenance and restoration retain the same automatic reconnect owner. */
     val isAutomaticReconnect: Boolean
         get() = this == AUTO_RECONNECT ||
             this == ANDROID_CDM ||

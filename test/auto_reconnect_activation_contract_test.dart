@@ -61,6 +61,24 @@ void main() {
     }
   });
 
+  test('background wake sources retain automatic reconnect ownership', () {
+    for (final source in <BleConnectSource>[
+      BleConnectSource.autoReconnect,
+      BleConnectSource.androidCdm,
+      BleConnectSource.androidBlePendingIntent,
+      BleConnectSource.stateRestoration,
+    ]) {
+      expect(source.isAutomaticReconnect, isTrue, reason: source.name);
+    }
+    for (final source in <BleConnectSource>[
+      BleConnectSource.unknown,
+      BleConnectSource.manualReconnect,
+      BleConnectSource.foreground,
+    ]) {
+      expect(source.isAutomaticReconnect, isFalse, reason: source.name);
+    }
+  });
+
   test('BleConnectModel round-trips session and attempt generations', () {
     final model = BleConnectModel(
       'device-1',

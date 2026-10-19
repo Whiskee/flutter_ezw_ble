@@ -64,6 +64,24 @@ class BleAndroidSecurityRecoveryPolicyTest {
     }
 
     @Test
+    fun `Android wake sources use automatic security recovery budget`() {
+        for (source in listOf(
+            BleConnectSource.ANDROID_CDM,
+            BleConnectSource.ANDROID_BLE_PENDING_INTENT,
+        )) {
+            assertEquals(source, BleConnectSource.fromFlutterValue(source.flutterValue))
+            val result = BleAndroidSecurityRecoveryPolicy.record(
+                source,
+                attemptGeneration = 1L,
+                currentCount = 0,
+                lastCountedAttemptGeneration = 0L,
+            )
+            assertEquals(BleAndroidSecurityRecoveryAction.RETRY, result.first)
+            assertEquals(1, result.second)
+        }
+    }
+
+    @Test
     fun `bond removal fast rebuild is limited to pre physical owner`() {
         assertEquals(
             BleBondRemovalAction.FAST_REBUILD_PRE_PHYSICAL,
