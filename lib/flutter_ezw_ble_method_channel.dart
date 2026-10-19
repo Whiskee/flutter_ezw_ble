@@ -8,6 +8,8 @@ import 'package:flutter_ezw_ble/core/models/ble_ota_recovery_disconnect_result.d
 import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_business_connection_attempt.dart';
 import 'package:flutter_ezw_ble/core/models/ble_scan_start_result.dart';
+import 'package:flutter_ezw_ble/core/models/ota_batch_metrics.dart';
+import 'package:flutter_ezw_ble/core/models/ble_ota_window.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble.dart';
 
 import 'flutter_ezw_ble_platform_interface.dart';
@@ -403,6 +405,7 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
     int expectedSessionGeneration = 0,
     int expectedAttemptGeneration = 0,
     BleG2OtaContext? otaContext,
+    BleOtaWindowReceipt? otaWindowCredit,
   }) async {
     final arguments = <String, Object?>{
       "uuid": uuid,
@@ -412,6 +415,8 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       // 且 psType==1 时启用 strict guard；旧调用保留 0 以维持兼容。
       "expectedSessionGeneration": expectedSessionGeneration,
       "expectedAttemptGeneration": expectedAttemptGeneration,
+      // Piggyback only a validated real-ACK receipt; no extra channel round trip.
+      if (otaWindowCredit != null) 'otaWindowCredit': otaWindowCredit.toJson(),
     };
     if (otaContext != null) {
       arguments.addAll(otaContext.toMethodArguments());
@@ -432,6 +437,49 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
     int expectedSessionGeneration = 0,
     int expectedAttemptGeneration = 0,
     BleG2OtaContext? otaContext,
+  }) async {
+    await _sendOtaPacketBatch(
+      uuid,
+      framedPackets,
+      psType: psType,
+      expectedSessionGeneration: expectedSessionGeneration,
+      expectedAttemptGeneration: expectedAttemptGeneration,
+      otaContext: otaContext,
+      measured: false,
+    );
+  }
+
+  /// Opt-in native timing leaves the established void batch API unchanged.
+  @override
+  Future<OtaBatchMetrics?> sendOtaPacketBatchMeasured(
+    String uuid,
+    List<Uint8List> framedPackets, {
+    int psType = 1,
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+    BleG2OtaContext? otaContext,
+    BleOtaWindow? otaWindow,
+  }) async =>
+      OtaBatchMetrics.fromNative(await _sendOtaPacketBatch(
+        uuid,
+        framedPackets,
+        psType: psType,
+        expectedSessionGeneration: expectedSessionGeneration,
+        expectedAttemptGeneration: expectedAttemptGeneration,
+        otaContext: otaContext,
+        measured: true,
+        otaWindow: otaWindow,
+      ));
+
+  Future<Object?> _sendOtaPacketBatch(
+    String uuid,
+    List<Uint8List> framedPackets, {
+    required int psType,
+    required int expectedSessionGeneration,
+    required int expectedAttemptGeneration,
+    required BleG2OtaContext? otaContext,
+    required bool measured,
+    BleOtaWindow? otaWindow,
   }) async {
     if (framedPackets.isEmpty) {
       throw ArgumentError.value(
@@ -454,11 +502,13 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       // 整批冻结同一物理 owner；native 每包提交前复验，不能跨重连发送剩余 RAW。
       'expectedSessionGeneration': expectedSessionGeneration,
       'expectedAttemptGeneration': expectedAttemptGeneration,
+      if (measured) 'metricsRequested': true,
+      if (otaWindow != null) 'otaWindow': otaWindow.toJson(),
     };
     if (otaContext != null) {
       arguments.addAll(otaContext.toMethodArguments());
     }
-    await methodChannel.invokeMethod<void>('sendOtaPacketBatch', arguments);
+    return methodChannel.invokeMethod<Object?>('sendOtaPacketBatch', arguments);
   }
 
   /// 把 even_connect 已组好的文件协议小包一次交给原生队列。

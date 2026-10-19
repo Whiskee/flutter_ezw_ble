@@ -72,16 +72,10 @@ void main() {
       manager.indexOf('func peripheralIsReady(toSendWriteWithoutResponse'),
     );
     final readyBody = ready.substring(0, ready.indexOf('\n    }'));
-    expect(
-      readyBody,
-      contains('otaWriteQueues[uuid]?.onPeripheralReadyToSendWriteWithoutResponse()'),
-    );
-    expect(
-      readyBody,
-      contains(
-        'fileWriteQueues[uuid]?.onPeripheralReadyToSendWriteWithoutResponse()',
-      ),
-    );
+    expect(readyBody, contains('let otaQueue = otaWriteQueues[uuid]'));
+    expect(readyBody, contains('let fileQueue = fileWriteQueues[uuid]'));
+    expect(readyBody, contains('queue.onPeripheralReadyToSendWriteWithoutResponse()'));
+    expect(readyBody, contains('fileQueue?.onPeripheralReadyToSendWriteWithoutResponse()'));
   });
 
   test('both platforms keep the file batch behind the upgrade gate', () {

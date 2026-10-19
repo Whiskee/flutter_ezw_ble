@@ -2046,6 +2046,7 @@ extension BleManager {
         expectedSessionGeneration: Int64 = 0,
         expectedAttemptGeneration: Int64 = 0,
         otaContext: BleG2OtaContext? = nil,
+        otaWindowCredit: [String: Any]? = nil,
         result: @escaping FlutterResult
     ) {
         let isOtaChannel = (psType == 1)
@@ -2123,6 +2124,18 @@ extension BleManager {
                 loggerD(msg: "[ezw_ble][ota] queue created uuid=\(uuid) peripheral=\(Unmanaged.passUnretained(device.peripheral).toOpaque())")
             }
             otaWriteQueues[uuid] = queue
+            // Receipt consumption is piggybacked on an already-admitted FILE.
+            // The legacy otaWindowCredit wire key is measurement-only now: even
+            // a valid receipt cannot reset soft64, cancel retry or bypass canSend.
+            if let credit = otaWindowCredit,
+               let windowId = credit["windowId"] as? String,
+               let receiptId = credit["receiptId"] as? String,
+               let owner = otaWindowCreditOwner(uuid: uuid,
+                   session: expectedSessionGeneration, attempt: expectedAttemptGeneration,
+                   context: otaContext) {
+                _ = queue.recordOtaWindowAckForNextFile(windowId: windowId,
+                    receiptId: receiptId, owner: owner, nextFile: data)
+            }
             //  - 4.2、入队后只有真正调用 peripheral.writeValue 才回调成功。
             //  -- 这里构造提交目标而不让队列直接依赖 CBCharacteristic，便于 XCTest 覆盖背压时序。
             let target = OtaWriteTarget(
@@ -2146,7 +2159,6 @@ extension BleManager {
                     return true
                 }
             )
-            loggerD(msg: "[ezw_ble][ota] enqueued uuid=\(uuid) bytes=\(data.count) canSend=\(device.peripheral.canSendWriteWithoutResponse) queueDepth=\(queue.queueDepth)")
             queue.enqueue(
                 data: data,
                 target: target,
@@ -2187,6 +2199,8 @@ extension BleManager {
         expectedSessionGeneration: Int64 = 0,
         expectedAttemptGeneration: Int64 = 0,
         otaContext: BleG2OtaContext? = nil,
+        otaWindow: [String: Any]? = nil,
+        metricsRequested: Bool = false,
         result: @escaping FlutterResult
     ) {
         guard psType == BlePsTypeValue.ota else {
@@ -2205,8 +2219,10 @@ extension BleManager {
             expectedSessionGeneration: expectedSessionGeneration,
             expectedAttemptGeneration: expectedAttemptGeneration,
             otaContext: otaContext,
+            otaWindow: otaWindow,
             existingQueue: { [weak self] in self?.otaWriteQueues[uuid] },
             storeQueue: { [weak self] queue in self?.otaWriteQueues[uuid] = queue },
+            metricsRequested: metricsRequested,
             result: result
         )
     }
@@ -2252,8 +2268,10 @@ extension BleManager {
         expectedSessionGeneration: Int64 = 0,
         expectedAttemptGeneration: Int64 = 0,
         otaContext: BleG2OtaContext? = nil,
+        otaWindow: [String: Any]? = nil,
         existingQueue: () -> OtaWriteQueue?,
         storeQueue: (OtaWriteQueue) -> Void,
+        metricsRequested: Bool = false,
         result: @escaping FlutterResult
     ) {
         guard !packets.isEmpty else {
@@ -2325,6 +2343,58 @@ extension BleManager {
             channel: channel
         )
         storeQueue(queue)
+        // Native allSubmitted and native actual notification are separate facts.
+        // Only RAW windows with a positive exact owner register a credit slot.
+        var registeredWindowId: String?
+        var registeredOwner: OtaWindowCreditOwner?
+        if let window = otaWindow {
+            guard psType == BlePsTypeValue.ota,
+                  let windowId = window["windowId"] as? String,
+                  let expectedAck = window["expectedAck"] as? FlutterStandardTypedData,
+                  let owner = otaWindowCreditOwner(uuid: uuid,
+                      session: expectedSessionGeneration, attempt: expectedAttemptGeneration,
+                      context: otaContext),
+                  queue.registerOtaWindow(windowId: windowId,
+                      expectedAck: expectedAck.data, owner: owner) else {
+                result(FlutterError(code: "ota_window_invalid",
+                    message: "Invalid or stale OTA window admission", details: nil))
+                return
+            }
+            registeredWindowId = windowId
+            registeredOwner = owner
+        }
+        // Freeze the observable CoreBluetooth write limit at admission time. Do not
+        // call getDeviceMTU() here: that helper logs, and iOS MTU would only be a
+        // limit+3 derivation rather than a true negotiated callback like Android.
+        let frozenWriteLimit: Int? = metricsRequested
+            ? device.peripheral.maximumWriteValueLength(for: .withoutResponse)
+            : nil
+        var queueMetrics: [String: Any]?
+        let batchResult: FlutterResult = { [weak self] value in
+            // Freeze submission before publishing Flutter completion: a genuine
+            // notify may reach Dart before the MethodChannel Future is resumed.
+            if let windowId = registeredWindowId, let owner = registeredOwner {
+                _ = queue.markOtaWindowSubmitted(windowId: windowId,
+                    owner: owner, success: value == nil)
+            }
+            guard metricsRequested, value == nil else {
+                result(value)
+                return
+            }
+            var metrics = queueMetrics ?? [:]
+            if let frozenWriteLimit {
+                metrics["writeLimitBytes"] = frozenWriteLimit
+            }
+            if let trace = self?.nativeTraceSnapshot(uuid: uuid) {
+                if let lastRssiDbm = trace.lastRssiDbm {
+                    metrics["lastRssiDbm"] = lastRssiDbm
+                }
+                if let rssiAgeMs = trace.rssiAgeMs {
+                    metrics["rssiAgeMs"] = rssiAgeMs
+                }
+            }
+            result(metrics)
+        }
         let target = OtaWriteTarget(
             characteristicUUID: writeChars.uuid.uuidString,
             submit: { [weak self, device] peripheral, value in
@@ -2351,13 +2421,23 @@ extension BleManager {
             target: target,
             expectedSessionGeneration: expectedSessionGeneration,
             expectedAttemptGeneration: expectedAttemptGeneration,
-            result: result
+            metrics: metricsRequested ? { metrics in queueMetrics = metrics } : nil,
+            result: batchResult
         )
     }
 
     /// OTA 错误 details 需要带上当前 native pending 深度，帮助区分“尚未提交”和“已提交后设备无 ack”。
     private func queueDepthForOta(uuid: String) -> Int {
         return otaWriteQueues[uuid]?.queueDepth ?? 0
+    }
+
+    /// Typed owner avoids concatenated-string collisions across endpoints/attempts.
+    private func otaWindowCreditOwner(uuid: String, session: Int64, attempt: Int64,
+        context: BleG2OtaContext?) -> OtaWindowCreditOwner? {
+        guard let context else { return nil }
+        return OtaWindowCreditOwner(uuid: uuid, sessionGeneration: session,
+            attemptGeneration: attempt, transactionId: context.transactionId,
+            otaGeneration: context.generation, instanceId: context.instanceId)
     }
 
     /**
@@ -4940,6 +5020,11 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             loggerE(msg: "cmd response: \(peripheral.identifier.uuidString), can not find chars")
             return
         }
+        // Keep the OTA peripheral-object guard as well as the shared receive
+        // admission/characteristic checks. Neither provides a firmware-window nonce.
+        if privateService.type == BlePsTypeValue.ota, device.peripheral !== peripheral {
+            return
+        }
         let receiveIdentity = receiveDataIdentity(
             peripheral: peripheral,
             characteristic: characteristic,
@@ -4963,7 +5048,7 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             ? g2OtaTransactions.activeContext(for: peripheral.identifier.uuidString)
             : nil
         //  4、发送指令到flutter。OTA response 必须带 exact pair，供 Dart 绑定当前恢复轮次。
-        let bleCmdMap = BleCmd(
+        var bleCmdMap = BleCmd(
             uuid: peripheral.identifier.uuidString,
             psType: privateService.type,
             data: data,
@@ -4975,8 +5060,22 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             otaInstanceId: otaContext?.instanceId ?? "",
             receiveIdentity: receiveIdentity
         ).toMap()
+        if privateService.type == BlePsTypeValue.ota,
+           let identity = responseIdentity,
+           let owner = otaWindowCreditOwner(uuid: peripheral.identifier.uuidString,
+               session: identity.sessionGeneration, attempt: identity.attemptGeneration,
+               context: otaContext),
+           let receipt = otaWriteQueues[peripheral.identifier.uuidString]?
+               .observeOtaAck(data: data, owner: owner) {
+            bleCmdMap["otaWindowReceipt"] = receipt
+        }
         BleEC.receiveData.emit(bleCmdMap)
-        loggerD(msg: "cmd response(char): \(peripheral.identifier.uuidString), chars = \(characteristic.uuid.uuidString), data length = \(data.count)")
+        // OTA 4 KiB ACKs are routine high-frequency progress signals and are
+        // already delivered to Dart/metrics above; keep non-OTA responses and
+        // all OTA rejection/error paths logged for causal diagnostics.
+        if privateService.type != BlePsTypeValue.ota {
+            loggerD(msg: "cmd response(char): \(peripheral.identifier.uuidString), chars = \(characteristic.uuid.uuidString), data length = \(data.count)")
+        }
     }
 
     private func receiveDataIdentity(

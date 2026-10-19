@@ -377,3 +377,17 @@ Bluetooth OFF 或迟到 OTA exit 都不能复活旧连接，也不能让旧清�
 
 Dart 侧团队已完成 G2 队列重构(`even_connect` 仓库),为本次原生侧改造铺好路径。
 有任何接口/语义问题请同步到上层 Dart 团队,避免双向假设漂移。
+
+## 11. 真实ACK测量与定时器换代（2026-10-13，预算回收已撤销）
+
+本节描述当前实现；前文示例与最初实施清单不代表所有现行队列细节。
+
+- soft64的500ms等待切换为 `canSend=false` 的100ms重查时，必须先取消并清空旧任务句柄，再为新episode建任务。取消后仍执行的旧block不能清新句柄；重复false不刷新15秒单调时钟起点。
+- OTA RAW批次可携独立 `otaWindow={windowId,expectedAck}`。本地ID不写入固件协议，native完成只标记全批已提交，不回收预算。
+- 只有当前owner（UUID、session、attempt、transaction、OTA generation、instance）完整匹配且native实际收到标准成功RAW ACK `AA 12 SS 04 01 01 C1 00 02 00 6D 7B` 才签发一次性receipt。Dart还需验证当前窗口、物理身份、事务、方向、SID/SS/CID/CRC和成功状态；早到ACK不能绕过尚未完成的批次Future。
+- 收据继续捎带到下一FILE的既有 `sendCmdNoWait` 参数 `otaWindowCredit`，native需队列空、owner/window/receipt匹配以及完整合法FILE帧，才记录ACK测量锚点。该兼容键不再授权预算回收：即使收据有效，也不清零累计包数、不解除soft64等待、不取消retry、不驱动pending。64包软等待只由原有ready/poll恢复；普通FILE队列不消费OTA收据。
+- `nativeNotifyToCreditMs` 保留历史字段名，现仅计notify→下一FILE准入消费receipt；`nativeAckToNextFileMs` 计notify→该FILE实际提交给CoreBluetooth，包含该FILE遭遇的soft64或hard backpressure。已完成的单包FILE软等待携带到后继RAW的measured result，不在receipt到达时提前结算或解除等待。其他软等待、timer迟到、poll/callback恢复次数仍输出批次/组件汇总，均非空口时间。
+- cancel、stall、peripheral释放或事务/物理owner清理不得保留旧receipt。旧批次失败只作废其自己的window，不能清掉新window。
+- 回归入口：`fvm flutter test test/ios_ota_queue_native_test.dart test/ota_window_bridge_test.dart`（host Swift行为测试仅macOS执行）；SDK生产发送链路另见其 strict ACK 与window credit回归测试。
+
+当前A/B版本只保留定时器修复及观察埋点，不启用64包预算回收；是否恢复速度须固定手机、固件和构建配置做真机对比。没有修改MTU/4KB协议、真实ACK、固件处理或iOS无线调度。固件只有8位SS而无窗口nonce，不声称解决所有空口旧帧重放。

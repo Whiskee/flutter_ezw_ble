@@ -454,12 +454,17 @@ enum class BleMC {
                 val uuid = jsonMap?.get("uuid") as? String ?: ""
                 val psType = jsonMap?.get("psType") as Int? ?: 1
                 val packets = decodeFramedBatchPackets(jsonMap?.get("packets"))
+                // Diagnostic-only clock starts before native admission; this is not device receipt.
+                val metricsRequested = jsonMap?.get("metricsRequested") == true
+                val batchStartedAtMs = android.os.SystemClock.elapsedRealtime()
                 // 批次与单包沿用同一 exact owner，必须传到每个排队 Item。
                 val expectedSessionGeneration =
                     (jsonMap?.get("expectedSessionGeneration") as? Number)?.toLong() ?: 0L
                 val expectedAttemptGeneration =
                     (jsonMap?.get("expectedAttemptGeneration") as? Number)?.toLong() ?: 0L
                 val otaContext = jsonMap?.get("otaContext") as? Map<*, *>
+                var nativeQueueMetrics: BleAndroidOtaBatchQueueMetrics? = null
+                var frozenLinkMetrics: Map<String, Any> = emptyMap()
                 BleManager.instance.sendOtaPacketBatch(
                     uuid,
                     packets,
@@ -469,9 +474,25 @@ enum class BleMC {
                     otaTransactionId = otaContext?.get("transactionId") as? String ?: "",
                     otaGeneration = otaContext?.get("generation").toStrictLongOrDefault(),
                     otaInstanceId = otaContext?.get("instanceId") as? String ?: "",
+                    queueMetrics = { metrics -> nativeQueueMetrics = metrics },
+                    linkMetrics = { metrics -> frozenLinkMetrics = metrics },
                 ) { error ->
                     if (error == null) {
-                        result.success(null)
+                        result.success(
+                            if (metricsRequested) mutableMapOf<String, Any>(
+                                "elapsedMs" to (android.os.SystemClock.elapsedRealtime() - batchStartedAtMs).toInt(),
+                                "packetCount" to packets.size,
+                                "wireBytes" to packets.sumOf { it.size },
+                                "completionKind" to "gatt_write_callback",
+                            ).also { metrics ->
+                                metrics.putAll(frozenLinkMetrics)
+                                nativeQueueMetrics?.let { queueMetrics ->
+                                    metrics["nativeQueueBackpressureCount"] = queueMetrics.backpressureCount
+                                    metrics["nativeQueueBackpressureWaitMs"] = queueMetrics.backpressureWaitMillis.toInt()
+                                    metrics["nativeQueueSoftThrottleCount"] = queueMetrics.softThrottleCount
+                                }
+                            } else null,
+                        )
                     } else {
                         result.error(error.code, error.reason, error.details)
                     }

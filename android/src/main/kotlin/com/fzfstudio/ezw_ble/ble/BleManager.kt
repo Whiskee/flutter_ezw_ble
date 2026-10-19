@@ -780,6 +780,11 @@ class BleManager private constructor() {
         otaWriteQueues[reconnectKey(uuid)]?.cancelAttempt(reason)
     }
 
+    /** OTA session 退役只丢弃 OTA 写队列；文件通道持有独立的 GATT 写 Future，不能被 OTA 清理误取消。 */
+    private fun discardOtaWriteQueueForSession(uuid: String, reason: String) {
+        otaWriteQueues.remove(reconnectKey(uuid))?.cancelAll(reason)
+    }
+
     /** 物理 GATT session 已失效后移除两条通道队列；迟到 callback 会被 session identity 拒绝。 */
     private fun discardWriteQueuesForSession(uuid: String, reason: String) {
         val key = reconnectKey(uuid)
@@ -3225,6 +3230,8 @@ class BleManager private constructor() {
         otaTransactionId: String = "",
         otaGeneration: Long = 0L,
         otaInstanceId: String = "",
+        queueMetrics: ((BleAndroidOtaBatchQueueMetrics) -> Unit)? = null,
+        linkMetrics: ((Map<String, Any>) -> Unit)? = null,
         completion: (BleOtaWriteError?) -> Unit,
     ) {
         if (psType != BlePsType.OTA) {
@@ -3242,8 +3249,47 @@ class BleManager private constructor() {
             otaTransactionId = otaTransactionId,
             otaGeneration = otaGeneration,
             otaInstanceId = otaInstanceId,
+            queueMetrics = queueMetrics,
+            linkMetrics = linkMetrics,
             completion = completion,
         )
+    }
+
+    /**
+     * Diagnostic-only snapshot for measured OTA batch events.
+     *
+     * The method only reuses cached connection/trace state. It must not issue RSSI,
+     * PHY, MTU or characteristic reads, because batch metrics are observational and
+     * must not perturb OTA scheduling.
+     */
+    fun otaBatchLinkMetrics(uuid: String): Map<String, Any> {
+        val device = findConnectedDevice(uuid) ?: return emptyMap()
+        val metrics = mutableMapOf<String, Any>()
+        device.writeLimitBytes?.let { metrics["writeLimitBytes"] = it }
+        device.negotiatedMtu?.let { metrics["mtu"] = it }
+        nativeTraceSnapshot(uuid)?.let { trace ->
+            if (trace.has("lastRssiDbm")) {
+                metrics["lastRssiDbm"] = trace.optInt("lastRssiDbm")
+            }
+            if (trace.has("rssiAgeMs")) {
+                metrics["rssiAgeMs"] = trace.optInt("rssiAgeMs")
+            }
+            trace.optString("phy").takeIf { it.isNotBlank() }?.let {
+                metrics["actualPhy"] = it
+            }
+            val steps = trace.optJSONArray("steps")
+            if (steps != null) {
+                for (index in 0 until steps.length()) {
+                    val step = steps.optJSONObject(index) ?: continue
+                    val trigger = step.optString("linkTrigger")
+                    val phy = step.optString("phy")
+                    if (phy.isNotBlank() && trigger != "phy_updated") {
+                        metrics["requestedPhy"] = phy
+                    }
+                }
+            }
+        }
+        return metrics
     }
 
     /**
@@ -3341,6 +3387,8 @@ class BleManager private constructor() {
         otaTransactionId: String = "",
         otaGeneration: Long = 0L,
         otaInstanceId: String = "",
+        queueMetrics: ((BleAndroidOtaBatchQueueMetrics) -> Unit)? = null,
+        linkMetrics: ((Map<String, Any>) -> Unit)? = null,
         completion: (BleOtaWriteError?) -> Unit,
     ) {
         if (packets.isEmpty()) {
@@ -3390,6 +3438,9 @@ class BleManager private constructor() {
             )
             return
         }
+        // Freeze link diagnostics after exact identity/capability validation but before enqueueing.
+        // Completion may run after reconnect/recovery changes the global device cache.
+        linkMetrics?.invoke(otaBatchLinkMetrics(uuid))
         // 每包保留冻结的 pair，后续 callback / BUSY 重试不得把剩余 RAW 写到新 owner。
         queue(uuid).enqueueBatch(
             packets,
@@ -3398,6 +3449,7 @@ class BleManager private constructor() {
             otaTransactionId = otaTransactionId,
             otaGeneration = otaGeneration,
             otaInstanceId = otaInstanceId,
+            metrics = queueMetrics,
             completion = completion,
         )
     }

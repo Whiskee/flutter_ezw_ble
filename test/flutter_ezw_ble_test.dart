@@ -7,9 +7,11 @@ import 'package:flutter_ezw_ble/core/models/ble_business_connection_attempt.dart
 import 'package:flutter_ezw_ble/core/models/ble_connect_source.dart';
 import 'package:flutter_ezw_ble/core/models/ble_device.dart';
 import 'package:flutter_ezw_ble/core/models/ble_g2_ota_transaction.dart';
+import 'package:flutter_ezw_ble/core/models/ble_ota_window.dart';
 import 'package:flutter_ezw_ble/core/models/ble_ota_recovery_disconnect_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_scan_start_result.dart';
+import 'package:flutter_ezw_ble/core/models/ota_batch_metrics.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_method_channel.dart';
 import 'package:flutter_ezw_ble/flutter_ezw_ble_platform_interface.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -247,6 +249,7 @@ class MockFlutterEzwBlePlatform
     int expectedSessionGeneration = 0,
     int expectedAttemptGeneration = 0,
     BleG2OtaContext? otaContext,
+    BleOtaWindowReceipt? otaWindowCredit,
   }) {
     throw UnimplementedError();
   }
@@ -258,7 +261,22 @@ class MockFlutterEzwBlePlatform
     int psType = 1,
     int expectedSessionGeneration = 0,
     int expectedAttemptGeneration = 0,
+    // Keep the mock aligned with the session-scoped OTA platform contract.
     BleG2OtaContext? otaContext,
+  }) {
+    throw UnimplementedError();
+  }
+
+  // Mirror the diagnostic entry point without changing transport behavior.
+  @override
+  Future<OtaBatchMetrics?> sendOtaPacketBatchMeasured(
+    String uuid,
+    List<Uint8List> framedPackets, {
+    int psType = 1,
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+    BleG2OtaContext? otaContext,
+    BleOtaWindow? otaWindow,
   }) {
     throw UnimplementedError();
   }

@@ -36,7 +36,8 @@ void main() {
     expect(queue, contains(r'\(channel)_write_stalled'));
     expect(queue, contains(r'\(channel)_write_cancelled'));
     expect(queue, contains('func enqueueBatch('));
-    expect(queue, contains('batch completed endpoint='));
+    expect(queue, contains('func logFileOnly'));
+    expect(queue, contains('channel != OtaWriteChannel.ota'));
     expect(queue, contains('backpressureStallTimeout: TimeInterval = 15.0'));
     expect(queue, contains('pending.removeFirst()'));
     expect(queue, contains('"expectedSessionGeneration"'));
@@ -113,6 +114,39 @@ void main() {
     expect(error, contains(r'${channel}_write_unsupported'));
   });
 
+  test('native OTA log policy suppresses routine success chatter only', () {
+    final androidQueue = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleAndroidOtaWriteQueue.kt',
+    ).readAsStringSync();
+    final androidCallback = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleGattSessionCallback.kt',
+    ).readAsStringSync();
+    final iosQueue = File(
+      'ios/Classes/ble/OtaWriteQueue.swift',
+    ).readAsStringSync();
+    final iosManager =
+        File('ios/Classes/ble/BleManager.swift').readAsStringSync();
+
+    expect(androidQueue, contains('logFileOnly'));
+    expect(androidQueue, contains('channel != BleWriteChannel.OTA'));
+    expect(androidQueue, contains(r'[ezw_ble][$channel][android] failed'));
+    expect(androidQueue, contains(r'[ezw_ble][$channel][android] stalled'));
+    expect(
+        androidCallback,
+        contains(
+            'writtenPsType != BlePsType.OTA || status != BluetoothGatt.GATT_SUCCESS'));
+    expect(androidCallback, contains('keep failures visible'));
+
+    expect(iosQueue, contains('func logFileOnly'));
+    expect(iosQueue, contains('channel != OtaWriteChannel.ota'));
+    expect(iosQueue, contains('[ezw_ble][\\(channel)] stalled'));
+    expect(iosQueue, contains('[ezw_ble][\\(channel)] cancelled'));
+    expect(iosManager, isNot(contains('[ezw_ble][ota] enqueued uuid=')));
+    expect(iosManager, contains('privateService.type != BlePsTypeValue.ota'));
+    expect(iosManager, contains('drop OTA response without exact identity'));
+    expect(iosManager, contains('already delivered to Dart/metrics'));
+  });
+
   test(
     'iOS OTA no-wait validates optional exact session identity before queueing',
     () {
@@ -145,4 +179,51 @@ void main() {
           contains('expectedAttemptGeneration: expectedAttemptGeneration'));
     },
   );
+
+  test('measured native OTA metrics preserve errors and freeze link context',
+      () {
+    final androidChannel = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleMethodChannel.kt',
+    ).readAsStringSync();
+    final androidManager = File(
+      'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleManager.kt',
+    ).readAsStringSync();
+    final iosChannel = File(
+      'ios/Classes/ble/BleMethodChannel.swift',
+    ).readAsStringSync();
+    final iosQueue = File(
+      'ios/Classes/ble/OtaWriteQueue.swift',
+    ).readAsStringSync();
+
+    expect(
+      androidChannel,
+      contains('var frozenLinkMetrics: Map<String, Any> = emptyMap()'),
+    );
+    expect(
+      androidChannel,
+      contains('linkMetrics = { metrics -> frozenLinkMetrics = metrics }'),
+    );
+    expect(androidChannel, contains('metrics.putAll(frozenLinkMetrics)'));
+    expect(
+      androidChannel,
+      isNot(contains('metrics.putAll(BleManager.instance.otaBatchLinkMetrics')),
+    );
+    expect(
+      androidManager,
+      contains('linkMetrics?.invoke(otaBatchLinkMetrics(uuid))'),
+    );
+
+    expect(
+      iosChannel,
+      contains('guard value == nil || value is [String: Any] else'),
+    );
+    expect(iosChannel, contains('result(value)'));
+    expect(
+        iosChannel, contains('var metrics = value as? [String: Any] ?? [:]'));
+    expect(iosQueue, contains('var monotonicNow: TimeInterval { get }'));
+    expect(
+      iosQueue,
+      contains('clock.monotonicNow - startedAt'),
+    );
+  });
 }

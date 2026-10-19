@@ -20,6 +20,8 @@ export 'core/models/ble_native_connection_trace.dart';
 export 'core/models/ble_device.dart';
 export 'core/models/ble_match_device.dart';
 export 'core/models/ble_ota_recovery_disconnect_result.dart';
+export 'core/models/ota_batch_metrics.dart';
+export 'core/models/ble_ota_window.dart';
 export 'core/models/ble_private_service.dart';
 export 'core/models/ble_reconnect_activation_result.dart';
 export 'core/models/ble_security_gate.dart';

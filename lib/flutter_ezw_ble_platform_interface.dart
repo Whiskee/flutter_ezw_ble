@@ -8,6 +8,8 @@ import 'package:flutter_ezw_ble/core/models/ble_ota_recovery_disconnect_result.d
 import 'package:flutter_ezw_ble/core/models/ble_reconnect_activation_result.dart';
 import 'package:flutter_ezw_ble/core/models/ble_business_connection_attempt.dart';
 import 'package:flutter_ezw_ble/core/models/ble_scan_start_result.dart';
+import 'package:flutter_ezw_ble/core/models/ota_batch_metrics.dart';
+import 'package:flutter_ezw_ble/core/models/ble_ota_window.dart';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
 import 'flutter_ezw_ble_method_channel.dart';
@@ -414,6 +416,7 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     int expectedSessionGeneration = 0,
     int expectedAttemptGeneration = 0,
     BleG2OtaContext? otaContext,
+    BleOtaWindowReceipt? otaWindowCredit,
   }) {
     throw UnimplementedError('sendCmdNoWait() has not been implemented.');
   }
@@ -433,6 +436,27 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     BleG2OtaContext? otaContext,
   }) {
     throw UnimplementedError('sendOtaPacketBatch() has not been implemented.');
+  }
+
+  /// Diagnostic variant of the same batch write; the result never represents firmware ACK.
+  Future<OtaBatchMetrics?> sendOtaPacketBatchMeasured(
+    String uuid,
+    List<Uint8List> framedPackets, {
+    int psType = 1,
+    int expectedSessionGeneration = 0,
+    int expectedAttemptGeneration = 0,
+    BleG2OtaContext? otaContext,
+    BleOtaWindow? otaWindow,
+  }) async {
+    await sendOtaPacketBatch(
+      uuid,
+      framedPackets,
+      psType: psType,
+      expectedSessionGeneration: expectedSessionGeneration,
+      expectedAttemptGeneration: expectedAttemptGeneration,
+      otaContext: otaContext,
+    );
+    return null;
   }
 
   /// 一次提交一组已经完成 Even 协议封装的文件小包。

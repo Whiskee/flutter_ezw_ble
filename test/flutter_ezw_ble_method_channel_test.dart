@@ -305,6 +305,83 @@ void main() {
     );
   });
 
+  test('measured OTA batch requests one native result without changing bytes',
+      () async {
+    MethodCall? capturedCall;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      capturedCall = call;
+      return <String, Object?>{
+        'elapsedMs': 12,
+        'packetCount': 2,
+        'wireBytes': 4,
+        'completionKind': 'corebluetooth_submitted',
+        'writeLimitBytes': 244,
+        'mtu': 247,
+        'requestedPhy': '2M',
+        'actualPhy': '1M',
+        'lastRssiDbm': -58,
+        'rssiAgeMs': 420,
+        'nativeQueueBackpressureCount': 3,
+        'nativeQueueBackpressureWaitMs': 150,
+        'nativeQueueSoftThrottleCount': 1,
+      };
+    });
+    final packets = <Uint8List>[
+      Uint8List.fromList(<int>[1, 2]),
+      Uint8List.fromList(<int>[3, 4]),
+    ];
+    final metrics = await MethodChannelEzwBle().sendOtaPacketBatchMeasured(
+      'left-uuid',
+      packets,
+      expectedSessionGeneration: 37,
+      expectedAttemptGeneration: 9,
+    );
+    expect(capturedCall?.arguments, containsPair('packets', packets));
+    expect(capturedCall?.arguments, containsPair('metricsRequested', true));
+    expect(metrics?.elapsedMs, 12);
+    expect(metrics?.completionKind, 'corebluetooth_submitted');
+    expect(metrics?.writeLimitBytes, 244);
+    expect(metrics?.mtu, 247);
+    expect(metrics?.requestedPhy, '2M');
+    expect(metrics?.actualPhy, '1M');
+    expect(metrics?.lastRssiDbm, -58);
+    expect(metrics?.rssiAgeMs, 420);
+    expect(metrics?.nativeQueueBackpressureCount, 3);
+    expect(metrics?.nativeQueueBackpressureWaitMs, 150);
+    expect(metrics?.nativeQueueSoftThrottleCount, 1);
+  });
+
+  test('measured OTA batch keeps missing diagnostic fields unknown', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      return <String, Object?>{
+        'elapsedMs': 12,
+        'packetCount': 2,
+        'wireBytes': 4,
+        'completionKind': 'gatt_write_callback',
+      };
+    });
+
+    final metrics = await MethodChannelEzwBle().sendOtaPacketBatchMeasured(
+      'left-uuid',
+      <Uint8List>[
+        Uint8List.fromList(<int>[1, 2]),
+        Uint8List.fromList(<int>[3, 4]),
+      ],
+    );
+
+    expect(metrics?.writeLimitBytes, isNull);
+    expect(metrics?.mtu, isNull);
+    expect(metrics?.requestedPhy, isNull);
+    expect(metrics?.actualPhy, isNull);
+    expect(metrics?.lastRssiDbm, isNull);
+    expect(metrics?.rssiAgeMs, isNull);
+    expect(metrics?.nativeQueueBackpressureCount, isNull);
+    expect(metrics?.nativeQueueBackpressureWaitMs, isNull);
+    expect(metrics?.nativeQueueSoftThrottleCount, isNull);
+  });
+
   test('sendFilePacketBatch forwards framed packets on the file channel',
       () async {
     MethodCall? capturedCall;

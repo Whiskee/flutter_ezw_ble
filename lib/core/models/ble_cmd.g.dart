@@ -10,6 +10,7 @@ BleCmd _$BleCmdFromJson(Map<String, dynamic> json) => BleCmd(
       json['uuid'] as String,
       (json['psType'] as num).toInt(),
       receiveIdentity: BleReceiveIdentity.fromJson(json['receiveIdentity']),
+      otaWindowReceipt: BleOtaWindowReceipt.fromJson(json['otaWindowReceipt']),
       data: _$JsonConverterFromJson<String, Uint8List>(
           json['data'], const Uint8ListConverter().fromJson),
       isSuccess: json['isSuccess'] as bool? ?? false,
@@ -32,6 +33,7 @@ Map<String, dynamic> _$BleCmdToJson(BleCmd instance) => <String, dynamic>{
       'otaGeneration': instance.otaGeneration,
       'otaInstanceId': instance.otaInstanceId,
       'receiveIdentity': instance.receiveIdentity?.toJson(),
+      'otaWindowReceipt': instance.otaWindowReceipt?.toJson(),
     };
 
 Value? _$JsonConverterFromJson<Json, Value>(

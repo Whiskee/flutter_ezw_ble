@@ -378,6 +378,7 @@ enum BleMC: String {
                 expectedSessionGeneration: expectedSessionGeneration,
                 expectedAttemptGeneration: expectedAttemptGeneration,
                 otaContext: otaContext,
+                otaWindowCredit: jsonData["otaWindowCredit"] as? [String: Any],
                 result: result
             )
             return
@@ -385,14 +386,37 @@ enum BleMC: String {
             let jsonData: [String: Any] = arguments as? [String: Any] ?? [:]
             let uuid: String = jsonData["uuid"] as? String ?? ""
             let psType: Int = jsonData["psType"] as? Int ?? BlePsTypeValue.ota
+            // Monotonic native duration ends when CoreBluetooth accepted the last submission.
+            let metricsRequested = jsonData["metricsRequested"] as? Bool ?? false
+            let batchStartedAt = ProcessInfo.processInfo.systemUptime
+            let packets = Self.decodeFramedBatchPackets(jsonData["packets"])
             BleManager.shared.sendOtaPacketBatch(
                 uuid: uuid,
-                packets: Self.decodeFramedBatchPackets(jsonData["packets"]),
+                packets: packets,
                 psType: psType,
                 expectedSessionGeneration: (jsonData["expectedSessionGeneration"] as? NSNumber)?.int64Value ?? 0,
                 expectedAttemptGeneration: (jsonData["expectedAttemptGeneration"] as? NSNumber)?.int64Value ?? 0,
                 otaContext: BleG2OtaContext(data: jsonData["otaContext"] as? [String: Any]),
-                result: result
+                otaWindow: jsonData["otaWindow"] as? [String: Any],
+                metricsRequested: metricsRequested,
+                result: { value in
+                    guard metricsRequested else {
+                        result(value)
+                        return
+                    }
+                    guard value == nil || value is [String: Any] else {
+                        result(value)
+                        return
+                    }
+                    var metrics = value as? [String: Any] ?? [:]
+                    metrics.merge([
+                        "elapsedMs": max(0, Int((ProcessInfo.processInfo.systemUptime - batchStartedAt) * 1_000)),
+                        "packetCount": packets.count,
+                        "wireBytes": packets.reduce(0) { $0 + $1.count },
+                        "completionKind": "corebluetooth_submitted"
+                    ]) { _, latest in latest }
+                    result(metrics)
+                }
             )
             return
         case .sendFilePacketBatch:

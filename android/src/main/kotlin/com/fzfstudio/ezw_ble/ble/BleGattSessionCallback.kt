@@ -495,10 +495,12 @@ internal class BleGattSessionCallback(
             otaInstanceId = otaContext?.instanceId ?: "",
         ).toFlutterMap()
         emitReceiveData(bleCmdMap)
-        sendLog(
-            BleLoggerTag.d,
-            "Receive cmd(old): ${gatt.device.address}, type=${privateService.type}, length=${characteristic.value.size}, chartsType=${characteristic.writeType}",
-        )
+        if (privateService.type != BlePsType.OTA) {
+            sendLog(
+                BleLoggerTag.d,
+                "Receive cmd(old): ${gatt.device.address}, type=${privateService.type}, length=${characteristic.value.size}, chartsType=${characteristic.writeType}",
+            )
+        }
     }
 
     /**
@@ -575,10 +577,15 @@ internal class BleGattSessionCallback(
 
         // 5. 其余 characteristic write 状态交给 manager 精确匹配普通/OTA owner；OTA Future
         //    只有在这里成功后才完成，不能再把同步提交成功当成 GATT 单槽位已经释放。
-        sendLog(BleLoggerTag.d, "Send cmd: $address, write call back is success = ${status == BluetoothGatt.GATT_SUCCESS}, status=$operationStatus")
+        val writtenPsType = device.psTypeForWriteCharacteristic(characteristic)
+        if (writtenPsType != BlePsType.OTA || status != BluetoothGatt.GATT_SUCCESS) {
+            // OTA success callbacks arrive once per RAW packet/window and are accounted for by
+            // queue completions/metrics; keep failures visible because they are causal evidence.
+            sendLog(BleLoggerTag.d, "Send cmd: $address, write call back is success = ${status == BluetoothGatt.GATT_SUCCESS}, status=$operationStatus")
+        }
         onCharacteristicWriteComplete(
             address,
-            device.psTypeForWriteCharacteristic(characteristic),
+            writtenPsType,
             status,
             operationStatus,
         )
@@ -598,11 +605,16 @@ internal class BleGattSessionCallback(
         }
 
         // 2. stale GATT 的 MTU 回调不能推进当前连接。
-        if (gatt == null || currentExpectedDeviceForGatt(gatt, "mtu changed") == null) {
+        val device = if (gatt == null) null else currentExpectedDeviceForGatt(gatt, "mtu changed")
+        if (gatt == null || device == null) {
             return
         }
 
         // 3. 保留旧行为：MTU 成功/失败都进入连接完成判断。
+        if (status == BluetoothGatt.GATT_SUCCESS) {
+            device.negotiatedMtu = mtu
+            device.writeLimitBytes = (mtu - 3).coerceAtLeast(0)
+        }
         recordTraceMtu(
             gatt.device.address,
             if (status == BluetoothGatt.GATT_SUCCESS) "success" else "failed",

@@ -34,6 +34,13 @@ internal fun interface BleOtaWriteScheduler {
     fun schedule(delayMillis: Long, block: () -> Unit): BleOtaWriteCancellable
 }
 
+/** Diagnostic-only counters for one native batch; absent values stay unknown to Dart. */
+data class BleAndroidOtaBatchQueueMetrics(
+    val backpressureCount: Int,
+    val backpressureWaitMillis: Long,
+    val softThrottleCount: Int,
+)
+
 /**
  * 单 endpoint、单通道的 Android 无应答批量写队列。
  *
@@ -57,13 +64,27 @@ internal class BleAndroidOtaWriteQueue(
     private class OtaWriteBatch(
         val completion: (BleOtaWriteError?) -> Unit,
         var remaining: Int,
+        val metrics: ((BleAndroidOtaBatchQueueMetrics) -> Unit)? = null,
         var settled: Boolean = false,
+        var backpressureCount: Int = 0,
+        var backpressureWaitMillis: Long = 0L,
     ) {
         fun settle(error: BleOtaWriteError?) {
             if (settled) {
                 return
             }
             settled = true
+            if (error == null) {
+                metrics?.invoke(
+                    BleAndroidOtaBatchQueueMetrics(
+                        backpressureCount = backpressureCount,
+                        backpressureWaitMillis = backpressureWaitMillis,
+                        // Android serializes on GATT callbacks and has no CoreBluetooth-style
+                        // soft throttle; report an explicit known zero only for measured batches.
+                        softThrottleCount = 0,
+                    ),
+                )
+            }
             completion(error)
         }
     }
@@ -85,6 +106,7 @@ internal class BleAndroidOtaWriteQueue(
     // 单槽位屏障，直到旧 callback 到达。新 attempt 只能排队，不能把旧 callback 当成自己的。
     private var cancelledInFlightCallbackPending = false
     private var waitStartedAtMillis: Long? = null
+    private var waitContributesToBatchMetrics = false
     private var watchdog: BleOtaWriteCancellable? = null
     private var lastBackpressure: BleOtaWriteSubmission? = null
 
@@ -118,7 +140,7 @@ internal class BleAndroidOtaWriteQueue(
                 completion = completion,
             ),
         )
-        logger("[ezw_ble][$channel][android] enqueued endpoint=$endpoint bytes=${data.size} pending=$queueDepth")
+        logFileOnly { "[ezw_ble][$channel][android] enqueued endpoint=$endpoint bytes=${data.size} pending=$queueDepth" }
         pump()
     }
 
@@ -131,13 +153,18 @@ internal class BleAndroidOtaWriteQueue(
         otaTransactionId: String = "",
         otaGeneration: Long = 0L,
         otaInstanceId: String = "",
+        metrics: ((BleAndroidOtaBatchQueueMetrics) -> Unit)? = null,
         completion: (BleOtaWriteError?) -> Unit,
     ) {
         if (packets.isEmpty()) {
             completion(BleOtaWriteError.unavailable(endpoint, "empty batch", channel = channel))
             return
         }
-        val batch = OtaWriteBatch(completion, remaining = packets.size)
+        val batch = OtaWriteBatch(
+            completion = completion,
+            remaining = packets.size,
+            metrics = metrics,
+        )
         packets.forEach { packet ->
             pending.addLast(
                 Item(
@@ -152,10 +179,10 @@ internal class BleAndroidOtaWriteQueue(
                 ),
             )
         }
-        logger(
+        logFileOnly {
             "[ezw_ble][$channel][android] batch enqueued endpoint=$endpoint " +
-                "packets=${packets.size} bytes=${packets.sumOf { it.size }} pending=$queueDepth",
-        )
+                "packets=${packets.size} bytes=${packets.sumOf { it.size }} pending=$queueDepth"
+        }
         pump()
     }
 
@@ -178,10 +205,10 @@ internal class BleAndroidOtaWriteQueue(
                 // 尚未提交，因此绝不能完成它的 Future；解除屏障后再驱动排队写入。
                 cancelledInFlightCallbackPending = false
                 clearWait()
-                logger(
+                logFileOnly {
                     "[ezw_ble][$channel][android] drained cancelled callback " +
-                        "endpoint=$endpoint status=$statusName pending=$queueDepth",
-                )
+                        "endpoint=$endpoint status=$statusName pending=$queueDepth"
+                }
                 pump()
                 return true
             }
@@ -191,7 +218,7 @@ internal class BleAndroidOtaWriteQueue(
                 clearWait()
                 if (success) {
                     if (completed.batch == null) {
-                        logger("[ezw_ble][$channel][android] completed endpoint=$endpoint status=$statusName pending=$queueDepth")
+                        logFileOnly { "[ezw_ble][$channel][android] completed endpoint=$endpoint status=$statusName pending=$queueDepth" }
                     }
                     completeItem(completed, error = null)
                 } else {
@@ -317,16 +344,17 @@ internal class BleAndroidOtaWriteQueue(
                     inFlight = head
                     waitStartedAtMillis = nowMillis()
                     lastBackpressure = null
-                    logger("[ezw_ble][$channel][android] submitted endpoint=$endpoint bytes=${head.data.size} pending=$queueDepth")
+                    logFileOnly { "[ezw_ble][$channel][android] submitted endpoint=$endpoint bytes=${head.data.size} pending=$queueDepth" }
                     scheduleWatchdog()
                     return
                 }
 
                 BleOtaWriteSubmission.Disposition.BUSY -> {
                     lastBackpressure = submission
-                    markWaitStarted()
+                    head.batch?.backpressureCount = (head.batch?.backpressureCount ?: 0) + 1
+                    markWaitStarted(contributesToBatchMetrics = true)
                     if (!failIfStalled(submission.reason, submission)) {
-                        logger("[ezw_ble][$channel][android] backpressure endpoint=$endpoint status=${submission.status} pending=$queueDepth")
+                        logFileOnly { "[ezw_ble][$channel][android] backpressure endpoint=$endpoint status=${submission.status} pending=$queueDepth" }
                         scheduleWatchdog()
                     }
                     return
@@ -399,9 +427,7 @@ internal class BleAndroidOtaWriteQueue(
         }
         batch.remaining -= 1
         if (batch.remaining <= 0) {
-            logger(
-                "[ezw_ble][$channel][android] batch completed endpoint=$endpoint pending=$queueDepth",
-            )
+            logFileOnly { "[ezw_ble][$channel][android] batch completed endpoint=$endpoint pending=$queueDepth" }
             batch.settle(null)
         }
     }
@@ -419,9 +445,12 @@ internal class BleAndroidOtaWriteQueue(
         }
     }
 
-    private fun markWaitStarted() {
+    private fun markWaitStarted(contributesToBatchMetrics: Boolean = false) {
         if (waitStartedAtMillis == null) {
             waitStartedAtMillis = nowMillis()
+            waitContributesToBatchMetrics = contributesToBatchMetrics
+        } else if (contributesToBatchMetrics) {
+            waitContributesToBatchMetrics = true
         }
     }
 
@@ -440,10 +469,29 @@ internal class BleAndroidOtaWriteQueue(
     }
 
     private fun clearWait() {
+        val startedAt = waitStartedAtMillis
+        if (startedAt != null && waitContributesToBatchMetrics) {
+            val waitedMillis = (nowMillis() - startedAt).coerceAtLeast(0L)
+            inFlight?.batch?.backpressureWaitMillis =
+                (inFlight?.batch?.backpressureWaitMillis ?: 0L) + waitedMillis
+            pending.firstOrNull()?.batch?.backpressureWaitMillis =
+                (pending.firstOrNull()?.batch?.backpressureWaitMillis ?: 0L) + waitedMillis
+        }
         waitStartedAtMillis = null
+        waitContributesToBatchMetrics = false
         lastBackpressure = null
         watchdog?.cancel()
         watchdog = null
+    }
+
+    /**
+     * OTA RAW can submit thousands of successful packets per upgrade; keep those routine
+     * milestones silent while leaving the shared FILE queue's existing diagnostics intact.
+     */
+    private inline fun logFileOnly(message: () -> String) {
+        if (channel != BleWriteChannel.OTA) {
+            logger(message())
+        }
     }
 
     private companion object {
