@@ -62,6 +62,9 @@ internal class BleAndroidOtaWriteQueue(
     private val logger: (String) -> Unit = {},
     private val channel: String = BleWriteChannel.OTA,
     private val fileTargetIsCurrent: () -> Boolean = { true },
+    // Production uses Manager's admission/teardown monitor for every entry, including timers.
+    // A separate Queue monitor would invert callback -> Manager against Manager -> cancel.
+    private val stateLock: Any = Any(),
 ) {
     /** 一批 framed OTA 小包共享一个 Dart Future；成功只在最后一包 callback 后结算。 */
     private class OtaWriteBatch(
@@ -122,8 +125,7 @@ internal class BleAndroidOtaWriteQueue(
     private var fileBatchSubmitted = false
 
     /** Reserve exactly one future FILE batch; native UUIDs do not repeat after teardown. */
-    @Synchronized
-    fun beginFilePacketBatch(): String? {
+    fun beginFilePacketBatch(): String? = synchronized(stateLock) {
         if (channel != BleWriteChannel.FILE || fileBatchToken != null || !fileTargetIsCurrent()) {
             return null
         }
@@ -135,11 +137,10 @@ internal class BleAndroidOtaWriteQueue(
 
     /** Begin must not issue a fresh token from a retained queue for an already-replaced target. */
     val isFileTargetCurrent: Boolean
-        get() = fileTargetIsCurrent()
+        get() = synchronized(stateLock) { fileTargetIsCurrent() }
 
     /** Admission failures before enqueue must also release their still-unused reservation. */
-    @Synchronized
-    fun retireUnsubmittedFilePacketBatch(token: String) {
+    fun retireUnsubmittedFilePacketBatch(token: String): Unit = synchronized(stateLock) {
         if (fileBatchToken == token && !fileBatchSubmitted) {
             retireFilePacketBatch(token)
         }
@@ -149,8 +150,7 @@ internal class BleAndroidOtaWriteQueue(
      * Revoke before callbacks and remove only this owner's native-unsent tail. An OS-submitted
      * write cannot be retracted; its old callback remains a barrier for every replacement batch.
      */
-    @Synchronized
-    fun cancelFilePacketBatch(token: String): Boolean {
+    fun cancelFilePacketBatch(token: String): Boolean = synchronized(stateLock) {
         if (channel != BleWriteChannel.FILE || fileBatchToken != token) {
             return false
         }
@@ -181,14 +181,13 @@ internal class BleAndroidOtaWriteQueue(
 
     /** 包含已提交但尚未收到 GATT callback 的包，便于错误详情反映真实深度。 */
     val queueDepth: Int
-        @Synchronized get() = pending.size + if (inFlight == null) 0 else 1
+        get() = synchronized(stateLock) { pending.size + if (inFlight == null) 0 else 1 }
 
     /** 当前 endpoint 是否仍占有物理 GATT 写槽；普通命令也必须等待该槽释放。 */
     val hasOutstandingGattWrite: Boolean
-        @Synchronized get() = inFlight != null || cancelledInFlightCallbackPending
+        get() = synchronized(stateLock) { inFlight != null || cancelledInFlightCallbackPending }
 
     /** 入队后立即尝试提交；成功回调只会在本包自己的 characteristic callback 后触发。 */
-    @Synchronized
     fun enqueue(
         data: ByteArray,
         sessionGeneration: Long = 0L,
@@ -197,7 +196,7 @@ internal class BleAndroidOtaWriteQueue(
         otaGeneration: Long = 0L,
         otaInstanceId: String = "",
         completion: (BleOtaWriteError?) -> Unit,
-    ) {
+    ): Unit = synchronized(stateLock) {
         pending.addLast(
             Item(
                 data = data.copyOf(),
@@ -214,7 +213,6 @@ internal class BleAndroidOtaWriteQueue(
     }
 
     /** 一批小包共享一个完成回调，但每包仍携带 exact OTA transaction identity。 */
-    @Synchronized
     fun enqueueBatch(
         packets: List<ByteArray>,
         sessionGeneration: Long = 0L,
@@ -225,7 +223,7 @@ internal class BleAndroidOtaWriteQueue(
         metrics: ((BleAndroidOtaBatchQueueMetrics) -> Unit)? = null,
         fileBatchToken: String? = null,
         completion: (BleOtaWriteError?) -> Unit,
-    ) {
+    ): Unit = synchronized(stateLock) {
         if (fileBatchToken != null &&
             (channel != BleWriteChannel.FILE || this.fileBatchToken != fileBatchToken || fileBatchSubmitted)
         ) {
@@ -273,13 +271,12 @@ internal class BleAndroidOtaWriteQueue(
      * [ownsInFlight] 由 manager 根据普通发送队列当前 head 与 characteristic psType 判定；
      * false 的回调只表示此前占用 GATT 的其它写已释放，可用于唤醒同步 BUSY 的 OTA 包。
      */
-    @Synchronized
     fun onCharacteristicWriteComplete(
         ownsInFlight: Boolean,
         success: Boolean,
         status: Int,
         statusName: String,
-    ): Boolean {
+    ): Boolean = synchronized(stateLock) {
         if (ownsInFlight) {
             if (cancelledInFlightCallbackPending) {
                 // 这条 callback 只证明上一个已取消 attempt 的系统写槽已释放。此时新 attempt
@@ -333,8 +330,7 @@ internal class BleAndroidOtaWriteQueue(
      * 退出升级不会关闭 GATT，Android 又无法在 callback 中回传本地 write token；因此只取消
      * Dart Future 不足以隔离下一轮 attempt，必须等旧 callback 被 drain 后才允许任何新写。
      */
-    @Synchronized
-    fun cancelAttempt(reason: String) {
+    fun cancelAttempt(reason: String): Unit = synchronized(stateLock) {
         fileBatchToken = null
         fileBatchSubmitted = false
         val hadInFlight = inFlight != null
@@ -364,8 +360,7 @@ internal class BleAndroidOtaWriteQueue(
     }
 
     /** 物理 GATT session 已失效时释放所有 Future，并丢弃旧 session 的 callback 屏障。 */
-    @Synchronized
-    fun cancelAll(reason: String) {
+    fun cancelAll(reason: String): Unit = synchronized(stateLock) {
         // Empty reservations have no queued Item, but physical teardown must revoke them too.
         fileBatchToken = null
         fileBatchSubmitted = false
@@ -561,7 +556,7 @@ internal class BleAndroidOtaWriteQueue(
         }
         val generation = ++watchdogGeneration
         watchdog = scheduler.schedule(RETRY_INTERVAL_MILLIS) {
-            synchronized(this) {
+            synchronized(stateLock) {
                 if (generation != watchdogGeneration) {
                     return@synchronized
                 }

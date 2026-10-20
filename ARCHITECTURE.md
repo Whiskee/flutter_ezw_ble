@@ -226,6 +226,9 @@ lease 失效时调用并等待 `cancelFilePacketBatch`。若 lease 在 begin 的
 - Android 已提交包不能从系统撤回；取消后保留 GATT callback drain barrier，旧回调只能
   排空旧槽位，不得完成新批次。iOS 仍受 canSend、64 包软等待和 15 秒 stall 约束；取消
   不回收预算，旧 timer / 回调不能恢复已撤销尾包或越过新等待。
+- Android OTA/FILE 队列的入口、状态读取和 watchdog 与 Manager admission/teardown
+  共用同一 monitor，避免写回调持队列锁后复验身份与蓝牙 OFF 反向取消形成锁环。
+  统一锁域不取消每包 exact owner/GATT/升级校验，也不把 native 提交视为固件 ACK。
 - 无 token 的历史 API 不具备逻辑 lease 撤权能力。新增 API 也不解决部分 iOS 设备持续
   `canSendWriteWithoutResponse=false` 的兼容性问题，调用方的平台准入策略应独立保留。
 - 回归：`test/file_batch_owner_bridge_test.dart`、Android `BleFilePacketBatchOwnerTest`
