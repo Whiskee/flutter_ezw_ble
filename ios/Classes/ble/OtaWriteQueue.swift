@@ -185,8 +185,8 @@ final class OtaWriteQueue {
     private var backpressureReason: String?
     //  - 每次建立或清理等待都推进 episode；旧 timer 即使迟到执行也不能驱动新 pending。
     private var backpressureEpisode: UInt64 = 0
-    //  - 硬阻塞后必须等待上层 exact recovery 真实断开并清队列；否则迟到 ready
-    //    可能继续发送旧 attempt 的后续 RAW。
+    //  - OTA 硬阻塞后必须等待 exact recovery 断开并清队列；普通 file 没有 OTA
+    //    recovery owner，须先退役失败事务，才允许其它事务建立全新的背压等待。
     private var stalledAwaitingRecovery: Bool = false
     //  - 兜底重查任务; 只允许一个 pending work item
     private var backpressureRetryWorkItem: OtaWriteCancellable?
@@ -203,7 +203,7 @@ final class OtaWriteQueue {
     //  - 时钟/调度器注入只服务于真实 XCTest 行为覆盖, 生产路径仍使用系统实现。
     private let clock: OtaWriteClock
     private let scheduler: OtaWriteScheduler
-    // OTA 与文件传输各自持有队列实例，channel 只决定诊断和 typed error 命名。
+    // OTA 与文件传输各自持有队列实例；file 仅在失败事务退役后重新准入。
     private let channel: String
     //  - 日志回调(由 BleManager 注入, 复用其 loggerD)
     private let logger: ((String) -> Void)?
@@ -412,6 +412,9 @@ extension OtaWriteQueue {
      *  - WriteWithoutResponse 本就无 ack, 取消后业务层按错误类型分类并终止本轮写入。
      */
     func cancelAll(reason: String) {
+        // Teardown also invalidates an error callback's pending continuation when
+        // the old wait was already cleared before publishing that callback.
+        backpressureEpisode &+= 1
         guard !pending.isEmpty else {
             sinceLastDrainSync = 0
             stalledAwaitingRecovery = false
@@ -604,19 +607,35 @@ private extension OtaWriteQueue {
                 pending.removeAll { $0.batch === batch }
             }
             var completion: Any = error
+            var retiredFileEpisode: UInt64?
             if let stalled = error as? FlutterError,
                stalled.code == "\(channel)_write_stalled",
                var details = stalled.details as? [String: Any] {
                 // Keep legacy `pending` (including the failed head) for diagnostics.
                 // Snapshot after same-batch cleanup and before callback reentrancy;
-                // other batches/singles stay queued, and the stall gate stays shut.
+                // other batches/singles stay queued. OTA retains its recovery gate.
                 details["remainingPending"] = pending.count
                 completion = FlutterError(code: stalled.code, message: stalled.message, details: details)
+                if channel == OtaWriteChannel.file {
+                    // The failed file transaction is now fully retired. Unlike
+                    // OTA, ordinary files have no exact recovery/disconnect owner;
+                    // retained/new transactions may start a fresh canSend wait.
+                    // Reopen before the callback so reentrant admission is valid,
+                    // but never restore the removed head or its same-batch tails.
+                    stalledAwaitingRecovery = false
+                    retiredFileEpisode = backpressureEpisode
+                }
             }
             if let batch = item.batch {
                 batch.settle(completion)
             } else {
                 item.result(completion)
+            }
+            if let episode = retiredFileEpisode, backpressureEpisode == episode {
+                // A callback may cancel the physical owner or establish a new
+                // wait/timer. Only this untouched retirement may resume retained
+                // owners, each through its original per-packet target validation.
+                pump()
             }
             return
         }
@@ -715,8 +734,8 @@ private extension OtaWriteQueue {
         }
     }
 
-    /// 15 秒仍不可写才终止队首请求；同批尾包在错误返回前撤销，其它请求仍须等
-    /// exact recovery/cleanup。保持 stall gate，迟到 ready 不能复活未提交的旧包。
+    /// 15 秒仍不可写才终止队首请求；同批尾包在错误返回前撤销。OTA 保持
+    /// exact recovery gate；file 在 completeItem 退役事务后才重新准入其它请求。
     func shouldCompleteStalledBackpressure(reason: String) -> Bool {
         guard let startedAt = backpressureStartedAtMonotonic else {
             return false

@@ -1,5 +1,6 @@
 ## 0.0.1
 
+* Retire stalled iOS ordinary file transactions without permanently blocking later file requests; preserve failed-tail cleanup, physical-target validation, and OTA fail-closed recovery.
 * Keep Android high-reliability PHY requests under the RSSI adaptive policy at GATT readiness and OTA entry; preserve direct 2M requests in ordinary mode.
 * Report iOS stalled-write `remainingPending` after failed-batch cleanup so the SDK can distinguish a cleared RAW window from other queued writes without weakening real-ACK recovery.
 * Gate synchronous iOS CoreBluetooth peripheral retrieval behind the active App lifecycle and defer exact auto-reconnect owners across inactive/process-exit windows.

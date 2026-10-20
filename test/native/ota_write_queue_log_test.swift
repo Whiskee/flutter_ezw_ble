@@ -98,6 +98,14 @@ struct OtaWriteQueueLogTests {
         try batchStallReportsPostCleanupDepth()
         try batchStallPreservesOtherPendingOwners()
         try stalledAdmissionDoesNotClaimCleanupEvidence()
+        try fileStallRetiresOnlyItsTransaction()
+        try fileStallPreservesOverlappingOwners()
+        try fileStallAcceptsReentrantNewTransaction()
+        try fileStallTeardownCannotResumeReplacement()
+        try fileStallRevalidatesRetainedTarget()
+        try fileSingleHeadStartsFreshTimeoutForNextOwner()
+        try fileStallPeripheralReleaseSettlesRetainedOwner()
+        try fileStallDoesNotChangeSoft64Budget()
         try fileBatchKeepsExistingRoutineLogs()
         try verifiedAckDoesNotResetPartial64PacketBudget()
         try verifiedAckDoesNotReleaseSoftWaitAndKeepsMeasurements()
@@ -767,15 +775,297 @@ struct OtaWriteQueueLogTests {
     }
 
     /// Read the actual native FlutterError payload, never a source-text surrogate.
-    private static func stalledDetails(_ result: Any?) throws -> [String: Any] {
+    private static func stalledDetails(_ result: Any?, channel: String = OtaWriteChannel.ota) throws -> [String: Any] {
         guard let error = result as? FlutterError,
-              error.code == "ota_write_stalled",
+              error.code == "\(channel)_write_stalled",
               let details = error.details as? [String: Any] else {
             throw NSError(domain: "OtaWriteQueueLogTests", code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "expected structured ota_write_stalled error"])
+                userInfo: [NSLocalizedDescriptionKey: "expected structured \(channel)_write_stalled error"])
         }
         return details
     }
+    /// An ordinary file transaction has no OTA recovery-disconnect protocol.
+    /// Its unsent tail must retire permanently, without poisoning later batches.
+    private static func fileStallRetiresOnlyItsTransaction() throws {
+        for submittedPrefix in [0, 2] {
+            let peripheral = FakeOtaPeripheral()
+            peripheral.canSendWriteWithoutResponse = submittedPrefix > 0
+            let clock = FakeOtaClock()
+            let scheduler = FakeOtaScheduler()
+            let queue = OtaWriteQueue(peripheral: peripheral, clock: clock,
+                scheduler: scheduler, channel: OtaWriteChannel.file)
+            var writes: [Data] = []
+            var failed: [Any?] = []
+            var next: [Any?] = []
+            let packets = (1...5).map { Data([UInt8($0)]) }
+            let target = OtaWriteTarget(characteristicUUID: "file") { _, data in
+                writes.append(data)
+                if writes.count == submittedPrefix { peripheral.canSendWriteWithoutResponse = false }
+                return true
+            }
+            queue.enqueueBatch(packets: packets, target: target, result: { failed.append($0) })
+            clock.monotonicNow += 15
+            queue.onPeripheralReadyToSendWriteWithoutResponse()
+            try assert(failed.count == 1 && queue.queueDepth == 0,
+                "file stall must settle once and retire only its unsent tail")
+            let details = try stalledDetails(failed[0], channel: OtaWriteChannel.file)
+            try assert(details["remainingPending"] as? Int == 0, "file cleanup evidence must remain truthful")
+            queue.enqueueBatch(packets: [Data([8]), Data([9])], target: target,
+                result: { next.append($0) })
+            try assert(next.isEmpty && queue.queueDepth == 2,
+                "a new file transaction must be admitted with a fresh wait, not rejected by old stall")
+            peripheral.canSendWriteWithoutResponse = true
+            scheduler.runOldestIncludingCancelled()
+            try assert(writes == Array(packets.prefix(submittedPrefix)),
+                "cancelled old stall timer cannot drive a new transaction")
+            scheduler.runNext()
+            try assert(writes == Array(packets.prefix(submittedPrefix)) + [Data([8]), Data([9])],
+                "only new file bytes may submit after real readiness")
+            try assert(next.count == 1 && next[0] == nil && failed.count == 1,
+                "both file transactions must settle exactly once")
+        }
+    }
+
+    /// Other batch/single requests keep their FIFO position and completion owner;
+    /// the failed request cannot cancel them or donate its elapsed stall budget.
+    private static func fileStallPreservesOverlappingOwners() throws {
+        for otherIsBatch in [false, true] {
+            let peripheral = FakeOtaPeripheral()
+            peripheral.canSendWriteWithoutResponse = false
+            let clock = FakeOtaClock()
+            let scheduler = FakeOtaScheduler()
+            let queue = OtaWriteQueue(peripheral: peripheral, clock: clock,
+                scheduler: scheduler, channel: OtaWriteChannel.file)
+            var failed: [Any?] = []
+            var other: [Any?] = []
+            var writes: [Data] = []
+            var callbackDepth = -1
+            let target = OtaWriteTarget(characteristicUUID: "file") { _, data in writes.append(data); return true }
+            queue.enqueueBatch(packets: [Data([1]), Data([2])], target: target, result: {
+                callbackDepth = queue.queueDepth
+                failed.append($0)
+            })
+            if otherIsBatch {
+                queue.enqueueBatch(packets: [Data([3]), Data([4])], target: target, result: { other.append($0) })
+            } else {
+                queue.enqueue(data: Data([3]), target: target, result: { other.append($0) })
+            }
+            let remaining = otherIsBatch ? 2 : 1
+            clock.monotonicNow += 15
+            queue.onPeripheralReadyToSendWriteWithoutResponse()
+            try assert(failed.count == 1 && other.isEmpty && callbackDepth == remaining && queue.queueDepth == remaining,
+                "failed file batch must preserve unrelated pending owners before publishing error")
+            let details = try stalledDetails(failed[0], channel: OtaWriteChannel.file)
+            try assert(details["remainingPending"] as? Int == remaining,
+                "file stall evidence must count retained owners")
+            clock.monotonicNow += 14.9
+            queue.onPeripheralReadyToSendWriteWithoutResponse()
+            try assert(other.isEmpty && writes.isEmpty, "next owner's watchdog starts after retirement, not at old request start")
+            peripheral.canSendWriteWithoutResponse = true
+            queue.onPeripheralReadyToSendWriteWithoutResponse()
+            scheduler.runOldestIncludingCancelled()
+            try assert(writes == (otherIsBatch ? [Data([3]), Data([4])] : [Data([3])]),
+                "only retained owner's bytes may resume, in order")
+            try assert(other.count == 1 && other[0] == nil && failed.count == 1,
+                "retained batch or single owner must settle exactly once")
+        }
+    }
+
+    /// The error callback may synchronously start a new file request. Cleanup and
+    /// episode invalidation must precede it, including a late cancelled poll.
+    private static func fileStallAcceptsReentrantNewTransaction() throws {
+        let peripheral = FakeOtaPeripheral()
+        peripheral.canSendWriteWithoutResponse = false
+        let clock = FakeOtaClock()
+        let scheduler = FakeOtaScheduler()
+        let queue = OtaWriteQueue(peripheral: peripheral, clock: clock,
+            scheduler: scheduler, channel: OtaWriteChannel.file)
+        var failed: [Any?] = []
+        var next: [Any?] = []
+        var writes: [Data] = []
+        let target = OtaWriteTarget(characteristicUUID: "file") { _, data in writes.append(data); return true }
+        queue.enqueueBatch(packets: [Data([1]), Data([2])], target: target, result: {
+            failed.append($0)
+            queue.enqueueBatch(packets: [Data([3]), Data([4])], target: target, result: { next.append($0) })
+        })
+        clock.monotonicNow += 15
+        queue.onPeripheralReadyToSendWriteWithoutResponse()
+        try assert(failed.count == 1 && next.isEmpty && queue.queueDepth == 2 && scheduler.activeIntervals == [0.1],
+            "retired file callback must admit reentrant work without losing its fresh poll")
+        peripheral.canSendWriteWithoutResponse = true
+        scheduler.runOldestIncludingCancelled()
+        try assert(writes.isEmpty && scheduler.activeIntervals == [0.1],
+            "old cancelled poll must not consume a reentrant transaction's live timer")
+        scheduler.runNext()
+        try assert(writes == [Data([3]), Data([4])] && next.count == 1 && next[0] == nil,
+            "only reentrant transaction submits and completes")
+    }
+
+    /// Teardown inside the stalled owner's callback cancels the retained owner;
+    /// the outer failure continuation cannot pump or clear a replacement's timer.
+    private static func fileStallTeardownCannotResumeReplacement() throws {
+        let peripheral = FakeOtaPeripheral()
+        peripheral.canSendWriteWithoutResponse = false
+        let clock = FakeOtaClock()
+        let scheduler = FakeOtaScheduler()
+        let queue = OtaWriteQueue(peripheral: peripheral, clock: clock,
+            scheduler: scheduler, channel: OtaWriteChannel.file)
+        var failed: [Any?] = []
+        var cancelled: [Any?] = []
+        var replacement: [Any?] = []
+        var writes: [Data] = []
+        let target = OtaWriteTarget(characteristicUUID: "file") { _, data in writes.append(data); return true }
+        queue.enqueueBatch(packets: [Data([1]), Data([2])], target: target, result: {
+            failed.append($0)
+            queue.cancelAll(reason: "physical owner retired")
+            queue.enqueueBatch(packets: [Data([5])], target: target, result: { replacement.append($0) })
+        })
+        queue.enqueueBatch(packets: [Data([3]), Data([4])], target: target, result: { cancelled.append($0) })
+        clock.monotonicNow += 15
+        queue.onPeripheralReadyToSendWriteWithoutResponse()
+        try assert(failed.count == 1 && cancelled.count == 1 && replacement.isEmpty && queue.queueDepth == 1,
+            "teardown must cancel only retained old work and preserve a new request")
+        try assert((cancelled[0] as? FlutterError)?.code == "file_write_cancelled", "retained owner must receive file cancellation")
+        peripheral.canSendWriteWithoutResponse = true
+        scheduler.runOldestIncludingCancelled()
+        try assert(writes.isEmpty && scheduler.activeIntervals == [0.1], "old retirement cannot drive replacement")
+        scheduler.runNext()
+        try assert(writes == [Data([5])] && replacement.count == 1 && replacement[0] == nil,
+            "only the replacement's live timer can submit its bytes")
+        queue.cancelAll(reason: "final teardown")
+        queue.onPeripheralReadyToSendWriteWithoutResponse()
+        try assert(replacement.count == 1 && queue.queueDepth == 0, "late ready cannot duplicate settled replacement")
+    }
+
+    /// Resuming an unrelated pending transaction is not admission permission.
+    /// Its original frozen target must still accept this physical owner.
+    private static func fileStallRevalidatesRetainedTarget() throws {
+        let peripheral = FakeOtaPeripheral()
+        peripheral.canSendWriteWithoutResponse = false
+        let clock = FakeOtaClock()
+        let scheduler = FakeOtaScheduler()
+        let queue = OtaWriteQueue(peripheral: peripheral, clock: clock,
+            scheduler: scheduler, channel: OtaWriteChannel.file)
+        var failed: [Any?] = []
+        var stale: [Any?] = []
+        var targetCalls = 0
+        queue.enqueueBatch(packets: [Data([1])], target: OtaWriteTarget(characteristicUUID: "file") { _, _ in true },
+            result: { failed.append($0) })
+        queue.enqueueBatch(packets: [Data([2]), Data([3])], target: OtaWriteTarget(characteristicUUID: "file") { _, _ in
+            targetCalls += 1
+            return false
+        }, result: { stale.append($0) })
+        clock.monotonicNow += 15
+        queue.onPeripheralReadyToSendWriteWithoutResponse()
+        peripheral.canSendWriteWithoutResponse = true
+        queue.onPeripheralReadyToSendWriteWithoutResponse()
+        try assert(failed.count == 1 && stale.count == 1 && targetCalls == 1 && queue.queueDepth == 0,
+            "stale target rejection must retire only its batch without writing its tail")
+        try assert((stale[0] as? FlutterError)?.code == "file_write_unavailable", "stale file target remains fail-closed")
+    }
+
+    /// Each independent file owner gets its own unchanged 15-second timeout,
+    /// including a single-packet owner followed by a batch that also cannot send.
+    private static func fileSingleHeadStartsFreshTimeoutForNextOwner() throws {
+        let peripheral = FakeOtaPeripheral()
+        peripheral.canSendWriteWithoutResponse = false
+        let clock = FakeOtaClock()
+        let scheduler = FakeOtaScheduler()
+        let queue = OtaWriteQueue(peripheral: peripheral, clock: clock,
+            scheduler: scheduler, channel: OtaWriteChannel.file)
+        var single: [Any?] = []
+        var batch: [Any?] = []
+        var fresh: [Any?] = []
+        var writes: [Data] = []
+        let target = OtaWriteTarget(characteristicUUID: "file") { _, data in writes.append(data); return true }
+        queue.enqueue(data: Data([1]), target: target, result: { single.append($0) })
+        queue.enqueueBatch(packets: [Data([2]), Data([3])], target: target, result: { batch.append($0) })
+        clock.monotonicNow += 15
+        scheduler.runNext()
+        let first = try stalledDetails(single.first ?? nil, channel: OtaWriteChannel.file)
+        try assert(first["remainingPending"] as? Int == 2 && single.count == 1 && batch.isEmpty,
+            "single head timeout must preserve the next batch")
+        clock.monotonicNow += 14.9
+        scheduler.runNext()
+        try assert(batch.isEmpty && queue.queueDepth == 2, "next batch must not inherit prior elapsed wait")
+        clock.monotonicNow += 0.11
+        scheduler.runNext()
+        let second = try stalledDetails(batch.first ?? nil, channel: OtaWriteChannel.file)
+        try assert(batch.count == 1 && second["remainingPending"] as? Int == 0 && queue.queueDepth == 0,
+            "next batch must retire at its own unchanged timeout")
+        peripheral.canSendWriteWithoutResponse = true
+        queue.enqueue(data: Data([4]), target: target, result: { fresh.append($0) })
+        try assert(writes == [Data([4])] && fresh.count == 1 && fresh[0] == nil,
+            "repeated failures cannot poison a later independent file request")
+    }
+
+    /// Local retirement cannot outlive its weak peripheral. A release during the
+    /// failure callback must terminally fail retained work, not leave an await.
+    private static func fileStallPeripheralReleaseSettlesRetainedOwner() throws {
+        var peripheral: FakeOtaPeripheral? = FakeOtaPeripheral()
+        peripheral!.canSendWriteWithoutResponse = false
+        let clock = FakeOtaClock()
+        let scheduler = FakeOtaScheduler()
+        let queue = OtaWriteQueue(peripheral: peripheral!, clock: clock,
+            scheduler: scheduler, channel: OtaWriteChannel.file)
+        var failed: [Any?] = []
+        var retained: [Any?] = []
+        var writes = 0
+        let target = OtaWriteTarget(characteristicUUID: "file") { _, _ in writes += 1; return true }
+        queue.enqueueBatch(packets: [Data([1]), Data([2])], target: target, result: {
+            failed.append($0)
+            peripheral = nil
+        })
+        queue.enqueueBatch(packets: [Data([3]), Data([4])], target: target, result: { retained.append($0) })
+        clock.monotonicNow += 15
+        scheduler.runNext()
+        // The active pump keeps the old peripheral alive until it returns. The
+        // next owned poll must observe release and settle the retained request.
+        scheduler.runNext()
+        try assert(failed.count == 1 && retained.count == 1 && writes == 0 && queue.queueDepth == 0,
+            "released peripheral must settle retained work without submission")
+        try assert((retained[0] as? FlutterError)?.code == "file_write_unavailable", "release remains a file unavailable error")
+        queue.onPeripheralReadyToSendWriteWithoutResponse()
+        queue.cancelAll(reason: "repeated teardown")
+        try assert(failed.count == 1 && retained.count == 1, "late ready and repeated teardown must be idempotent")
+    }
+
+    /// Retirement is not a budget credit: a fresh file batch still yields after
+    /// exactly 64 submissions and uses the existing 500ms soft-throttle poll.
+    private static func fileStallDoesNotChangeSoft64Budget() throws {
+        for reentrant in [false, true] {
+            let peripheral = FakeOtaPeripheral()
+            peripheral.canSendWriteWithoutResponse = false
+            let clock = FakeOtaClock()
+            let scheduler = FakeOtaScheduler()
+            let queue = OtaWriteQueue(peripheral: peripheral, clock: clock,
+                scheduler: scheduler, channel: OtaWriteChannel.file)
+            var failed: [Any?] = []
+            var fresh: [Any?] = []
+            var writes: [Data] = []
+            let packets = (0..<65).map { Data([UInt8($0)]) }
+            let target = OtaWriteTarget(characteristicUUID: "file") { _, data in writes.append(data); return true }
+            func enqueueFresh() {
+                peripheral.canSendWriteWithoutResponse = true
+                queue.enqueueBatch(packets: packets, target: target, result: { fresh.append($0) })
+            }
+            queue.enqueueBatch(packets: [Data([255])], target: target, result: {
+                failed.append($0)
+                if reentrant { enqueueFresh() }
+            })
+            clock.monotonicNow += 15
+            queue.onPeripheralReadyToSendWriteWithoutResponse()
+            if !reentrant { enqueueFresh() }
+            try assert(writes == Array(packets.prefix(64)) && fresh.isEmpty && scheduler.activeIntervals == [0.5],
+                "retirement continuation must not bypass a fresh or reentrant soft64 yield")
+            scheduler.runOldestIncludingCancelled()
+            try assert(writes.count == 64, "old stall poll cannot bypass the fresh soft yield")
+            scheduler.runNext()
+            try assert(writes == packets && fresh.count == 1 && fresh[0] == nil && failed.count == 1,
+                "live soft poll must submit the final file packet only once")
+        }
+    }
+
     private static func fileBatchKeepsExistingRoutineLogs() throws {
         let peripheral = FakeOtaPeripheral()
         let clock = FakeOtaClock()
