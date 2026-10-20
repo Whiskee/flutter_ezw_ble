@@ -774,6 +774,9 @@ class BleManager private constructor() {
                 nowMillis = SystemClock::elapsedRealtime,
                 logger = { message -> sendLog(BleLoggerTag.d, message) },
                 channel = channel,
+                // Queue callbacks and watchdogs re-enter synchronized identity validation.
+                // Share this monitor so teardown cannot take Manager -> Queue in reverse.
+                stateLock = this@BleManager,
                 fileTargetIsCurrent = {
                     val currentTarget = findConnectedDevice(uuid)?.writeTargetFor(psType)
                     frozenFileTarget != null && currentTarget?.first === frozenFileTarget.first &&
