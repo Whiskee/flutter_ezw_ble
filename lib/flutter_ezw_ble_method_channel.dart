@@ -552,6 +552,51 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
     return methodChannel.invokeMethod<Object?>('sendOtaPacketBatch', arguments);
   }
 
+  /// 预留当前物理文件队列的唯一批次身份；不支持此能力时必须向调用方报错。
+  @override
+  Future<String> beginFilePacketBatch(String uuid) async {
+    if (uuid.trim().isEmpty) {
+      throw ArgumentError.value(
+          uuid, 'uuid', 'A live file endpoint is required');
+    }
+    final token = await methodChannel.invokeMethod<Object?>(
+      'beginFilePacketBatch',
+      {'uuid': uuid},
+    );
+    // 身份只能由 native 创建；空值或旧插件返回值不能降级为无 owner 批次。
+    if (token is! String || token.trim().isEmpty) {
+      throw PlatformException(
+        code: 'file_batch_invalid_response',
+        message: 'Native did not return a file batch reservation token',
+      );
+    }
+    return token;
+  }
+
+  /// 仅撤销指定 reservation；确认不代表 OS 已提交包被撤回或固件已 ACK。
+  @override
+  Future<bool> cancelFilePacketBatch(String uuid, String fileBatchToken) async {
+    if (uuid.trim().isEmpty) {
+      throw ArgumentError.value(uuid, 'uuid', 'A file endpoint is required');
+    }
+    if (fileBatchToken.trim().isEmpty) {
+      throw ArgumentError.value(
+          fileBatchToken, 'fileBatchToken', 'A native reservation is required');
+    }
+    final revoked = await methodChannel.invokeMethod<Object?>(
+      'cancelFilePacketBatch',
+      {'uuid': uuid, 'fileBatchToken': fileBatchToken},
+    );
+    // 未知响应不能被解读成“不存在”，否则上层可能在尾包未撤销时替换 lease。
+    if (revoked is! bool) {
+      throw PlatformException(
+        code: 'file_batch_invalid_response',
+        message: 'Native did not acknowledge file batch cancellation',
+      );
+    }
+    return revoked;
+  }
+
   /// 把 even_connect 已组好的文件协议小包一次交给原生队列。
   ///
   /// 与 OTA 批次共用队列实现但通道实例独立，因此 `quiteUpgradeState` 不会取消文件传输。
@@ -561,6 +606,7 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
     String uuid,
     List<Uint8List> framedPackets, {
     int psType = 3,
+    String? fileBatchToken,
   }) async {
     if (framedPackets.isEmpty) {
       throw ArgumentError.value(
@@ -576,10 +622,16 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
         'sendFilePacketBatch only supports the file channel (psType=3)',
       );
     }
+    if (fileBatchToken != null && fileBatchToken.trim().isEmpty) {
+      throw ArgumentError.value(
+          fileBatchToken, 'fileBatchToken', 'A native reservation is required');
+    }
     await methodChannel.invokeMethod<void>('sendFilePacketBatch', {
       'uuid': uuid,
       'packets': framedPackets,
       'psType': psType,
+      // 不传 token 的既有调用保持完全相同的桥参数，不做隐式注册或错误降级。
+      if (fileBatchToken != null) 'fileBatchToken': fileBatchToken,
     });
   }
 

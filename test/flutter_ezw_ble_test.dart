@@ -297,11 +297,23 @@ class MockFlutterEzwBlePlatform
     throw UnimplementedError();
   }
 
+  // Keep the platform fake complete when the opt-in native ownership API grows.
+  @override
+  Future<String> beginFilePacketBatch(String uuid) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<bool> cancelFilePacketBatch(String uuid, String fileBatchToken) {
+    throw UnimplementedError();
+  }
+
   @override
   Future<void> sendFilePacketBatch(
     String uuid,
     List<Uint8List> framedPackets, {
     int psType = 3,
+    String? fileBatchToken,
   }) {
     throw UnimplementedError();
   }

@@ -84,6 +84,10 @@ enum class BleMC {
     SEND_OTA_PACKET_BATCH,
     /** 一次提交一组已封装文件小包；Future 等最后一包 GATT callback。 */
     SEND_FILE_PACKET_BATCH,
+    /** 原生保留一个文件批次身份，不写入数据。 */
+    BEGIN_FILE_PACKET_BATCH,
+    /** 只撤销同 endpoint 的精确文件批次，保留已提交写的回调屏障。 */
+    CANCEL_FILE_PACKET_BATCH,
     /** 标记设备进入升级状态。 */
     ENTER_UPGRADE_STATE,
     /** 标记设备退出升级状态。 */
@@ -514,17 +518,46 @@ enum class BleMC {
             SEND_FILE_PACKET_BATCH -> {
                 // 1. 文件 RAW 批次与 OTA 同样是 already-framed 小包；Future 等最后一包写回调，
                 //    上层据此才能启动固件 8s ACK 计时。
-                val jsonMap = arguments as Map<*, *>?
+                val jsonMap = arguments as? Map<*, *>
                 val uuid = jsonMap?.get("uuid") as? String ?: ""
-                val psType = jsonMap?.get("psType") as Int? ?: 3
-                val packets = decodeFramedBatchPackets(jsonMap?.get("packets"))
-                BleManager.instance.sendFilePacketBatch(uuid, packets, psType) { error ->
+                val psType = jsonMap?.get("psType") as? Int ?: if (jsonMap?.containsKey("psType") == true) -1 else 3
+                val rawPackets = jsonMap?.get("packets")
+                val packets = decodeFramedBatchPackets(rawPackets)
+                val fileBatchToken = jsonMap?.get("fileBatchToken")
+                // Supplied malformed identities must not silently fall back to legacy sending.
+                if (jsonMap?.containsKey("fileBatchToken") == true &&
+                    (fileBatchToken !is String || fileBatchToken.isEmpty())
+                ) {
+                    val error = BleOtaWriteError.unavailable(uuid, "invalid file batch token", channel = BleWriteChannel.FILE)
+                    result.error(error.code, error.reason, error.details)
+                    return
+                }
+                // Owned batches fail as a whole for malformed frames; legacy decoding stays
+                // unchanged. Manager retires a valid unused token before reporting this error.
+                val validPackets = if (fileBatchToken != null &&
+                    (rawPackets !is List<*> || rawPackets.any { it !is ByteArray && it !is java.nio.ByteBuffer })
+                ) emptyList() else packets
+                BleManager.instance.sendFilePacketBatch(uuid, validPackets, psType, fileBatchToken as? String) { error ->
                     if (error == null) {
                         result.success(null)
                     } else {
                         result.error(error.code, error.reason, error.details)
                     }
                 }
+                return
+            }
+            BEGIN_FILE_PACKET_BATCH -> {
+                val uuid = (arguments as? Map<*, *>)?.get("uuid") as? String ?: ""
+                BleManager.instance.beginFilePacketBatch(uuid) { token, error ->
+                    if (error == null) result.success(token) else result.error(error.code, error.reason, error.details)
+                }
+                return
+            }
+            CANCEL_FILE_PACKET_BATCH -> {
+                val jsonMap = arguments as? Map<*, *>
+                val uuid = jsonMap?.get("uuid") as? String ?: ""
+                val token = jsonMap?.get("fileBatchToken") as? String
+                result.success(token != null && token.isNotEmpty() && BleManager.instance.cancelFilePacketBatch(uuid, token))
                 return
             }
             ENTER_UPGRADE_STATE -> {

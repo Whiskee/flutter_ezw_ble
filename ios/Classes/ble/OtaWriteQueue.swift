@@ -96,8 +96,12 @@ private final class OtaWriteBatch {
     var settled = false
     let extraMetrics: [String: Any]
     let metrics: (([String: Any]) -> Void)?
+    // Retire the native reservation before metrics/result can synchronously
+    // register another owner. A token never becomes live again after settlement.
+    let fileBatchToken: String?
+    let beforeSettlement: (() -> Void)?
 
-    init(result: @escaping FlutterResult, packets: [Data], enqueuedAt: Date, extraMetrics: [String: Any] = [:], metrics: (([String: Any]) -> Void)? = nil) {
+    init(result: @escaping FlutterResult, packets: [Data], enqueuedAt: Date, extraMetrics: [String: Any] = [:], metrics: (([String: Any]) -> Void)? = nil, fileBatchToken: String? = nil, beforeSettlement: (() -> Void)? = nil) {
         self.result = result
         packetCount = packets.count
         byteCount = packets.reduce(0) { $0 + $1.count }
@@ -105,12 +109,15 @@ private final class OtaWriteBatch {
         self.extraMetrics = extraMetrics
         softThrottleWaitSeconds = Double(extraMetrics["nativeQueueSoftThrottleWaitMs"] as? Int ?? 0) / 1_000
         self.metrics = metrics
+        self.fileBatchToken = fileBatchToken
+        self.beforeSettlement = beforeSettlement
         remaining = packets.count
     }
 
     func settle(_ value: Any?) {
         guard !settled else { return }
         settled = true
+        beforeSettlement?()
         if value == nil {
             var payload = extraMetrics
             payload.merge([
@@ -172,6 +179,20 @@ final class OtaWriteQueue {
     private weak var peripheral: OtaWritePeripheral?
     //  - 待写入队列
     private var pending: [OtaWriteItem] = []
+    // Exactly one bounded reservation, not a tombstone set. UUID uniqueness also
+    // spans queue recreation; its batch reference covers a head inside submit().
+    private var fileBatchReservation: (token: String, batch: OtaWriteBatch?)?
+    // Cancellation/teardown and synchronous replacement fence an older pump's
+    // continuation without using a new owner as evidence that canSend recovered.
+    private var fileOwnerRevision: UInt64 = 0
+    // Owned submissions publish callbacks synchronously. Defer nested pumps
+    // until the current CoreBluetooth submit has counted its packet, so cancel
+    // callbacks cannot sneak a replacement through the 64-packet boundary.
+    private var ownedFilePumpRunning = false
+    private var ownedFilePumpRequested = false
+    // This belongs only to the current soft wait, never a permanent queue mode.
+    // Owned FILE tails cannot use enqueue (including legacy enqueue) to bypass it.
+    private var ownedFileSoftWait = false
     //  - 自上一次软节流以来已成功写入的包数
     private var sinceLastDrainSync: Int = 0
     //  - 进入 canSend=false 等待的时间；softThrottle 不参与 15 秒硬阻塞计时。
@@ -242,6 +263,63 @@ final class OtaWriteQueue {
 // MARK: - Public Methods
 extension OtaWriteQueue {
 
+    /// Reservation is minted only by native code and is submitted at most once.
+    /// BleManager validates the live characteristic before reaching this method.
+    func beginFilePacketBatch() -> String? {
+        guard channel == OtaWriteChannel.file, peripheral != nil,
+              fileBatchReservation == nil, !stalledAwaitingRecovery else { return nil }
+        let token = UUID().uuidString
+        fileBatchReservation = (token, nil)
+        return token
+    }
+
+    /// The queue is frozen to a physical object, not merely a reused UUID.
+    func ownsPeripheral(_ candidate: OtaWritePeripheral) -> Bool {
+        return peripheral === candidate
+    }
+
+    /// A failed preflight may retire only an unsubmitted reservation; a duplicate
+    /// send must never cancel the original batch that already consumed its token.
+    func retireUnsubmittedFilePacketBatch(fileBatchToken: String) {
+        guard let reservation = fileBatchReservation,
+              reservation.token == fileBatchToken, reservation.batch == nil else { return }
+        fileBatchReservation = nil
+        fileOwnerRevision &+= 1
+    }
+
+    /// Revoke first, then remove exactly this owner's unsent tail and settle once.
+    /// Already submitted CoreBluetooth writes and unrelated batches remain intact.
+    @discardableResult
+    func cancelFilePacketBatch(fileBatchToken: String) -> Bool {
+        guard channel == OtaWriteChannel.file, let reservation = fileBatchReservation,
+              reservation.token == fileBatchToken else { return false }
+        fileBatchReservation = nil
+        fileOwnerRevision &+= 1
+        let revision = fileOwnerRevision
+        let cancelledHead = pending.first?.batch === reservation.batch && reservation.batch != nil
+        if let batch = reservation.batch { pending.removeAll { $0.batch === batch } }
+        if cancelledHead {
+            if let softStart = softThrottleStartedAtMonotonic {
+                // Retain the original 64-packet stop, but give any retained/new
+                // work a fresh timer episode. The cancelled callback cannot use
+                // the old timer to drive a replacement reservation's wait.
+                backpressureEpisode &+= 1
+                cancelScheduledRetryForWaitTransition()
+                scheduleBackpressureRetry(after: max(0,
+                    Self.softThrottleRetryInterval - max(0, clock.monotonicNow - softStart)))
+            } else {
+                clearBackpressureWait()
+            }
+        }
+        reservation.batch?.settle(Self.error(code: "file_write_cancelled",
+            endpoint: peripheral?.otaEndpointId, reason: "file batch owner cancelled",
+            waitSeconds: nil, pending: pending.count))
+        // A callback that installs a new owner owns its own wait. Only untouched
+        // cancellation may resume unrelated retained work, through its old target.
+        if cancelledHead, fileOwnerRevision == revision, !pending.isEmpty { pump() }
+        return true
+    }
+
     /**
      *  入队一笔 OTA 写入
      *  - 调用方持有 Dart 端的 await, 直到本条完成后才会发下一包;
@@ -283,14 +361,26 @@ extension OtaWriteQueue {
         target: OtaWriteTarget,
         expectedSessionGeneration: Int64 = 0,
         expectedAttemptGeneration: Int64 = 0,
+        fileBatchToken: String? = nil,
         metrics: (([String: Any]) -> Void)? = nil,
         result: @escaping FlutterResult
     ) {
+        if let token = fileBatchToken {
+            guard channel == OtaWriteChannel.file,
+                  let reservation = fileBatchReservation,
+                  reservation.token == token, reservation.batch == nil else {
+                result(Self.unavailableError(endpoint: peripheral?.otaEndpointId ?? "",
+                    reason: "invalid or already submitted file batch token", channel: channel))
+                return
+            }
+        }
         guard !packets.isEmpty else {
+            if let token = fileBatchToken { retireUnsubmittedFilePacketBatch(fileBatchToken: token) }
             result(Self.unavailableError(endpoint: peripheral?.otaEndpointId ?? "", reason: "empty batch", channel: channel))
             return
         }
         if stalledAwaitingRecovery {
+            if let token = fileBatchToken { retireUnsubmittedFilePacketBatch(fileBatchToken: token) }
             result(Self.stalledError(
                 endpoint: peripheral?.otaEndpointId,
                 reason: "queue stalled awaiting recovery disconnect",
@@ -307,8 +397,15 @@ extension OtaWriteQueue {
             packets: packets,
             enqueuedAt: clock.now,
             extraMetrics: takeCarriedOtaWindowCreditMetrics(),
-            metrics: metrics
+            metrics: metrics,
+            fileBatchToken: fileBatchToken,
+            beforeSettlement: { [weak self] in
+                guard let self, let token = fileBatchToken,
+                      self.fileBatchReservation?.token == token else { return }
+                self.fileBatchReservation = nil
+            }
         )
+        if let token = fileBatchToken { fileBatchReservation = (token, batch) }
         packets.forEach { packet in
             pending.append(OtaWriteItem(
                 data: packet,
@@ -420,11 +517,16 @@ extension OtaWriteQueue {
         // Teardown also invalidates an error callback's pending continuation when
         // the old wait was already cleared before publishing that callback.
         backpressureEpisode &+= 1
+        fileOwnerRevision &+= 1
+        let reservedBatch = fileBatchReservation?.batch
+        fileBatchReservation = nil
         guard !pending.isEmpty else {
             sinceLastDrainSync = 0
             stalledAwaitingRecovery = false
             clearOtaWindowCredits()
             clearBackpressureWait()
+            reservedBatch?.settle(Self.error(code: "\(channel)_write_cancelled",
+                endpoint: peripheral?.otaEndpointId, reason: reason, waitSeconds: nil, pending: 0))
             return
         }
         logger?("[ezw_ble][\(channel)] cancelled endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) reason=\(reason) pending=\(pending.count)")
@@ -445,6 +547,9 @@ extension OtaWriteQueue {
                 expectedAttemptGeneration: item.expectedAttemptGeneration
             )
         }
+        // A reentrant platform submit has already popped its head from pending.
+        reservedBatch?.settle(Self.error(code: "\(channel)_write_cancelled",
+            endpoint: peripheral?.otaEndpointId, reason: reason, waitSeconds: nil, pending: snapshot.count))
     }
 
     static func unavailableError(endpoint: String, reason: String, pending: Int = 0, channel: String = OtaWriteChannel.ota) -> FlutterError {
@@ -486,6 +591,22 @@ extension OtaWriteQueue {
      *  - 3、每包提交给 CoreBluetooth 后 result(nil), Dart 侧自然按 await 串行发下一包.
      */
     private func pump(resumeSource: String? = nil) {
+        if ownedFilePumpRunning {
+            ownedFilePumpRequested = true
+            return
+        }
+        let serializesOwnedFile = channel == OtaWriteChannel.file && fileBatchReservation != nil
+        if serializesOwnedFile { ownedFilePumpRunning = true }
+        defer {
+            if serializesOwnedFile {
+                ownedFilePumpRunning = false
+                if ownedFilePumpRequested {
+                    ownedFilePumpRequested = false
+                    pump()
+                }
+            }
+        }
+        let revision = fileOwnerRevision
         //  1、外设已被释放(异常断连/重置), 清空所有 pending
         guard let peripheral = peripheral else {
             completePendingAsUnavailable(reason: "peripheral released")
@@ -497,7 +618,7 @@ extension OtaWriteQueue {
         // A soft 64-packet yield is an explicit budget stop. Normal enqueue must not
         // bypass it; only the owned ready/poll path may reopen the queue. Even a
         // strictly verified real ACK remains observation-only during this A/B.
-        if channel == OtaWriteChannel.ota, resumeSource == nil,
+        if (channel == OtaWriteChannel.ota || ownedFileSoftWait), resumeSource == nil,
            softThrottleStartedAtMonotonic != nil, peripheral.canSendWriteWithoutResponse {
             return
         }
@@ -531,6 +652,7 @@ extension OtaWriteQueue {
                     pending: pending.count,
                     channel: channel
                 ))
+                if fileOwnerRevision != revision { return }
                 continue
             }
             if let credited = creditedNextFile, credited.data == head.data {
@@ -549,7 +671,18 @@ extension OtaWriteQueue {
             }
             //  - 2.3、CoreBluetooth 已接受本次 writeValue 调用后才向 Dart 回包;
             //  -- WriteWithoutResponse 无设备 ack, 这里的成功只代表已提交给 CoreBluetooth。
+            let ownedSoftStop = shouldSoftThrottle &&
+                (head.batch?.fileBatchToken != nil || fileBatchReservation != nil)
+            if ownedSoftStop {
+                // Arm before publishing completion: a synchronous callback may
+                // cancel this owner or enqueue its successor at packet 64.
+                sinceLastDrainSync = 0
+                markSoftThrottleWait()
+                ownedFileSoftWait = true
+                scheduleBackpressureRetry(after: Self.softThrottleRetryInterval)
+            }
             completeItem(head, nil)
+            if fileOwnerRevision != revision || ownedSoftStop { return }
             //  - 2.4、软节流: 每 N 包主动让出
             //  -- canSendWriteWithoutResponse 在 iPhone 6s/SE 一代等老机型上"报喜不报忧",
             //  -- 突发塞包会触发底层丢包, 这里强制等下一次 peripheralIsReady 回调
@@ -582,12 +715,16 @@ private extension OtaWriteQueue {
     }
 
     func completePendingAsUnavailable(reason: String) {
+        fileOwnerRevision &+= 1
+        let reservedBatch = fileBatchReservation?.batch
+        fileBatchReservation = nil
         guard !pending.isEmpty else {
             // A terminal batch can leave only the soft timer/ACK slot behind.
             // Releasing the peripheral must invalidate those owners too.
             sinceLastDrainSync = 0
             clearOtaWindowCredits()
             clearBackpressureWait()
+            reservedBatch?.settle(Self.unavailableError(endpoint: "", reason: reason, channel: channel))
             return
         }
         errorLogger?("[ezw_ble][\(channel)] cancelled endpoint=released reason=\(reason) pending=\(pending.count)")
@@ -608,18 +745,21 @@ private extension OtaWriteQueue {
                 expectedAttemptGeneration: item.expectedAttemptGeneration
             )
         }
+        reservedBatch?.settle(Self.unavailableError(endpoint: "", reason: reason, channel: channel))
     }
 
     /// Complete one queue item, retiring only its failed batch before publishing
     /// the error. A stall's post-cleanup count proves local unsent-queue state,
     /// never CoreBluetooth drain or a firmware ACK.
     func completeItem(_ item: OtaWriteItem, _ value: Any?) {
+        guard item.batch?.settled != true else { return }
         if let error = value {
             if let batch = item.batch {
                 pending.removeAll { $0.batch === batch }
             }
             var completion: Any = error
             var retiredFileEpisode: UInt64?
+            let revision = fileOwnerRevision
             if let stalled = error as? FlutterError,
                stalled.code == "\(channel)_write_stalled",
                var details = stalled.details as? [String: Any] {
@@ -643,7 +783,7 @@ private extension OtaWriteQueue {
             } else {
                 item.result(completion)
             }
-            if let episode = retiredFileEpisode, backpressureEpisode == episode {
+            if let episode = retiredFileEpisode, backpressureEpisode == episode, fileOwnerRevision == revision {
                 // A callback may cancel the physical owner or establish a new
                 // wait/timer. Only this untouched retirement may resume retained
                 // owners, each through its original per-packet target validation.
@@ -799,6 +939,7 @@ private extension OtaWriteQueue {
                 previous + max(0, Int(waitSeconds * 1_000))
         }
         softThrottleStartedAtMonotonic = nil
+        ownedFileSoftWait = false
     }
 
     func cancelScheduledRetryForWaitTransition() {

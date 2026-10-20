@@ -711,6 +711,9 @@ class BleManager private constructor() {
     ): BleAndroidOtaWriteQueue {
         val key = reconnectKey(uuid)
         return queues.getOrPut(key) {
+            // Ordinary FILE has no OTA pair (0/0). Freeze its physical GATT here so a
+            // queued tail can never resolve the same UUID onto a replacement connection.
+            val frozenFileTarget = if (channel == BleWriteChannel.FILE) findConnectedDevice(uuid)?.writeTargetFor(psType) else null
             BleAndroidOtaWriteQueue(
                 endpoint = uuid,
                 submit = {
@@ -727,9 +730,14 @@ class BleManager private constructor() {
                             status = null,
                             reason = "device or characteristic missing",
                         )
+                    } else if (channel == BleWriteChannel.FILE &&
+                        (!checkIsFunctionCanBeCalled() || frozenFileTarget == null || device.myGatt !== frozenFileTarget.first ||
+                            !BleUpgradeCommandPolicy.canSend(upgradeDevices.contains(uuid), psType))
+                    ) {
+                        BleOtaWriteSubmission.rejected(null, "file physical target or admission changed")
                     } else if (!validateG2OtaContextForWrite(
                             uuid = uuid,
-                            psType = 1,
+                            psType = psType,
                             transactionId = submitTransactionId,
                             generation = submitOtaGeneration,
                             instanceId = submitInstanceId,
@@ -752,7 +760,7 @@ class BleManager private constructor() {
                                 reason = identityError.reason,
                             )
                         } else {
-                            device.submitOtaCharacteristic(data, psType = psType)
+                            device.submitOtaCharacteristic(data, psType = psType, expectedTarget = frozenFileTarget)
                         }
                     }
                 },
@@ -766,6 +774,11 @@ class BleManager private constructor() {
                 nowMillis = SystemClock::elapsedRealtime,
                 logger = { message -> sendLog(BleLoggerTag.d, message) },
                 channel = channel,
+                fileTargetIsCurrent = {
+                    val currentTarget = findConnectedDevice(uuid)?.writeTargetFor(psType)
+                    frozenFileTarget != null && currentTarget?.first === frozenFileTarget.first &&
+                        currentTarget.second === frozenFileTarget.second
+                },
             )
         }
     }
@@ -3353,10 +3366,24 @@ class BleManager private constructor() {
         uuid: String,
         packets: List<ByteArray>,
         psType: Int = BlePsType.FILE,
+        fileBatchToken: String? = null,
         completion: (BleOtaWriteError?) -> Unit,
     ) {
+        val reservedQueue = fileBatchToken?.let { fileWriteQueues[reconnectKey(uuid)] }
+        // A failing pre-enqueue admission consumes an unused reservation too. Duplicate sends
+        // must not retire an already-enqueued batch, hence the queue's unsubmitted-only check.
+        val settle: (BleOtaWriteError?) -> Unit = { error ->
+            if (error != null && fileBatchToken != null) {
+                reservedQueue?.retireUnsubmittedFilePacketBatch(fileBatchToken)
+            }
+            completion(error)
+        }
+        if (fileBatchToken != null && reservedQueue == null) {
+            settle(BleOtaWriteError.unavailable(uuid, "unknown file batch token", channel = BleWriteChannel.FILE))
+            return
+        }
         if (psType != BlePsType.FILE) {
-            completion(
+            settle(
                 BleOtaWriteError.unsupported(
                     uuid,
                     "batch requires file psType=3",
@@ -3370,10 +3397,41 @@ class BleManager private constructor() {
             packets = packets,
             psType = psType,
             channel = BleWriteChannel.FILE,
-            queue = { fallbackUuid -> fileWriteQueueFor(fallbackUuid) },
-            completion = completion,
+            queue = { fallbackUuid -> reservedQueue ?: fileWriteQueueFor(fallbackUuid) },
+            fileBatchToken = fileBatchToken,
+            completion = settle,
         )
     }
+
+    /** Reserve a live FILE target without submitting bytes or claiming firmware acceptance. */
+    fun beginFilePacketBatch(uuid: String, completion: (String?, BleOtaWriteError?) -> Unit) {
+        val device = findConnectedDevice(uuid)
+        val error = when {
+            uuid.isEmpty() || !checkIsFunctionCanBeCalled() || device?.myGatt == null ->
+                BleOtaWriteError.unavailable(uuid, "manager or file target unavailable", channel = BleWriteChannel.FILE)
+            !BleUpgradeCommandPolicy.canSend(upgradeDevices.contains(uuid), BlePsType.FILE) ||
+                !validateG2OtaContextForWrite(uuid, BlePsType.FILE, "", 0L, "") ->
+                BleOtaWriteError.unavailable(uuid, "file admission rejected", channel = BleWriteChannel.FILE)
+            !device.supportsWriteWithoutResponse(BlePsType.FILE) ->
+                BleOtaWriteError.unsupported(uuid, "missing writeWithoutResponse", channel = BleWriteChannel.FILE)
+            else -> null
+        }
+        if (error != null) {
+            completion(null, error)
+            return
+        }
+        val queue = fileWriteQueueFor(uuid)
+        if (!queue.isFileTargetCurrent) {
+            completion(null, BleOtaWriteError.unavailable(uuid, "file physical target changed", channel = BleWriteChannel.FILE))
+            return
+        }
+        val token = queue.beginFilePacketBatch()
+        completion(token, if (token == null) BleOtaWriteError("file_write_busy", uuid, "file batch reservation already active") else null)
+    }
+
+    /** Exact revocation works even while normal admission is closed; never creates a queue. */
+    fun cancelFilePacketBatch(uuid: String, fileBatchToken: String): Boolean =
+        fileWriteQueues[reconnectKey(uuid)]?.cancelFilePacketBatch(fileBatchToken) ?: false
 
     /** 批量写入口的公共准入：参数、升级 gate、live device 与 no-response 能力都必须 fail closed。 */
     private fun submitPacketBatch(
@@ -3389,6 +3447,7 @@ class BleManager private constructor() {
         otaInstanceId: String = "",
         queueMetrics: ((BleAndroidOtaBatchQueueMetrics) -> Unit)? = null,
         linkMetrics: ((Map<String, Any>) -> Unit)? = null,
+        fileBatchToken: String? = null,
         completion: (BleOtaWriteError?) -> Unit,
     ) {
         if (packets.isEmpty()) {
@@ -3450,6 +3509,7 @@ class BleManager private constructor() {
             otaGeneration = otaGeneration,
             otaInstanceId = otaInstanceId,
             metrics = queueMetrics,
+            fileBatchToken = fileBatchToken,
             completion = completion,
         )
     }
