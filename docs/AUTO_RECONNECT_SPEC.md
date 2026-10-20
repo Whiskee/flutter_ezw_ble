@@ -170,6 +170,30 @@ Dart may seed the already-bound targets and activate them immediately; this is
 still recovery of a previously authorized owner, not retry of an unknown
 first-connect failure.
 
+### iOS target persistence
+
+`BleReconnectStore.saveTargets` skips `UserDefaults.set` only when the raw stored
+list already contains the same complete four-field records (`belongConfig`,
+`uuid`, `name`, `expectedMacSuffix`) with unique UUIDs and no duplicate nonempty names. UUID
+uniqueness is case-insensitive; names follow the exact lookup comparison. Normal
+upsert moves a matching item to the end of its proposed list, but that incidental
+rotation does not carry activation priority: the incoming activation batch and
+physical callback/Gate queues determine execution order. Equivalent unambiguous
+upserts therefore keep the stored order, including when batches arrive in a
+different order. This is not permission to reorder or merge ambiguous caches:
+`target()` uses first-match UUID/name lookup, so duplicate identities must still
+pass through the original write/cleanup path.
+
+Comparison reads the actual raw defaults rather than decoded `targets()` results
+or a process cache. Missing/extra fields, invalid container/field types, dropped
+legacy entries and any changed field value or casing still write the canonical
+format. Only the final target storage side effect is skipped; canonical identity
+resolution, replaced-identity safety cleanup and new runtime owner/session
+installation run normally. The separate security recovery record writes,
+including the fifth-failure exhaustion latch, and explicit reset key removal are
+unchanged. Optimized native behavior evidence and limits are in
+[target storage verification](reconnect_target_storage_verification.md).
+
 The task is a long-lived reconnect intent. Native must keep it alive until an
 explicit owner cancels it, because timeout/noDeviceFound/service failures only
 describe one failed attempt, not the end of the reconnect contract.
@@ -777,3 +801,16 @@ hard cancel reachability without linear memory growth.
 - Authentication hang after `connectFinish` times out and retries instead of getting stuck.
 - G2 scan results are displayed only after both legs are matched by `matchCount = 2`.
 - G2 is marked business-connected only after `AUTHENTICATION` returns `authMgr.secAuth == true`; right-leg `PIPE_ROLE_CHANGE` and `TIME_SYNC` run before final `deviceConnected`.
+
+### Runtime common CCCD recovery
+
+The iOS charging-idle API reads only a successful business reconnect owner's paired
+positive `lastConnectedGeneration/lastConnectedAttemptGeneration`, requiring
+`sessionGeneration == lastConnectedGeneration`, current objects, full business
+connection, and no OTA. It never combines historical attempt with a newer session.
+An unknown runtime CCCD operation with latest desired=true may request one actual
+`cancelPeripheralConnection` through `disconnectForRuntimeNotificationRecovery`.
+This preserves the reconnect owner, leaves OTA state alone, and emits no synthetic
+terminal. Only real didDisconnect ends the old physical lane and schedules the
+existing reconnect flow. No FlowPolicy, retry count, gate or GATT-readiness changes
+are introduced. A new positive attempt is not blocked by the old runtime write fence.

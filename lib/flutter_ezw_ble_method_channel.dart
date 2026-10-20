@@ -32,6 +32,47 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       await methodChannel.invokeMethod<int>("bleRecoveryEpoch") ?? 0;
 
   @override
+  Future<BleRuntimeCommonOwner?> getRuntimeCommonOwner(String uuid) async =>
+      BleRuntimeCommonOwner.fromNative(
+        await methodChannel.invokeMethod<Object?>('getRuntimeCommonOwner', {
+          'uuid': uuid,
+        }),
+      );
+
+  @override
+  Future<BleRuntimeCommonResult> setRuntimeCommonNotifications(
+    String uuid, {
+    required int sessionGeneration,
+    required int attemptGeneration,
+    required int revision,
+    required bool enabled,
+  }) async => BleRuntimeCommonResult.fromNative(
+    await methodChannel.invokeMethod<Object?>('setRuntimeCommonNotifications', {
+      'uuid': uuid,
+      'sessionGeneration': sessionGeneration,
+      'attemptGeneration': attemptGeneration,
+      'revision': revision,
+      'enabled': enabled,
+    }),
+  );
+
+  @override
+  Future<BleRuntimeCommonResult> disconnectForRuntimeNotificationRecovery(
+    String uuid, {
+    required int sessionGeneration,
+    required int attemptGeneration,
+    required int revision,
+  }) async => BleRuntimeCommonResult.fromNative(
+    await methodChannel
+        .invokeMethod<Object?>('disconnectForRuntimeNotificationRecovery', {
+          'uuid': uuid,
+          'sessionGeneration': sessionGeneration,
+          'attemptGeneration': attemptGeneration,
+          'revision': revision,
+        }),
+  );
+
+  @override
   Future<void> initConfigs(List<BleConfig> configs) async =>
       methodChannel.invokeMethod(
         "initConfigs",
@@ -560,8 +601,16 @@ class MethodChannelEzwBle extends FlutterEzwBlePlatform {
       });
 
   @override
+  Future<void> setDebugLoggingEnabled(bool enabled) =>
+      methodChannel.invokeMethod("setDebugLoggingEnabled", enabled);
+
+  @override
   Future<void> setConnectionTraceEnabled(bool enabled) =>
       methodChannel.invokeMethod("setConnectionTraceEnabled", enabled);
+
+  @override
+  Future<void> setConnectionTraceSamplingPaused(bool paused) =>
+      methodChannel.invokeMethod("setConnectionTraceSamplingPaused", paused);
 
   @override
   Future<void> openBleSettings() async =>

@@ -106,6 +106,8 @@ class BleManager: NSObject {
     lazy var preConnectedDevices: Set<String> = []
     //  - OTA WriteWithoutResponse 写队列(key: peripheral.identifier.uuidString)
     //  - 仅在 sendCmdNoWait + psType==1 路径上使用, 详见 docs/IOS_OTA_NOWAIT_SPEC.md §4.2
+    /// Runtime common CCCD state is independent of initialization readiness.
+    let runtimeCommonNotifications = BleRuntimeCommonNotifications()
     private lazy var otaWriteQueues: [String: OtaWriteQueue] = [:]
     //  - 文件 RAW 批次写队列。与 OTA 同构但实例独立: pending 不共享, 退出升级只取消 OTA,
     //    不能连带清掉正在传输的文件批次。文件控制包仍走 sendCmd 的即时写路径。
@@ -188,7 +190,11 @@ class BleManager: NSObject {
     // Native Trace 默认关闭。开启后仅记录下一次真实物理 attempt，不改变连接/回连行为。
     var connectionTraceEnabled = false
     var nativeConnectionTraces: [String: BleNativeConnectionTraceBuffer] = [:]
-    var nativeTraceRssiTimers: [String: Timer] = [:]
+    // Sampling pause is independent from Trace authorization and passive events.
+    let nativeTraceRssiSampler = BleNativeTraceRssiSampler.shared
+    // Unfinished CoreBluetooth reads outlive sampling/trace replacement. This
+    // weak ledger prevents their callbacks from consuming a newer attempt.
+    let nativeTraceRssiRequests = BleNativeTraceRssiRequests()
     var nativeTraceRssiInFlightAttemptIds: [String: String] = [:]
     /// Trace 专用的前一连接状态，仅用于区分 Bond 恢复超时/取消与普通连接终态。
     var nativeTraceLastConnectStates: [String: BleConnectState] = [:]
@@ -927,13 +933,15 @@ extension BleManager {
         activeScanGeneration = generation
         // 生成本次扫描所使用的配置快照。搜索无结果时，首先要确认 native 真的拿到了
         // Dart 缓存配置；但同一配置重复开始扫描时只打印一次，避免日志噪声盖过扫描决策日志。
-        let configSummary = bleConfigs.map { config in
-            "\(config.name){filters=\(config.scan.nameFilters),matchCount=\(config.scan.matchCount)}"
-        }.joined(separator: ";")
-        let configSignature = "\(signature)|\(configSummary)"
-        if lastLoggedScanConfigSignature != configSignature {
-            lastLoggedScanConfigSignature = configSignature
-            loggerD(msg: "startScan/config: pure=\(effectivePureModel), normalResults=\(includeNormalResults), services=\(serviceUuidStrings), state=\(centralManager.state.label), configs=[\(configSummary)]")
+        if BleDebugLogPolicy.isEnabled {
+            let configSummary = bleConfigs.map { config in
+                "\(config.name){filters=\(config.scan.nameFilters),matchCount=\(config.scan.matchCount)}"
+            }.joined(separator: ";")
+            let configSignature = "\(signature)|\(configSummary)"
+            if lastLoggedScanConfigSignature != configSignature {
+                lastLoggedScanConfigSignature = configSignature
+                loggerD(msg: "startScan/config: pure=\(effectivePureModel), normalResults=\(includeNormalResults), services=\(serviceUuidStrings), state=\(centralManager.state.label), configs=[\(configSummary)]")
+            }
         }
         loggerD(msg: "startScan: generation=\(generation), reason=\(reason), services=\(serviceUuidStrings)")
         return scanStartResult(
@@ -1972,6 +1980,7 @@ extension BleManager {
      *  - 升级中仅允许 OTA 通道和上层协议白名单确认的恢复控制指令
      *
      */
+    @discardableResult
     func sendCmd(
         uuid: String,
         data: Data,
@@ -1980,9 +1989,9 @@ extension BleManager {
         expectedSessionGeneration: Int64 = 0,
         expectedAttemptGeneration: Int64 = 0,
         otaContext: BleG2OtaContext? = nil
-    ) {
+    ) -> FlutterError? {
         guard checkIsFunctionCanBeCalled() else {
-            return
+            return nil
         }
         // OTA 数据通道天然放行；common 只有 AUTH/时间同步等由业务协议显式标记后
         // 才能越过升级态，普通业务写入仍保持阻断。
@@ -1992,19 +2001,19 @@ extension BleManager {
             allowDuringUpgrade: allowDuringUpgrade
         ) else {
             loggerE(msg: "sendCmd: \(uuid), type=\(psType), cannot send non-OTA commands during upgrade")
-            return
+            return nil
         }
         guard let device = connectedDevices.first(where: { device in
             device.peripheral.identifier.uuidString == uuid
         }) else {
             loggerE(msg: "sendCmd: \(uuid), type=\(psType), device cache missing")
-            return
+            return nil
         }
         if let admission = currentConnectionAdmission(uuid: uuid) {
             guard let session = peripheralConnectionSessions[admission.sessionId],
                   session.peripheral === device.peripheral else {
                 loggerE(msg: "sendCmd: \(uuid), type=\(psType), attempt stale, sessionGeneration=\(admission.sessionGeneration), attemptGeneration=\(admission.generation)")
-                return
+                return nil
             }
         }
         if psType == 1,
@@ -2016,11 +2025,16 @@ extension BleManager {
                otaContext: otaContext
            ) {
             loggerE(msg: "sendCmd: \(uuid), type=\(psType), \(identityError.message ?? "attempt identity mismatch")")
-            return
+            return nil
         }
         guard let writeChars = device.writeCharsDic[psType] else {
             loggerE(msg: "sendCmd: \(uuid), type=\(psType), write characteristic missing")
-            return
+            return nil
+        }
+        // Runtime pause must reject at the actual write edge, including callers
+        // that bypass the SDK queue. Other characteristics retain their contract.
+        if let error = runtimeCommonWriteError(uuid: uuid, psType: psType, device: device) {
+            return error
         }
         //  根据不同uuid类型获取不同的服务特征
         //  - 写前采样发送就绪标志只用于诊断日志：本入口历来不读取该标志就直接写出，
@@ -2028,6 +2042,7 @@ extension BleManager {
         let canSendBefore = device.peripheral.canSendWriteWithoutResponse
         device.peripheral.writeValue(data, for: writeChars, type: .withoutResponse)
         loggerD(msg: "sendCmd: \(uuid), type=\(psType), writeChars=\(writeChars.uuid.uuidString), data length =\(data.count), \(wwrDiagnostics(device.peripheral, before: canSendBefore))")
+        return nil
     }
 
     /**
@@ -2119,6 +2134,9 @@ extension BleManager {
                     peripheral: device.peripheral,
                     logger: { [weak self] msg in
                         self?.loggerD(msg: msg)
+                    },
+                    errorLogger: { [weak self] msg in
+                        self?.loggerE(msg: msg)
                     }
                 )
                 loggerD(msg: "[ezw_ble][ota] queue created uuid=\(uuid) peripheral=\(Unmanaged.passUnretained(device.peripheral).toOpaque())")
@@ -2176,6 +2194,11 @@ extension BleManager {
                 pending: queueDepthForOta(uuid: uuid)
             ))
         } else {
+            // Pause has a typed failure even on the legacy no-wait common path.
+            if let error = runtimeCommonWriteError(uuid: uuid, psType: psType, device: device) {
+                result(error)
+                return
+            }
             //  - 4.4、保持现有非 OTA 行为: WriteWithoutResponse 立即返回, 不做背压
             //  -- 写前采样只用于诊断日志, 不参与放行判断(原因同 sendCmd).
             let canSendBefore = device.peripheral.canSendWriteWithoutResponse
@@ -2713,6 +2736,7 @@ extension BleManager {
             timer.invalidate()
         }
         scanConnectTimeoutTimers.removeAll()
+        runtimeCommonNotifications.removeAll()
         upgradeStateRegistry.clear()
         preConnectedDevices.removeAll()
         // 冷启动 reset 发生在 willRestoreState 和账号 target 加载之间时保留 escrow；
@@ -3301,29 +3325,29 @@ extension BleManager {
         // Freeze the producer attempt into the timer. A replacement attempt may
         // reuse the same CoreBluetooth UUID but must never inherit this sampler.
         guard let expectedAttemptId = nativeConnectionTraces[key]?.attemptId else { return }
-        nativeTraceRssiTimers[key] = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { [weak self, weak peripheral] _ in
-            guard let self = self, let peripheral = peripheral else { return }
+        nativeTraceRssiSampler.start(key: key, isOwnerCurrent: { [weak self, weak peripheral] in
+            guard let self, let peripheral else { return false }
+            return self.isNativeTraceRssiOwnerCurrent(peripheral: peripheral, expectedAttemptId: expectedAttemptId)
+        }, read: { [weak self, weak peripheral] in
+            guard let self, let peripheral else { return }
             self.readNativeTraceRssi(peripheral: peripheral, expectedAttemptId: expectedAttemptId)
-            self.nativeTraceRssiTimers[key] = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: true) { [weak self, weak peripheral] _ in
-                guard let self = self, let peripheral = peripheral else { return }
-                self.readNativeTraceRssi(peripheral: peripheral, expectedAttemptId: expectedAttemptId)
-            }
-        }
+        })
     }
 
     func stopNativeTraceRssiSampling(uuid: String) {
         let key = reconnectKey(uuid: uuid)
-        nativeTraceRssiTimers.removeValue(forKey: key)?.invalidate()
+        nativeTraceRssiSampler.stop(key: key)
         nativeTraceRssiInFlightAttemptIds.removeValue(forKey: key)
     }
 
     func stopAllNativeTraceRssiSampling() {
-        nativeTraceRssiTimers.values.forEach { $0.invalidate() }
-        nativeTraceRssiTimers.removeAll()
+        nativeTraceRssiSampler.stopAll()
         nativeTraceRssiInFlightAttemptIds.removeAll()
     }
 
-    private func readNativeTraceRssi(peripheral: CBPeripheral, expectedAttemptId: String) {
+    /// The sampler's retained request is not a BLE owner. Revalidate the live
+    /// peripheral and current attempt before resume and every diagnostic read.
+    private func isNativeTraceRssiOwnerCurrent(peripheral: CBPeripheral, expectedAttemptId: String) -> Bool {
         let uuid = peripheral.identifier.uuidString
         let key = reconnectKey(uuid: uuid)
         // The Gate admission ends at business connected, while the physical
@@ -3334,13 +3358,20 @@ extension BleManager {
                 device.isConnected &&
                 device.isBleFlowCompleted
         }
-        guard connectionTraceEnabled,
+        return connectionTraceEnabled && peripheral.state == .connected &&
+            nativeConnectionTraces[key]?.attemptId == expectedAttemptId &&
+            (currentConnectionAdmission(uuid: uuid) != nil || hasExactBusinessOwner)
+    }
+
+    private func readNativeTraceRssi(peripheral: CBPeripheral, expectedAttemptId: String) {
+        let key = reconnectKey(uuid: peripheral.identifier.uuidString)
+        guard !nativeTraceRssiSampler.isPaused,
+              isNativeTraceRssiOwnerCurrent(peripheral: peripheral, expectedAttemptId: expectedAttemptId),
               let trace = nativeConnectionTraces[key],
-              trace.attemptId == expectedAttemptId,
-              nativeTraceRssiInFlightAttemptIds[key] == nil,
-              currentConnectionAdmission(uuid: uuid) != nil || hasExactBusinessOwner else {
+              nativeTraceRssiInFlightAttemptIds[key] == nil else {
             return
         }
+        guard nativeTraceRssiRequests.begin(peripheral: peripheral, attemptId: expectedAttemptId) else { return }
         nativeTraceRssiInFlightAttemptIds[key] = expectedAttemptId
         trace.markRssiRequested()
         peripheral.readRSSI()
@@ -3379,8 +3410,11 @@ extension BleManager {
             if let nsError {
                 recordBondSecurityFailureIfNeeded(peripheral: peripheral, error: nsError)
             }
+            // Preserve failure evidence even when Debug/Trace is off, before
+            // teardown removes the exact admission used by this callback.
+            let admission = currentConnectionAdmission(uuid: peripheral.identifier.uuidString)
+            loggerE(msg: "didDiscoverServices: \(peripheral.identifier.uuidString), search service fail = \(String(describing: error)), sessionGeneration=\(admission?.sessionGeneration ?? 0), attemptGeneration=\(admission?.generation ?? 0)")
             handleConnectState(uuid: peripheral.identifier.uuidString, name: peripheral.name ?? "", state: .serviceFail, tag: tag)
-            loggerD(msg: "didDiscoverServices: \(peripheral.identifier.uuidString), search service fail = \(String(describing: error))")
             return
         }
         //  - 1.2、没有查询到配置
@@ -4458,8 +4492,11 @@ extension BleManager {
     /**
      * Logger d
      */
-    func loggerD(msg: String) {
-        BleEC.logger.emit("[d]-BleManage::\(msg)")
+    func loggerD(msg: @autoclosure () -> String) {
+        // Notify/write can run per packet: return before interpolation and
+        // EventChannel buffering, including before Dart subscribes at startup.
+        guard BleDebugLogPolicy.isEnabled else { return }
+        BleEC.logger.emit("[d]-BleManage::\(msg())")
     }
     
     /**
@@ -4496,6 +4533,7 @@ extension BleManager: CBCentralManagerDelegate {
             retireG2OtaEndpoints(invalidatedOtaEndpoints, reason: "central \(central.state.label)", snapshots: invalidatedOtaSnapshots)
             clearG2OtaRecoveryGrants(contextsByEndpoint: invalidatedOtaContexts)
             //  - 1.1、移除所有升级设备，避免退出OTA时，重置会连接状态的设备
+            runtimeCommonNotifications.removeAll()
             upgradeStateRegistry.clear()
             //  - 1.2、系统级蓝牙关闭：把连接中/已连接端点标记为 .disconnectFromSys，
             //         让 Dart 状态机先退出陈旧连接态；长期回连 task 仍由 native 暂停并在恢复后继续。
@@ -4652,6 +4690,7 @@ extension BleManager: CBCentralManagerDelegate {
     
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, timestamp: CFAbsoluteTime, isReconnecting: Bool, error: (any Error)?) {
         loggerE(msg: "didDisconnectPeripheral: timestamp = \(timestamp), isReconnecting = \(isReconnecting), error = \(String(describing: error))")
+        runtimeCommonNotifications.terminal(uuid: peripheral.identifier.uuidString, peripheralId: ObjectIdentifier(peripheral))
         if consumePeripheralCancellationBarrier(peripheral) { return }
         recordPhysicalTrace(peripheral, event: "disconnected")
         if shouldStateRestorationEscrowHandleTerminal(peripheral) && handleStateRestorationEscrowTerminal(
@@ -4716,6 +4755,7 @@ extension BleManager: CBCentralManagerDelegate {
      *  设备断连回调
      */
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        runtimeCommonNotifications.terminal(uuid: peripheral.identifier.uuidString, peripheralId: ObjectIdentifier(peripheral))
         if consumePeripheralCancellationBarrier(peripheral) { return }
         recordPhysicalTrace(peripheral, event: "disconnected")
         if shouldStateRestorationEscrowHandleTerminal(peripheral) && handleStateRestorationEscrowTerminal(
@@ -4761,6 +4801,15 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
      */
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         let tag = "didUpdateNotification"
+        // Business-connected has released the initialization Gate. Runtime false
+        // callbacks must be consumed before that guard, without changing counters.
+        if runtimeCommonNotifications.didUpdate(
+            uuid: peripheral.identifier.uuidString,
+            peripheralId: ObjectIdentifier(peripheral),
+            characteristicId: ObjectIdentifier(characteristic),
+            enabled: characteristic.isNotifying,
+            failed: error != nil
+        ) { return }
         guard isCurrentConnectionPipeline(peripheral) else { return }
         if let error = error {
             let nsError = error as NSError
@@ -5000,8 +5049,13 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
         let uuid = peripheral.identifier.uuidString
         let key = reconnectKey(uuid: uuid)
-        let inFlightAttemptId = nativeTraceRssiInFlightAttemptIds.removeValue(forKey: key)
-        guard connectionTraceEnabled,
+        let inFlightAttemptId = nativeTraceRssiRequests.finish(peripheral: peripheral)
+        guard let inFlightAttemptId, nativeTraceRssiInFlightAttemptIds[key] == inFlightAttemptId else { return }
+        nativeTraceRssiInFlightAttemptIds.removeValue(forKey: key)
+        // Do not clear in-flight requests when pausing: a late system callback
+        // must drain its original attempt before a resumed sampler can read.
+        guard !nativeTraceRssiSampler.isPaused,
+              isNativeTraceRssiOwnerCurrent(peripheral: peripheral, expectedAttemptId: inFlightAttemptId),
               let trace = nativeConnectionTraces[key],
               trace.attemptId == inFlightAttemptId else {
             return
@@ -5048,6 +5102,13 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
             loggerE(msg: "cmd response: \(peripheral.identifier.uuidString), can not find chars")
             return
         }
+        // Charging eligibility needs live source provenance. Do not stamp a
+        // replaced CBPeripheral/read characteristic with the current UUID owner.
+        // This does not grant the separate Android owned-write receipt contract.
+        if privateService.type == 0 {
+            guard device.peripheral === peripheral,
+                  device.readCharsDic[0] === characteristic else { return }
+        }
         // Keep the OTA peripheral-object guard as well as the shared receive
         // admission/characteristic checks. Neither provides a firmware-window nonce.
         if privateService.type == BlePsTypeValue.ota, device.peripheral !== peripheral {
@@ -5075,14 +5136,20 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
         let otaContext = privateService.type == 1
             ? g2OtaTransactions.activeContext(for: peripheral.identifier.uuidString)
             : nil
+        let commonIdentity = privateService.type == 0
+            ? runtimeCommonSnapshot(uuid: peripheral.identifier.uuidString)?.identity
+            : nil
+        //  4、OTA identity keeps its existing contract; common business packets
+        // additionally identify their currently validated successful attempt.
+        // AUTH packets before business commit retain the original zero pair.
         //  4、发送指令到flutter。OTA response 必须带 exact pair，供 Dart 绑定当前恢复轮次。
         var bleCmdMap = BleCmd(
             uuid: peripheral.identifier.uuidString,
             psType: privateService.type,
             data: data,
             isSuccess: error == nil,
-            sessionGeneration: responseIdentity?.sessionGeneration ?? 0,
-            attemptGeneration: responseIdentity?.attemptGeneration ?? 0,
+            sessionGeneration: responseIdentity?.sessionGeneration ?? commonIdentity?.sessionGeneration ?? 0,
+            attemptGeneration: responseIdentity?.attemptGeneration ?? commonIdentity?.attemptGeneration ?? 0,
             otaTransactionId: otaContext?.transactionId ?? "",
             otaGeneration: otaContext?.generation ?? 0,
             otaInstanceId: otaContext?.instanceId ?? "",

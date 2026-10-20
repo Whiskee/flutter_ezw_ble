@@ -24,6 +24,7 @@ void main() {
     expect(stub.exitCode, 0, reason: '${stub.stdout}\n${stub.stderr}');
     for (final target in <String, List<String>>{
       'queue': [
+        'ios/Classes/ble/BleDebugLogPolicy.swift',
         'ios/Classes/ble/OtaWindowCreditLedger.swift',
         'ios/Classes/ble/OtaWriteQueue.swift',
         'test/native/ota_write_queue_log_test.swift',

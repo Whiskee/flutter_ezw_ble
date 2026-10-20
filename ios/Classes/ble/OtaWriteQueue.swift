@@ -207,6 +207,9 @@ final class OtaWriteQueue {
     private let channel: String
     //  - 日志回调(由 BleManager 注入, 复用其 loggerD)
     private let logger: ((String) -> Void)?
+    // Terminal failures remain observable with Debug off; this callback must
+    // not be used for ordinary cancellation or successful packet submission.
+    private let errorLogger: ((String) -> Void)?
 
     //  =========== Get/Set
     /// 当前队列深度(包含尚未写入 BLE 栈的项)
@@ -222,12 +225,14 @@ final class OtaWriteQueue {
     init(
         peripheral: OtaWritePeripheral,
         logger: ((String) -> Void)? = nil,
+        errorLogger: ((String) -> Void)? = nil,
         clock: OtaWriteClock = SystemOtaWriteClock(),
         scheduler: OtaWriteScheduler = MainQueueOtaWriteScheduler(),
         channel: String = OtaWriteChannel.ota
     ) {
         self.peripheral = peripheral
         self.logger = logger
+        self.errorLogger = errorLogger
         self.clock = clock
         self.scheduler = scheduler
         self.channel = channel
@@ -569,6 +574,13 @@ extension OtaWriteQueue {
 
 private extension OtaWriteQueue {
 
+    /// Gate at the producer, before the String callback reaches BleManager.
+    /// This keeps each packet's interpolation lazy without changing queue flow.
+    func debugLog(_ message: @autoclosure () -> String) {
+        guard BleDebugLogPolicy.isEnabled, let logger else { return }
+        logger(message())
+    }
+
     func completePendingAsUnavailable(reason: String) {
         guard !pending.isEmpty else {
             // A terminal batch can leave only the soft timer/ACK slot behind.
@@ -578,7 +590,7 @@ private extension OtaWriteQueue {
             clearBackpressureWait()
             return
         }
-        logger?("[ezw_ble][\(channel)] cancelled endpoint=released reason=\(reason) pending=\(pending.count)")
+        errorLogger?("[ezw_ble][\(channel)] cancelled endpoint=released reason=\(reason) pending=\(pending.count)")
         let snapshot = pending
         pending.removeAll()
         sinceLastDrainSync = 0
@@ -746,7 +758,7 @@ private extension OtaWriteQueue {
         }
         let stalled = pending.removeFirst()
         let pendingCount = pending.count + 1
-        logger?("[ezw_ble][\(channel)] stalled endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) reason=\(reason) wait=\(String(format: "%.3f", waitSeconds))s pending=\(pendingCount) session=\(stalled.expectedSessionGeneration) attempt=\(stalled.expectedAttemptGeneration)")
+        errorLogger?("[ezw_ble][\(channel)] stalled endpoint=\(peripheral?.otaEndpointId ?? "released") episode=\(backpressureEpisode) reason=\(reason) wait=\(String(format: "%.3f", waitSeconds))s pending=\(pendingCount) session=\(stalled.expectedSessionGeneration) attempt=\(stalled.expectedAttemptGeneration)")
         sinceLastDrainSync = 0
         stalledAwaitingRecovery = true
         clearOtaWindowCredits()
@@ -857,10 +869,10 @@ private extension OtaWriteQueue {
 
 private extension OtaWriteQueue {
 
-    /// Successful OTA windows are measured through callbacks/metrics; text logs keep only
-    /// abnormal evidence so full upgrades do not grow logs linearly with packet count.
+    /// Preserve batch metrics while formatting successful OTA detail only for Debug;
+    /// the FILE channel retains its independent diagnostics.
     func logFileOnly(_ message: @autoclosure () -> String) {
-        guard channel != OtaWriteChannel.ota else {
+        guard channel != OtaWriteChannel.ota || BleDebugLogPolicy.isEnabled else {
             return
         }
         logger?(message())
