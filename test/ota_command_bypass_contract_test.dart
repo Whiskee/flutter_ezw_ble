@@ -131,11 +131,13 @@ void main() {
     expect(androidQueue, contains('channel != BleWriteChannel.OTA'));
     expect(androidQueue, contains(r'[ezw_ble][$channel][android] failed'));
     expect(androidQueue, contains(r'[ezw_ble][$channel][android] stalled'));
-    expect(
-        androidCallback,
-        contains(
-            'writtenPsType != BlePsType.OTA || status != BluetoothGatt.GATT_SUCCESS'));
-    expect(androidCallback, contains('keep failures visible'));
+    // The merged callback delegates the lazy logging decision to the shared
+    // policy. Kotlin policy/callback behavior tests cover both enabled values,
+    // failures and owner dispatch; this assertion verifies production wiring.
+    expect(androidCallback, contains('BleOtaDebugLogPolicy.logWriteCallback('));
+    expect(androidCallback,
+        contains('success = status == BluetoothGatt.GATT_SUCCESS'));
+    expect(androidCallback, contains('onCharacteristicWriteComplete('));
 
     expect(iosQueue, contains('func logFileOnly'));
     expect(iosQueue, contains('channel != OtaWriteChannel.ota'));

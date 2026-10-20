@@ -17,6 +17,10 @@ enum BleMC: String {
     case bleState
     /// Query the process-local transport reset epoch without mutating owners.
     case bleRecoveryEpoch
+    /// iOS runtime common notification control, independent of GATT readiness.
+    case getRuntimeCommonOwner
+    case setRuntimeCommonNotifications
+    case disconnectForRuntimeNotificationRecovery
     /// Replace the native BLE configuration table.
     case initConfigs
     /// Start scan with optional pure scan mode.
@@ -77,6 +81,10 @@ enum BleMC: String {
     case quiteUpgradeState
     /// Enable/disable process-local native connection Trace.
     case setConnectionTraceEnabled
+    /// Pause RSSI timers without changing Trace, BLE ownership or startup.
+    case setConnectionTraceSamplingPaused
+    /// Change Debug formatting/emission only; never construct BleManager here.
+    case setDebugLoggingEnabled
     /// Open system Bluetooth settings.
     case openBleSettings
     /// Open this app's settings page.
@@ -115,6 +123,33 @@ enum BleMC: String {
         case .bleRecoveryEpoch:
             result(BleManager.shared.currentBleRecoveryEpoch)
             return
+        case .getRuntimeCommonOwner:
+            let data = arguments as? [String: Any] ?? [:]
+            result(BleManager.shared.getRuntimeCommonOwner(uuid: data["uuid"] as? String ?? ""))
+            return
+        case .setRuntimeCommonNotifications:
+            let data = arguments as? [String: Any] ?? [:]
+            guard let enabled = data["enabled"] as? Bool else {
+                result(FlutterError(code: "INVALID_RUNTIME_COMMON_ARGUMENTS",
+                    message: "Runtime common desired state is required", details: nil))
+                return
+            }
+            BleManager.shared.setRuntimeCommonNotifications(
+                uuid: data["uuid"] as? String ?? "",
+                sessionGeneration: (data["sessionGeneration"] as? NSNumber)?.int64Value ?? 0,
+                attemptGeneration: (data["attemptGeneration"] as? NSNumber)?.int64Value ?? 0,
+                revision: (data["revision"] as? NSNumber)?.int64Value ?? 0,
+                enabled: enabled,
+                result: result)
+            return
+        case .disconnectForRuntimeNotificationRecovery:
+            let data = arguments as? [String: Any] ?? [:]
+            result(BleManager.shared.disconnectForRuntimeNotificationRecovery(
+                uuid: data["uuid"] as? String ?? "",
+                sessionGeneration: (data["sessionGeneration"] as? NSNumber)?.int64Value ?? 0,
+                attemptGeneration: (data["attemptGeneration"] as? NSNumber)?.int64Value ?? 0,
+                revision: (data["revision"] as? NSNumber)?.int64Value ?? 0))
+            return
         case .initConfigs:
             let jsonArray: Array<[String: Any]> = arguments as? Array<[String: Any]> ?? []
             let configs: Array<BleConfig?> = jsonArray
@@ -122,7 +157,7 @@ enum BleMC: String {
                     jsonData.decodeTo()
                 }
                 .filter { $0 != nil }
-            BleEC.logger.emit("[d]-BleChannel::initConfigs received=\(jsonArray.count), decoded=\(configs.count)")
+            BleDebugLogPolicy.emit("[d]-BleChannel::initConfigs received=\(jsonArray.count), decoded=\(configs.count)")
             // 配置本身必须先同步写入 native，再返回 Dart；否则 Dart await 后立刻
             // startScan/connect 时，iOS 仍可能处于空配置。BleManager.initConfigs 内部
             // 已经把 reconnect 重放 defer 到下一轮主队列，所以这里不会阻塞首帧。
@@ -168,7 +203,7 @@ enum BleMC: String {
             // Optional Android foreground request identity has no CoreBluetooth meaning.
             // Accept shared callers without altering the existing iOS session allocator.
             jsonData.removeValue(forKey: "sessionGeneration")
-            BleEC.logger.emit("[d]-BleChannel::connectDevice args uuid=\(jsonData["uuid"] as? String ?? ""), name=\(jsonData["name"] as? String ?? ""), sn=\(jsonData["sn"] as? String ?? ""), config=\(jsonData["belongConfig"] as? String ?? ""), afterUpgrade=\(jsonData["afterUpgrade"] as? Bool ?? false), directConnect=\(jsonData["directConnect"] as? Bool ?? false)")
+            BleDebugLogPolicy.emit("[d]-BleChannel::connectDevice args uuid=\(jsonData["uuid"] as? String ?? ""), name=\(jsonData["name"] as? String ?? ""), sn=\(jsonData["sn"] as? String ?? ""), config=\(jsonData["belongConfig"] as? String ?? ""), afterUpgrade=\(jsonData["afterUpgrade"] as? Bool ?? false), directConnect=\(jsonData["directConnect"] as? Bool ?? false)")
             if let easyConnect: BleEasyConnect = jsonData.decodeTo() {
                 BleManager.shared.connect(easyConnect: easyConnect)
             } else {
@@ -346,7 +381,7 @@ enum BleMC: String {
             let expectedAttemptGeneration = (jsonData["expectedAttemptGeneration"] as? NSNumber)?.int64Value ?? 0
             let otaContext = BleG2OtaContext(data: jsonData["otaContext"] as? [String: Any])
             if let data = jsonData["data"] as? FlutterStandardTypedData {
-                BleManager.shared.sendCmd(
+                let error = BleManager.shared.sendCmd(
                     uuid: uuid,
                     data: data.data,
                     psType: psType,
@@ -355,6 +390,7 @@ enum BleMC: String {
                     expectedAttemptGeneration: expectedAttemptGeneration,
                     otaContext: otaContext
                 )
+                if let error { result(error); return }
             }
             // CoreBluetooth does not expose a reliable per-packet success callback here;
             // return after enqueueing to preserve the historical Dart contract.
@@ -447,6 +483,15 @@ enum BleMC: String {
             break
         case .setConnectionTraceEnabled:
             BleManager.shared.setConnectionTraceEnabled(arguments as? Bool == true)
+            break
+        case .setConnectionTraceSamplingPaused:
+            // This diagnostic policy also works before BleManager/central init.
+            BleNativeTraceRssiSampler.shared.setPaused(arguments as? Bool == true)
+            break
+        case .setDebugLoggingEnabled:
+            // This policy exists before any central/manager. Logging settings
+            // cannot become a new BLE startup or State Restoration entry point.
+            BleDebugLogPolicy.setEnabled(arguments as? Bool == true)
             break
         case .cleanConnectCache:
             BleManager.shared.cleanConnectCache()

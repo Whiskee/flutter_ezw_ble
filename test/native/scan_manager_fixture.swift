@@ -50,6 +50,8 @@ final class ScanEventSpy {
 
 enum BleEC {
     static let scanResult = ScanEventSpy()
+    // Compile the production policy against the EventChannel boundary.
+    static let logger = ScanEventSpy()
 }
 
 extension CBPeripheral {

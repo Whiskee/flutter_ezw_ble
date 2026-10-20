@@ -1,11 +1,108 @@
 package com.fzfstudio.ezw_ble.ble
 
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class BleAndroidOtaWriteQueueTest {
+    @BeforeTest
+    fun ordinaryMode() = BleOtaDebugLogPolicy.setEnabled(false)
+
+    @AfterTest
+    fun resetPolicy() = BleOtaDebugLogPolicy.setEnabled(false)
+
+    @Test
+    fun `ordinary mode completes a thousand packets without per packet detail logs`() {
+        val submissions = mutableListOf<ByteArray>()
+        val completions = mutableListOf<BleOtaWriteError?>()
+        val logs = mutableListOf<String>()
+        val queue = queue(
+            submit = { data ->
+                submissions.add(data.copyOf())
+                BleOtaWriteSubmission.accepted()
+            },
+            logger = logs::add,
+        )
+
+        repeat(1_000) { index ->
+            val packet = byteArrayOf(index.toByte(), (index / 256).toByte())
+            queue.enqueue(packet) { completions.add(it) }
+            assertEquals(index, completions.size, "submission must still await its callback")
+            queue.onCharacteristicWriteComplete(true, true, 0, "GATT_SUCCESS")
+            assertContentEquals(packet, submissions.last())
+        }
+
+        assertEquals(1_000, submissions.size)
+        assertEquals(List<BleOtaWriteError?>(1_000) { null }, completions)
+        assertEquals(0, queue.queueDepth)
+        assertEquals(emptyList(), logs, "ordinary OTA must not emit three logs for every packet")
+    }
+
+    @Test
+    fun `debug toggles affect the next packet log without changing queue completions`() {
+        val logs = mutableListOf<String>()
+        val completions = mutableListOf<BleOtaWriteError?>()
+        val queue = queue(submit = { BleOtaWriteSubmission.accepted() }, logger = logs::add)
+        queue.enqueue(byteArrayOf(1)) { completions.add(it) }
+        BleOtaDebugLogPolicy.setEnabled(true)
+        queue.onCharacteristicWriteComplete(true, true, 0, "GATT_SUCCESS")
+        assertEquals(1, logs.size, "enabling must not replay enqueue or submit logs")
+        assertTrue(logs.single().contains("completed endpoint=g2-left"))
+        queue.enqueue(byteArrayOf(2)) { completions.add(it) }
+        assertTrue(logs[1].contains("enqueued endpoint=g2-left"))
+        assertTrue(logs[2].contains("submitted endpoint=g2-left"))
+        BleOtaDebugLogPolicy.setEnabled(false)
+        queue.onCharacteristicWriteComplete(true, true, 0, "GATT_SUCCESS")
+        assertEquals(3, logs.size)
+        assertEquals(listOf<BleOtaWriteError?>(null, null), completions)
+        assertEquals(0, queue.queueDepth)
+    }
+
+    @Test
+    fun `ordinary mode retains backpressure stall rejection failure cancel and drain diagnostics`() {
+        val logs = mutableListOf<String>()
+        var nowMillis = 0L
+        val scheduler = FakeScheduler()
+        val busyErrors = mutableListOf<BleOtaWriteError?>()
+        val busy = queue(
+            submit = { BleOtaWriteSubmission.busy(201, "GATT busy") },
+            scheduler = scheduler, nowMillis = { nowMillis }, logger = logs::add,
+        )
+        busy.enqueue(byteArrayOf(1)) { busyErrors.add(it) }
+        nowMillis = 4_000L
+        scheduler.runNext()
+        assertEquals("ota_write_stalled", busyErrors.single()?.code)
+
+        val rejectedErrors = mutableListOf<BleOtaWriteError?>()
+        queue(
+            submit = { BleOtaWriteSubmission.rejected(133, "GATT rejected") }, logger = logs::add,
+        ).enqueue(byteArrayOf(2)) { rejectedErrors.add(it) }
+        assertEquals("ota_write_unavailable", rejectedErrors.single()?.code)
+
+        val failedErrors = mutableListOf<BleOtaWriteError?>()
+        val accepted = queue(submit = { BleOtaWriteSubmission.accepted() }, logger = logs::add)
+        accepted.enqueue(byteArrayOf(3)) { failedErrors.add(it) }
+        accepted.onCharacteristicWriteComplete(true, false, 133, "GATT_ERROR")
+        assertEquals("ota_write_unavailable", failedErrors.single()?.code)
+
+        val cancelledErrors = mutableListOf<BleOtaWriteError?>()
+        accepted.enqueue(byteArrayOf(4)) { cancelledErrors.add(it) }
+        accepted.cancelAttempt("leave ota")
+        accepted.onCharacteristicWriteComplete(true, true, 0, "GATT_SUCCESS")
+        accepted.enqueue(byteArrayOf(5)) { cancelledErrors.add(it) }
+        accepted.cancelAll("disconnect")
+        assertEquals(listOf("ota_write_cancelled", "ota_write_cancelled"), cancelledErrors.map { it?.code })
+        assertEquals(0, accepted.queueDepth)
+
+        listOf("backpressure", "stalled", "rejected", "failed", "attempt cancelled", "drained cancelled callback", "] cancelled").forEach { marker ->
+            assertTrue(logs.any { marker in it }, "missing diagnostic: $marker")
+        }
+        assertEquals(7, logs.size, "success detail must remain suppressed on every recovery path")
+    }
 
     @Test
     fun `busy raw packet waits for the active gatt callback then retries the same bytes`() {

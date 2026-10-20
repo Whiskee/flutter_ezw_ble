@@ -26,6 +26,10 @@ enum class BleMC {
     BLE_STATE,
     /** iOS transport reset epoch；Android 当前固定返回 0。 */
     BLE_RECOVERY_EPOCH,
+    /** iOS runtime CCCD control: Android explicitly reports unsupported. */
+    GET_RUNTIME_COMMON_OWNER,
+    SET_RUNTIME_COMMON_NOTIFICATIONS,
+    DISCONNECT_FOR_RUNTIME_NOTIFICATION_RECOVERY,
     /** 初始化 BLE 配置列表。 */
     INIT_CONFIGS,
     /** 开始扫描设备。 */
@@ -86,6 +90,10 @@ enum class BleMC {
     QUITE_UPGRADE_STATE,
     /** 打开/关闭 native 连接 Trace；默认关闭且不改变连接/回连状态。 */
     SET_CONNECTION_TRACE_ENABLED,
+    /** iOS RSSI timer pause only; Android accepts without changing diagnostics. */
+    SET_CONNECTION_TRACE_SAMPLING_PAUSED,
+    /** iOS Debug 与 Android OTA 成功逐包详情门控；错误、阶段和业务流程独立。 */
+    SET_DEBUG_LOGGING_ENABLED,
     /** 清理本地连接缓存。 */
     CLEAN_CONNECT_CACHE,
     /** 读取并清空原生自动回连/后台恢复事件。 */
@@ -143,6 +151,10 @@ enum class BleMC {
             }
             BLE_RECOVERY_EPOCH -> {
                 return result.success(0L)
+            }
+            GET_RUNTIME_COMMON_OWNER -> return result.success(null)
+            SET_RUNTIME_COMMON_NOTIFICATIONS, DISCONNECT_FOR_RUNTIME_NOTIFICATION_RECOVERY -> {
+                return result.success(mapOf("status" to "unavailable"))
             }
             INIT_CONFIGS -> {
                 // 1. Dart 传入的是 List<Map>，这里转换成原生配置模型。
@@ -535,6 +547,13 @@ enum class BleMC {
             SET_CONNECTION_TRACE_ENABLED -> {
                 // 1. Trace 只控制诊断采集；关闭时 manager 仅清 Trace/RSSI 诊断缓存。
                 BleManager.instance.setConnectionTraceEnabled(arguments as? Boolean == true)
+            }
+            SET_CONNECTION_TRACE_SAMPLING_PAUSED -> {
+                // Compatibility no-op; do not construct a manager or change Trace/owners.
+            }
+            SET_DEBUG_LOGGING_ENABLED -> {
+                // 仅写静态 policy；宿主可在 BLE 初始化前设置，禁止访问 manager/改 owner。
+                BleOtaDebugLogPolicy.setEnabled(arguments as? Boolean == true)
             }
             CLEAN_CONNECT_CACHE -> {
                 // 1. 调试/恢复入口：清理插件侧连接缓存。

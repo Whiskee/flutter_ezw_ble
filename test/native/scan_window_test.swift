@@ -1,5 +1,12 @@
 import Foundation
 
+// Logger EventChannel is a platform boundary; the gate remains production code.
+final class NativeLogSink {
+    var events: [String] = []
+    func emit(_ message: String) { events.append(message) }
+}
+enum BleEC { static let logger = NativeLogSink() }
+
 // Only the platform boundaries are spies. The Dart harness inserts the actual
 // BleManager methods below so these assertions exercise production scan policy.
 
