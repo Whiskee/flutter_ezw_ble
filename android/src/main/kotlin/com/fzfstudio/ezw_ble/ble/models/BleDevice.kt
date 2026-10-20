@@ -196,6 +196,13 @@ class BleDevice(
         return writeChars.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
     }
 
+    /** Freeze FILE's exact native characteristic as well as its physical GATT before reservation. */
+    internal fun writeTargetFor(psType: Int): Pair<BluetoothGatt, BluetoothGattCharacteristic>? {
+        val currentGatt = gatt ?: return null
+        val characteristic = writeAndReadList.firstOrNull { it.psType == psType }?.writeChars ?: return null
+        return currentGatt to characteristic
+    }
+
     /**
      * Business connected may only be committed after every configured private
      * service has an active write/read characteristic cache on the current GATT.
@@ -221,7 +228,11 @@ class BleDevice(
      * Android 13+ 会明确返回 `ERROR_GATT_WRITE_REQUEST_BUSY`；旧系统只有 Boolean，false
      * 无法区分瞬时 BUSY 与其它拒绝，因此先按可恢复背压处理，再由上层 4 秒 watchdog 收口。
      */
-    internal fun submitOtaCharacteristic(data: ByteArray, psType: Int): BleOtaWriteSubmission {
+    internal fun submitOtaCharacteristic(
+        data: ByteArray,
+        psType: Int,
+        expectedTarget: Pair<BluetoothGatt, BluetoothGattCharacteristic>? = null,
+    ): BleOtaWriteSubmission {
         if (data.isEmpty()) {
             return BleOtaWriteSubmission.rejected(status = null, reason = "empty OTA payload")
         }
@@ -232,6 +243,12 @@ class BleDevice(
                 status = null,
                 reason = "OTA write characteristic missing",
             )
+
+        // Validate and then use these local handles; a concurrent same-UUID reconnect cannot
+        // redirect an already-admitted FILE packet between Manager's check and the OS call.
+        if (expectedTarget != null && (currentGatt !== expectedTarget.first || writeChars !== expectedTarget.second)) {
+            return BleOtaWriteSubmission.rejected(null, "file physical write target changed")
+        }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             val status = currentGatt.writeCharacteristic(

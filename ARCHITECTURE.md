@@ -187,7 +187,9 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `sendCmd` | `Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0, bool allowDuringUpgrade = false, int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0, BleG2OtaContext? otaContext, BleBusinessConnectionAttempt? expectedAttempt})` | 普通命令 Future 到 channel/入队边界；可选 expectedAttempt 在 Android 原队列 dequeue 时复验 exact GATT。`psType` 是"私有服务类型"，对应 `BlePrivateService.type`（0=基础，1=OTA，2+=自定义）。升级态默认阻断非 OTA 写入；只有上层协议白名单确认的 AUTH、时间同步等恢复控制指令可显式传 `allowDuringUpgrade=true`。OTA 控制包携带正 `expectedSessionGeneration/expectedAttemptGeneration` 时，native 必须在实际 dispatch 前按当前物理 owner 校验；携带 `otaContext` 时还必须命中当前 G2 OTA transaction，避免旧 START/INFORMATION/RESULT 写入新 GATT 或越权清理。 |
 | `sendCmdNoWait` | `Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0, int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0, BleG2OtaContext? otaContext})` | OTA 连发入口。Android：`psType == 1` 走 per-endpoint `WRITE_TYPE_NO_RESPONSE` 队列；同步 BUSY 保留原包，Future 等本包 `onCharacteristicWrite` 成功后返回，4s 停滞/teardown typed fail，避免固定延时撞 GATT 单槽位。iOS：`psType == 1` 走 `WriteWithoutResponse` + `canSendWriteWithoutResponse` 背压队列（见 `ios/Classes/ble/OtaWriteQueue.swift` 与 `docs/IOS_OTA_NOWAIT_SPEC.md`）。OTA RAW 携带正 expected pair 时，native 在入队/提交前按当前物理 owner 校验；携带 `otaContext` 时还必须命中当前 G2 OTA transaction。其它 `psType` 保持历史 no-wait 语义。 |
 | `sendOtaPacketBatch` | `Future<void> sendOtaPacketBatch(String uuid, List<Uint8List> framedPackets, {int psType = 1, int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0})` | 批量接收已封装 OTA 小包但仍逐包提交；Future 等最后一包提交，失败丢弃本批剩余包。每包复验冻结的 exact physical pair。 |
-| `sendFilePacketBatch` | `Future<void> sendFilePacketBatch(String uuid, List<Uint8List> framedPackets, {int psType = 3})` | 文件 RAW 批量入口，与 OTA 共用实现但使用独立队列实例和 `file_write_*` typed error；升级取消不得误清文件批次。 |
+| `beginFilePacketBatch` | `Future<String> beginFilePacketBatch(String uuid)` | 在当前物理文件队列预留唯一、单次提交的 native token；busy / unavailable 拒绝，不提交数据。 |
+| `sendFilePacketBatch` | `Future<void> sendFilePacketBatch(String uuid, List<Uint8List> framedPackets, {int psType = 3, String? fileBatchToken})` | 文件 RAW 批量入口，与 OTA 使用独立队列和 `file_write_*` typed error。可选 token 必须来自同 endpoint 的有效 reservation；省略保持旧调用语义。 |
+| `cancelFilePacketBatch` | `Future<bool> cancelFilePacketBatch(String uuid, String fileBatchToken)` | 先退役匹配 reservation，再精确撤销其原生未提交尾包；已不存在返回 false。确认不表示撤回 OS 写入、物理 drain 或固件 ACK。 |
 | `beginG2OtaTransaction` | `Future<BleG2OtaTransactionResult> beginG2OtaTransaction({required String transactionId, required int generation, required String config, required String sn, required List<BleG2OtaEndpointIdentity> endpoints})` | 在首条 G2 OTA 指令前原子登记本轮事务、完整 endpoint 集合和初始物理 identity。重复相同 scope 幂等返回同一 native instance；参数冲突、空 identity、非正 generation 或旧 tombstone 必须拒绝。 |
 | `updateG2OtaEndpoint` | `Future<BleG2OtaTransactionResult> updateG2OtaEndpoint({required BleG2OtaContext context, required String uuid, required BleG2OtaEndpointAction action, int sessionGeneration = 0, int attemptGeneration = 0})` | 在同一事务内绑定真实连接、进入 recover，或将完成 endpoint 转为 `parked`。更新请求不重复携带 `config/SN/endpoints`；native 必须按 exact context 读取 begin 已冻结的 scope，不能把缺失的重复字段当成无效请求，也不能信任调用方补传的可变副本。`bind` 需要 live exact pair；`recover` 需要已登记旧 pair 的真实断连，或从未绑定的 waiting endpoint；`park` 使用已登记的正 exact pair，可在 GATT 已释放时隔离旧 transport。 |
 | `finishG2OtaTransaction` | `Future<BleG2OtaTransactionResult> finishG2OtaTransaction({required String transactionId, required int generation, required String reason, required String config, required String sn, required List<BleG2OtaEndpointIdentity> endpoints, String instanceId = ''})` | 整组退役入口。native 校验 begin 冻结的 transaction/config/SN/endpoint 集合，但 session/attempt 属于可变 physical lease，恢复重绑后不得拿调用方的旧 pair 拒绝合法 finish；实际 teardown 始终使用 registry 当前 exact pair。在同一串行域隔离队列、通知、回调和旧 owner，本地退役完成后一次性解除门禁并记录 terminal ledger。只有 `committed` / `alreadyCommitted` 证明退役完成。 |
@@ -206,6 +208,29 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `cleanConnectCache` | `Future<void> cleanConnectCache()` | 清"上次连接的设备"等连接缓存，不动 GATT。 |
 
 > **修改提示**：新增 MethodChannel 方法时，三处都要改：① `FlutterEzwBlePlatform`（抽象签名 + 默认 `UnimplementedError`）；② `MethodChannelEzwBle`（`@override` + `methodChannel.invokeMethod`）；③ 原生侧两个平台的 `onMethodCall` 分支。
+
+### 文件批次的精确撤权
+
+原生批量提交不能逐包调用 Dart 的动态 lease predicate。需要逻辑撤权的调用方应先
+`beginFilePacketBatch(uuid)`，在确认自己的 lease 仍有效后，只提交一次带 token 的批次；
+lease 失效时调用并等待 `cancelFilePacketBatch`。若 lease 在 begin 的 await 期间失效，
+仍须撤销返回的 token，不能把它提交或留给下一次请求。任一步桥接失败或超时都属于未知
+结果，不得降级无 token 发送，也不得据此宣布固件接收成功。
+
+- 每 endpoint 的文件队列最多持有一个 reservation，不建立取消 token 历史表。
+  token 由 native 随机生成并绑定创建时物理目标；成功、失败、精确取消或物理 teardown
+  都会在回调前退役它。未知、跨 endpoint、重复提交或已退役 token 均拒绝。
+- cancel-before-submit 先移除 reservation，之后迟到 send 无法重新注册；旧 cancel 不能
+  取消新 reservation。仅匹配批次的未提交尾包被删除，其 Future 失败一次，其它批次、
+  endpoint、common 和 OTA 工作不被批量清空。空 reservation 同样受 teardown 清理。
+- Android 已提交包不能从系统撤回；取消后保留 GATT callback drain barrier，旧回调只能
+  排空旧槽位，不得完成新批次。iOS 仍受 canSend、64 包软等待和 15 秒 stall 约束；取消
+  不回收预算，旧 timer / 回调不能恢复已撤销尾包或越过新等待。
+- 无 token 的历史 API 不具备逻辑 lease 撤权能力。新增 API 也不解决部分 iOS 设备持续
+  `canSendWriteWithoutResponse=false` 的兼容性问题，调用方的平台准入策略应独立保留。
+- 回归：`test/file_batch_owner_bridge_test.dart`、Android `BleFilePacketBatchOwnerTest`
+  和 `test/ios_ota_queue_native_test.dart` 的真实 Swift 队列 harness。host 测试不是双端
+  真机、固件 ACK 兼容性或吞吐证明。
 
 ---
 

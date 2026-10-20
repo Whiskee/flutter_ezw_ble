@@ -407,3 +407,15 @@ Dart 侧团队已完成 G2 队列重构(`even_connect` 仓库),为本次原生�
 - 回归入口：`fvm flutter test test/ios_ota_queue_native_test.dart test/ota_window_bridge_test.dart`（host Swift行为测试仅macOS执行）；SDK生产发送链路另见其 strict ACK 与window credit回归测试。
 
 当前A/B版本只保留定时器修复及观察埋点，不启用64包预算回收；是否恢复速度须固定手机、固件和构建配置做真机对比。没有修改MTU/4KB协议、真实ACK、固件处理或iOS无线调度。固件只有8位SS而无窗口nonce，不声称解决所有空口旧帧重放。
+
+## 12. 普通文件批次的可选逻辑撤权
+
+文件调用方可通过 `beginFilePacketBatch` 获取当前原生文件队列的单次 reservation，
+然后向 `sendFilePacketBatch` 传入 `fileBatchToken`。`cancelFilePacketBatch` 先退役该
+身份，再只删除匹配的未提交尾包并结束该批次 await；其它文件请求与 OTA 队列不被清空。
+取消前尚未提交的 reservation 也会失效，迟到 send 或旧 cancel 不能操作新 reservation。
+
+这不是 CoreBluetooth 写入撤回或固件 ACK。仍保留 64 包预算、500ms 软等待、100ms
+背压重查、15 秒 stall 与每包物理目标复验；精确取消不能清零预算或让旧 timer 驱动新
+批次。持续 canSend=false 的机型兼容性仍需调用方独立决策，不能用此接口绕过背压。
+完整桥接及生命周期契约见 [ARCHITECTURE](../ARCHITECTURE.md#文件批次的精确撤权)。

@@ -1,5 +1,7 @@
 package com.fzfstudio.ezw_ble.ble
 
+import java.util.UUID
+
 /** Android 对一次 `BluetoothGatt.writeCharacteristic` 同步提交的精确分类。 */
 internal class BleOtaWriteSubmission private constructor(
     val disposition: Disposition,
@@ -50,7 +52,7 @@ data class BleAndroidOtaBatchQueueMetrics(
  * 完成下一轮写入。其它错误、断连与超时均 fail closed，保证 Dart await 必有终态。
  *
  * OTA(psType=1) 与文件(psType=3) 各自持有独立实例，不共享 pending：退出升级只能取消 OTA
- * attempt，绝不能顺手清掉正在传输的文件批次。[channel] 只用于区分日志与 typed error 前缀。
+ * attempt，绝不能顺手清掉正在传输的文件批次。只有 FILE 可保留可精确撤销的 native token。
  */
 internal class BleAndroidOtaWriteQueue(
     private val endpoint: String,
@@ -59,12 +61,14 @@ internal class BleAndroidOtaWriteQueue(
     private val nowMillis: () -> Long,
     private val logger: (String) -> Unit = {},
     private val channel: String = BleWriteChannel.OTA,
+    private val fileTargetIsCurrent: () -> Boolean = { true },
 ) {
     /** 一批 framed OTA 小包共享一个 Dart Future；成功只在最后一包 callback 后结算。 */
     private class OtaWriteBatch(
         val completion: (BleOtaWriteError?) -> Unit,
         var remaining: Int,
         val metrics: ((BleAndroidOtaBatchQueueMetrics) -> Unit)? = null,
+        val fileBatchToken: String? = null,
         var settled: Boolean = false,
         var backpressureCount: Int = 0,
         var backpressureWaitMillis: Long = 0L,
@@ -108,7 +112,72 @@ internal class BleAndroidOtaWriteQueue(
     private var waitStartedAtMillis: Long? = null
     private var waitContributesToBatchMetrics = false
     private var watchdog: BleOtaWriteCancellable? = null
+    // Cancelled coroutine callbacks may already be queued; they cannot drive a new owner or
+    // clear its watchdog handle after exact cancellation/completion has installed a replacement.
+    private var watchdogGeneration = 0L
     private var lastBackpressure: BleOtaWriteSubmission? = null
+    // One native reservation per endpoint; retiring it is sufficient to reject delayed sends,
+    // without retaining an unbounded history of cancelled tokens across queue recreation.
+    private var fileBatchToken: String? = null
+    private var fileBatchSubmitted = false
+
+    /** Reserve exactly one future FILE batch; native UUIDs do not repeat after teardown. */
+    @Synchronized
+    fun beginFilePacketBatch(): String? {
+        if (channel != BleWriteChannel.FILE || fileBatchToken != null || !fileTargetIsCurrent()) {
+            return null
+        }
+        return UUID.randomUUID().toString().also {
+            fileBatchToken = it
+            fileBatchSubmitted = false
+        }
+    }
+
+    /** Begin must not issue a fresh token from a retained queue for an already-replaced target. */
+    val isFileTargetCurrent: Boolean
+        get() = fileTargetIsCurrent()
+
+    /** Admission failures before enqueue must also release their still-unused reservation. */
+    @Synchronized
+    fun retireUnsubmittedFilePacketBatch(token: String) {
+        if (fileBatchToken == token && !fileBatchSubmitted) {
+            retireFilePacketBatch(token)
+        }
+    }
+
+    /**
+     * Revoke before callbacks and remove only this owner's native-unsent tail. An OS-submitted
+     * write cannot be retracted; its old callback remains a barrier for every replacement batch.
+     */
+    @Synchronized
+    fun cancelFilePacketBatch(token: String): Boolean {
+        if (channel != BleWriteChannel.FILE || fileBatchToken != token) {
+            return false
+        }
+        val ownsCurrentWait = inFlight?.batch?.fileBatchToken == token ||
+            (inFlight == null && pending.firstOrNull()?.batch?.fileBatchToken == token)
+        retireFilePacketBatch(token)
+        val snapshot = buildList {
+            inFlight?.takeIf { it.batch?.fileBatchToken == token }?.let(::add)
+            addAll(pending.filter { it.batch?.fileBatchToken == token })
+        }
+        if (inFlight?.batch?.fileBatchToken == token) {
+            inFlight = null
+            cancelledInFlightCallbackPending = true
+        }
+        pending.removeAll { it.batch?.fileBatchToken == token }
+        if (snapshot.isNotEmpty()) {
+            // An owner queued behind an unrelated legacy write must not reset that write's
+            // existing four-second watchdog or trigger an extra native BUSY retry.
+            if (ownsCurrentWait) clearWait()
+            completeSnapshot(
+                snapshot,
+                BleOtaWriteError.cancelled(endpoint, "file batch revoked", snapshot.size, channel),
+            )
+            if (ownsCurrentWait) pump()
+        }
+        return true
+    }
 
     /** 包含已提交但尚未收到 GATT callback 的包，便于错误详情反映真实深度。 */
     val queueDepth: Int
@@ -154,16 +223,28 @@ internal class BleAndroidOtaWriteQueue(
         otaGeneration: Long = 0L,
         otaInstanceId: String = "",
         metrics: ((BleAndroidOtaBatchQueueMetrics) -> Unit)? = null,
+        fileBatchToken: String? = null,
         completion: (BleOtaWriteError?) -> Unit,
     ) {
+        if (fileBatchToken != null &&
+            (channel != BleWriteChannel.FILE || this.fileBatchToken != fileBatchToken || fileBatchSubmitted)
+        ) {
+            completion(BleOtaWriteError.unavailable(endpoint, "unknown or consumed file batch token", channel = channel))
+            return
+        }
         if (packets.isEmpty()) {
+            fileBatchToken?.let(::retireFilePacketBatch)
             completion(BleOtaWriteError.unavailable(endpoint, "empty batch", channel = channel))
             return
+        }
+        if (fileBatchToken != null) {
+            fileBatchSubmitted = true
         }
         val batch = OtaWriteBatch(
             completion = completion,
             remaining = packets.size,
             metrics = metrics,
+            fileBatchToken = fileBatchToken,
         )
         packets.forEach { packet ->
             pending.addLast(
@@ -254,6 +335,8 @@ internal class BleAndroidOtaWriteQueue(
      */
     @Synchronized
     fun cancelAttempt(reason: String) {
+        fileBatchToken = null
+        fileBatchSubmitted = false
         val hadInFlight = inFlight != null
         val snapshot = buildList {
             inFlight?.let(::add)
@@ -283,6 +366,9 @@ internal class BleAndroidOtaWriteQueue(
     /** 物理 GATT session 已失效时释放所有 Future，并丢弃旧 session 的 callback 屏障。 */
     @Synchronized
     fun cancelAll(reason: String) {
+        // Empty reservations have no queued Item, but physical teardown must revoke them too.
+        fileBatchToken = null
+        fileBatchSubmitted = false
         val snapshot = buildList {
             inFlight?.let(::add)
             addAll(pending)
@@ -391,6 +477,10 @@ internal class BleAndroidOtaWriteQueue(
             return false
         }
 
+        if (channel == BleWriteChannel.FILE && inFlight?.batch?.fileBatchToken != null) {
+            // A timeout does not release Android's physical slot any more than explicit cancel.
+            cancelledInFlightCallbackPending = true
+        }
         val snapshot = buildList {
             inFlight?.let(::add)
             addAll(pending)
@@ -422,18 +512,22 @@ internal class BleAndroidOtaWriteQueue(
         }
         if (error != null) {
             pending.removeAll { it.batch === batch }
+            batch.fileBatchToken?.let(::retireFilePacketBatch)
             batch.settle(error)
             return
         }
         batch.remaining -= 1
         if (batch.remaining <= 0) {
             logFileOnly { "[ezw_ble][$channel][android] batch completed endpoint=$endpoint pending=$queueDepth" }
+            batch.fileBatchToken?.let(::retireFilePacketBatch)
             batch.settle(null)
         }
     }
 
     /** 取消/停滞快照里同一批次只能回调一次，避免重复完成 Dart Future。 */
     private fun completeSnapshot(snapshot: List<Item>, error: BleOtaWriteError) {
+        // Retire all old identities before any callback can reserve a replacement.
+        snapshot.forEach { it.batch?.fileBatchToken?.let(::retireFilePacketBatch) }
         val settledBatches = mutableSetOf<OtaWriteBatch>()
         snapshot.forEach { item ->
             val batch = item.batch
@@ -442,6 +536,13 @@ internal class BleAndroidOtaWriteQueue(
             } else if (settledBatches.add(batch)) {
                 batch.settle(error)
             }
+        }
+    }
+
+    private fun retireFilePacketBatch(token: String) {
+        if (fileBatchToken == token) {
+            fileBatchToken = null
+            fileBatchSubmitted = false
         }
     }
 
@@ -458,8 +559,12 @@ internal class BleAndroidOtaWriteQueue(
         if (watchdog != null || queueDepth == 0) {
             return
         }
+        val generation = ++watchdogGeneration
         watchdog = scheduler.schedule(RETRY_INTERVAL_MILLIS) {
             synchronized(this) {
+                if (generation != watchdogGeneration) {
+                    return@synchronized
+                }
                 watchdog = null
                 if (queueDepth > 0) {
                     pump()
@@ -480,6 +585,7 @@ internal class BleAndroidOtaWriteQueue(
         waitStartedAtMillis = null
         waitContributesToBatchMetrics = false
         lastBackpressure = null
+        watchdogGeneration += 1L
         watchdog?.cancel()
         watchdog = null
     }

@@ -22,8 +22,13 @@ void main() {
     expect(channel, contains('SEND_FILE_PACKET_BATCH'));
     expect(
       channel,
-      contains('BleManager.instance.sendFilePacketBatch(uuid, packets, psType)'),
+      contains(
+          'BleManager.instance.sendFilePacketBatch(uuid, validPackets, psType, fileBatchToken as? String)'),
     );
+    // The opt-in owner must survive the bridge; native behavior tests verify
+    // exact cancellation without weakening the omitted-token legacy path.
+    expect(channel, contains('BEGIN_FILE_PACKET_BATCH'));
+    expect(channel, contains('CANCEL_FILE_PACKET_BATCH'));
 
     // 退出升级只能取消 OTA 队列；文件队列必须留给自己的 generation 收口。
     final cancelAttempt = manager.substring(
@@ -66,6 +71,11 @@ void main() {
     expect(manager, contains('func sendFilePacketBatch'));
     expect(manager, contains('channel: OtaWriteChannel.file'));
     expect(channel, contains('sendFilePacketBatch'));
+    expect(channel, contains('case .beginFilePacketBatch:'));
+    expect(channel, contains('case .cancelFilePacketBatch:'));
+    expect(
+        channel, contains('let token = jsonData["fileBatchToken"] as? String'));
+    expect(channel, contains('fileBatchToken: token,'));
 
     // peripheralIsReady 不区分通道，两条队列都要被唤醒，否则文件批次只能等兜底重查。
     final ready = manager.substring(
@@ -74,8 +84,10 @@ void main() {
     final readyBody = ready.substring(0, ready.indexOf('\n    }'));
     expect(readyBody, contains('let otaQueue = otaWriteQueues[uuid]'));
     expect(readyBody, contains('let fileQueue = fileWriteQueues[uuid]'));
-    expect(readyBody, contains('queue.onPeripheralReadyToSendWriteWithoutResponse()'));
-    expect(readyBody, contains('fileQueue?.onPeripheralReadyToSendWriteWithoutResponse()'));
+    expect(readyBody,
+        contains('queue.onPeripheralReadyToSendWriteWithoutResponse()'));
+    expect(readyBody,
+        contains('fileQueue?.onPeripheralReadyToSendWriteWithoutResponse()'));
   });
 
   test('both platforms keep the file batch behind the upgrade gate', () {
