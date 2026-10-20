@@ -807,7 +807,10 @@ GATT 创建路径（前台、passive 自动回连、扫描可见后的 direct �
 高可靠配置以 1M 建链。`autoConnect=true` 的 `connectGatt` PHY 参数按 Android 官方语义不会
 生效，因此 passive 路径仍需在真实 `STATE_CONNECTED` 后调用 `setPreferredPhy`。连接后每 5 秒
 读取一次 RSSI：`>= -60dBm` 才偏好 2M，`<= -70dBm` 回退 1M，中间区保持现状；实际 PHY 以
-`onPhyUpdate` 为准。初始 GATT/鉴权突发与真实 notify/write 活动使用 HIGH connection priority，
+`onPhyUpdate` 为准。高可靠模式的 GATT ready 与 OTA 准入入口不得绕过自适应策略另发 2M
+请求，否则会使 callback 保存的请求偏好与控制器请求失配，持续弱信号时无法触发 1M 回退；
+普通模式仍在这两个入口请求 2M。请求序列测试不代表外设最终协商到该 PHY。
+初始 GATT/鉴权突发与真实 notify/write 活动使用 HIGH connection priority，
 连续空闲 10 秒恢复 BALANCED，避免把 G2 全天常驻连接固定成高功耗参数。RSSI/PHY/priority
 失败只记录诊断，不改变 Gate owner、GATT readiness 或业务 connected 语义。
 

@@ -3,7 +3,8 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  test('Android requests LE 2M PHY after GATT ready and OTA enter', () {
+  test('Android ordinary mode requests LE 2M after GATT ready and OTA enter',
+      () {
     final helper = File(
       'android/src/main/kotlin/com/fzfstudio/ezw_ble/ble/BleAndroidPreferredPhy.kt',
     ).readAsStringSync();
@@ -19,6 +20,12 @@ void main() {
     expect(helper, contains('setPreferredPhy'));
     expect(helper, contains('readPhy()'));
     expect(callback, contains('reason = "connectFinish"'));
+    // Runtime callback/Manager coverage lives in BleHighReliabilityPhyTest;
+    // keep this cross-platform wiring check explicit about the mode boundary.
+    expect(
+      callback,
+      contains('if (!device.belongConfig.androidHighReliabilityMode)'),
+    );
     expect(callback, contains('override fun onPhyUpdate'));
     expect(
       RegExp(r'override fun onPhyUpdate\(').allMatches(callback),
@@ -29,6 +36,10 @@ void main() {
     expect(callback, contains('override fun onPhyRead'));
     expect(helper, contains('isLe2MPhySupported'));
     expect(manager, contains('reason = "enterUpgradeState"'));
+    expect(
+      manager,
+      contains('if (!connectedDevice.belongConfig.androidHighReliabilityMode)'),
+    );
     expect(manager, contains('logAdapterCapability'));
     expect(ios, contains('logLe2mPhyUnavailable'));
     expect(ios, isNot(contains('setPreferredPHY(')));
