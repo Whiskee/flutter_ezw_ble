@@ -170,6 +170,14 @@ episode，使旧 timer 在取消、reset 或新 attempt 建立后不能驱动新
 沿现有直写兜底用新 syncId 重发整个 RAW 窗口；非零/无效证据继续保守恢复，旧 SDK 不变。
 本地队列清空不等于 CoreBluetooth drain 或固件 ACK，进度仍只认真实协议响应。
 
+普通 `file` batch 虽复用队列实现，但使用独立实例且没有 OTA recovery owner。
+`file_write_stalled` 只永久撤销失败事务的未提交尾包；错误回调前的 `pending` /
+`remainingPending` 口径与上述一致。退役完成后，其它已准入及新 file 事务可以继续，
+但必须重新检查真实 `canSend`、使用全新的 15 秒等待；不得重放失败事务或清除其它 owner。
+每包还须通过当前 file queue 注册、相同物理 peripheral/characteristic、manager 可用及
+升级 gate 校验。回调重入若建立新等待/软节流或执行 teardown，旧 continuation/timer
+不得覆盖它。OTA 的 stalled gate、真实 ACK、64 包节流及恢复协议均不因此改变。
+
 ### 4.3 兜底路径
 
 若该 characteristic 不声明 `.writeWithoutResponse` property(理论上 OTA
