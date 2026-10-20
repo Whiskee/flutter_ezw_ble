@@ -2397,7 +2397,7 @@ extension BleManager {
         }
         let target = OtaWriteTarget(
             characteristicUUID: writeChars.uuid.uuidString,
-            submit: { [weak self, device] peripheral, value in
+            submit: { [weak self, weak queue, device] peripheral, value in
                 // 背压之后再次提交时仍须属于入队 owner，不能让旧批次进入重连后的链路。
                 guard let self = self,
                       self.validateOtaWriteIdentity(
@@ -2412,6 +2412,12 @@ extension BleManager {
                 guard let cbPeripheral = peripheral as? CBPeripheral else {
                     return false
                 }
+                if psType == BlePsTypeValue.file,
+                   !self.canSubmitFilePacket(uuid: uuid, psType: psType, queue: queue,
+                       peripheral: cbPeripheral, expectedPeripheral: device.peripheral,
+                       characteristic: writeChars) {
+                    return false
+                }
                 cbPeripheral.writeValue(value, for: writeChars, type: .withoutResponse)
                 return true
             }
@@ -2424,6 +2430,28 @@ extension BleManager {
             metrics: metricsRequested ? { metrics in queueMetrics = metrics } : nil,
             result: batchResult
         )
+    }
+
+    /// A retired file transaction can resume unrelated work without an OTA
+    /// disconnect. Validate the still-registered physical target on every packet,
+    /// including after a reentrant error callback changes the manager or gate.
+    private func canSubmitFilePacket(uuid: String, psType: Int, queue: OtaWriteQueue?,
+        peripheral: CBPeripheral, expectedPeripheral: CBPeripheral,
+        characteristic: CBCharacteristic) -> Bool {
+        guard let queue = queue,
+              fileWriteQueues[uuid] === queue,
+              checkIsFunctionCanBeCalled(),
+              upgradeStateRegistry.canSend(endpointId: uuid, psType: psType),
+              peripheral === expectedPeripheral,
+              peripheral.state == .connected,
+              let current = connectedDevices.first(where: {
+                  $0.peripheral.identifier.uuidString == uuid
+              }),
+              current.peripheral === peripheral,
+              current.writeCharsDic[psType] === characteristic else {
+            return false
+        }
+        return true
     }
 
     /// OTA 错误 details 需要带上当前 native pending 深度，帮助区分“尚未提交”和“已提交后设备无 ack”。

@@ -3,7 +3,7 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  test('native OTA timer ownership and observation-only real ACK regressions',
+  test('native OTA/file timer ownership and observation-only ACK regressions',
       () async {
     final directory = await Directory.systemTemp.createTemp('ota-queue-test-');
     addTearDown(() => directory.delete(recursive: true));
@@ -49,5 +49,28 @@ void main() {
           reason: '${target.key}: ${run.stdout}\n${run.stderr}');
       stdout.write(run.stdout);
     }
+
+    // Exercise the exact private production validator, not a duplicated policy.
+    // Identity-only fakes let every revoked-target branch run without hardware.
+    final manager = File('ios/Classes/ble/BleManager.swift').readAsStringSync();
+    final start = manager.indexOf('    private func canSubmitFilePacket(');
+    final end = manager.indexOf('\n    /// OTA 错误 details', start);
+    expect(start, isNonNegative);
+    expect(end, greaterThan(start));
+    expect(manager, contains('!self.canSubmitFilePacket(uuid: uuid'));
+    final template =
+        File('test/native/file_write_target_test.swift').readAsStringSync();
+    final source = File('${directory.path}/file-target.swift');
+    await source.writeAsString(template.replaceFirst(
+      '    // PRODUCTION_FILE_TARGET_VALIDATOR',
+      manager.substring(start, end),
+    ));
+    final executable = '${directory.path}/file-target';
+    final compile = await Process.run(
+        'swiftc', ['-parse-as-library', source.path, '-o', executable]);
+    expect(compile.exitCode, 0, reason: '${compile.stdout}\n${compile.stderr}');
+    final run = await Process.run(executable, const []);
+    expect(run.exitCode, 0, reason: '${run.stdout}\n${run.stderr}');
+    stdout.write(run.stdout);
   }, skip: !Platform.isMacOS);
 }
