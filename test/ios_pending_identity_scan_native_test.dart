@@ -36,6 +36,7 @@ void main() {
       'ios/Classes/ble/BleScanPipeline.swift',
       'ios/Classes/ble/BlePendingReconnectIdentity.swift',
       'ios/Classes/ble/BleRecoveryActivationGate.swift',
+      'ios/Classes/ble/BleReconnectFailurePolicy.swift',
       'ios/Classes/ble/models/BleDevice.swift',
       'ios/Classes/ble/models/BleScan.swift',
       'ios/Classes/ble/models/BleMacRule.swift',

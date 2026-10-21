@@ -216,6 +216,8 @@ class BleManager: NSObject {
     /// Dart 在 available 后读取此值并随 activation 回传，防止连续 reset 时第一轮
     /// 迟到 session 消费第二轮门禁。它只参与准入，不持久化也不替代 physical attempt。
     private(set) var currentTransportRecoveryEpoch: Int64 = 0
+    /// Object lifetime is independent of recovery activation and ordinary off/on.
+    let peripheralValidity = BlePeripheralValidityRegistry()
     /// 同一轮 resetting/unknown/poweredOff 连续状态只推进一次 epoch。
     private var isTransportRecoveryCycleActive = false
     //  - 最近一次已输出的扫描配置签名，用于避免每次 startScan 都重复刷配置详情。
@@ -254,6 +256,7 @@ class BleManager: NSObject {
     /// 状态也必须取得同一周期 epoch，不能创建 recoveryEpoch=0 的暂停 task。
     @discardableResult
     func beginTransportRecoveryCycleIfNeeded() -> Int64 {
+        peripheralValidity.observeTransportState(rawValue: centralManager.state.rawValue)
         if !isTransportRecoveryCycleActive {
             currentTransportRecoveryEpoch =
                 currentTransportRecoveryEpoch == Int64.max
@@ -1388,6 +1391,25 @@ extension BleManager {
             return nil
         }
         return metadata
+    }
+
+    /// Validate before any UUID-wide terminal teardown/adoption. A late pre-reset
+    /// object must not terminate a newer object or recreate its session owner.
+    func acceptsCurrentPeripheralCallback(_ peripheral: CBPeripheral) -> Bool {
+        guard peripheralValidity.isValid(peripheral) else { return false }
+        let uuid = peripheral.identifier.uuidString
+        if let admission = currentConnectionAdmission(uuid: uuid) {
+            return peripheralConnectionSessions[admission.sessionId]?.peripheral === peripheral
+        }
+        if let committed = connectedDevices.first(where: {
+            $0.peripheral.identifier == peripheral.identifier && $0.isConnected
+        }) {
+            return committed.peripheral === peripheral
+        }
+        if restorationCoordinator.contains(uuid: uuid) {
+            return restorationCoordinator.owns(peripheral)
+        }
+        return true
     }
 
     private func currentAdmissionOwnsPeripheral(_ peripheral: CBPeripheral) -> BleConnectionAdmission? {
@@ -2924,7 +2946,11 @@ extension BleManager {
         BleSynchronousCoreBluetoothLookup.retrieve(
             isAppActive: allowsSynchronousCoreBluetoothLookup,
             isBluetoothPoweredOn: centralManager.state == .poweredOn,
-            query: { centralManager.retrieveConnectedPeripherals(withServices: serviceUUIDs) },
+            query: {
+                let peripherals = centralManager.retrieveConnectedPeripherals(withServices: serviceUUIDs)
+                peripherals.forEach { peripheralValidity.observe($0) }
+                return peripherals
+            },
             onDeferred: {
                 loggerD(msg: "appLifecycle: defer retrieveConnectedPeripherals context=\(context), central=\(centralManager.state.label)")
             }
@@ -2944,7 +2970,11 @@ extension BleManager {
         BleSynchronousCoreBluetoothLookup.retrieve(
             isAppActive: allowsSynchronousCoreBluetoothLookup,
             isBluetoothPoweredOn: centralManager.state == .poweredOn,
-            query: { centralManager.retrievePeripherals(withIdentifiers: identifiers) },
+            query: {
+                let peripherals = centralManager.retrievePeripherals(withIdentifiers: identifiers)
+                peripherals.forEach { peripheralValidity.observe($0) }
+                return peripherals
+            },
             onDeferred: {
                 loggerD(msg: "appLifecycle: defer retrievePeripherals context=\(context), central=\(centralManager.state.label)")
             }
@@ -3004,6 +3034,7 @@ extension BleManager {
         // 静默，沙盒日志的最后一行就能指认它（2026-09-07 18:22 进程静默原因待证）。
         loggerD(msg: "appLifecycle: state restoration launch retrieve begin uuid=\(endpointId), context=\(context)")
         let retrieved = centralManager.retrievePeripherals(withIdentifiers: [identifier]).first
+        if let retrieved { peripheralValidity.observe(retrieved) }
         recordAutoReconnectEvent(
             type: "ios_sr_launch_retrieve",
             uuid: endpointId,
@@ -3816,6 +3847,13 @@ extension BleManager {
                 return
             }
             let nsError = error as NSError?
+            // This callback already proved exact admission + peripheral identity.
+            // Freeze Code 1's deadline before terminal cleanup schedules anything.
+            registerInvalidParametersFailure(
+                peripheral: peripheral,
+                error: nsError,
+                sessionGeneration: admission.sessionGeneration
+            )
             let hasAutoReconnectTask = reconnectTasks.values.contains { task in
                 isSameConnectTarget(
                     storedUuid: task.uuid,
@@ -3872,6 +3910,16 @@ extension BleManager {
             loggerE(msg: "\(logHead) \(peripheral.identifier.uuidString), not my connected device")
             return
         }
+        guard myDevice.peripheral === peripheral,
+              peripheralValidity.isValid(peripheral) else {
+            loggerD(msg: "didDisconnect: stale cached peripheral ignored")
+            return
+        }
+        registerInvalidParametersFailure(
+            peripheral: peripheral,
+            error: error as NSError?,
+            sessionGeneration: reconnectTasks[reconnectKey(uuid: peripheral.identifier.uuidString)]?.lastConnectedGeneration ?? 0
+        )
         //  3、error 为空不一定是用户主动断连。蓝牙关闭 / 系统回收 CoreBluetooth
         //     pending 连接时也可能给 nil error；只要当前是系统蓝牙不可用，或该设备仍有
         //     autoReconnect 任务，就必须按系统断连处理，避免误清长期回连意图。
@@ -4575,6 +4623,8 @@ extension BleManager: CBCentralManagerDelegate {
      *  蓝牙状态监听
      */
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        // Invalidate objects before terminal projection can schedule a retry.
+        peripheralValidity.observeTransportState(rawValue: central.state.rawValue)
         BleEC.bleState.emit(central.state.rawValue)
         //  1、如果蓝牙状态不是开启，则将所有已连接的设备设置为非连接状态
         if central.state != .poweredOn {
@@ -4668,6 +4718,7 @@ extension BleManager: CBCentralManagerDelegate {
     }
     
     func centralManager(_ central: CBCentralManager, connectionEventDidOccur event: CBConnectionEvent, for peripheral: CBPeripheral) {
+        guard acceptsCurrentPeripheralCallback(peripheral) else { return }
         let uuid = peripheral.identifier.uuidString
         let name = peripheral.name ?? ""
         recordAutoReconnectEvent(
@@ -4752,13 +4803,15 @@ extension BleManager: CBCentralManagerDelegate {
         loggerE(msg: "didDisconnectPeripheral: timestamp = \(timestamp), isReconnecting = \(isReconnecting), error = \(String(describing: error))")
         runtimeCommonNotifications.terminal(uuid: peripheral.identifier.uuidString, peripheralId: ObjectIdentifier(peripheral))
         if consumePeripheralCancellationBarrier(peripheral) { return }
+        guard acceptsCurrentPeripheralCallback(peripheral) else { return }
         recordPhysicalTrace(peripheral, event: "disconnected")
         if shouldStateRestorationEscrowHandleTerminal(peripheral) && handleStateRestorationEscrowTerminal(
             peripheral,
             systemIsReconnecting: isReconnecting,
+            invalidParameters: BleInvalidParametersBackoff.matches(domain: (error as NSError?)?.domain, code: (error as NSError?)?.code),
             reason: "didDisconnect isReconnecting=\(isReconnecting)"
         ) { return }
-        if isReconnecting {
+        if isReconnecting && !BleInvalidParametersBackoff.matches(domain: (error as NSError?)?.domain, code: (error as NSError?)?.code) {
             // 系统已持有 reconnect 时只结束旧业务 session 并重建 admission；再次 connect/cancel
             // 会破坏 CoreBluetooth 的自动回连 rendezvous。
             handleConnectState(
@@ -4785,6 +4838,7 @@ extension BleManager: CBCentralManagerDelegate {
             loggerD(msg: "admission gate: \(peripheral.identifier.uuidString), stale didConnect blocked by cancellation barrier")
             return
         }
+        guard acceptsCurrentPeripheralCallback(peripheral) else { return }
         if handleStateRestorationEscrowDidConnect(peripheral) { return }
         //  1、检查是否获取到了蓝牙配置
         guard let connectRequest = findActiveConnectRequest(peripheral: peripheral),
@@ -4803,9 +4857,11 @@ extension BleManager: CBCentralManagerDelegate {
      */
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         if consumePeripheralCancellationBarrier(peripheral) { return }
+        guard acceptsCurrentPeripheralCallback(peripheral) else { return }
         if shouldStateRestorationEscrowHandleTerminal(peripheral) && handleStateRestorationEscrowTerminal(
             peripheral,
             systemIsReconnecting: false,
+            invalidParameters: BleInvalidParametersBackoff.matches(domain: (error as NSError?)?.domain, code: (error as NSError?)?.code),
             reason: "didFailToConnect error=\(String(describing: error))"
         ) { return }
         handleConnectError(peripheral: peripheral, error: error, formMethod: "didFailToConnect")
@@ -4817,10 +4873,12 @@ extension BleManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         runtimeCommonNotifications.terminal(uuid: peripheral.identifier.uuidString, peripheralId: ObjectIdentifier(peripheral))
         if consumePeripheralCancellationBarrier(peripheral) { return }
+        guard acceptsCurrentPeripheralCallback(peripheral) else { return }
         recordPhysicalTrace(peripheral, event: "disconnected")
         if shouldStateRestorationEscrowHandleTerminal(peripheral) && handleStateRestorationEscrowTerminal(
             peripheral,
             systemIsReconnecting: false,
+            invalidParameters: BleInvalidParametersBackoff.matches(domain: (error as NSError?)?.domain, code: (error as NSError?)?.code),
             reason: "didDisconnect legacy error=\(String(describing: error))"
         ) { return }
         handleConnectError(peripheral: peripheral, error: error, formMethod: "didDisconnectPeripheral")

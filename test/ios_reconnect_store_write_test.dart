@@ -63,6 +63,8 @@ ${_method(coordinator, '    func armReconnectTarget(')}
           '-O',
           productionStore.path,
           productionMethods.path,
+          // Reconnect owners carry the real Code 1 episode policy after merge.
+          'ios/Classes/ble/BleReconnectFailurePolicy.swift',
           'ios/Classes/ble/BleConnectionAdmissionGate.swift',
           'ios/Classes/ble/BleG2OtaTransactionRegistry.swift',
           'test/native/reconnect_store_write_test.swift',

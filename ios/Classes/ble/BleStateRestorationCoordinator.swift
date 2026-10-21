@@ -26,15 +26,25 @@ enum BleStateRestorationEscrowAction: Equatable {
     case keepPending
     case holdConnected
     case rearm
+    /// Invalid parameters cannot spin an ownerless escrow reconnect loop. Keep
+    /// the target available for the next exact Dart claim instead of reconnecting.
+    case deferUntilClaim
 }
 
 /// 可独立测试的 UUID 状态机；CBPeripheral 引用由 coordinator 另行持有。
 final class BleStateRestorationEscrowStateMachine {
     private var states: [String: BleStateRestorationEscrowState] = [:]
+    /// Ownerless escrow has no business retry episode. A real Code 1 parks it
+    /// until exact activation claims it, including repeated lifecycle rearm.
+    private var invalidParametersAwaitingClaim: Set<String> = []
 
     var countForTesting: Int { states.count }
 
     func stage(endpointId: String, peripheralState: CBPeripheralState) -> BleStateRestorationEscrowAction {
+        if invalidParametersAwaitingClaim.contains(endpointId), peripheralState != .connected {
+            states[endpointId] = .idle
+            return .deferUntilClaim
+        }
         switch peripheralState {
         case .connected:
             states[endpointId] = .connected
@@ -61,22 +71,36 @@ final class BleStateRestorationEscrowStateMachine {
         return .holdConnected
     }
 
-    func didTerminate(endpointId: String, systemIsReconnecting: Bool) -> BleStateRestorationEscrowAction {
+    func didTerminate(endpointId: String, systemIsReconnecting: Bool, invalidParameters: Bool = false) -> BleStateRestorationEscrowAction {
         guard states[endpointId] != nil else { return .ignore }
+        if invalidParameters { invalidParametersAwaitingClaim.insert(endpointId) }
+        if invalidParametersAwaitingClaim.contains(endpointId) {
+            states[endpointId] = .idle
+            return .deferUntilClaim
+        }
         states[endpointId] = .pending
         return systemIsReconnecting ? .keepPending : .rearm
     }
 
     func claim(endpointId: String) -> BleStateRestorationEscrowState? {
-        states.removeValue(forKey: endpointId)
+        invalidParametersAwaitingClaim.remove(endpointId)
+        return states.removeValue(forKey: endpointId)
+    }
+
+    func canRearm(endpointId: String) -> Bool {
+        !invalidParametersAwaitingClaim.contains(endpointId)
     }
 
     func remove(endpointIds: Set<String>) {
-        endpointIds.forEach { states.removeValue(forKey: $0) }
+        endpointIds.forEach {
+            states.removeValue(forKey: $0)
+            invalidParametersAwaitingClaim.remove($0)
+        }
     }
 
     func reset() {
         states.removeAll()
+        invalidParametersAwaitingClaim.removeAll()
     }
 }
 
@@ -87,6 +111,8 @@ struct BleStateRestorationEscrowClaim {
     /// escrow 期间系统对该 peripheral 发出过 `peerConnected` connection event 的时刻；
     /// claim 时对象仍为 `.connecting` 说明 restored pending 请求可能已不再绑定该链路。
     var peerConnectedObservedAt: Date? = nil
+    /// Preserve the ownerless Code 1 deadline when Dart claims the endpoint.
+    var invalidParametersBackoff = BleInvalidParametersBackoff()
 }
 
 /**
@@ -110,6 +136,9 @@ final class BleStateRestorationCoordinator {
     private var powerOnRearmDeferrals: Set<String> = []
     /// escrow 期间收到系统 `peerConnected` 但对象仍非 `.connected` 的 endpoint 及时刻。
     private var peerConnectedObservations: [String: Date] = [:]
+    /// No timer runs before account claim; its exact endpoint debt transfers to
+    /// the regular reconnect owner, where the single scheduler enforces it.
+    private var invalidParametersBackoffs: [String: BleInvalidParametersBackoff] = [:]
 
     /**
      *  是否存在等待恢复的 peripheral。
@@ -148,6 +177,11 @@ final class BleStateRestorationCoordinator {
         }
     }
 
+    /// UUID identifies the endpoint; only its exact current object owns callbacks.
+    func owns(_ peripheral: CBPeripheral) -> Bool {
+        pendingPeripherals.contains { $0 === peripheral }
+    }
+
     /// activation 开始时把当前已知 escrow 全部纳入认领窗口；重复调用只会扩大窗口。
     func markClaimWindowSnapshot() {
         claimWindowSequence = max(claimWindowSequence ?? 0, escrowSequence)
@@ -182,7 +216,7 @@ final class BleStateRestorationCoordinator {
 
     /// 物理连接在 claim 前完成时只更新 escrow，不进入 GATT readiness。
     func didConnect(_ peripheral: CBPeripheral) -> BleStateRestorationEscrowAction {
-        guard pendingPeripherals.contains(where: { $0.identifier == peripheral.identifier }) else {
+        guard pendingPeripherals.contains(where: { $0 === peripheral }) else {
             return .ignore
         }
         return stateMachine.didConnect(endpointId: peripheral.identifier.uuidString)
@@ -191,17 +225,40 @@ final class BleStateRestorationCoordinator {
     /// escrow terminal 每次只返回一个动作：系统已重连则保留，否则补一条 pending connect。
     func didTerminate(
         _ peripheral: CBPeripheral,
-        systemIsReconnecting: Bool
+        systemIsReconnecting: Bool,
+        invalidParameters: Bool = false,
+        now: TimeInterval = ProcessInfo.processInfo.systemUptime
     ) -> BleStateRestorationEscrowAction {
-        guard pendingPeripherals.contains(where: { $0.identifier == peripheral.identifier }) else {
+        guard pendingPeripherals.contains(where: { $0 === peripheral }) else {
             return .ignore
+        }
+        let endpoint = peripheral.identifier.uuidString
+        if invalidParameters, stateMachine.canRearm(endpointId: endpoint) {
+            // A duplicated terminal while parked is still the same attempt.
+            var debt = invalidParametersBackoffs[endpoint] ?? BleInvalidParametersBackoff()
+            debt.registerFailure(now: now)
+            invalidParametersBackoffs[endpoint] = debt
         }
         // 链路已终止，此前的 peerConnected 证据随之失效。
         peerConnectedObservations.removeValue(forKey: peripheral.identifier.uuidString)
         return stateMachine.didTerminate(
             endpointId: peripheral.identifier.uuidString,
-            systemIsReconnecting: systemIsReconnecting
+            systemIsReconnecting: systemIsReconnecting,
+            invalidParameters: invalidParameters
         )
+    }
+
+    /// A lifecycle/scan activation may reach the long-lived owner before a Dart
+    /// claim. All entries must observe the same endpoint debt during that gap.
+    func invalidParametersBackoff(uuid: String) -> BleInvalidParametersBackoff? {
+        invalidParametersBackoffs[uuid]
+    }
+
+    /// Old power-on debts and repeated restoration callbacks cannot rearm a
+    /// Code 1 escrow while it is waiting for an exact business owner claim.
+    func canRearm(_ peripheral: CBPeripheral) -> Bool {
+        pendingPeripherals.contains { $0 === peripheral } &&
+            stateMachine.canRearm(endpointId: peripheral.identifier.uuidString)
     }
 
     /**
@@ -216,6 +273,7 @@ final class BleStateRestorationCoordinator {
         entrySequences.removeAll()
         powerOnRearmDeferrals.removeAll()
         peerConnectedObservations.removeAll()
+        invalidParametersBackoffs.removeAll()
         stateMachine.reset()
         return peripherals
     }
@@ -240,6 +298,7 @@ final class BleStateRestorationCoordinator {
             entrySequences.removeValue(forKey: $0)
             powerOnRearmDeferrals.remove($0)
             peerConnectedObservations.removeValue(forKey: $0)
+            invalidParametersBackoffs.removeValue(forKey: $0)
         }
         stateMachine.remove(endpointIds: drainedIds)
         return drained
@@ -295,7 +354,8 @@ final class BleStateRestorationCoordinator {
         return BleStateRestorationEscrowClaim(
             peripheral: peripheral,
             state: state,
-            peerConnectedObservedAt: peerConnectedObservedAt
+            peerConnectedObservedAt: peerConnectedObservedAt,
+            invalidParametersBackoff: invalidParametersBackoffs.removeValue(forKey: peripheral.identifier.uuidString) ?? BleInvalidParametersBackoff()
         )
     }
 
@@ -313,6 +373,7 @@ final class BleStateRestorationCoordinator {
             entrySequences.removeValue(forKey: $0)
             powerOnRearmDeferrals.remove($0)
             peerConnectedObservations.removeValue(forKey: $0)
+            invalidParametersBackoffs.removeValue(forKey: $0)
         }
         stateMachine.remove(endpointIds: removedIds)
         return removed
@@ -328,6 +389,7 @@ final class BleStateRestorationCoordinator {
         powerOnRearmDeferrals.removeAll()
         peerConnectedObservations.removeAll()
         claimWindowSequence = nil
+        invalidParametersBackoffs.removeAll()
         stateMachine.reset()
         return peripherals
     }

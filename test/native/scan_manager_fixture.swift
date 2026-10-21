@@ -62,6 +62,7 @@ extension CBPeripheral {
 
 final class BleManager {
     let centralManager = CBCentralManager()
+    let peripheralValidity = BlePeripheralValidityRegistry()
     var currentTransportRecoveryEpoch: Int64 = 4
     var pendingReconnectIdentities: [String: BlePendingReconnectIdentity] = [:]
     var scanResultTemp: [(BleDevice, CBPeripheral)] = []
@@ -93,6 +94,12 @@ final class BleManager {
     func resumePeerPairingRecoveryIfMatched(peripheral: CBPeripheral, advertisedName: String, belongConfig: String, advertisedMac: String, rssi: Int) -> Bool {
         peerPairingCalls += 1
         return false
+    }
+    // UUID wake belongs to the reconnect coordinator; this fixture executes the
+    // real scan pipeline and observes only its validated wake boundary.
+    var validatedWakeCalls = 0
+    func resumeDeferredReconnectFromFreshAdvertisement(peripheral: CBPeripheral, advertisedName: String, belongConfig: String, sn: String, mac: String, rssi: Int) {
+        validatedWakeCalls += 1
     }
     func stopScan() {}
     func cancelScanConnectTimeout(uuid: String, name: String) {}

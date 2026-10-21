@@ -47,6 +47,13 @@ extension BleManager {
             loggerD(msg: "stateRestoration: ignore connection event for non-target uuid=\(peripheral.identifier.uuidString), name=\(peripheral.name ?? ""), state=\(peripheral.state.rawValue)")
             return
         }
+        // Explicit restoration is a new CoreBluetooth object provenance. Ordinary
+        // terminal callbacks never renew a peripheral invalidated by reset.
+        if source == "willRestoreState" {
+            peripheralValidity.observe(peripheral)
+        } else {
+            guard acceptsCurrentPeripheralCallback(peripheral) else { return }
+        }
         peripheral.delegate = self
         let action = restorationCoordinator.enqueue(peripheral)
         recordAutoReconnectEvent(
@@ -87,14 +94,25 @@ extension BleManager {
     func handleStateRestorationEscrowTerminal(
         _ peripheral: CBPeripheral,
         systemIsReconnecting: Bool,
+        invalidParameters: Bool = false,
         reason: String
     ) -> Bool {
+        // Freeze whether this is the first exact terminal before coordinator
+        // parks it. Stop a system-owned pending Code 1 once, without creating a
+        // cancellation barrier that could swallow the next legitimate owner.
+        let wasRearmable = restorationCoordinator.canRearm(peripheral)
         let action = restorationCoordinator.didTerminate(
             peripheral,
-            systemIsReconnecting: systemIsReconnecting
+            systemIsReconnecting: systemIsReconnecting,
+            invalidParameters: invalidParameters
         )
         guard action != .ignore else { return false }
-        if action == .rearm {
+        if action == .deferUntilClaim {
+            if invalidParameters && systemIsReconnecting && wasRearmable {
+                centralManager.cancelPeripheralConnection(peripheral)
+            }
+            loggerD(msg: "stateRestoration: Code 1 escrow deferred until exact claim uuid=\(peripheral.identifier.uuidString)")
+        } else if action == .rearm {
             rearmStateRestorationEscrow(peripheral, reason: reason)
         } else {
             loggerD(msg: "stateRestoration: escrow keep system pending uuid=\(peripheral.identifier.uuidString), reason=\(reason)")
@@ -104,6 +122,7 @@ extension BleManager {
 
     /// escrow 只调用 CoreBluetooth connect；正式 admission 必须等 Dart target claim。
     private func rearmStateRestorationEscrow(_ peripheral: CBPeripheral, reason: String) {
+        guard restorationCoordinator.canRearm(peripheral) else { return }
         // 只为当前账号的目标补 pending connect。willRestoreState 也可能交还旧眼镜的
         // ANCS 右腿（已 .disconnected）：为它 connect 只会让本 central 再次抱住旧设备，
         // 随后每次 finalize 都要 cancel、下次重启又被交还。非目标留在 escrow 等 finalize 丢弃。
@@ -124,7 +143,7 @@ extension BleManager {
             loggerD(msg: "stateRestoration: escrow rearm deferred until poweredOn uuid=\(peripheral.identifier.uuidString), reason=\(reason), state=\(centralManager.state.rawValue)")
             return
         }
-        connectPeripheral(peripheral, autoReconnect: true)
+        guard connectPeripheral(peripheral, autoReconnect: true) else { return }
         recordAutoReconnectEvent(
             type: "ios_restore_escrow_rearm",
             uuid: peripheral.identifier.uuidString,

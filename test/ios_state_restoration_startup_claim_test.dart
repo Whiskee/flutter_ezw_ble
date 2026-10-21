@@ -79,7 +79,8 @@ void main() {
       // 契约后它携带 mode，并声明此前没有 owner（ownerExistedBeforeActivation=false）。
       final fallbackStart = reconnect.indexOf(
         'activateArmedReconnectTask(',
-        reconnect.indexOf('reason: "restoredPeripheralClaimed"'),
+        reconnect.indexOf('} else {',
+            reconnect.indexOf('} else if let claimedRestoration {')),
       );
       expect(fallbackStart, greaterThan(claim));
       final fallbackCall = reconnect.substring(

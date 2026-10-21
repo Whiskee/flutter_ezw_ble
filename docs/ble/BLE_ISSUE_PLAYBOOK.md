@@ -1293,3 +1293,29 @@ Owner:
   session installation.
 - `even_connect` owns the bounded three-round OTA recovery transaction and may not
   fall back to ordinary activation when native rejects the credential.
+
+
+## iOS reset followed by immediate Code 1 retry storm (BUG 7139355187)
+
+- Evidence: customer logs show `resetting → poweredOn`, inactive in-memory
+  peripheral reuse and hundreds of thousands of `CBErrorDomain Code=1` failures
+  with immediate retry. The logs do not prove pointer identity, a Jetsam kill,
+  or the cause of independent firmware resets.
+- Native repair: isolate pre-reset object provenance from transport activation;
+  keep endpoint intent, require retrieve/discover/restoration provenance for a
+  usable object, and apply exact Code 1 endpoint backoff at 1/2/4/8/16/30 seconds.
+  A new session cannot erase that deadline; successful business connected can.
+  Ownerless SR Code 1 parks until claim, retaining its deadline across lifecycle
+  entries; a pre-deadline claim returns deferred. Modern system callbacks and
+  connected/pending SR claims must reject old objects before adopting an owner
+  or entering GATT.
+- Deferred UUID owners may consume validated MAC/SN advertisements before display
+  deduplication. No valid object in background means defer, not polling; returning
+  active reuses the existing gated lookup. This does not guarantee continuous
+  background recovery.
+- Regression: `test/ios_reset_reconnect_failure_native_test.dart` executes pure
+  Swift policy and actual scheduler/dispatch/scan-wake/callback/adoption/claim
+  methods with fake platform time; existing pending-identity,
+  Bluetooth-on barrier and Code 14 tests remain required. Device release testing
+  must inject reset while G2/R1 are background-connected, verify bounded retries
+  and foreground recovery, and check ordinary off/on and OTA separately.
