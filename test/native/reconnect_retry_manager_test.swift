@@ -5,7 +5,71 @@ import Foundation
 @main
 struct ReconnectRetryManagerTests {
     static func require(_ condition: @autoclosure () -> Bool, _ message: String) { precondition(condition(), message) }
+    /// A terminal manual attempt must only keep its own admission source. The
+    /// durable owner becomes automatic before any shared retry gate reloads it.
+    static func terminalSourceResetScenarios() {
+        for scenario in ["immediate", "Code1", "expired escrow", "inactive", "Bluetooth off", "preserved manual"] {
+            let manager = BleManager()
+            let key = UUID().uuidString
+            let peripheral = CBPeripheral(UUID(uuidString: key)!)
+            var task = BleReconnectTask(belongConfig: "g2", uuid: key, name: "left")
+            task.source = .manualReconnect
+            task.sessionGeneration = 27
+            manager.reconnectTasks[key] = task
+            let admission = BleConnectionAdmission(endpointId: key, sessionId: 91, sessionGeneration: task.sessionGeneration, source: .manualReconnect)
+            manager.admissions[key] = admission
+            if scenario == "Code1" {
+                manager.registerInvalidParametersFailure(peripheral: peripheral, error: NSError(domain: "CBErrorDomain", code: 1), sessionGeneration: task.sessionGeneration)
+            }
+            if scenario == "expired escrow" {
+                var debt = BleInvalidParametersBackoff()
+                debt.registerFailure(now: ProcessInfo.processInfo.systemUptime - 10)
+                manager.restorationCoordinator.debt = debt
+            }
+            manager.inactiveWithoutObject = scenario == "inactive"
+            manager.centralManager.state = scenario == "Bluetooth off" ? .poweredOff : .poweredOn
+            let preserveManual = scenario == "preserved manual"
+            let expectedSource: BleConnectSource = preserveManual ? .manualReconnect : .autoReconnect
+            manager.scheduleReconnect(uuid: key, name: "left", state: .disconnectFromSys, preserveAttemptSource: preserveManual)
+            let stored = manager.reconnectTasks[key]!
+            require(stored.source == expectedSource, "\(scenario): terminal source reset lost before shared gate")
+            require(stored.ownerToken == task.ownerToken && stored.sessionGeneration == 27, "\(scenario): source reset replaced the positive-session owner")
+            require(manager.admissions[key] == admission && manager.admissions[key]!.source == .manualReconnect, "\(scenario): source reset rewrote the current physical admission")
+            require(manager.directReconnectStarts.isEmpty, "\(scenario): dispatched before queue/deadline/defer handling")
+            if scenario == "Code1" {
+                require(stored.invalidParametersBackoff.failureCount == 1 && stored.timer != nil, "Code1: terminal source reset lost retry debt/job")
+                ProcessInfo.processInfo.advance(0.999)
+                require(manager.directReconnectStarts.isEmpty, "Code1: source reset bypassed deadline")
+                ProcessInfo.processInfo.advance(0.002)
+            } else if scenario == "inactive" {
+                require(stored.deferredByAppInactivity, "inactive: automatic owner was not retained for later activation")
+                manager.inactiveWithoutObject = false
+                manager.beginReconnectAttempt(uuid: key)
+            } else if scenario == "Bluetooth off" {
+                require(stored.pausedByBluetoothOff && stored.recoveryEpoch == manager.currentTransportRecoveryEpoch, "Bluetooth off: source reset lost paused transport owner")
+                DispatchQueue.main.drain()
+                manager.beginReconnectAttempt(uuid: key)
+                require(manager.directReconnectStarts.isEmpty, "Bluetooth off: paused source reset opened an attempt")
+                continue
+            } else {
+                DispatchQueue.main.drain()
+            }
+            require(manager.directReconnectStarts.count == 1, "\(scenario): terminal retry did not reach one actual beginDirect call")
+            let started = manager.directReconnectStarts[0]
+            require(started.source == expectedSource && started.ownerToken == task.ownerToken && started.sessionGeneration == 27, "\(scenario): actual beginDirect received stale source or owner")
+            require(manager.admissions[key] == admission, "\(scenario): next attempt scheduling mutated the previous admission")
+            if scenario == "expired escrow" {
+                require(started.invalidParametersBackoff.failureCount == 1, "expired escrow: source reset overwrote merged debt")
+                manager.restorationCoordinator.debt = nil
+                manager.registerInvalidParametersFailure(peripheral: peripheral, error: NSError(domain: "CBErrorDomain", code: 1), sessionGeneration: task.sessionGeneration)
+                require(manager.reconnectTasks[key]!.invalidParametersBackoff.remaining(now: ProcessInfo.processInfo.systemUptime) == 2, "expired escrow: next Code1 did not retain its episode")
+            }
+        }
+        print("PASS: terminal source reset survives immediate/Code1/expired escrow/inactive/off gates; explicit manual preservation and current admission source remain exact")
+    }
+
     static func main() {
+        terminalSourceResetScenarios()
         let manager = BleManager()
         let uuid = UUID()
         let key = uuid.uuidString

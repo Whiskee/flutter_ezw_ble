@@ -2134,6 +2134,10 @@ extension BleManager {
             loggerD(msg: "autoReconnect: \(task.uuid), paused because bluetooth is unavailable")
             return
         }
+        // The shared gate reloads this value and may merge restoration debt.
+        // Persist the terminal source reset first, then keep its merged result;
+        // otherwise both deferred and immediate retries inherit the old manual source.
+        reconnectTasks[reconnectKey(uuid: task.uuid)] = task
         if deferInvalidParametersRetryIfNeeded(task) { return }
         task = reconnectTasks[reconnectKey(uuid: task.uuid)] ?? task
         if shouldDeferReconnectForAppInactivity(task) {

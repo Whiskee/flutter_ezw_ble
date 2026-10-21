@@ -12,6 +12,29 @@ final class FakeClock {
     }
 }
 enum ProcessInfo { static let processInfo = FakeClock() }
+
+// Keep main-queue work separate from the scheduling call so assertions can
+// inspect the persisted owner before the real beginReconnectAttempt body runs.
+struct DispatchTime {
+    let uptime: TimeInterval
+    static func now() -> DispatchTime { DispatchTime(uptime: ProcessInfo.processInfo.systemUptime) }
+    static func + (lhs: DispatchTime, rhs: TimeInterval) -> DispatchTime {
+        DispatchTime(uptime: lhs.uptime + rhs)
+    }
+}
+final class MainDispatchSpy {
+    private var pending: [() -> Void] = []
+    func async(execute work: @escaping () -> Void) { pending.append(work) }
+    func asyncAfter(deadline: DispatchTime, execute work: @escaping () -> Void) {
+        _ = Timer.scheduledTimer(withTimeInterval: max(0, deadline.uptime - ProcessInfo.processInfo.systemUptime), repeats: false) { _ in work() }
+    }
+    func drain() {
+        let ready = pending
+        pending.removeAll()
+        ready.forEach { $0() }
+    }
+}
+enum DispatchQueue { static let main = MainDispatchSpy() }
 final class Timer {
     let deadline: TimeInterval
     let callback: (Timer) -> Void
@@ -92,6 +115,7 @@ struct BleConnectionAdmission: Equatable {
     let sessionId: Int64
     var generation: Int64 { sessionId }
     let sessionGeneration: Int64
+    var source: BleConnectSource = .autoReconnect
 }
 struct BlePeripheralConnectionSession {
     let peripheral: CBPeripheral
@@ -118,6 +142,9 @@ final class BleManager {
     let upgradeStateRegistry = UpgradeRegistry()
     var currentTransportRecoveryEpoch: Int64 = 4
     var physicalStarts: [String] = []
+    // Snapshot the production begin call rather than deriving its source from
+    // the stored owner after dispatch; that would hide stale argument copies.
+    var directReconnectStarts: [BleReconnectTask] = []
     var connectedDevices: [BleConnectedDevice] = []
     let restorationCoordinator = RestorationSpy()
     var scanResultTemp: [(BleDevice, CBPeripheral)] = []
@@ -171,6 +198,9 @@ final class BleManager {
         reconnectTasks[reconnectKey(uuid: task.uuid)] = current
     }
     func findActiveConnectRequest(uuid: String, name: String) -> Int? { nil }
-    func beginDirectReconnectAttempt(task: BleReconnectTask, config: BleConfig) { physicalStarts.append(task.uuid) }
+    func beginDirectReconnectAttempt(task: BleReconnectTask, config: BleConfig) {
+        physicalStarts.append(task.uuid)
+        directReconnectStarts.append(task)
+    }
     func loggerD(msg: String) {}
 }

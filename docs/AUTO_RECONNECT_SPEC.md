@@ -599,6 +599,14 @@ Validated ordinary MAC/SN advertisements wake a current epoch-authorized UUID
 deferred owner before display deduplication, without bypassing Code 14 or OTA
 admission. Code 1 does not consume the Bond/security recovery budget.
 
+After an ordinary terminal attempt, scheduling persists the long-lived owner's
+`autoReconnect` source before the shared deadline gate reloads that owner or
+merges restoration debt. Both a delayed Code 1 retry and an immediate retry must
+therefore open the next automatic attempt, while retaining the same positive
+session/owner and any merged debt. Only `preserveAttemptSource=true` keeps an
+explicit manual continuation. Updating the long-lived source never rewrites the
+current physical admission's source or its terminal event identity.
+
 Ownerless restoration escrow parks an exact Code 1 terminal instead of rearming
 immediately. Its endpoint backoff transfers on claim and is also visible to any
 intervening scan/lifecycle activation. The normal owner owns the only retry timer;
