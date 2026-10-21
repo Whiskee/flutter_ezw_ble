@@ -20,11 +20,16 @@
 ```bash
 export JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home
 ./scripts/fvm flutter pub get --offline
-ORG_GRADLE_PROJECT_evenTargetAbis=arm64-v8a ./scripts/fvm flutter build apk --debug --no-pub --target-platform android-arm64
+# 先查询手机已安装版本；将下行 build-number 替换为不低于其 versionCode 的数值。
+adb -s <device-id> shell dumpsys package com.even.sg | rg 'versionCode|versionName'
+ORG_GRADLE_PROJECT_evenTargetAbis=arm64-v8a ./scripts/fvm flutter build apk --debug --no-pub --target-platform android-arm64 --build-number=<version-code>
 ```
 
-APK：`build/app/outputs/flutter-apk/app-debug.apk`。需要覆盖安装时使用 `adb install -r`，
-保留测试账号和 App 状态。安装会替换设备上的同包名 App，执行前先确认目标手机。
+APK：`build/app/outputs/flutter-apk/app-debug.apk`。先确认目标手机，再用
+`adb -s <device-id> install -r <apk>` 覆盖安装；安装成功后启动 App 并用
+`./scripts/fvm flutter attach -d <device-id>` 连接调试器。若覆盖失败，先解决版本号或签名问题，
+不要卸载原包。Flutter 3.41.9 的 `flutter run` 在安装失败后会自动尝试卸载旧包重装，
+即使没有传 `--uninstall-first`，也可能清掉登录和本地设置；需保留手机状态时不要依赖这个回退。
 
 探针跟随现有 `Debug Mode`：native 进程默认关闭，App 的 logger 配置同步
 `setDebugLoggingEnabled(true)` 后生效；需要在开始下一轮配对前打开。
