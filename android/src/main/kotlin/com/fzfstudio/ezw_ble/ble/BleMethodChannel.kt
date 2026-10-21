@@ -587,6 +587,8 @@ enum class BleMC {
             SET_DEBUG_LOGGING_ENABLED -> {
                 // 仅写静态 policy；宿主可在 BLE 初始化前设置，禁止访问 manager/改 owner。
                 BleOtaDebugLogPolicy.setEnabled(arguments as? Boolean == true)
+                // Test-branch diagnostics retire only their own timers/receiver; never create Manager.
+                BleBondTimingDiagnostics.setEnabled(arguments as? Boolean == true)
             }
             CLEAN_CONNECT_CACHE -> {
                 // 1. 调试/恢复入口：清理插件侧连接缓存。

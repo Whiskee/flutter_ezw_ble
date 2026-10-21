@@ -7,6 +7,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
+import com.fzfstudio.ezw_ble.ble.BleBondTimingDiagnostics
+import com.fzfstudio.ezw_ble.ble.BleBondTimingProbe
 
 class BleStateListener(private val context: Context) {
 
@@ -33,6 +35,8 @@ class BleStateListener(private val context: Context) {
     // 定义广播接收器
     private val bluetoothReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
+            // Freeze at production receiver entry, before parcelable decoding and BLE callbacks.
+            val bondTimingStamp = BleBondTimingDiagnostics.capture()
             //  获取监听到的设备对象
             val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 intent?.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
@@ -54,9 +58,19 @@ class BleStateListener(private val context: Context) {
                         BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE,
                         -1,
                     )
+                    // The diagnostic receiver is independent; this original callback/thread is unchanged.
+                    if (device != null && bondTimingStamp != null) {
+                        BleBondTimingDiagnostics.record(device.address, "receiver_main", bondTimingStamp) {
+                            mapOf("bondState" to bondState, "previousBondState" to previousBondState)
+                        }
+                    }
                     // 2、Manager 使用 current/previous 识别成功与明确的 BONDING -> NONE 拒绝。
                     device?.let {
-                        callback?.onDeviceBondStateChanged(it, bondState, previousBondState)
+                        // Attribution follows this receiver entry even if its callback waits on a lock.
+                        // The helper restores its ThreadLocal in finally, including callback failures.
+                        BleBondTimingProbe.withReceiverStamp(bondTimingStamp) {
+                            callback?.onDeviceBondStateChanged(it, bondState, previousBondState)
+                        }
                     }
                 }
                 BluetoothDevice.ACTION_ACL_DISCONNECTED -> {

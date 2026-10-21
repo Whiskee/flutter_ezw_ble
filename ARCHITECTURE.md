@@ -296,6 +296,12 @@ Future 完成，`sendLog` 和 native/Dart 日志桥保持原样。行为回归�
 `BleAndroidOtaWriteQueueTest`、`BleOtaWriteCallbackLoggingTest`、`BleOtaReceiveCallbackLoggingTest` 与
 `BleOtaDebugLogPolicyTest`；本地 JVM 测试不代表真实 OTA 或功耗验证。
 
+测试分支的 Android Bond 时序探针跟随同一 Debug 日志门禁，默认关闭。
+只为 exact admission 做 100ms、最长 15 秒的公开 Bond 状态观测，并通过独立后台 receiver
+对比既有生产 receiver 的到达时间；不得用采样结果推进 GATT，或修改生产 receiver 线程、
+Gate、安全校验及重试。关闭、取消、替换和 release 只清诊断窗口；事件时钟在生产点冻结。
+使用方法、采集命令与归因边界见 [Android Bond 时序验证](docs/ble/ANDROID_BOND_TIMING_PROBE.md)。
+
 `setConnectionTraceSamplingPaused(bool)` 是独立的 iOS 采样策略，不等同于关闭
 Trace。`BleNativeTraceRssiSampler` 不构造 Manager/central；暂停撤销 Timer，保留
 已请求采样的弱 peripheral/attempt 校验闭包。恢复与每次读之前重新验证当前
