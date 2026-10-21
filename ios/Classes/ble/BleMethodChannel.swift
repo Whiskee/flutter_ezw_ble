@@ -73,6 +73,10 @@ enum BleMC: String {
     case sendCmdNoWait
     /// Submit a batch of already-framed OTA packets; Future waits for the last packet.
     case sendOtaPacketBatch
+    /// Reserve one native-only FILE batch owner before asynchronous SDK work.
+    case beginFilePacketBatch
+    /// Revoke only that reservation and its native-unsent batch tail.
+    case cancelFilePacketBatch
     /// Submit a batch of already-framed file packets; Future waits for the last packet.
     case sendFilePacketBatch
     /// Mark a device as entering OTA mode.
@@ -455,14 +459,55 @@ enum BleMC: String {
                 }
             )
             return
+        case .beginFilePacketBatch:
+            let jsonData = arguments as? [String: Any] ?? [:]
+            BleManager.shared.beginFilePacketBatch(uuid: jsonData["uuid"] as? String ?? "", result: result)
+            return
+        case .cancelFilePacketBatch:
+            let jsonData = arguments as? [String: Any] ?? [:]
+            let uuid = jsonData["uuid"] as? String ?? ""
+            guard let token = jsonData["fileBatchToken"] as? String, !token.isEmpty else {
+                result(OtaWriteQueue.unavailableError(endpoint: uuid,
+                    reason: "file batch cancellation requires a token", channel: OtaWriteChannel.file))
+                return
+            }
+            BleManager.shared.cancelFilePacketBatch(uuid: uuid, fileBatchToken: token, result: result)
+            return
         case .sendFilePacketBatch:
             let jsonData: [String: Any] = arguments as? [String: Any] ?? [:]
             let uuid: String = jsonData["uuid"] as? String ?? ""
             let psType: Int = jsonData["psType"] as? Int ?? BlePsTypeValue.file
+            // A supplied malformed owner cannot silently fall back to legacy
+            // unowned batching. Only absence keeps the existing call semantics.
+            if let rawToken = jsonData["fileBatchToken"],
+               !(rawToken is String) || (rawToken as? String)?.isEmpty == true {
+                result(OtaWriteQueue.unavailableError(endpoint: uuid,
+                    reason: "invalid file batch token", channel: OtaWriteChannel.file))
+                return
+            }
+            let token = jsonData["fileBatchToken"] as? String
+            let packets: [Data]
+            if let token {
+                // The owned path is all-or-nothing: compactMap must not silently
+                // omit a malformed frame and claim the original batch submitted.
+                guard (jsonData["psType"] == nil || jsonData["psType"] is Int),
+                      let typedPackets = jsonData["packets"] as? [FlutterStandardTypedData],
+                      !typedPackets.isEmpty else {
+                    // Use the manager's empty-batch preflight so only a matching,
+                    // still-unused reservation retires before this typed error.
+                    BleManager.shared.sendFilePacketBatch(uuid: uuid, packets: [], psType: psType,
+                        fileBatchToken: token, result: result)
+                    return
+                }
+                packets = typedPackets.map { $0.data }
+            } else {
+                packets = Self.decodeFramedBatchPackets(jsonData["packets"])
+            }
             BleManager.shared.sendFilePacketBatch(
                 uuid: uuid,
-                packets: Self.decodeFramedBatchPackets(jsonData["packets"]),
+                packets: packets,
                 psType: psType,
+                fileBatchToken: token,
                 result: result
             )
             return

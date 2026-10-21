@@ -10,6 +10,8 @@ void main() {
     // Compile the production queue against a minimal Flutter result/error stub;
     // the ledger uses Foundation only. No device or altered production SDK.
     final stub = await Process.run('swiftc', [
+      '-module-cache-path',
+      '${directory.path}/module-cache',
       '-parse-as-library',
       '-emit-module',
       '-emit-object',
@@ -33,9 +35,17 @@ void main() {
         'ios/Classes/ble/OtaWindowCreditLedger.swift',
         'test/native/ota_window_credit_ledger_test.swift',
       ],
+      'file-owner': [
+        'ios/Classes/ble/BleDebugLogPolicy.swift',
+        'ios/Classes/ble/OtaWindowCreditLedger.swift',
+        'ios/Classes/ble/OtaWriteQueue.swift',
+        'test/native/file_batch_owner_test.swift',
+      ],
     }.entries) {
       final executable = '${directory.path}/${target.key}';
       final compile = await Process.run('swiftc', [
+        '-module-cache-path',
+        '${directory.path}/module-cache',
         '-I',
         directory.path,
         '${directory.path}/Flutter.o',
@@ -73,5 +83,59 @@ void main() {
     final run = await Process.run(executable, const []);
     expect(run.exitCode, 0, reason: '${run.stdout}\n${run.stderr}');
     stdout.write(run.stdout);
+
+    // Compile actual manager and MethodChannel FILE methods together with the
+    // production queue. Only platform identity/writes and registry are fake.
+    final ownerStart = manager.indexOf('    func beginFilePacketBatch(');
+    final ownerEnd = manager.indexOf('\n    /// OTA 错误 details', ownerStart);
+    expect(ownerStart, isNonNegative);
+    expect(ownerEnd, greaterThan(ownerStart));
+    final channel =
+        File('ios/Classes/ble/BleMethodChannel.swift').readAsStringSync();
+    final dispatchStart =
+        channel.indexOf('        case .beginFilePacketBatch:');
+    final dispatchEnd =
+        channel.indexOf('        case .enterUpgradeState:', dispatchStart);
+    final decoderStart =
+        channel.indexOf('    private static func decodeFramedBatchPackets(');
+    final ownerTemplate =
+        File('test/native/file_batch_manager_test.swift').readAsStringSync();
+    final readyStart = manager
+        .indexOf('    func peripheralIsReady(toSendWriteWithoutResponse');
+    final readyEnd =
+        manager.indexOf('\n    /// Routes a consumed 5403 failure', readyStart);
+    expect(readyStart, isNonNegative);
+    expect(readyEnd, greaterThan(readyStart));
+    final ownerSource = File('${directory.path}/file-manager.swift');
+    await ownerSource.writeAsString(ownerTemplate
+        .replaceFirst('    // PRODUCTION_FILE_BATCH_MANAGER',
+            manager.substring(ownerStart, ownerEnd))
+        .replaceFirst('    // PRODUCTION_FILE_READY_CALLBACK',
+            manager.substring(readyStart, readyEnd))
+        .replaceFirst('        // PRODUCTION_FILE_BATCH_DISPATCH',
+            channel.substring(dispatchStart, dispatchEnd))
+        .replaceFirst('    // PRODUCTION_FILE_BATCH_DECODER',
+            channel.substring(decoderStart, channel.lastIndexOf('\n}'))));
+    final ownerExecutable = '${directory.path}/file-manager';
+    final ownerCompile = await Process.run('swiftc', [
+      '-module-cache-path',
+      '${directory.path}/module-cache',
+      '-parse-as-library',
+      '-I',
+      directory.path,
+      '${directory.path}/Flutter.o',
+      'ios/Classes/ble/BleDebugLogPolicy.swift',
+      'ios/Classes/ble/OtaWindowCreditLedger.swift',
+      'ios/Classes/ble/OtaWriteQueue.swift',
+      ownerSource.path,
+      '-o',
+      ownerExecutable,
+    ]);
+    expect(ownerCompile.exitCode, 0,
+        reason: '${ownerCompile.stdout}\n${ownerCompile.stderr}');
+    final ownerRun = await Process.run(ownerExecutable, const []);
+    expect(ownerRun.exitCode, 0,
+        reason: '${ownerRun.stdout}\n${ownerRun.stderr}');
+    stdout.write(ownerRun.stdout);
   }, skip: !Platform.isMacOS);
 }

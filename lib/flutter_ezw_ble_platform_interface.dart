@@ -493,15 +493,43 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
     return null;
   }
 
+  /// Reserve one cancellable file batch on the current native endpoint queue.
+  ///
+  /// Native creates an opaque, single-use token; a busy/unavailable endpoint
+  /// fails closed. The reservation is bounded to one per endpoint and is
+  /// invalidated by completion, cancellation or physical teardown. If the
+  /// caller's lease expires while awaiting this method, cancel the returned
+  /// token before starting replacement work; never submit it after expiry.
+  Future<String> beginFilePacketBatch(String uuid) {
+    throw UnimplementedError(
+        'beginFilePacketBatch() has not been implemented.');
+  }
+
+  /// Revoke only [fileBatchToken]'s unsent packets, never a whole endpoint queue.
+  ///
+  /// True means the exact active reservation was revoked; false means it is
+  /// already absent/stale. Neither result proves firmware ACK or retracts OS
+  /// writes. Android retains its submitted-write callback drain barrier.
+  /// Await this acknowledgement before authorizing replacement work. Channel
+  /// errors/timeouts are unknown outcomes, not permission to send unguarded.
+  Future<bool> cancelFilePacketBatch(String uuid, String fileBatchToken) {
+    throw UnimplementedError(
+        'cancelFilePacketBatch() has not been implemented.');
+  }
+
   /// 一次提交一组已经完成 Even 协议封装的文件小包。
   ///
   /// 与 [sendOtaPacketBatch] 语义相同但通道独立：原生用另一条队列承载，退出升级只取消 OTA，
   /// 不会打断正在传输的文件批次；升级态仍然拒绝文件写入。Future 必须等本批最后一包被原生队列
   /// 真正提交成功后才完成，否则上层 8s 固件 ACK 计时会提前启动。
+  /// [fileBatchToken] must come from [beginFilePacketBatch] for this endpoint.
+  /// A supplied token is single-use and fails closed after retirement; omitted
+  /// tokens preserve legacy behavior and offer no logical-lease revocation.
   Future<void> sendFilePacketBatch(
     String uuid,
     List<Uint8List> framedPackets, {
     int psType = 3,
+    String? fileBatchToken,
   }) {
     throw UnimplementedError('sendFilePacketBatch() has not been implemented.');
   }

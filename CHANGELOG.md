@@ -1,5 +1,6 @@
 ## 0.0.1
 
+* Add opt-in native file batch reservations and exact unsent-tail cancellation on Android/iOS; preserve legacy calls, unrelated queues, submitted-write barriers, pacing and real-ACK boundaries.
 * Retire stalled iOS ordinary file transactions without permanently blocking later file requests; preserve failed-tail cleanup, physical-target validation, and OTA fail-closed recovery.
 * Keep Android high-reliability PHY requests under the RSSI adaptive policy at GATT readiness and OTA entry; preserve direct 2M requests in ordinary mode.
 * Report iOS stalled-write `remainingPending` after failed-batch cleanup so the SDK can distinguish a cleared RAW window from other queued writes without weakening real-ACK recovery.

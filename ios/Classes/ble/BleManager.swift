@@ -2272,6 +2272,41 @@ extension BleManager {
         )
     }
 
+    /// Freeze the live physical FILE target before minting a native-only token.
+    /// Reusing an endpoint UUID after reconnect cannot transfer an old queue owner.
+    func beginFilePacketBatch(uuid: String, result: @escaping FlutterResult) {
+        guard checkIsFunctionCanBeCalled(),
+              upgradeStateRegistry.canSend(endpointId: uuid, psType: BlePsTypeValue.file),
+              let device = connectedDevices.first(where: { $0.peripheral.identifier.uuidString == uuid }),
+              device.peripheral.state == .connected,
+              let characteristic = device.writeCharsDic[BlePsTypeValue.file],
+              characteristic.properties.contains(.writeWithoutResponse) else {
+            result(OtaWriteQueue.unavailableError(endpoint: uuid,
+                reason: "live file write target unavailable", channel: OtaWriteChannel.file))
+            return
+        }
+        if let existing = fileWriteQueues[uuid], !existing.ownsPeripheral(device.peripheral) {
+            result(OtaWriteQueue.unavailableError(endpoint: uuid,
+                reason: "file queue belongs to another physical peripheral", channel: OtaWriteChannel.file))
+            return
+        }
+        let queue = fileWriteQueues[uuid] ?? OtaWriteQueue(peripheral: device.peripheral,
+            logger: { [weak self] message in self?.loggerD(msg: message) }, channel: OtaWriteChannel.file)
+        fileWriteQueues[uuid] = queue
+        guard let token = queue.beginFilePacketBatch() else {
+            result(OtaWriteQueue.unavailableError(endpoint: uuid,
+                reason: "file batch reservation already active", channel: OtaWriteChannel.file))
+            return
+        }
+        result(token)
+    }
+
+    /// Lookup only: cancellation must not construct a queue or a new BLE owner.
+    /// It remains callable when the manager/upgrade gate has already closed.
+    func cancelFilePacketBatch(uuid: String, fileBatchToken: String, result: @escaping FlutterResult) {
+        result(fileWriteQueues[uuid]?.cancelFilePacketBatch(fileBatchToken: fileBatchToken) ?? false)
+    }
+
     /**
      *  一次提交一组 already-framed 文件小包。
      *
@@ -2282,9 +2317,13 @@ extension BleManager {
         uuid: String,
         packets: [Data],
         psType: Int,
+        fileBatchToken: String? = nil,
         result: @escaping FlutterResult
     ) {
         guard psType == BlePsTypeValue.file else {
+            if let token = fileBatchToken {
+                fileWriteQueues[uuid]?.retireUnsubmittedFilePacketBatch(fileBatchToken: token)
+            }
             result(OtaWriteQueue.unsupportedError(
                 endpoint: uuid,
                 reason: "batch requires file psType=3",
@@ -2298,6 +2337,7 @@ extension BleManager {
             packets: packets,
             psType: psType,
             channel: OtaWriteChannel.file,
+            fileBatchToken: fileBatchToken,
             existingQueue: { [weak self] in self?.fileWriteQueues[uuid] },
             storeQueue: { [weak self] queue in self?.fileWriteQueues[uuid] = queue },
             result: result
@@ -2314,11 +2354,21 @@ extension BleManager {
         expectedAttemptGeneration: Int64 = 0,
         otaContext: BleG2OtaContext? = nil,
         otaWindow: [String: Any]? = nil,
-        existingQueue: () -> OtaWriteQueue?,
+        fileBatchToken: String? = nil,
+        existingQueue: @escaping () -> OtaWriteQueue?,
         storeQueue: (OtaWriteQueue) -> Void,
         metricsRequested: Bool = false,
         result: @escaping FlutterResult
     ) {
+        // Only unused matching reservations can be retired by preflight errors.
+        // A duplicate send must leave its already-submitted original untouched.
+        let originalResult = result
+        let result: FlutterResult = { value in
+            if value != nil, let token = fileBatchToken {
+                existingQueue()?.retireUnsubmittedFilePacketBatch(fileBatchToken: token)
+            }
+            originalResult(value)
+        }
         guard !packets.isEmpty else {
             result(OtaWriteQueue.unavailableError(
                 endpoint: uuid,
@@ -2379,6 +2429,15 @@ extension BleManager {
            ) {
             result(identityError)
             return
+        }
+        if fileBatchToken != nil {
+            guard channel == OtaWriteChannel.file,
+                  let registeredQueue = existingQueue(),
+                  registeredQueue.ownsPeripheral(device.peripheral) else {
+                result(OtaWriteQueue.unavailableError(endpoint: uuid,
+                    reason: "file batch token has no matching physical queue", channel: channel))
+                return
+            }
         }
         let queue = existingQueue() ?? OtaWriteQueue(
             peripheral: device.peripheral,
@@ -2472,6 +2531,7 @@ extension BleManager {
             target: target,
             expectedSessionGeneration: expectedSessionGeneration,
             expectedAttemptGeneration: expectedAttemptGeneration,
+            fileBatchToken: fileBatchToken,
             metrics: metricsRequested ? { metrics in queueMetrics = metrics } : nil,
             result: batchResult
         )
@@ -4928,7 +4988,9 @@ extension BleManager: CBPeripheralManagerDelegate, CBPeripheralDelegate {
     func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
         let uuid = peripheral.identifier.uuidString
         let otaQueue = otaWriteQueues[uuid]
-        let fileQueue = fileWriteQueues[uuid]
+        // A late ready callback from an old same-UUID object is not evidence
+        // that the replacement FILE owner's physical wait has recovered.
+        let fileQueue = fileWriteQueues[uuid].flatMap { $0.ownsPeripheral(peripheral) ? $0 : nil }
         guard otaQueue != nil || fileQueue != nil else {
             loggerD(msg: "[ezw_ble][wwr] ready uuid=\(uuid) canSend=\(peripheral.canSendWriteWithoutResponse) queue=none peripheral=\(Unmanaged.passUnretained(peripheral).toOpaque())")
             return
