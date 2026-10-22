@@ -171,16 +171,20 @@ enum class BleMC {
                 }
             }
             START_SCAN -> {
-                // 1. 只解析扫描纯净模式开关，具体扫描状态由 BleManager 控制。
+                // 1. 与 iOS 复用既有双路字段；ordinary owner 不能被 DFU pure 观察暂停。
                 val jsonMap = arguments as Map<*, *>?
                 val turnOnPureModel = jsonMap?.get("turnOnPureModel") as? Boolean ?: false
+                val includeNormalScanResults = jsonMap?.get("includeNormalScanResults") as? Boolean ?: false
                 return result.success(
-                    BleManager.instance.startScan(pureModel = turnOnPureModel),
+                    BleManager.instance.startScan(
+                        pureModel = turnOnPureModel,
+                        includeNormalScanResults = includeNormalScanResults,
+                    ),
                 )
             }
             STOP_SCAN -> {
-                // 1. 停止扫描不需要额外参数。
-                BleManager.instance.stopScan()
+                // Dart 已释放全部共享 owner；native 连接等待只撤销外部租约后继续复用 scanner。
+                BleManager.instance.releaseExternalScanLease()
             }
             CONNECT_DEVICE -> {
                 // 1. 主动连接参数必须显式解析，避免 `null` 进入底层状态机。

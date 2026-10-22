@@ -171,8 +171,8 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `bleState` | `Future<int> bleState()` | 主动查询当前蓝牙状态码，配合 `BleStateExt.from(int)` 解码。 |
 | `bleRecoveryEpoch` | `Future<int> bleRecoveryEpoch()` | 只读查询当前进程 transport reset 周期；iOS final recovery activation 必须原样回传，Android 当前返回 0。 |
 | `initConfigs` | `Future<void> initConfigs(List<BleConfig> configs)` | **必须最先调用**。把多份配置一次性下发给原生层；下发参数是 `configs.map((c) => c.customToJson())`（保证嵌套 model 也序列化）。 |
-| `startScan` | `Future<BleScanStartResult> startScan({bool turnOnPureModel = false, List<String> iosServiceUuids = const [], bool includeUnfilteredScan = true, bool includeNormalScanResults = false, bool includeUnfilteredPureScanResults = true})` | 启动扫描并确认正 generation。iOS 后台 DFU 使用 FE59 服务过滤；前台普通 owner 保持 nil-service 扫描。pure 与普通需求并存时独立解析、独立去重。DFU-only 将 `includeUnfilteredPureScanResults` 置 false，让 raw 仅匹配服务提示；双模式识别保留 true，允许未广播 FE59 的应用态候选，身份匹配仍由业务 owner 校验。Android 忽略 iOS 参数，保持原有 pure 行为。 |
-| `stopScan` | `Future<void> stopScan()` | 显式停止扫描。 |
+| `startScan` | `Future<BleScanStartResult> startScan({bool turnOnPureModel = false, List<String> iosServiceUuids = const [], bool includeUnfilteredScan = true, bool includeNormalScanResults = false, bool includeUnfilteredPureScanResults = true})` | 启动扫描并确认正 generation。iOS 后台 DFU 使用 FE59 服务过滤；前台普通 owner 保持 nil-service 扫描。pure 与普通需求并存时独立解析、独立去重。DFU-only 将 `includeUnfilteredPureScanResults` 置 false，让 raw 仅匹配服务提示；双模式识别保留 true，允许未广播 FE59 的应用态候选，身份匹配仍由业务 owner 校验。Android 忽略 iOS 服务过滤参数；pure 观察先于普通缓存去重，`includeNormalScanResults` 控制是否同时发送普通事件，运行中模式更新复用同一 generation、物理扫描与普通设备缓存。 |
+| `stopScan` | `Future<void> stopScan()` | 释放上层扫描需求；Android 若仍有原生 scan-refresh / pending connect 则继续复用扫描，最后一份需求退出才停止物理扫描。 |
 | `connectDevice` | `Future<void> connectDevice(String belongConfig, String uuid, String name, {String? sn, bool? afterUpgrade, bool directConnect = false, int? sessionGeneration})` | 发起连接。`belongConfig` 必须命中 `initConfigs` 注册过的配置名；`name` 在 iOS 端定位，`sn` 仅 Android 用；`afterUpgrade=true` 时走 OTA 后的特殊重连路径；`directConnect=true` 表示调用方明确接受本地/系统缓存直连，不再要求当前扫描窗口可见；默认 `false` 仍保持 scan-first。 |
 | `armAutoReconnectTargets` | `Future<void> armAutoReconnectTargets(List<BleDevice> devices)` | 只登记长期自动回连 owner，不立即打开 GATT/CoreBluetooth connect。保留给业务成功后的持久化与兼容调用。 |
 | `activateAutoReconnectTargets` | `Future<List<BleReconnectActivationResult>> activateAutoReconnectTargets(List<BleDevice> devices, {BleConnectSource source = BleConnectSource.autoReconnect, BleReconnectActivationMode mode = BleReconnectActivationMode.initial, int sessionGeneration = 0, int recoveryEpoch = 0, BleG2OtaContext? otaContext})` | 对全部目标立即建立/复用/对账原生 pending 直连并逐目标返回接管结果；`resolved` 表示已有稳定身份，`identityPending` 表示 iOS 已按配置与完整名称持有待解析 owner，`rejected` 表示原生没有接管。`ownerDisposition` 进一步区分 `created/reused/repaired/deferred/rejected`，上层复用 batch 时必须用 `reconcile` 重新确认实时 owner，不能把历史 ACK 等同于当前 native owner。`promotion` 使用手动提升语义，不创建重复连接。iOS transport reset 后还必须携带刚读取的 exact `recoveryEpoch`，连续 reset 的旧周期请求不得消费新门禁。G2 OTA 专用恢复可携带 `otaContext`，native 仅对当前 transaction 的未完成 endpoint 准入；普通 activation 不得绕过 OTA transaction 门禁。 |
@@ -258,7 +258,7 @@ enum BleEventChannel {
 | 事件 | 原始数据 | Dart 映射 | 含义 |
 | --- | --- | --- | --- |
 | `bleState` | `int`（iOS CoreBluetooth state 值，扩展 `6 = noLocation` 给 Android） | `BleState` | 蓝牙开关、定位权限变化。Android 主动查询、Activity start/resume 与扫描入口都会重新读取实时权限和开关，仅在状态变化时 push。 |
-| `scanResult` | JSON 字符串 | `BleMatchDevice.fromJson` | 一次扫描命中（按 `BleScan.matchCount` 已聚合好的"组合设备"）。 |
+| `scanResult` | JSON 字符串 | `BleMatchDevice.fromJson` | 普通结果按 `BleScan.matchCount` 聚合；`isPureScanResult=true` 为当前真实广播的单设备 raw 观察，随机 SN 不进入普通缓存或业务身份。 |
 | `connectStatus` | JSON 字符串 | `BleConnectModel.fromJson` | 连接流程的每一步推进（见 §8）；可选 `pairingPhase` 表示 Android 配对控制进度（见 §11.4），不作为真实物理连接证据；携带 `source`、兼容键 `generation`、`sessionGeneration` 与 `attemptGeneration`。`generation` 始终序列化为 Dart session generation；旧 payload 分别回退为 `unknown` / `0`。 |
 | `receiveData` | Map：`{uuid, psType, data:Base64, isSuccess, sessionGeneration, attemptGeneration, receiveIdentity:{uuid,sessionGeneration,attemptGeneration}, otaTransactionId, otaGeneration, otaInstanceId}` | `BleCmd.receiveMap` | 来自原生的特征值数据。**注意 `data` 字段是 Base64**，业务侧拿到的 `BleCmd.data` 已经是 `Uint8List`，背后由 `flutter_ezw_utils.encodeBase64()` 解码。`receiveIdentity` 是冻结的通知归属；Android 来自原 callback 的 exact GATT owner，iOS 来自当前 admission 或业务已接受 owner。旧事件、unknown 或非法 pair 不填 nested identity。G2 OTA 事务持有期间还会附带 transaction 字段；Dart 必须同时校验 transaction 与 physical pair 后才消费 ACK/Notify。 |
 | `logger` | String，含 `[d]-` / `[e]-` 前缀 | `String` | 仅 iOS 主动 push；业务侧自行根据前缀分级。 |
@@ -546,6 +546,14 @@ G1/G2 是双 BLE 设备，业务侧"整机"状态需要聚合两条腿：
 - `isDisconnected` = 任一断开即视为断开（避免业务上把"半连接"当成功）。
 
 改这类聚合规则时要注意：**判定边界往哪偏，会直接影响业务侧自动重连/排障弹窗触发条件**。
+
+### Android 共享扫描与 pure 观察
+
+`startScan` 在系统扫描已运行时只更新 pure/普通事件策略，并返回原有正 generation；不得 stop/start、清普通设备缓存或回放历史广告来满足新 owner。每次当前 generation 的真实 callback 先向 pure 观察者发送 `isPureScanResult=true` 的单设备结果，再按稳定 SN 执行普通 cache、scan response 补齐、native pending 命中与 matchCount 聚合。pure 随机 SN 不进入普通 cache，也不推进连接。普通结果按稳定身份和成员集合独立记录本轮已交付状态，pure-only 期间已缓存但未交付的聚合须等下一条真实 callback 才首次交付；连续普通需求的已交付聚合跨模式更新继续去重；普通需求全部退出后重进（含 pure-only→mixed），仅推进普通交付 epoch，下一真实 callback 才重置普通交付去重。
+
+Dart `startScan` 成功后持有一份聚合租约，`stopScan` MethodChannel 只释放此租约；原生 scan-refresh / pending connect 只确保扫描运行，不修改外部 pure 策略。最后一个 native demand 命中、超时或取消时，仅在没有 Dart 租约和其它 native demand 时停止 scanner。外部 owner 全部退出但仍有 native demand 时，在原 generation 恢复普通模式并保留 cache；reset/release、当前扫描失败与蓝牙 OFF 则使物理窗口及租约失效，旧 generation 不能删除新租约。
+
+`includeNormalScanResults` 仅控制 pure 期间的普通 Dart 事件；原生稳定身份解析和连接路由仍继续，避免 DFU-only 观察饿死共享 native pending。停止或新 generation 替换后，旧 callback 的结果不能再写缓存/触发连接，旧失败也不能关闭新扫描。普通展示/回连消费者必须拒绝 `isPureScanResult=true`，DFU owner 仍自行校验完整身份，不得放宽名字/MAC 匹配。
 
 ### 8.4 连接前扫描策略：`directConnect` vs scan-first
 

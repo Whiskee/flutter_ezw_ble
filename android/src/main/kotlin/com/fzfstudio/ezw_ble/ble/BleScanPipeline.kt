@@ -22,6 +22,12 @@ internal class BleScanPipeline(
     private val bleConfigs: () -> List<BleConfig>,
     /** 是否处于纯净扫描模式。 */
     private val scanPureMode: () -> Boolean,
+    /** 共享 ordinary owner 决定是否同时发布普通事件；原生身份缓存/连接路由不受此开关暂停。 */
+    private val scanIncludeNormalResults: () -> Boolean = { false },
+    /** 外部普通需求重新加入时推进，保留稳定 cache 但允许下一真实广播首次交付。 */
+    private val normalDeliveryEpoch: () -> Long = { 0L },
+    /** 已停止/被新 generation 替换的 callback 不能写入当前扫描缓存。 */
+    private val isActiveScan: () -> Boolean = { true },
     /** 本轮扫描缓存，供 matchCount 聚合和 connect 可见性判断复用。 */
     private val scanResultTemp: MutableList<BleDevice>,
     /** 扫描过程中定期淘汰已经超时的 scan-then-connect 请求。 */
@@ -29,12 +35,18 @@ internal class BleScanPipeline(
     /** 扫描命中目标后继续推进待连接请求。 */
     private val tryConnectFromPendingScan: (BleDevice) -> Unit,
     /** 将已经按 SN 聚合好的设备列表发送给 Flutter。 */
-    private val emitMatchDevices: (String, List<BleDevice>) -> Unit,
+    private val emitMatchDevices: (String, List<BleDevice>, Boolean) -> Unit,
     /** 与 ScanCallback.onScanFailed 保持不同名称，避免失败回调误调用自身；manager 按 exact generation 收口。 */
     private val reportScanFailure: (Int) -> Unit,
     /** 统一日志出口。 */
     private val sendLog: (BleLoggerTag, String) -> Unit,
 ) : ScanCallback() {
+
+    // 普通 cache 也服务 pure-only 期间的原生连接，因此不能再把“已缓存”等同“已交付普通事件”。
+    // 每个连续普通需求记录已交付稳定聚合；新 owner 仍必须等待真实 callback 才能首次收到。
+    private val emittedNormalResults = mutableSetOf<List<BleDevice>>()
+    // 仅在真实广告交付路径观察 epoch，模式更新本身不得回放历史结果。
+    private var observedNormalDeliveryEpoch = Long.MIN_VALUE
 
     /**
      * 处理单条扫描结果。
@@ -44,6 +56,8 @@ internal class BleScanPipeline(
      */
     override fun onScanResult(callbackType: Int, result: ScanResult) {
         try {
+            if (!isActiveScan()) return
+
             // 1. 优先使用 scan record 中的广播名称。Android 的 BluetoothDevice.name
             // 依赖系统缓存/配对历史，首次扫描或重装 App 后经常为空；只看它会导致 nameFilters
             // 完全匹配不到，最终表现为“搜索没有结果”。
@@ -56,26 +70,29 @@ internal class BleScanPipeline(
             // 2. 使用配置的 nameFilters 找到该广播对应的设备配置。
             val bleConfig = resolveConfigForName(advertisedName) ?: return
 
-            // 3. 已缓存设备仍可能需要用 scan response 覆盖 SN，不能直接忽略。
+            // 3. raw 观察权属于当前 owner，必须先于普通展示缓存去重，且只来自本次真实 callback。
+            // 随机 SN 只出现在 pure 事件中，不能污染 G2 双腿聚合或 R1 连接身份。
+            if (scanPureMode()) {
+                val pureSn = UUID.randomUUID().toString()
+                val pureDevice = device.toBleDevice(bleConfig, advertisedName, pureSn, result.rssi)
+                emitMatchDevices(pureSn, listOf(pureDevice), true)
+                // 事件交付可能释放最后一个扫描 owner；不能继续写入已失效的扫描窗口。
+                if (!isActiveScan()) return
+            }
+
+            // 4. 普通身份/cache/pending 路由在 pure-only 期间仍工作，避免饿死共享 native 连接。
+            // 已缓存设备仍可能需要用 scan response 覆盖 SN，不能直接忽略。
             val cachedScanDevice = synchronized(scanResultTemp) {
                 scanResultTemp.firstOrNull { it.uuid == device.address }
             }
             if (cachedScanDevice != null) {
-                updateCachedDeviceFromScanResponseIfNeeded(
+                val stableDevice = updateCachedDeviceFromScanResponseIfNeeded(
                     cachedDevice = cachedScanDevice,
                     result = result,
                     bleConfig = bleConfig,
                     advertisedName = advertisedName,
                 )
-                return
-            }
-
-            // 4. 纯净模式不解析 SN/MAC，直接用随机 SN 作为单条扫描结果标识。
-            if (scanPureMode()) {
-                val deviceSn = UUID.randomUUID().toString()
-                val bleDevice = device.toBleDevice(bleConfig, advertisedName, deviceSn, result.rssi)
-                cacheAndRouteDevice(bleDevice)
-                emitMatchDevices(deviceSn, listOf(bleDevice))
+                emitIfMatchCountSatisfied(bleConfig, stableDevice.sn, stableDevice)
                 return
             }
 
@@ -153,14 +170,14 @@ internal class BleScanPipeline(
         result: ScanResult,
         bleConfig: BleConfig,
         advertisedName: String,
-    ) {
-        // 1. 纯净模式或缓存已经有真实 SN 时，不需要覆盖。
-        if (scanPureMode() || cachedDevice.sn != cachedDevice.name) {
-            return
+    ): BleDevice {
+        // 1. 只有普通 cache 的 fallback SN 需要补齐；pure 观察不能阻断稳定身份解析。
+        if (cachedDevice.sn != cachedDevice.name) {
+            return cachedDevice
         }
 
         // 2. 没有 snRule 无法解析后续 scan response。
-        val snRule = bleConfig.scan.snRule ?: return
+        val snRule = bleConfig.scan.snRule ?: return cachedDevice
         val parsedSn = parseDataToObtainSn(result.scanRecord?.bytes, snRule)
         logRingSnAdvertisementDebug(
             name = advertisedName,
@@ -173,7 +190,7 @@ internal class BleScanPipeline(
         val hasValidSn = parsedSn.isNotEmpty() &&
             (snRule.filters.isEmpty() || snRule.filters.any { parsedSn.contains(it) })
         if (!hasValidSn || parsedSn == cachedDevice.sn) {
-            return
+            return cachedDevice
         }
 
         // 4. 使用真实 SN 重建 BleDevice，并替换同 address 的旧缓存。
@@ -183,10 +200,10 @@ internal class BleScanPipeline(
             scanResultTemp.add(bleDevice)
         }
 
-        // 5. 缓存替换后重新推进待连接和 matchCount 聚合。
+        // 5. 缓存替换后重新推进待连接，交付去重由调用处统一收口。
         expirePendingScanConnects()
         tryConnectFromPendingScan(bleDevice)
-        emitIfMatchCountSatisfied(bleConfig, parsedSn, bleDevice)
+        return bleDevice
     }
 
     /**
@@ -256,19 +273,30 @@ internal class BleScanPipeline(
      * G2 左右腿类设备需要等同 SN 的多个广播都出现后再一次性上报。
      */
     private fun emitIfMatchCountSatisfied(bleConfig: BleConfig, deviceSn: String, bleDevice: BleDevice) {
-        // 1. 单设备配置无需聚合，直接发给 Flutter。
-        if (bleConfig.scan.matchCount < 2) {
-            emitMatchDevices(deviceSn, listOf(bleDevice))
-            return
+        // pure-only 只抑制普通 Dart 展示，缓存与 pending 路由已经按真实身份完成。
+        if (scanPureMode() && !scanIncludeNormalResults()) return
+
+        // 普通 owner 曾全部退出时，不能让上一需求的去重挡住新 owner 的真实新广告。
+        val epoch = normalDeliveryEpoch()
+        if (observedNormalDeliveryEpoch != epoch) {
+            emittedNormalResults.clear()
+            observedNormalDeliveryEpoch = epoch
         }
 
-        // 2. 多设备配置按 SN 聚合同组设备，直到数量达到 matchCount。
-        val matchDevices = synchronized(scanResultTemp) {
-            scanResultTemp.filter { it.sn == bleDevice.sn }
+        // 单设备直接交付；G2 等多设备沿用同 SN 的 matchCount 聚合。
+        val matchDevices = if (bleConfig.scan.matchCount < 2) {
+            listOf(bleDevice)
+        } else {
+            synchronized(scanResultTemp) { scanResultTemp.filter { it.sn == bleDevice.sn } }
+                .takeIf { it.size == bleConfig.scan.matchCount } ?: return
         }
-        if (matchDevices.size == bleConfig.scan.matchCount) {
-            emitMatchDevices(deviceSn, matchDevices)
-        }
+
+        // 普通 owner 在 pure-only 之后加入时，缓存的稳定聚合可由下一条真实广告首次交付。
+        // 连续普通需求已交付的聚合跨模式更新仍去重；SN 补齐/成员变化保留新身份事件。
+        // 使用当前 cache 对象而不是仅 UUID：配置撤销后重新发现的相同地址仍须重新交付。
+        val deliveryKey = matchDevices.sortedBy { it.uuid }
+        if (!emittedNormalResults.add(deliveryKey)) return
+        emitMatchDevices(deviceSn, matchDevices, false)
     }
 
     /**

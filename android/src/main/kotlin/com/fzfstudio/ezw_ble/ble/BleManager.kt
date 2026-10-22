@@ -438,8 +438,13 @@ class BleManager private constructor() {
     private var bleStateListener: BleStateListener? = null
     //  - 蓝牙搜索状态，是否正在搜索中
     private var isScanning = false
-    //  - 搜索纯净模式
+    // Dart 已合并各业务 owner；原生连接只复用窗口，不能释放这份外部扫描租约。
+    private var hasExternalScanLease = false
+    // 普通需求中断后重新加入须在下一真实广告重新交付；不更换物理 generation 或稳定 cache。
+    private var normalScanDeliveryEpoch = 0L
+    //  - pure 观察与普通展示共享同一物理窗口，模式切换不能清普通 cache 或更换 generation。
     private var scanPureMode: Boolean = false
+    private var scanIncludeNormalResults: Boolean = false
     //  - 蓝牙搜索回调
     private var scanCallback: ScanCallback? = null
     /** 每次系统确认启动扫描后递增，用于拒绝上一轮迟到的 onScanFailed。 */
@@ -1173,10 +1178,36 @@ class BleManager private constructor() {
     internal fun notifyAutoReconnectTargetVisible(uuid: String, name: String): Boolean =
         autoReconnectSupervisor.notifyTargetVisible(uuid, name)
 
-    /**
-     *  开启扫描
-     */
-    fun startScan(pureModel: Boolean = false): Map<String, Any> {
+    /** Dart 聚合 owner 的启动/策略更新入口；只在启动成功后建立外部租约。 */
+    @Synchronized
+    fun startScan(
+        pureModel: Boolean = false,
+        includeNormalScanResults: Boolean = false,
+    ): Map<String, Any> {
+        val hadExternalLease = hasExternalScanLease
+        val hadNormalDelivery = !scanPureMode || scanIncludeNormalResults
+        val result = startScanWindow(pureModel, includeNormalScanResults)
+        if (result["started"] == true) {
+            // 聚合租约可在 native 保活期间重建，也可在 pure-only 中重新加入普通需求。
+            // 连续的 normal/mixed owner 不重复交付；新需求只重置交付记录，不回放 cache。
+            if (!hadExternalLease || (!hadNormalDelivery && (!scanPureMode || scanIncludeNormalResults))) {
+                normalScanDeliveryEpoch++
+            }
+            hasExternalScanLease = true
+        }
+        return result
+    }
+
+    /** 原生连接只确保 scanner 运行，不能覆写仍在使用的 Dart pure/普通事件策略。 */
+    private fun ensureNativeScanRunning() {
+        if (!isScanning) startScanWindow(pureModel = false, includeNormalScanResults = false)
+    }
+
+    /** 物理扫描与模式更新共用同一实现；调用方负责外部或 native demand 的生命周期。 */
+    private fun startScanWindow(
+        pureModel: Boolean,
+        includeNormalScanResults: Boolean,
+    ): Map<String, Any> {
         val state = try {
             refreshBleState("startScan")
         } catch (error: Exception) {
@@ -1191,6 +1222,9 @@ class BleManager private constructor() {
             return scanStartResult(started = false, reason = "notConfigured")
         }
         if (isScanning) {
+            // 参数属于当前共享扫描的解析策略，不需要重启系统 scanner；保留其它设备 cache。
+            scanPureMode = pureModel
+            scanIncludeNormalResults = includeNormalScanResults
             return scanStartResult(
                 started = true,
                 generation = activeScanGeneration,
@@ -1219,6 +1253,7 @@ class BleManager private constructor() {
             // 只有系统调用成功后才发布本地 scanning；失败路径不能留下伪扫描窗口。
             scanCallback = callback
             scanPureMode = pureModel
+            scanIncludeNormalResults = includeNormalScanResults
             isScanning = true
             activeScanGeneration = generation
             scanResultTemp.clear()
@@ -1250,6 +1285,7 @@ class BleManager private constructor() {
     }
 
     /** Android 可能在 startScan 返回后才异步失败，只允许当前 generation 清理运行态。 */
+    @Synchronized
     private fun handleScanFailed(generation: Long, errorCode: Int) {
         if (!isScanning || activeScanGeneration != generation) {
             sendLog(
@@ -1269,9 +1305,26 @@ class BleManager private constructor() {
         )
     }
 
-    /**
-     *  停止扫描
-     */
+    /** Dart 释放最后的聚合 owner；native pending/refresh 仍可继续使用同一物理窗口。 */
+    @Synchronized
+    fun releaseExternalScanLease() {
+        hasExternalScanLease = false
+        // 剩余 native demand 只需普通解析，退出的 DFU owner 不能留下 raw 广播策略。
+        scanPureMode = false
+        scanIncludeNormalResults = false
+        stopScanIfUnused()
+    }
+
+    /** 每个需求只释放自己；最后一个需求退出时才停止系统 scanner。 */
+    @Synchronized
+    private fun stopScanIfUnused() {
+        if (!hasExternalScanLease && pendingScanConnects.isEmpty() && scanRefreshGenerations.isEmpty()) {
+            stopScan()
+        }
+    }
+
+    /** 强制停止物理窗口，供 reset/release/系统失效清理；普通 owner 退出使用租约释放入口。 */
+    @Synchronized
     fun stopScan(isStartScan: Boolean = false) {
         val callback = scanCallback
         try {
@@ -1289,10 +1342,12 @@ class BleManager private constructor() {
         }
     }
 
-    /** 只清理本地扫描投影，不触碰扫描 owner、连接恢复或 FlowPolicy。 */
+    /** 物理窗口失效时一并清外部租约；native intent 的超时/重试仍沿用各自原有机制。 */
     private fun clearLocalScanState() {
+        hasExternalScanLease = false
         scanCallback = null
         scanPureMode = false
+        scanIncludeNormalResults = false
         isScanning = false
         activeScanGeneration = 0L
     }
@@ -2076,14 +2131,15 @@ class BleManager private constructor() {
         plan.cachedDevice?.needsScanBeforeConnect = false
 
         // 2. 同一 uuid 只允许一个 scan-refresh owner；旧任务必须取消，避免晚回调重入 connect。
-        scanRefreshJobs.remove(refreshKey)?.cancel()
+        // 先发布新 generation，避免旧 Job 的 finally 在交接期间误停共享窗口。
         scanRefreshGenerations[refreshKey] = refreshGeneration
+        scanRefreshJobs.remove(refreshKey)?.cancel()
 
         // 3. 扫描刷新期间先上报 connecting，避免 UI 在蓝牙恢复后长时间停留在 idle。
         handleConnectState(plan.request.uuid, plan.request.name, BleConnectState.CONNECTING, generation = plan.request.sessionGeneration)
 
         // 4. 开启扫描后延迟检查目标是否出现；未出现则 fast-fail，避免盲连 GATT 超时。
-        startScan()
+        ensureNativeScanRunning()
         val refreshJob = mainScope.launch {
             try {
                 delay(10000)
@@ -2092,7 +2148,6 @@ class BleManager private constructor() {
                     sendLog(BleLoggerTag.d, "Start connect: ${plan.request.uuid}, stale scan refresh skipped")
                     return@launch
                 }
-                stopScan()
                 if (!isTargetVisibleInScan(plan.request.uuid, plan.request.name, plan.request.sn)) {
                     connectedDevices.removeAll { it.uuid == plan.request.uuid && it.myGatt == null }
                     handleConnectState(plan.request.uuid, plan.request.name, BleConnectState.NO_DEVICE_FOUND, generation = plan.request.sessionGeneration)
@@ -2122,6 +2177,8 @@ class BleManager private constructor() {
                 if (scanRefreshGenerations[refreshKey] == refreshGeneration) {
                     scanRefreshGenerations.remove(refreshKey)
                     scanRefreshJobs.remove(refreshKey)
+                    // 本轮刷新结束只撤销本需求，外部 owner 与其它连接刷新继续运行。
+                    stopScanIfUnused()
                 }
             }
         }
@@ -2184,10 +2241,8 @@ class BleManager private constructor() {
             ),
         )
 
-        // 5. 如果当前没有扫描，启动扫描等待目标广播。
-        if (!isScanning) {
-            startScan()
-        }
+        // 5. 只确保物理扫描运行，不能把 native 等待误登记成外部 owner。
+        ensureNativeScanRunning()
 
         // 6. 没有扫描结果时也要在 connectTimeout 后 fast-fail，避免 UI 永久 connecting。
         mainScope.launch {
@@ -3681,6 +3736,8 @@ class BleManager private constructor() {
         // 2. 停掉所有会在未来重新打开连接的 owner/delay，再释放 connectedDevices GATT。
         cancelAllScanRefresh()
         pendingScanConnects.clear()
+        // clean cache 同样释放 native pending，但不得中断仍有外部 owner 的 scanner。
+        stopScanIfUnused()
         autoReconnectSupervisor.cancelAll(reason = reason)
         cancelAllWriteQueues(reason)
         connectedDevices.forEach { device ->
@@ -3735,6 +3792,7 @@ class BleManager private constructor() {
 
         // 2. 再 cancel Job，释放 delay 挂起的协程。
         scanRefreshJobs.remove(key)?.cancel()
+        stopScanIfUnused()
     }
 
     /**
@@ -3749,6 +3807,7 @@ class BleManager private constructor() {
         // 2. 再逐个取消 Job 并清空表。
         scanRefreshJobs.values.forEach { it.cancel() }
         scanRefreshJobs.clear()
+        stopScanIfUnused()
     }
 
     /**
@@ -3760,10 +3819,8 @@ class BleManager private constructor() {
         // 1. 仅按 uuid 取消，避免同名多设备互相影响。
         pendingScanConnects.removeAll { it.uuid.equals(uuid, ignoreCase = true) }
 
-        // 2. 没有待连接请求时停止扫描，释放硬件扫描资源。
-        if (pendingScanConnects.isEmpty()) {
-            stopScan()
-        }
+        // 2. 只释放本轮 pending 需求，共享外部/refresh owner 仍需物理扫描。
+        stopScanIfUnused()
     }
 
     /**
@@ -3940,6 +3997,8 @@ class BleManager private constructor() {
             else -> return
         }
         if (bleState != 5) {
+            // 蓝牙 OFF/ERROR 已使物理扫描窗口失效；旧 callback/租约不能跨电源周期复用。
+            clearLocalScanState()
             // 2、先冻结终态身份，再暂停 supervisor 和关闭所有连接态物理句柄。
             // Adapter OFF is the native callback that invalidates every live GATT.
             // Freeze the physical marker in the same exact-owner capture operation;
@@ -4300,9 +4359,8 @@ class BleManager private constructor() {
         }
         for (pending in expired) {
             pendingScanConnects.removeAll { it.uuid.equals(pending.uuid, ignoreCase = true) }
-            if (pendingScanConnects.isEmpty()) {
-                stopScan()
-            }
+            // timeout 只结束本请求；其它共享扫描需求继续持有窗口。
+            stopScanIfUnused()
             connectedDevices.removeAll { it.uuid == pending.uuid && it.myGatt == null }
             handleConnectState(pending.uuid, pending.name, BleConnectState.NO_DEVICE_FOUND, generation = pending.sessionGeneration)
             sendLog(BleLoggerTag.d, "Start connect: ${pending.uuid}, scan-then-connect timeout")
@@ -4317,9 +4375,8 @@ class BleManager private constructor() {
         val matched = pendingScanConnects.filter { matchesPendingScan(foundDevice, it) }
         for (pending in matched) {
             pendingScanConnects.removeAll { it.uuid.equals(pending.uuid, ignoreCase = true) }
-            if (pendingScanConnects.isEmpty()) {
-                stopScan()
-            }
+            // 命中后只撤销本 pending，不能关闭 DFU 或其它设备的共享扫描。
+            stopScanIfUnused()
             connect(
                 pending.belongConfig,
                 pending.uuid,
@@ -4346,9 +4403,12 @@ class BleManager private constructor() {
                 bleConfigs
             },
             scanPureMode = {
-                // 2. 纯净扫描是一次扫描会话状态，不进入 pipeline 持久化。
+                // 2. 读取当前共享 owner 的策略，同 generation 模式更新立即生效。
                 scanPureMode
             },
+            scanIncludeNormalResults = { scanIncludeNormalResults },
+            normalDeliveryEpoch = { normalScanDeliveryEpoch },
+            isActiveScan = { isScanning && activeScanGeneration == generation },
             scanResultTemp = scanResultTemp,
             expirePendingScanConnects = {
                 // 3. 扫描期间顺手淘汰 scan-then-connect 超时请求，避免 UI 永久 connecting。
@@ -4358,9 +4418,9 @@ class BleManager private constructor() {
                 // 4. 新扫描结果命中待连接目标后，manager 重新进入 connect 流程。
                 tryConnectFromPendingScan(device)
             },
-            emitMatchDevices = { sn, devices ->
-                // 5. EventChannel 输出保持在 manager，避免 pipeline 关心 Flutter JSON 结构。
-                sendMatchDevices(sn, devices)
+            emitMatchDevices = { sn, devices, isPureScanResult ->
+                // 5. raw 事件显式标记，普通发现/回连消费者不得把随机 SN 当成稳定业务身份。
+                sendMatchDevices(sn, devices, isPureScanResult)
             },
             reportScanFailure = { errorCode ->
                 // 6. Android 异步失败按创建 callback 时冻结的 generation 精确收口。
@@ -4375,10 +4435,11 @@ class BleManager private constructor() {
     /**
      *  发送配对设备到Flutter
      */
-    private fun sendMatchDevices(sn: String, devices: List<BleDevice>) {
+    private fun sendMatchDevices(sn: String, devices: List<BleDevice>, isPureScanResult: Boolean = false) {
         // 1、序列化聚合后的扫描结果，并通过 EventChannel 发送到 Flutter。
         val json = JSONObject()
             .put("sn", sn)
+            .put("isPureScanResult", isPureScanResult)
             .put("devices", JSONArray().also { array ->
                 devices.forEach { device ->
                     array.put(device.toFlutterJson())
