@@ -184,7 +184,7 @@ const String ezwBleTag = "flutter_ezw_ble";
 | `commitBusinessConnection` | `Future<BleBusinessConnectionStatus> commitBusinessConnection(BleBusinessConnectionAttempt attempt, {bool armAutoReconnect = true})` | G2 exact-attempt 真连接入口。原生同时校验 prepare lease、当前 admission、物理连接、当前 GATT/CBPeripheral 身份，以及 write/read/notify readiness；只有成功发布 `connected` 后返回 `accepted`。Android Temp 首配可传 `armAutoReconnect: false`，仅跳过本次成功后的长期 owner 登记，仍发布同代 `connected` 并释放 Gate；iOS 保留既有行为。 |
 | `abortBusinessConnection` | `Future<bool> abortBusinessConnection(BleBusinessConnectionAttempt attempt)` | 只撤销完全匹配的 prepare lease；旧 token abort 不能删除新 lease，也不能断开 GATT、移除 autoReconnect owner 或伪造用户断连。 |
 | `invalidateBusinessConnection` | `Future<bool> invalidateBusinessConnection(BleBusinessConnectionAttempt attempt)` | iOS G2 心跳兜底入口。只接受当前已提交、仍物理 connected、开启 autoReconnect、正 session/attempt 且未被新 admission/OTA 替代的业务 owner；先建立 cancellation barrier，再以上一业务代次发布 `timeout`，保留长期回连意图。陈旧、重复、OTA 中或 Android 调用返回 `false`。 |
-| `sendCmd` | `Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0, bool allowDuringUpgrade = false, int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0, BleG2OtaContext? otaContext, BleBusinessConnectionAttempt? expectedAttempt})` | 普通命令 Future 到 channel/入队边界；可选 expectedAttempt 在 Android 原队列 dequeue 时复验 exact GATT。`psType` 是"私有服务类型"，对应 `BlePrivateService.type`（0=基础，1=OTA，2+=自定义）。升级态默认阻断非 OTA 写入；只有上层协议白名单确认的 AUTH、时间同步等恢复控制指令可显式传 `allowDuringUpgrade=true`。OTA 控制包携带正 `expectedSessionGeneration/expectedAttemptGeneration` 时，native 必须在实际 dispatch 前按当前物理 owner 校验；携带 `otaContext` 时还必须命中当前 G2 OTA transaction，避免旧 START/INFORMATION/RESULT 写入新 GATT 或越权清理。 |
+| `sendCmd` | `Future<void> sendCmd(String uuid, Uint8List data, {int psType = 0, bool allowDuringUpgrade = false, int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0, BleG2OtaContext? otaContext, BleBusinessConnectionAttempt? expectedAttempt})` | 普通命令 Future 到 channel/入队边界；可选 `expectedAttempt` 在 Android 原队列 dequeue 时复验 exact GATT，iOS 仅在 `psType=0` 实际同步写入前复验当前已提交业务 owner、正 session/attempt、配置和 peripheral/characteristic 对象。每个分片须重复携带 token；成功只证明到达 native 写入边界，不证明固件 ACK。iOS 非 common owned 写返回 `owned_write_unsupported`，非法 token/data 返回 `owned_write_invalid_arguments`，失效 owner 返回 `owned_write_stale`，CCCD 未确认返回 `COMMON_NOT_READY`，不得退回无 owner 写入。`psType` 是"私有服务类型"，对应 `BlePrivateService.type`（0=基础，1=OTA，2+=自定义）。升级态默认阻断非 OTA 写入；只有上层协议白名单确认的 AUTH、时间同步等恢复控制指令可显式传 `allowDuringUpgrade=true`，该选项不能放行 iOS owned common。OTA 控制包携带正 `expectedSessionGeneration/expectedAttemptGeneration` 时，native 必须在实际 dispatch 前按当前物理 owner 校验；携带 `otaContext` 时还必须命中当前 G2 OTA transaction，避免旧 START/INFORMATION/RESULT 写入新 GATT 或越权清理。 |
 | `sendCmdNoWait` | `Future<void> sendCmdNoWait(String uuid, Uint8List data, {int psType = 0, int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0, BleG2OtaContext? otaContext})` | OTA 连发入口。Android：`psType == 1` 走 per-endpoint `WRITE_TYPE_NO_RESPONSE` 队列；同步 BUSY 保留原包，Future 等本包 `onCharacteristicWrite` 成功后返回，4s 停滞/teardown typed fail，避免固定延时撞 GATT 单槽位。iOS：`psType == 1` 走 `WriteWithoutResponse` + `canSendWriteWithoutResponse` 背压队列（见 `ios/Classes/ble/OtaWriteQueue.swift` 与 `docs/IOS_OTA_NOWAIT_SPEC.md`）。OTA RAW 携带正 expected pair 时，native 在入队/提交前按当前物理 owner 校验；携带 `otaContext` 时还必须命中当前 G2 OTA transaction。其它 `psType` 保持历史 no-wait 语义。 |
 | `sendOtaPacketBatch` | `Future<void> sendOtaPacketBatch(String uuid, List<Uint8List> framedPackets, {int psType = 1, int expectedSessionGeneration = 0, int expectedAttemptGeneration = 0})` | 批量接收已封装 OTA 小包但仍逐包提交；Future 等最后一包提交，失败丢弃本批剩余包。每包复验冻结的 exact physical pair。 |
 | `beginFilePacketBatch` | `Future<String> beginFilePacketBatch(String uuid)` | 在当前物理文件队列预留唯一、单次提交的 native token；busy / unavailable 拒绝，不提交数据。 |
@@ -1138,5 +1138,36 @@ object before attaching their successful runtime pair to the existing outer
 `receiveIdentity`: pre-business packets require the exact current admission and
 connection pipeline; committed packets require the accepted reconnect owner. A
 runtime-common snapshot cannot bypass a failed admission check or synthesize this
-nested proof. These observations do not enable iOS expected-attempt writes or claim
+nested proof. Neither these observations nor the owned-write checks below claim
 Android GATT handle provenance.
+
+### iOS owned common writes
+
+The existing `sendCmd(expectedAttempt: ...)` API supports only `psType=0` on iOS.
+The MethodChannel distinguishes an absent token (legacy dispatch) from a malformed
+token (typed rejection); UUIDs must match exactly and both generations must be
+positive codec integers. Empty data, booleans, fractional values and overflow must
+not be coerced into a valid write. OTA, RAW/file and custom-service owned intents
+remain unsupported, while existing callers without `expectedAttempt` retain their
+original behavior.
+
+`sendOwnedCommonCmd` runs on the manager's main queue with no native delayed queue.
+Immediately before `writeValue` it requires the current successful reconnect pair,
+business/flow-complete and physically connected peripheral, no cancellation barrier,
+newer admission or OTA owner, the current registered config's common read/write UUIDs, and both
+characteristics' actual service/peripheral objects. The runtime common lane fence
+and the actual `isNotifying` state must permit the write. Any failed check returns a
+typed error without submitting, reconnecting or changing ownership. Each packet in
+an SDK queue or multi-packet command must call this API with the frozen token again;
+an old token cannot write a later packet after a reconnect. A future native queue
+must move these checks to every actual packet submission rather than validating
+only at enqueue time.
+
+Returning successfully proves only that native issued the local `writeValue`
+call on the checked objects. The SDK must still validate its protocol
+ACK and received `receiveIdentity` against the original pair. CoreBluetooth can
+reuse peripheral/characteristic objects and exposes no per-notification GATT handle,
+so the existing iOS receive-provenance limit still applies. Validation compiles the
+real MethodChannel case and manager/coordinator bodies with platform boundaries
+stubbed in `test/runtime_common_notifications_test.dart`; radio delivery and firmware
+ACK behavior require separate device verification.
