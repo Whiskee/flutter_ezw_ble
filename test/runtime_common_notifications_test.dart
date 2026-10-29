@@ -128,20 +128,34 @@ void main() {
       final reconnectSource =
           File('ios/Classes/ble/BleAutoReconnectCoordinator.swift')
               .readAsStringSync();
+      final channelSource =
+          File('ios/Classes/ble/BleMethodChannel.swift').readAsStringSync();
+      final sendCaseStart = channelSource.indexOf('        case .sendCmd:');
+      final sendCaseEnd =
+          channelSource.indexOf('        case .sendCmdNoWait:', sendCaseStart);
+      expect(sendCaseStart, greaterThanOrEqualTo(0));
+      expect(sendCaseEnd, greaterThan(sendCaseStart));
+      final sendCase = channelSource.substring(
+          sendCaseStart + '        case .sendCmd:'.length, sendCaseEnd);
       final methods = File('${temporary.path}/ManagerMethods.swift');
       methods.writeAsStringSync('''
 import Foundation
 final class BleManager {
+  static let shared = BleManager()
   let runtimeCommonNotifications = BleRuntimeCommonNotifications()
   let upgradeStateRegistry = UpgradeRegistry()
   let g2OtaTransactions = OtaTransactions()
   let centralManager = Central()
   var connectedDevices: [BleConnectedDevice] = []
+  var bleConfigs: [Config] = []
   var reconnectTasks: [String: Task] = [:]
   var admission: Admission?
   var peripheralConnectionSessions: [String: ConnectionSession] = [:]
   var otaWriteQueues: [String: OtaWriteQueue] = [:]
-  func checkIsFunctionCanBeCalled() -> Bool { true }
+  var callable = true
+  var cancellationBarrier = false
+  func checkIsFunctionCanBeCalled() -> Bool { callable }
+  func hasPeripheralCancellationBarrier(_ peripheral: CBPeripheral) -> Bool { cancellationBarrier }
   func currentConnectionAdmission(uuid: String) -> Admission? { admission }
   func isCurrentConnectionPipeline(_ peripheral: CBPeripheral) -> Bool {
     guard let admission = currentConnectionAdmission(uuid: peripheral.identifier.uuidString),
@@ -154,6 +168,9 @@ final class BleManager {
   func validateOtaWriteIdentity(uuid: String, device: BleConnectedDevice,
       expectedSessionGeneration: Int64, expectedAttemptGeneration: Int64,
       otaContext: BleG2OtaContext?) -> FlutterError? { nil }
+  func dispatchSendCmd(_ arguments: Any?, result: @escaping FlutterResult) {
+$sendCase
+  }
 ${_method(source, '    func sendCmd(')}
 ${_method(source, '    private func receiveDataIdentity(')}
 ${_method(source, '    private func otaResponseIdentity(')}
@@ -173,6 +190,7 @@ $extension
         'swiftc',
         '-O',
         'ios/Classes/ble/BleRuntimeCommonNotifications.swift',
+        'ios/Classes/ble/BleBusinessConnectionAttempt.swift',
         'ios/Classes/ble/BleReceiveIdentityPolicy.swift',
         'ios/Classes/ble/BleDebugLogPolicy.swift',
         'ios/Classes/ble/OtaWindowCreditLedger.swift',

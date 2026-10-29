@@ -51,6 +51,7 @@
 - 改 auto reconnect 时，同步更新 `docs/AUTO_RECONNECT_SPEC.md`、`ARCHITECTURE.md` 和相关测试/排障记录。
 - iOS 回连目标去重只在 `saveTargets` 存储边界执行，完整约束见 `docs/AUTO_RECONNECT_SPEC.md` 的目标持久化段：只跳过完整原始四字段相等且 UUID/名称无歧义的写入并保留原排列；不得短路 canonical/安全清理、新 session owner 安装或独立的第五次安全失败落盘，旧格式、坏缓存及字段大小写变化仍须走写入。
 - iOS 运行期 common 订阅完整约束见 `ARCHITECTURE.md` 的 runtime common 段：必须使用当前业务 owner 的正 session/attempt 与实际 peripheral/characteristic 对象；超时保留未回执 lane，旧 false 不得确认新 true；common 实际写边界须返回 `COMMON_NOT_READY`。unknown 恢复只允许 exact 非 OTA owner 每物理 lane 一次真实 cancel，禁止清 OTA、删 reconnect owner、伪造终态或重复发布 connected；新 attempt 的初始化/AUTH 不得被旧 fence 阻塞。
+- iOS `sendCmd(expectedAttempt:)` 仅支持已提交业务 owner 的 common（`psType=0`），完整约束见 `ARCHITECTURE.md` 的 owned common 段：必须在每包实际写入前复验正 exact pair、当前配置、peripheral/characteristic 和通知 fence；非法或失效 token 不得降级为无 owner 写入，OTA/FILE/其它 owned 通道仍须拒绝。Future 不代表固件 ACK，不能提高 iOS 接收归属证明等级。
 - BLE 行为变化通常需要同时审视 Dart 和原生两端，不要假设 Android 与 iOS 可以共享实现细节。
 
 ## 常用命令

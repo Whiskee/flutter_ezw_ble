@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 
 /// Exact Dart business-auth token derived from one connectStatus event.
 struct BleBusinessConnectionAttempt: Equatable {
@@ -16,6 +17,51 @@ struct BleBusinessConnectionAttempt: Equatable {
         uuid = data["uuid"] as? String ?? ""
         sessionGeneration = (data["sessionGeneration"] as? NSNumber)?.int64Value ?? 0
         attemptGeneration = (data["attemptGeneration"] as? NSNumber)?.int64Value ?? 0
+    }
+}
+
+/// Decode the optional common-write intent before constructing the BLE manager.
+/// Presence is significant: a malformed token must never use legacy dispatch.
+enum BleOwnedCommonWriteIntent {
+    case legacy
+    case owned(BleBusinessConnectionAttempt)
+    case rejected(String)
+
+    static func decode(_ arguments: [String: Any]) -> BleOwnedCommonWriteIntent {
+        guard arguments.keys.contains("expectedAttempt") else { return .legacy }
+        guard let uuid = arguments["uuid"] as? String,
+              !uuid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let raw = arguments["expectedAttempt"] as? [String: Any],
+              raw["uuid"] as? String == uuid,
+              let session = positiveInteger(raw["sessionGeneration"]),
+              let attempt = positiveInteger(raw["attemptGeneration"]) else {
+            return .rejected("owned_write_invalid_arguments")
+        }
+        // Only the existing synchronous common path is owned on iOS. OTA/FILE
+        // retain their independent transactions and cannot inherit this token.
+        if let rawType = arguments["psType"], integer(rawType) == nil {
+            return .rejected("owned_write_invalid_arguments")
+        }
+        guard (arguments["psType"].flatMap(integer) ?? 0) == 0 else {
+            return .rejected("owned_write_unsupported")
+        }
+        return .owned(BleBusinessConnectionAttempt(uuid: uuid,
+            sessionGeneration: session, attemptGeneration: attempt))
+    }
+
+    /// Flutter's integer codec produces NSNumber integer types; bool, float,
+    /// string and overflow values must not be truncated into another owner.
+    private static func integer(_ raw: Any) -> Int64? {
+        guard let number = raw as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              !["f", "d"].contains(String(cString: number.objCType)),
+              number.stringValue == String(number.int64Value) else { return nil }
+        return number.int64Value
+    }
+
+    private static func positiveInteger(_ raw: Any?) -> Int64? {
+        guard let raw, let value = integer(raw), value > 0 else { return nil }
+        return value
     }
 }
 

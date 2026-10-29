@@ -371,10 +371,22 @@ enum BleMC: String {
             return
         case .sendCmd:
             let jsonData: [String: Any] = arguments as? [String: Any] ?? [:]
-            // CoreBluetooth subscription provenance is not yet an owned-write contract.
-            if jsonData.keys.contains("expectedAttempt") {
-                result(FlutterError(code: "owned_write_unsupported",
-                    message: "Expected-attempt writes are unavailable on iOS", details: nil))
+            let expectedAttempt: BleBusinessConnectionAttempt?
+            switch BleOwnedCommonWriteIntent.decode(jsonData) {
+            case .legacy:
+                expectedAttempt = nil
+            case .owned(let attempt):
+                // An owned request cannot silently succeed without a packet.
+                guard let data = jsonData["data"] as? FlutterStandardTypedData,
+                      !data.data.isEmpty else {
+                    result(FlutterError(code: "owned_write_invalid_arguments",
+                        message: "Owned common write requires data", details: nil))
+                    return
+                }
+                expectedAttempt = attempt
+            case .rejected(let code):
+                result(FlutterError(code: code,
+                    message: "Invalid or unsupported owned common write", details: nil))
                 return
             }
             let uuid: String = jsonData["uuid"] as? String ?? ""
@@ -392,12 +404,14 @@ enum BleMC: String {
                     allowDuringUpgrade: allowDuringUpgrade,
                     expectedSessionGeneration: expectedSessionGeneration,
                     expectedAttemptGeneration: expectedAttemptGeneration,
-                    otaContext: otaContext
+                    otaContext: otaContext,
+                    expectedAttempt: expectedAttempt
                 )
                 if let error { result(error); return }
             }
-            // CoreBluetooth does not expose a reliable per-packet success callback here;
-            // return after enqueueing to preserve the historical Dart contract.
+            // Owned common has reached its checked synchronous writeValue edge;
+            // legacy preserves the historical return contract. Neither proves
+            // delivery or a firmware ACK for WriteWithoutResponse.
             result(nil)
             return
         case .sendCmdNoWait:

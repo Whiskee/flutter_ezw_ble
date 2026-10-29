@@ -3,6 +3,60 @@ import Foundation
 import Flutter
 
 extension BleManager {
+    /// The common sendCmd path has no native async queue: admission and the
+    /// actual CB write share the manager's main-queue turn. Every later packet
+    /// must present the same token again; a disconnect/new admission invalidates
+    /// it without clearing or reconnecting any other owner.
+    func sendOwnedCommonCmd(uuid: String, data: Data, psType: Int,
+        expectedAttempt: BleBusinessConnectionAttempt) -> FlutterError? {
+        guard psType == 0 else {
+            return FlutterError(code: "owned_write_unsupported",
+                message: "Owned writes support only the common sendCmd path", details: nil)
+        }
+        guard expectedAttempt.uuid == uuid, !uuid.isEmpty, !data.isEmpty,
+              expectedAttempt.sessionGeneration > 0,
+              expectedAttempt.attemptGeneration > 0 else {
+            return FlutterError(code: "owned_write_invalid_arguments",
+                message: "Invalid expected BLE attempt", details: nil)
+        }
+        // A successful committed reconnect pair, current live objects and the
+        // current configuration are all required. Cache flags alone are not a
+        // lease, and allowDuringUpgrade cannot authorize this new branch.
+        guard Thread.isMainThread,
+              let snapshot = runtimeCommonSnapshot(uuid: uuid),
+              !hasPeripheralCancellationBarrier(snapshot.device.peripheral),
+              snapshot.identity.sessionGeneration == expectedAttempt.sessionGeneration,
+              snapshot.identity.attemptGeneration == expectedAttempt.attemptGeneration,
+              let task = reconnectTasks.values.first(where: {
+                  $0.uuid.caseInsensitiveCompare(uuid) == .orderedSame
+              }), task.belongConfig == snapshot.device.belongConfig.name,
+              let config = bleConfigs.first(where: { $0.name == task.belongConfig }),
+              let common = config.privateServices.first(where: { $0.type == 0 }),
+              let readUUID = common.readCharUUID, let writeUUID = common.writeCharUUID,
+              let writeCharacteristic = snapshot.device.writeCharsDic[0],
+              snapshot.characteristic.uuid == readUUID,
+              writeCharacteristic.uuid == writeUUID,
+              snapshot.characteristic.service?.uuid == common.serviceUUID,
+              writeCharacteristic.service?.uuid == common.serviceUUID,
+              snapshot.characteristic.service?.peripheral === snapshot.device.peripheral,
+              writeCharacteristic.service?.peripheral === snapshot.device.peripheral else {
+            return FlutterError(code: "owned_write_stale",
+                message: "Committed common write owner is no longer current", details: nil)
+        }
+        // Preserve the exact runtime CCCD fence as well as CoreBluetooth's
+        // actual subscription state. Neither a pending true nor an old false
+        // callback is permission to start this packet.
+        if let error = runtimeCommonWriteError(uuid: uuid, psType: 0, device: snapshot.device) {
+            return error
+        }
+        guard snapshot.characteristic.isNotifying else {
+            return FlutterError(code: "COMMON_NOT_READY",
+                message: "Common notification is not subscribed", details: nil)
+        }
+        snapshot.device.peripheral.writeValue(data, for: writeCharacteristic, type: .withoutResponse)
+        return nil
+    }
+
     /// Read only successful reconnect-owner metadata. A new/pending admission,
     /// an OTA transaction or a cache-only connected flag is insufficient.
     func getRuntimeCommonOwner(uuid: String) -> [String: Any]? {

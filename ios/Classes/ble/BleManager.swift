@@ -2010,8 +2010,15 @@ extension BleManager {
         allowDuringUpgrade: Bool = false,
         expectedSessionGeneration: Int64 = 0,
         expectedAttemptGeneration: Int64 = 0,
-        otaContext: BleG2OtaContext? = nil
+        otaContext: BleG2OtaContext? = nil,
+        expectedAttempt: BleBusinessConnectionAttempt? = nil
     ) -> FlutterError? {
+        // Each SDK-framed common packet reaches this main-queue boundary with
+        // its frozen owner. Never downgrade owned admission to legacy writes.
+        if let expectedAttempt {
+            return sendOwnedCommonCmd(uuid: uuid, data: data, psType: psType,
+                expectedAttempt: expectedAttempt)
+        }
         guard checkIsFunctionCanBeCalled() else {
             return nil
         }

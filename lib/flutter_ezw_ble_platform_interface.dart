@@ -420,6 +420,9 @@ abstract class FlutterEzwBlePlatform extends PlatformInterface {
   /// - param expectedSessionGeneration OTA 调用方冻结的业务 session；0 表示兼容旧调用
   /// - param expectedAttemptGeneration OTA 调用方冻结的物理 attempt；0 表示兼容旧调用
   /// - param otaContext G2 OTA 原生事务凭据；非空时 native 必须同时校验事务和物理身份
+  /// - param expectedAttempt 每包冻结的 exact owner；Android 在出队时复验，iOS 仅支持
+  ///   已提交业务连接的 psType=0，并在实际写入前复验；失败不得降级为无 owner。
+  ///   Future 不代表固件 ACK；iOS 其它 owned 通道返回 owned_write_unsupported。
   ///
   Future<void> sendCmd(
     String uuid,
